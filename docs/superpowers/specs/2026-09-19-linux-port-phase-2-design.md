@@ -167,7 +167,7 @@ The math is already in core (`Zoom`, Phase 1). Phase 2 adds rendering and input.
 **Rendering**
 - The video `Image` sits in a `clip: true` container.
 - Its `x`/`y`/`width`/`height` are set from `Zoom::transform(frame_w, frame_h, area_w, area_h)`: `tx`, `ty`, `frame_w·a`, `frame_h·d`.
-- This gives continuous, sub-pixel zoom on the GPU, and it updates while **paused**. A GStreamer-side transform would need a new frame to be pushed before a changed zoom showed.
+- This gives smooth zoom on the GPU that updates while **paused**. Scale is continuous. Position snaps to whole physical pixels: Slint's Skia renderer pixel-aligns translate-only image draws (`i-slint-renderer-skia` 1.18 `itemrenderer.rs:474-512`, measured in the Phase 2 Task 0 spike). A slow pan therefore moves in 1-pixel steps, which is judged by eye in Task 7. A GStreamer-side transform would need a new frame to be pushed before a changed zoom showed.
 - Slint has no translate property, so geometry is the mechanism. Export (Phase 8) drives `gltransformation` from the same `Zoom::transform`.
 
 **Letterbox.** The player area is fitted with `Zoom::IDENTITY.transform(...)`. There is no aspect-locked frame as on macOS, so:

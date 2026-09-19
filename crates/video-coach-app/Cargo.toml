@@ -7,3 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+# Used only by examples/zero_copy_spike.rs until the app itself needs them.
+[dev-dependencies]
+slint.workspace = true
+gstreamer.workspace = true
+gstreamer-video.workspace = true
+gstreamer-app.workspace = true
+gstreamer-gl.workspace = true
+gstreamer-gl-egl.workspace = true
+glutin_egl_sys.workspace = true

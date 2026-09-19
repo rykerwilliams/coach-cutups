@@ -1,11 +1,11 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.92"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/rykerwilliams/coach-cutups"
 
@@ -15,3 +15,15 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 tempfile = "3"
+
+# UI and media stack (Phase 2). video-coach-core must never use any of these.
+slint = { version = "1.18", default-features = false, features = ["std", "backend-winit", "renderer-skia-opengl", "compat-1-18"] }
+slint-build = "1.18"
+gstreamer = { version = "0.25", features = ["v1_24"] }
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
+gstreamer-app = { version = "0.25", features = ["v1_24"] }
+gstreamer-gl = { version = "0.25", features = ["v1_24"] }
+gstreamer-gl-egl = { version = "0.25", features = ["v1_24"] }
+gstreamer-pbutils = { version = "0.25", features = ["v1_24"] }
+glutin_egl_sys = "0.7"
+rfd = "0.17"

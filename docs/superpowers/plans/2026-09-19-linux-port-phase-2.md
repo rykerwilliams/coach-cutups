@@ -67,6 +67,26 @@
 
 Commit: `chore(app): Phase 2 toolchain, CI and zero-copy spike`.
 
+### Task 0 notes (2026-09-19, reference laptop)
+
+- **Gate: passed.** Measured with `GST_DEBUG=glupload:6 zero_copy_spike 20260502121738_000004.MP4 --quit-after 15`.
+  - Decoder: `vah265dec`.
+  - Caps into `glupload`: `video/x-raw(memory:DMABuf), format=DMA_DRM, 2560x1440, drm-format=NV12:0x0100000000000002`.
+  - Uploader: `Changing uploader from None to DirectDmabufExternal`, and it stayed there. There were 434 `DirectDmabufExternal returned 1` uploads in about 14.5 s, which is 30 fps, and no `Raw Data`. The single `Dmabuf Passthrough` line is the first candidate being tried before it is rejected.
+  - Platform: Slint's context is `EGL`/`GLES2`. The context `glupload` uses is `EGL` with an `EGL` display.
+  - Playback produced no QoS messages and no warnings, and exited cleanly at `--quit-after`.
+  - Screenshot: yes, the camera frame is visible. The root-window screenshot showed only the Cinnamon screensaver, which was active on `:0`. Grabbing the spike's own window with `import -window <id>` works through it, because the compositor redirects windows.
+- **Sub-pixel check: `x` steps and `width` doesn't.** Screenshots were taken while paused on the preroll frame, comparing mean absolute luma over the interior.
+  - `x` = 0.25 is identical to `x` = 0 (difference 0.000), and `x` = 0.5 is identical to `x` = 1. The Skia renderer rounds the origin to whole physical pixels whenever the transform is translate-only (`i-slint-renderer-skia` `itemrenderer.rs:474-512`, `pixel_align_origin_auto_restore`, used by `draw_image_impl`).
+  - `width` = 800.25 and 800.5 each differ from both 800 and 801, so scaling is continuous.
+  - Consequence for D9: zoom scale is continuous, but pan and zoom offsets move in steps of 1 physical pixel. The spec's claim of "continuous, sub-pixel zoom" is only half true. Whether a 1 px step is visible during slow pans is for the human to judge in Task 7.
+- **Build.** The first build of the spike took 4 min 36 s of wall time and 28.5 CPU-minutes.
+  - The workspace also passes clippy on Rust 1.92 with `--locked`. `kstring` is held at 2.0.2, as the resolver note predicted.
+  - `cargo test --workspace` passed: 152 tests, all in core.
+- **Surprises.**
+  - The deps the spike needs are `[dev-dependencies]` of `video-coach-app` until Task 5 uses them for real. `rfd` and `slint-build` are workspace-only for now.
+  - Task 5 says to delete this example once the window works, but step 3 above says it stays as a diagnostic. Decide which in Task 5.
+
 ## Task 1 — Core additions (no GStreamer)
 
 Work in `crates/video-coach-core`, following the `port-swift-module` skill.
@@ -234,7 +254,7 @@ This moves the spike into the app, so every later task can check its work by eye
   - a cross-source skip in a two-source project;
   - the log shows the decoder, `memory:DMABuf` caps and EGL.
 
-  Delete the spike example once this works.
+  Keep the spike example as a diagnostic (Task 0 decision); it isolates the zero-copy path from the app.
 
 Commit: `feat(app): window with zero-copy video`.
 
@@ -290,6 +310,7 @@ D9. Zoom state lives in the UI and isn't persisted.
 - **Reset.** Return to identity on `ProjectOpened`.
 - **Indicator.** Use the D9 constants.
 - **Manual check.** Ctrl+scroll and two-finger pan on the touchpad, and zoom while paused.
+- **Pixel snapping** (Task 0 finding). Skia rounds a translate-only image position to whole physical pixels, while width scales continuously. Judge by eye whether a slow pan steps visibly. If it does, try giving the `Image` a non-translate transform (for example `transform-scale`) so Skia stops snapping. Record the outcome.
 
 Commit: `feat(app): zoom and pan`.
 
