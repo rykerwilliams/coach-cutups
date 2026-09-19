@@ -92,6 +92,31 @@ pub struct SourceRef {
     pub relative_path: String,
     pub display_name: String,
     pub duration_seconds: f64,
+    /// Width / height after pixel aspect ratio, stored at probe time.
+    ///
+    /// Read **only** by the aspect gate ([`Project::check_aspect`]); rendering
+    /// uses the live caps. Required rather than defaulted: a `0.0` default
+    /// would fail every gate comparison, and no file without it was ever
+    /// written outside tests (the field amends the unshipped v7).
+    pub display_aspect: f64,
+}
+
+/// [`Project::remove_source`] refused because a clip or match event still
+/// points at the source. Silently retargeting them would produce subtly wrong
+/// playback, so the user must delete them first.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("source {index} is still used by a clip or match event")]
+pub struct SourceReferenced {
+    pub index: usize,
+}
+
+/// [`Project::check_aspect`] refused: every source in a project shares one
+/// display aspect, and `attempted` differs from the project's `existing` one.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq)]
+#[error("aspect {attempted:.4} does not match the project's {existing:.4}")]
+pub struct AspectMismatch {
+    pub existing: f64,
+    pub attempted: f64,
 }
 
 /// One tagged moment with its commentary recording.
@@ -178,5 +203,153 @@ impl Project {
     /// format rather than with the player.
     pub fn abs_seconds(&self, source_index: usize, source_seconds: f64) -> f64 {
         self.cumulative_offset(source_index) + source_seconds
+    }
+
+    /// Concat time → `(source_index, source_seconds)`. The inverse is
+    /// [`Project::abs_seconds`].
+    ///
+    /// Ported from macOS `Workspace.sourceTime(at:)`:
+    ///
+    /// - the first source with `abs < cumulative + duration` contains it;
+    /// - an instant exactly on a boundary belongs to the **next** source, at 0;
+    /// - past the end, it clamps to `(last, last_duration)`;
+    /// - with no sources, it is `(0, 0)`.
+    ///
+    /// Uses the stored durations (the duration authority), so a zero-length
+    /// source is never located into.
+    pub fn locate(&self, abs_seconds: f64) -> (usize, f64) {
+        let Some(last) = self.source_videos.len().checked_sub(1) else {
+            return (0, 0.0);
+        };
+        let mut cumulative = 0.0;
+        for (i, src) in self.source_videos.iter().enumerate() {
+            let next = cumulative + src.duration_seconds;
+            if abs_seconds < next {
+                // `f64::max` returns the non-NaN operand, so this never goes
+                // negative for an `abs_seconds` before the start.
+                return (i, (abs_seconds - cumulative).max(0.0));
+            }
+            cumulative = next;
+        }
+        (last, self.source_videos[last].duration_seconds)
+    }
+
+    /// True if any clip or match event points at source `index`.
+    ///
+    /// The UI disables a source's remove button on this; [`remove_source`]
+    /// re-checks it. macOS counted clips only, so a match event could be left
+    /// pointing at the wrong file.
+    ///
+    /// [`remove_source`]: Project::remove_source
+    pub fn source_is_referenced(&self, index: usize) -> bool {
+        self.clips.iter().any(|c| c.source_index == index)
+            || self.match_events.iter().any(|m| m.source_index == index)
+    }
+
+    /// Remove source `index`, keeping every clip and match event on its own
+    /// physical file.
+    ///
+    /// Refuses while the source is referenced. On success every higher
+    /// `source_index` — in clips **and** match events (macOS remapped clips
+    /// only) — drops by one, and `current` (the player's source) goes through
+    /// the same remap: `None` means the current source was the one removed.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is out of range, like `Vec::remove`.
+    pub fn remove_source(
+        &mut self,
+        index: usize,
+        current: usize,
+    ) -> Result<Option<usize>, SourceReferenced> {
+        if self.source_is_referenced(index) {
+            return Err(SourceReferenced { index });
+        }
+        self.source_videos.remove(index);
+        let shift = |i: &mut usize| {
+            if *i > index {
+                *i -= 1;
+            }
+        };
+        self.clips
+            .iter_mut()
+            .for_each(|c| shift(&mut c.source_index));
+        self.match_events
+            .iter_mut()
+            .for_each(|m| shift(&mut m.source_index));
+        Ok(match current.cmp(&index) {
+            std::cmp::Ordering::Less => Some(current),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(current - 1),
+        })
+    }
+
+    /// Move source `from` to position `to` (the `Vec::remove` + `Vec::insert`
+    /// convention) and remap clips, match events and `current` through the same
+    /// permutation, returning the new `current`.
+    ///
+    /// A move is always a valid permutation, so there is nothing to refuse.
+    /// macOS remapped clips only.
+    ///
+    /// # Panics
+    ///
+    /// If `from` or `to` is out of range.
+    pub fn move_source(&mut self, from: usize, to: usize, current: usize) -> usize {
+        let src = self.source_videos.remove(from);
+        self.source_videos.insert(to, src);
+        let remap = |i: usize| {
+            if i == from {
+                to
+            } else if from < i && i <= to {
+                i - 1
+            } else if to <= i && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+        for c in &mut self.clips {
+            c.source_index = remap(c.source_index);
+        }
+        for m in &mut self.match_events {
+            m.source_index = remap(m.source_index);
+        }
+        remap(current)
+    }
+
+    /// Gate a candidate source's display aspect against the project's.
+    ///
+    /// The reference is the stored aspect of the first source other than
+    /// `excluding` (the one being relinked; `None` on add). With no such source
+    /// there is no gate, so a sole source can be relinked to a new aspect —
+    /// the intent of macOS's relink gate, which in practice never ran. Stored
+    /// aspects are used, so the gate works while other sources are missing.
+    ///
+    /// Rule (macOS `aspectsMatch`): both aspects > 0 and
+    /// `|a − b| / max(a, b) < 0.005`. The 0.5% absorbs phone footage that lands
+    /// a pixel off (1920×1078) without admitting a genuinely different aspect.
+    /// A NaN aspect fails the `> 0` test and so mismatches.
+    pub fn check_aspect(
+        &self,
+        candidate: f64,
+        excluding: Option<usize>,
+    ) -> Result<(), AspectMismatch> {
+        let reference = self
+            .source_videos
+            .iter()
+            .enumerate()
+            .find(|&(i, _)| Some(i) != excluding);
+        let Some((_, reference)) = reference else {
+            return Ok(());
+        };
+        let (a, b) = (reference.display_aspect, candidate);
+        if a > 0.0 && b > 0.0 && (a - b).abs() / a.max(b) < 0.005 {
+            Ok(())
+        } else {
+            Err(AspectMismatch {
+                existing: a,
+                attempted: b,
+            })
+        }
     }
 }

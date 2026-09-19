@@ -30,6 +30,7 @@ fn project_with(clips: Vec<Clip>) -> Project {
         relative_path: "film.mp4".into(),
         display_name: "film".into(),
         duration_seconds: 1000.0,
+        display_aspect: 16.0 / 9.0,
     });
     p.clips = clips;
     p

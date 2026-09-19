@@ -336,3 +336,47 @@ fn a_nan_zoom_does_not_panic() {
         z.scale
     );
 }
+
+// --------------------------------------------------------- content fraction
+// New: the port letterboxes the player area, so a window-space cursor must be
+// normalized to the content rect before it reaches `zoomed_to_cursor`.
+
+/// A 16:9 frame fills a 16:9 area, so the fraction is the plain ratio.
+#[test]
+fn content_fraction_of_a_filling_frame_is_the_plain_ratio() {
+    let f = |x, y| Zoom::content_fraction(x, y, 1920.0, 1080.0, 960.0, 540.0);
+    assert_eq!(f(0.0, 0.0), (0.0, 0.0));
+    assert_eq!(f(480.0, 135.0), (0.5, 0.25));
+    assert_eq!(f(960.0, 540.0), (1.0, 1.0));
+}
+
+/// A 4:3 frame in a 16:9 area is pillarboxed: the fraction is of the content
+/// rect (120..840 of a 960 area), not of the window.
+#[test]
+fn content_fraction_is_relative_to_the_pillarboxed_content_rect() {
+    let f = |x, y| Zoom::content_fraction(x, y, 1440.0, 1080.0, 960.0, 540.0);
+    assert_eq!(f(120.0, 0.0), (0.0, 0.0));
+    assert_eq!(f(480.0, 270.0), (0.5, 0.5));
+    assert_eq!(f(660.0, 405.0), (0.75, 0.75));
+    assert_eq!(f(840.0, 540.0), (1.0, 1.0));
+}
+
+/// A cursor in the bars (or outside the area) clamps to the content edge.
+#[test]
+fn content_fraction_clamps_a_cursor_in_the_letterbox_bars() {
+    let f = |x, y| Zoom::content_fraction(x, y, 1440.0, 1080.0, 960.0, 540.0);
+    assert_eq!(f(100.0, 270.0), (0.0, 0.5), "left bar");
+    assert_eq!(f(900.0, 270.0), (1.0, 0.5), "right bar");
+    assert_eq!(f(-50.0, 600.0), (0.0, 1.0), "outside the area");
+}
+
+/// The fraction feeds `zoomed_to_cursor`: zooming about a cursor keeps the
+/// source point under it fixed.
+#[test]
+fn content_fraction_feeds_zoomed_to_cursor() {
+    let (cx, cy) = Zoom::content_fraction(600.0, 405.0, 1440.0, 1080.0, 960.0, 540.0);
+    let before = Zoom::IDENTITY.source_point(cx, cy);
+    let z = Zoom::IDENTITY.zoomed_to_cursor(2.0, cx, cy);
+    let after = z.source_point(cx, cy);
+    assert!(approx(before.0, after.0) && approx(before.1, after.1));
+}

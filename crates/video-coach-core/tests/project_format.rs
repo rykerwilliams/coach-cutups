@@ -37,6 +37,7 @@ fn sample_project() -> Project {
         relative_path: "../film/first-half.mp4".into(),
         display_name: "first-half.mp4".into(),
         duration_seconds: 2700.0,
+        display_aspect: 16.0 / 9.0,
     });
     p.clips.push(sample_clip());
     p.scoreboard = Some(ScoreboardConfig {
@@ -117,6 +118,44 @@ fn missing_clips_is_an_error_not_an_empty_project() {
     write_raw(
         dir.path(),
         json!({"formatVersion": 7, "name": "x", "sourceVideos": []}),
+    );
+    assert!(matches!(
+        store::read(dir.path()),
+        Err(StoreError::Malformed(_))
+    ));
+}
+
+/// New. The on-disk shape of a source reference. A round trip can't catch a
+/// wrong field name; this can.
+#[test]
+fn source_ref_has_the_expected_wire_shape() {
+    let s = SourceRef {
+        relative_path: "../film/a.mp4".into(),
+        display_name: "a.mp4".into(),
+        duration_seconds: 10.5,
+        display_aspect: 1.5,
+    };
+    assert_eq!(
+        serde_json::to_string(&s).unwrap(),
+        r#"{"relativePath":"../film/a.mp4","displayName":"a.mp4","durationSeconds":10.5,"displayAspect":1.5}"#
+    );
+}
+
+/// New. `displayAspect` is required: a `0.0` default would fail every aspect
+/// gate, so a source without one is malformed rather than silently unprobed.
+#[test]
+fn a_source_without_display_aspect_is_malformed() {
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        dir.path(),
+        json!({
+            "formatVersion": 7,
+            "name": "x",
+            "sourceVideos": [
+                {"relativePath": "a.mp4", "displayName": "a", "durationSeconds": 1.0}
+            ],
+            "clips": []
+        }),
     );
     assert!(matches!(
         store::read(dir.path()),
@@ -322,6 +361,7 @@ fn cumulative_offset_accumulates_preceding_sources() {
             relative_path: "x.mp4".into(),
             display_name: "x".into(),
             duration_seconds: d,
+            display_aspect: 16.0 / 9.0,
         });
     }
     assert_eq!(p.cumulative_offset(0), 0.0);
@@ -340,6 +380,7 @@ fn cumulative_offset_clamps_index_past_the_end() {
         relative_path: "x.mp4".into(),
         display_name: "x".into(),
         duration_seconds: 10.0,
+        display_aspect: 16.0 / 9.0,
     });
     assert_eq!(p.cumulative_offset(99), 10.0);
 }
@@ -360,6 +401,7 @@ fn abs_seconds_projects_onto_the_concat_timeline() {
             relative_path: "x.mp4".into(),
             display_name: "x".into(),
             duration_seconds: d,
+            display_aspect: 16.0 / 9.0,
         });
     }
     assert_eq!(p.abs_seconds(0, 5.0), 5.0);

@@ -205,6 +205,31 @@ impl Zoom {
             ty: (out_h - src_h * s) / 2.0 - self.pan_y * src_h * s,
         }
     }
+
+    /// A cursor in window-area coordinates as fractions of the letterboxed
+    /// **content rect**, clamped to `[0, 1]` — the `content_x` / `content_y`
+    /// that [`Zoom::zoomed_to_cursor`] and [`Zoom::source_point`] take.
+    ///
+    /// The content rect is [`Zoom::IDENTITY`]'s [`Zoom::transform`], the
+    /// letterbox fit the player area draws. A cursor in the bars clamps to the
+    /// content edge rather than extrapolating past the source.
+    ///
+    /// The frame and area must be non-empty; the UI has no frame size before
+    /// the first frame and must not call this until it does.
+    pub fn content_fraction(
+        cursor_x: f64,
+        cursor_y: f64,
+        frame_w: f64,
+        frame_h: f64,
+        area_w: f64,
+        area_h: f64,
+    ) -> (f64, f64) {
+        let t = Zoom::IDENTITY.transform(frame_w, frame_h, area_w, area_h);
+        (
+            ((cursor_x - t.tx) / (frame_w * t.a)).clamp(0.0, 1.0),
+            ((cursor_y - t.ty) / (frame_h * t.d)).clamp(0.0, 1.0),
+        )
+    }
 }
 
 /// The zoom in effect at `record_time`, **linearly interpolated** between
