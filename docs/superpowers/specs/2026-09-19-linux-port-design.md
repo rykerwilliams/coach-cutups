@@ -364,9 +364,14 @@ Twelve phases in four milestones. Each gets its own plan document and follows th
 
 **Milestone C — Record and review**
 
+> **Execution order changed 2026-09-19 (user decision): Phase 4 (Capture) runs before Phase 3 (Clips).** The user won't use the app until the port is done, so phases are ordered by engineering risk rather than by what becomes usable when, and capture carries the most risk: real devices, clock alignment, a crash-safe file format. Numbers are kept so existing references stay valid. Scope moves that come with the swap:
+> - **Into Phase 4:** clip construction (a pending recording becomes a `Clip`: default name, `sortIndex = max + 1` rather than macOS's `clips.count`, which duplicates indices once delete leaves gaps); a minimal Clips list in the sidebar (name and duration, so recordings are visible); and **zoom keyframe emission** (`appendInitialZoom`/`appendZoom`, moved from Phase 6). Zoom rendering and the gesture already exist, so without keyframe emission a clip recorded while zoomed would replay unzoomed, and that loss would be persisted.
+> - **Stays in Phase 3:** clip editing (name, notes, tags), the tag overview and filter, jump-to-clip, reorder and sort, delete with `.trash`, and undo.
+> - **Stays in Phase 6:** stroke capture. A clip recorded before then simply has no strokes, which loses nothing.
+
 - **Phase 4. Capture.** PipeWire enumeration and selection, recording to `.mkv`, level meter, the `RecordingController` event log with its monotonic-clock guarantee, injected-clock testability, and **caller-captured play/pause timestamps**. `t0Seconds` is the running-time of the first buffer that reaches the muxer, and `recordingDuration` is read back from the finished file (`CaptureSessionController.swift:459-468`), not from wall clock — with a fallback for a `.mkv` reporting unknown duration after a crash.
 - **Phase 5. Passthrough export.** One MP4 per clip from `playbackSegments`: decode the source range, encode, mux. No overlays. Encoder probe and fallback chain. **First output artifact, and the first validation of `PlaybackTimeline` against a real decoder** rather than a unit test. Under the hybrid architecture this graph *is* the full export graph minus the overlay branch — a skeleton, not a throwaway.
-- **Phase 6. Drawing and zoom keyframes during recording.** Stroke capture overlay; zoom *keyframe emission* including the 100 ms anchor keyframe. (Zoom rendering and gesture are Phase 2.)
+- **Phase 6. Drawing during recording.** Stroke capture overlay. (Zoom keyframe emission moved to Phase 4, and zoom rendering and the gesture shipped in Phase 2.)
 - **Phase 7. Clip preview.** Commentary + PiP + strokes + zoom composited live at preview resolution. First use of the shared compositor.
 
 **Milestone D — Ship**
