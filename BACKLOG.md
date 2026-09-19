@@ -373,3 +373,14 @@ Each entry: what, why deferred, when to revisit.
 ### 45. Multi-select and bulk tag edits
 - **Why deferred:** macOS had single selection only.
 - **When to revisit:** if tagging many clips at once becomes a chore.
+
+## Phase 5 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-5-design.md`)
+
+### 46. Export on machines without surfaceless EGL, and more encoders
+- **Why deferred:** the exporter uses `GLDisplayEGL::new_surfaceless()`
+  (Mesa); proprietary NVIDIA drivers may lack the extension, and export then
+  fails loudly. `vah264enc` and `nvh264enc` aren't on any test machine, so
+  their settings would be untested.
+- **When to revisit:** when someone runs the port on NVIDIA or an AMD/VA
+  machine with `vah264enc`; add an EGL-device or GBM display path and the
+  encoder entries then, measured.
