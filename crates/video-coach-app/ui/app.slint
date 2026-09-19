@@ -1,5 +1,5 @@
-// The Coach Cuts window (spec D10, D11): sidebar, player area with its
-// empty-state cards, transport bar, error dialog, and the keyboard.
+// The Coach Cuts window (spec D9, D10, D11): sidebar, player area with its
+// zoom and empty-state cards, transport bar, error dialog, and the keyboard.
 //
 // Everything here is presentation. `src/main.rs` turns the callbacks into bus
 // commands and feeds bus events back in through the `in` properties.
@@ -14,6 +14,86 @@ export struct SourceRow {
     missing: bool,
     /// Used by a clip or match event, so it can't be removed.
     referenced: bool,
+}
+
+/// Zoom and pan (spec D9), mirrored from the Rust side, which owns it.
+export struct ZoomState {
+    scale: float,
+    pan-x: float,
+    pan-y: float,
+}
+
+/// Where the picture is drawn in the player area.
+export struct PictureRect {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+}
+
+/// The zoom readout (spec D9, macOS `ZoomIndicator`): the scale over a
+/// logarithmic track from 1× to 10×, with ticks at the snap notches. Hidden
+/// at 1×, where there's nothing to read.
+component ZoomIndicator inherits Rectangle {
+    in property <float> scale;
+    in property <[float]> notches;
+
+    /// 1× is the left end, 10× the right: log2(scale) / log2(10).
+    function track-x(scale: float) -> length {
+        max(0, min(1, log(max(scale, 1), 10))) * track.width
+    }
+
+    width: row.preferred-width;
+    height: row.preferred-height;
+    background: #0000008c;
+    border-radius: 6px;
+    opacity: root.scale > 1 ? 1 : 0;
+    animate opacity { duration: 180ms; easing: ease-out; }
+
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 10px;
+
+        Text {
+            text: root.scale.to-fixed(2) + "×";
+            color: white;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: "monospace";
+            width: 56px;
+            vertical-alignment: center;
+        }
+
+        track := Rectangle {
+            width: 140px;
+            height: 12px;
+
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 3px;
+                border-radius: 1.5px;
+                background: #ffffff40;
+            }
+            for notch in root.notches: Rectangle {
+                x: root.track-x(notch) - 0.5px;
+                y: (parent.height - self.height) / 2;
+                width: 1px;
+                height: 9px;
+                background: #ffffff8c;
+            }
+            Rectangle {
+                x: root.track-x(root.scale) - 4.5px;
+                y: (parent.height - self.height) / 2;
+                width: 9px;
+                height: 9px;
+                border-radius: 4.5px;
+                background: white;
+            }
+        }
+    }
 }
 
 /// A card over the player area: the next thing to do when there's nothing to
@@ -74,9 +154,27 @@ export component AppWindow inherits Window {
 
     /// The newest video frame (a borrowed GL texture).
     in property <image> frame;
-    /// Display width / height of `frame`, from the negotiated caps (pixel
-    /// aspect ratio included), so the picture is never stretched.
-    in property <float> frame-aspect: 16 / 9;
+    /// Display size of `frame`, from the negotiated caps (pixel aspect ratio
+    /// included), so the picture is never stretched. Only its shape matters.
+    in property <float> frame-width: 16;
+    in property <float> frame-height: 9;
+
+    // --- Zoom (spec D9; the state and the math are on the Rust side) ---
+
+    in property <ZoomState> zoom: { scale: 1 };
+    /// Core's `SNAP_NOTCHES`, for the indicator's ticks.
+    in property <[float]> zoom-notches;
+    out property <length> player-width: player.width;
+    out property <length> player-height: player.height;
+    /// The picture's rect at `zoom`. Pure, so the binding that calls it is
+    /// re-evaluated whenever an argument changes.
+    pure callback place-picture(ZoomState, float, float, length, length) -> PictureRect;
+    /// A scroll over the player at (x, y): pan, or zoom with Ctrl.
+    callback zoom-scroll(length, length, length, length, bool, bool);
+    /// The primary button went down over the player at (x, y) ...
+    callback zoom-press(length, length);
+    /// ... and, still down, the pointer moved to (x, y).
+    callback zoom-drag(length, length);
 
     // --- Project state (from bus events) ---
 
@@ -121,9 +219,10 @@ export component AppWindow inherits Window {
     callback scrub-release(float);
     callback volume-changed(float);
     callback volume-released(float);
-    /// Zoom keys (spec D9), wired in Task 7: `1`/`Ctrl+0` reset, `2`/`3` step.
+    /// Zoom keys (spec D9): `1`/`Ctrl+0` reset; `2`/`3` step the scale about
+    /// the pointer at (x, y) when it's over the player (the bool).
     callback zoom-reset();
-    callback zoom-step(float);
+    callback zoom-step(float, bool, length, length);
     /// Drag-to-reorder payload: a source index to and from `data-transfer`.
     pure callback source-payload(int) -> data-transfer;
     pure callback payload-source(data-transfer) -> int;
@@ -188,7 +287,7 @@ export component AppWindow inherits Window {
         }
         if (event.text == "2" || event.text == "3") {
             if (pressed) {
-                root.zoom-step(event.text == "2" ? -0.25 : 0.25);
+                root.zoom-step(event.text == "2" ? -0.25 : 0.25, zoom-area.has-hover, zoom-area.mouse-x, zoom-area.mouse-y);
             }
             return accept;
         }
@@ -310,17 +409,71 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- Player area: black, the picture fitted and centred ---
+                // --- Player area: black, the picture fitted, zoomed and
+                // panned (spec D9) ---
                 player := Rectangle {
-                    background: black;
+                    property <PictureRect> picture: root.place-picture(root.zoom, root.frame-width, root.frame-height, self.width, self.height);
+                    // The letterboxed rect at 1×. The zoomed picture is clipped
+                    // to it, not to the whole player area, so the view is
+                    // exactly the crop export produces (spec D9: one
+                    // `Zoom::transform`) and the letterbox bars stay black at
+                    // any zoom. Phase 6 strokes are normalized to this rect too.
+                    property <PictureRect> content: root.place-picture({ scale: 1, pan-x: 0, pan-y: 0 }, root.frame-width, root.frame-height, self.width, self.height);
 
-                    Image {
-                        source: root.frame;
-                        width: min(player.width, player.height * root.frame-aspect);
-                        height: self.width / root.frame-aspect;
-                        x: (player.width - self.width) / 2;
-                        y: (player.height - self.height) / 2;
-                        image-fit: fill;
+                    background: black;
+                    clip: true;
+
+                    Rectangle {
+                        x: player.content.x;
+                        y: player.content.y;
+                        width: player.content.width;
+                        height: player.content.height;
+                        clip: true;
+
+                        // Drawn at 1× size and scaled up by a transform, rather
+                        // than sized to `picture`: Skia rounds a translate-only
+                        // image's origin to whole pixels, so a slow pan would
+                        // step 1 px at a time. With a scale in the transform it
+                        // moves smoothly. (At 1× nothing pans, so the rounding
+                        // left there is harmless.) Same rect either way.
+                        // Coordinates are relative to the content rect.
+                        Image {
+                            source: root.frame;
+                            x: player.picture.x - player.content.x;
+                            y: player.picture.y - player.content.y;
+                            width: player.picture.width / root.zoom.scale;
+                            height: player.picture.height / root.zoom.scale;
+                            transform-origin: { x: 0, y: 0 };
+                            transform-scale: root.zoom.scale;
+                            image-fit: fill;
+                        }
+                    }
+
+                    zoom-area := TouchArea {
+                        // Only over a picture: the empty-state cards cover it otherwise.
+                        enabled: root.can-play;
+                        scroll-event(event) => {
+                            root.zoom-scroll(self.mouse-x, self.mouse-y, event.delta-x, event.delta-y, event.modifiers.control, event.modifiers.shift);
+                            accept
+                        }
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.zoom-press(self.mouse-x, self.mouse-y);
+                            }
+                        }
+                        // Only while a button is down; `pressed` is the primary one.
+                        moved => {
+                            if (self.pressed) {
+                                root.zoom-drag(self.mouse-x, self.mouse-y);
+                            }
+                        }
+                    }
+
+                    ZoomIndicator {
+                        x: (parent.width - self.width) / 2;
+                        y: 12px;
+                        scale: root.zoom.scale;
+                        notches: root.zoom-notches;
                     }
 
                     if !root.has-project: EmptyCard {

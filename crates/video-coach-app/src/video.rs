@@ -85,10 +85,10 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
                 // D3: the display shape comes from the caps, including the
                 // pixel aspect ratio, never a forced 1:1.
                 let par = frame.info.par();
-                let aspect = mapped.width() as f64 * par.numer() as f64
-                    / (mapped.height() as f64 * par.denom() as f64);
+                let display_w = mapped.width() as f64 * par.numer() as f64 / par.denom() as f64;
                 if let Some(w) = weak.upgrade() {
-                    w.set_frame_aspect(aspect as f32);
+                    w.set_frame_width(display_w as f32);
+                    w.set_frame_height(mapped.height() as f32);
                     w.set_frame(image);
                 }
                 current.replace(mapped);

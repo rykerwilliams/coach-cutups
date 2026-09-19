@@ -6,3 +6,4 @@
 
 pub mod bus;
 pub mod format;
+pub mod zoom_input;
