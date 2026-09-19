@@ -9,6 +9,7 @@
 //! deadlines (the skip debounce and the recording start timeout); with
 //! neither armed it simply blocks.
 
+mod clips;
 mod project;
 mod recording;
 mod sources;
@@ -22,9 +23,11 @@ use std::time::Instant;
 
 use gstreamer as gst;
 use gstreamer_gl as gst_gl;
+use uuid::Uuid;
 use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
+use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
     FrameMailbox, PositionHandle, ProbeError, RecorderMessage, SinkKind, SourcePlayer,
@@ -52,6 +55,29 @@ pub enum Command {
         to: usize,
     },
     RelinkSource(usize, PathBuf),
+
+    // Clips (Phase 3 spec C5). Each mutation is one undo step, and none is
+    // one if it changes nothing.
+    /// Set one field of a clip. Tags arrive as the field's raw text, as one
+    /// element, and are normalized here.
+    EditClip {
+        id: Uuid,
+        edit: ClipEdit,
+    },
+    /// Move the clip to `.trash`, undoably.
+    DeleteClip(Uuid),
+    /// Move the clip at list position `from` to `to` (the `Vec::remove` +
+    /// `Vec::insert` convention).
+    MoveClip {
+        from: usize,
+        to: usize,
+    },
+    /// Order the clips by source, then start.
+    SortClipsBySource,
+    /// Pause the game video at the clip's start.
+    JumpToClip(Uuid),
+    Undo,
+    Redo,
 
     // Transport. Positions are concat-timeline seconds unless named `source_`.
     // `host_ns` is `now_ns()` at the input event, captured by the caller
@@ -148,6 +174,10 @@ pub enum Event {
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
     Level(f64),
+    /// Select this clip: an undo restored or edited it, or a redo edited it.
+    /// Always sent after that change's `ProjectChanged`, which drops a
+    /// selection whose clip is gone.
+    Select(Uuid),
     /// A failure, or a notice (see [`UserError::is_notice`]).
     Error(UserError),
 }
@@ -287,6 +317,8 @@ pub struct Bus {
     recording: Option<recording::Active>,
     /// The latest recorder's generation. Messages from any other are stale.
     generation: u64,
+    /// The clip undo history (Phase 3 spec C1). Cleared on every open.
+    history: UndoController,
 }
 
 impl Bus {
@@ -344,6 +376,7 @@ impl Bus {
             capture,
             recording: None,
             generation: 0,
+            history: UndoController::new(),
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -441,6 +474,13 @@ impl Bus {
             Command::RemoveSource(index) => self.remove_source(index),
             Command::MoveSource { from, to } => self.move_source(from, to),
             Command::RelinkSource(index, path) => self.relink_source(index, path),
+            Command::EditClip { id, edit } => self.edit_clip(id, edit),
+            Command::DeleteClip(id) => self.delete_clip(id),
+            Command::MoveClip { from, to } => self.move_clip(from, to),
+            Command::SortClipsBySource => self.sort_clips_by_source(),
+            Command::JumpToClip(id) => self.jump_to_clip(id),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
             Command::TogglePlay {
                 host_ns,
                 source_secs,

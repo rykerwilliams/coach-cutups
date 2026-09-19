@@ -6,14 +6,15 @@
 //! [`Harness::shutdown`] as a barrier when they need to assert that something
 //! did **not** happen.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use uuid::Uuid;
 use video_coach_app::bus::{
     Bus, BusHandle, CaptureKind, Command, Event, RecordingStatus, Snapshot, StateFile, UserError,
 };
-use video_coach_core::project::{Project, SourceRef};
+use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
 use video_coach_media::{fixtures, now_ns, probe, SinkKind};
 
@@ -156,6 +157,14 @@ impl Harness {
         })
     }
 
+    /// Waits for the next `Select`.
+    pub fn wait_select(&mut self) -> Uuid {
+        self.wait_map("Select", |e| match e {
+            Event::Select(id) => Some(*id),
+            _ => None,
+        })
+    }
+
     /// Waits until no seek is outstanding: a `Position` with no target.
     /// Returns its source index.
     pub fn wait_settled(&mut self) -> usize {
@@ -228,4 +237,73 @@ pub fn write_project(folder: &Path, media: &Path, videos: &[(&str, u32)]) -> Pro
     }
     store::write(folder, &mut project).expect("write the fixture project");
     project
+}
+
+/// A clip on `source_index`, starting 0.5 s in, with a fresh recording
+/// filename and no file.
+pub fn clip(source_index: usize) -> Clip {
+    Clip {
+        id: Uuid::new_v4(),
+        name: format!("clip on {source_index}"),
+        notes: String::new(),
+        tags: Vec::new(),
+        source_index,
+        start_source_seconds: 0.5,
+        recording_duration: 1.0,
+        recording_filename: format!("{}.mkv", Uuid::new_v4()),
+        events: Vec::new(),
+        show_pip: true,
+        sort_index: 0,
+        created_at: "2026-09-19T00:00:00Z".into(),
+        transcript: String::new(),
+    }
+}
+
+/// Appends a [`clip`] on each of `source_indices` to `project`, each with a
+/// small stand-in recording in `recordings/` holding its id, and saves it to
+/// `folder`. Returns the new clips, in order.
+pub fn add_clips(folder: &Path, project: &mut Project, source_indices: &[usize]) -> Vec<Clip> {
+    let recordings = folder.join(store::RECORDINGS_DIRNAME);
+    std::fs::create_dir_all(&recordings).expect("create recordings/");
+    let added: Vec<Clip> = source_indices.iter().map(|&i| clip(i)).collect();
+    for c in &added {
+        std::fs::write(recordings.join(&c.recording_filename), c.id.to_string())
+            .expect("write a stand-in recording");
+        let mut c = c.clone();
+        c.sort_index = project.clips.len() as i64;
+        project.clips.push(c);
+    }
+    store::write(folder, project).expect("write the project with its clips");
+    added
+}
+
+/// Makes a folder read-only until dropped, so a failing test still leaves a
+/// temp dir that can be deleted.
+pub struct ReadOnly(PathBuf);
+
+impl ReadOnly {
+    pub fn new(folder: &Path) -> Self {
+        set_mode(folder, 0o555);
+        ReadOnly(folder.to_owned())
+    }
+
+    /// Whether the kernel enforces it: not when running as root. A test that
+    /// needs a failing write skips when this is false.
+    pub fn enforced(&self) -> bool {
+        let probe = self.0.join(".read-only-probe");
+        let written = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        !written
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o755);
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }

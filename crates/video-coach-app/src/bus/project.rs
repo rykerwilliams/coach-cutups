@@ -84,6 +84,10 @@ impl Bus {
         // Nothing of the previous project survives: not its requests, its
         // skip burst, nor its frame.
         self.unload();
+        // Undo is in-memory only, so the trash it held is unreachable now
+        // (Phase 3 spec C4).
+        self.history.clear();
+        super::clips::empty_trash(&folder);
         self.player.set_volume(project.preferences.scan_volume);
         self.current = 0;
         self.open = Some(Open { folder, project });
@@ -98,13 +102,23 @@ impl Bus {
     /// failed save is reported; the in-memory change stands, and the next
     /// successful save carries it.
     pub(super) fn project_changed(&mut self) {
-        let Some(open) = &mut self.open else {
-            return;
-        };
-        if let Err(e) = store::write(&open.folder, &mut open.project) {
-            self.emit(Event::Error(e.into()));
-        }
+        self.save();
         self.publish_project();
+    }
+
+    /// [`Bus::project_changed`]'s save, for a caller with more to do before
+    /// it publishes. Returns whether it succeeded.
+    pub(super) fn save(&mut self) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        match store::write(&open.folder, &mut open.project) {
+            Ok(()) => true,
+            Err(e) => {
+                self.emit(Event::Error(e.into()));
+                false
+            }
+        }
     }
 
     /// Publishes the open project, with the cached missing flags.

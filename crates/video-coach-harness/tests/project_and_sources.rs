@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{Command, Event, StateFile, UserError};
-use video_coach_core::project::{Clip, Project};
+use video_coach_core::project::Project;
 use video_coach_core::scoreboard_config::{MatchEventKind, MatchEventRecord};
 use video_coach_core::store;
-use video_coach_harness::{write_project, Harness};
+use video_coach_harness::{clip, write_project, Harness, ReadOnly};
 use video_coach_media::{fixtures, ProbeError};
 
 struct Dirs {
@@ -58,24 +58,6 @@ impl Dirs {
         project.match_events = event_on.iter().map(|&i| match_event(i)).collect();
         store::write(&self.project(), &mut project).unwrap();
         project
-    }
-}
-
-fn clip(source_index: usize) -> Clip {
-    Clip {
-        id: Uuid::new_v4(),
-        name: format!("clip on {source_index}"),
-        notes: String::new(),
-        tags: Vec::new(),
-        source_index,
-        start_source_seconds: 0.5,
-        recording_duration: 1.0,
-        recording_filename: format!("{}.mkv", Uuid::new_v4()),
-        events: Vec::new(),
-        show_pip: true,
-        sort_index: 0,
-        created_at: "2026-09-19T00:00:00Z".into(),
-        transcript: String::new(),
     }
 }
 
@@ -416,28 +398,6 @@ fn opening_a_folder_that_does_not_exist_errors_and_creates_nothing() {
     );
 }
 
-/// Makes a folder read-only until dropped, so a failing test still leaves a
-/// temp dir that can be deleted.
-struct ReadOnly(PathBuf);
-
-impl ReadOnly {
-    fn new(folder: &Path) -> Self {
-        set_mode(folder, 0o555);
-        ReadOnly(folder.to_owned())
-    }
-}
-
-impl Drop for ReadOnly {
-    fn drop(&mut self) {
-        set_mode(&self.0, 0o755);
-    }
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
 #[test]
 fn a_failed_save_is_reported_and_the_change_still_stands() {
     let dirs = Dirs::new();
@@ -446,7 +406,7 @@ fn a_failed_save_is_reported_and_the_change_still_stands() {
     h.wait_opened();
 
     let read_only = ReadOnly::new(&dirs.project());
-    if std::fs::write(dirs.project().join("probe"), b"").is_ok() {
+    if !read_only.enforced() {
         eprintln!("skipped: permissions aren't enforced (running as root?)");
         return;
     }

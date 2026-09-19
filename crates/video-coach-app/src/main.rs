@@ -504,6 +504,8 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
+        // Selection arrives with the Clips list (Phase 3, Task 3).
+        Event::Select(_) => {}
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {

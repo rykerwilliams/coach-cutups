@@ -178,7 +178,7 @@ impl Bus {
     }
 
     /// Whether seeks are allowed: some sources, none missing.
-    fn seekable(&self) -> bool {
+    pub(super) fn seekable(&self) -> bool {
         self.open
             .as_ref()
             .is_some_and(|open| !open.project.source_videos.is_empty())

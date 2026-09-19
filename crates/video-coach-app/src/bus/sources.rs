@@ -63,6 +63,7 @@ impl Bus {
         }
         self.reset_skip();
         self.refresh_missing();
+        self.evict_trashed_clips();
         self.project_changed();
         self.ensure_loaded(0.0);
     }
@@ -81,6 +82,7 @@ impl Bus {
         self.current = open.project.move_source(from, to, self.current);
         self.reset_skip();
         self.refresh_missing();
+        self.evict_trashed_clips();
         self.project_changed();
         self.ensure_loaded(0.0);
     }
