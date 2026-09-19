@@ -470,17 +470,32 @@ fn a_recorded_clip_is_built_from_the_pending_clip() {
     assert_eq!(p.clips, vec![c]);
 }
 
-/// macOS used `clips.count`, which repeats an index after a delete.
+/// Clips are kept in order with `sort_index == position` (Phase 3 spec C3),
+/// so a file with gaps, ties or an unsorted array (Phase 4 wrote `max + 1`) is
+/// normalized on read, stably, and a recorded clip is appended after it.
 #[test]
-fn sort_index_is_one_past_the_largest_even_after_a_gap() {
-    let mut p = Project::new("p");
-    let mut a = sample_clip();
-    a.sort_index = 0;
-    let mut b = sample_clip();
-    b.sort_index = 5;
-    p.clips = vec![b, a];
-    let c = p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new());
-    assert_eq!(c.sort_index, 6);
+fn clip_order_is_normalized_on_read_and_a_recorded_clip_appends() {
+    let dir = TempDir::new().unwrap();
+    let mut p = sample_project();
+    let clip = |n: u128, sort_index: i64| Clip {
+        id: Uuid::from_u128(n),
+        sort_index,
+        ..sample_clip()
+    };
+    p.clips = vec![clip(1, 9), clip(2, 5), clip(3, 0), clip(4, 5)];
+    store::write(dir.path(), &mut p).unwrap();
+
+    let mut read = store::read(dir.path()).unwrap();
+    let order: Vec<(u128, i64)> = read
+        .clips
+        .iter()
+        .map(|c| (c.id.as_u128(), c.sort_index))
+        .collect();
+    assert_eq!(order, [(3, 0), (2, 1), (4, 2), (1, 3)]);
+
+    let c = read.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new());
+    assert_eq!(c.sort_index, 4);
+    assert_eq!(read.clips.last().unwrap().id, Uuid::from_u128(0x1234));
 }
 
 #[test]

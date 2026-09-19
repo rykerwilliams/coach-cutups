@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::event::CommentaryEvent;
 use crate::recording::PendingClip;
 use crate::scoreboard_config::{MatchEventRecord, ScoreboardConfig};
+use crate::undo::ClipEdit;
 
 /// Export frame size. `source` is deliberately absent — it was ill-defined
 /// (undefined for a compilation mixing sources of different dimensions) and
@@ -357,9 +358,10 @@ impl Project {
     /// Appends the clip a finished recording produced and returns it.
     ///
     /// The name is macOS's `defaultClipName`: the 1-based source number and
-    /// the floored start, `"2-01:02:05"`. `sort_index` is one past the largest
-    /// existing one; macOS used the clip count, which repeats an index after a
-    /// delete. `created_at` is passed in because core has no clock.
+    /// the floored start, `"2-01:02:05"`. `sort_index` is the clip count,
+    /// which is the next position because clips are kept in order (see
+    /// [`Project::apply_clip_order`]). `created_at` is passed in because core
+    /// has no clock.
     pub fn add_recorded_clip(
         &mut self,
         pending: PendingClip,
@@ -377,12 +379,7 @@ impl Project {
             total % 3600 / 60,
             total % 60
         );
-        let sort_index = self
-            .clips
-            .iter()
-            .map(|c| c.sort_index)
-            .max()
-            .map_or(0, |m| m + 1);
+        let sort_index = self.clips.len() as i64;
         self.clips.push(Clip {
             id: pending.id,
             name,
@@ -399,5 +396,100 @@ impl Project {
             transcript: String::new(),
         });
         self.clips.last().expect("just pushed")
+    }
+
+    // ------------------------------------------------------------ clip order
+    //
+    // `clips` is kept in order with `sort_index == position` (Phase 3 spec
+    // C3): `store::read` normalizes it and every mutation renumbers. Each order
+    // operation is then a `Vec` operation, and export never meets a tie or a
+    // gap.
+
+    /// Set every `sort_index` to its position.
+    pub(crate) fn renumber(&mut self) {
+        for (i, c) in self.clips.iter_mut().enumerate() {
+            c.sort_index = i as i64;
+        }
+    }
+
+    /// The clip ids in list order.
+    pub fn clip_order(&self) -> Vec<Uuid> {
+        self.clips.iter().map(|c| c.id).collect()
+    }
+
+    /// The one order mutation, shared by move, sort, undo and redo.
+    ///
+    /// Clips named in `order` come first, in that order; ids that no longer
+    /// exist (or repeat) are skipped. The rest follow in their current order,
+    /// so an order captured before an add or delete still applies.
+    pub fn apply_clip_order(&mut self, order: &[Uuid]) {
+        let mut rest = std::mem::take(&mut self.clips);
+        for id in order {
+            if let Some(i) = rest.iter().position(|c| c.id == *id) {
+                self.clips.push(rest.remove(i));
+            }
+        }
+        self.clips.append(&mut rest);
+        self.renumber();
+    }
+
+    /// The order after moving the clip at `from` to position `to` (the
+    /// `Vec::remove` + `Vec::insert` convention).
+    ///
+    /// # Panics
+    ///
+    /// If `from` or `to` is out of range.
+    pub fn moved_order(&self, from: usize, to: usize) -> Vec<Uuid> {
+        let mut order = self.clip_order();
+        let id = order.remove(from);
+        order.insert(to, id);
+        order
+    }
+
+    /// The order sorted by position in the game: source, then start. Stable,
+    /// so clips at the same instant keep their relative order.
+    pub fn source_sorted_order(&self) -> Vec<Uuid> {
+        let mut clips: Vec<&Clip> = self.clips.iter().collect();
+        clips.sort_by(|a, b| {
+            a.source_index
+                .cmp(&b.source_index)
+                .then(a.start_source_seconds.total_cmp(&b.start_source_seconds))
+        });
+        clips.into_iter().map(|c| c.id).collect()
+    }
+
+    /// Remove clip `id` and return it. Its `sort_index` still holds the
+    /// position it was removed from, which [`Project::insert_clip`] restores.
+    pub fn remove_clip(&mut self, id: Uuid) -> Option<Clip> {
+        let i = self.clips.iter().position(|c| c.id == id)?;
+        let clip = self.clips.remove(i);
+        self.renumber();
+        Some(clip)
+    }
+
+    /// Insert `clip` at its `sort_index`, clamped to the list. A no-op if a
+    /// clip with its id is already present.
+    pub fn insert_clip(&mut self, clip: Clip) {
+        if self.clips.iter().any(|c| c.id == clip.id) {
+            return;
+        }
+        let at = usize::try_from(clip.sort_index)
+            .unwrap_or(0)
+            .min(self.clips.len());
+        self.clips.insert(at, clip);
+        self.renumber();
+    }
+
+    /// Set one field of clip `id`, returning its previous value as the same
+    /// variant, or `None` if there is no such clip. The caller normalizes
+    /// (tags go through `normalize_tags`) and compares for "unchanged".
+    pub fn apply_edit(&mut self, id: Uuid, edit: ClipEdit) -> Option<ClipEdit> {
+        let c = self.clips.iter_mut().find(|c| c.id == id)?;
+        Some(match edit {
+            ClipEdit::Name(v) => ClipEdit::Name(std::mem::replace(&mut c.name, v)),
+            ClipEdit::Tags(v) => ClipEdit::Tags(std::mem::replace(&mut c.tags, v)),
+            ClipEdit::Notes(v) => ClipEdit::Notes(std::mem::replace(&mut c.notes, v)),
+            ClipEdit::ShowPip(v) => ClipEdit::ShowPip(std::mem::replace(&mut c.show_pip, v)),
+        })
     }
 }

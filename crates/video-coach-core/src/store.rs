@@ -133,7 +133,16 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
         .expect("root shape checked above")
         .insert("formatVersion".into(), serde_json::Value::from(found));
 
-    Project::deserialize(&value).map_err(|e| StoreError::Malformed(e.to_string()))
+    let mut project =
+        Project::deserialize(&value).map_err(|e| StoreError::Malformed(e.to_string()))?;
+
+    // Clips are kept in order with `sort_index == position` (Phase 3 spec
+    // C3). A file may have gaps, ties or an unsorted array (Phase 4 wrote
+    // `max + 1`), so normalize here, at decode time. The sort is stable, so
+    // ties keep their array order.
+    project.clips.sort_by_key(|c| c.sort_index);
+    project.renumber();
+    Ok(project)
 }
 
 /// Write the project into `project_dir`, creating `recordings/` if needed.

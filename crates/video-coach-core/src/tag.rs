@@ -1,4 +1,21 @@
-//! Tag normalization.
+//! Tags: normalization, the overview's summaries, and the tag field's
+//! suggestions.
+
+use std::collections::BTreeMap;
+
+use crate::project::Clip;
+
+/// The most suggestions [`tag_suggestions`] returns.
+pub const MAX_SUGGESTIONS: usize = 8;
+
+/// One row of the tag overview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagSummary {
+    pub tag: String,
+    pub clip_count: usize,
+    /// Sum of the tagged clips' recording durations.
+    pub total_seconds: f64,
+}
 
 /// Split a comma-separated tag string into normalized tags.
 ///
@@ -14,6 +31,50 @@ pub fn normalize_tags(input: &str) -> Vec<String> {
         seen.push(trimmed);
     }
     seen
+}
+
+/// Every tag in `clips` with its clip count and total length, sorted
+/// alphabetically. Ported from macOS `TagAggregation.aggregate`.
+pub fn tag_summaries(clips: &[Clip]) -> Vec<TagSummary> {
+    let mut by_tag: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
+    for clip in clips {
+        for tag in &clip.tags {
+            let entry = by_tag.entry(tag).or_default();
+            entry.0 += 1;
+            entry.1 += clip.recording_duration;
+        }
+    }
+    by_tag
+        .into_iter()
+        .map(|(tag, (clip_count, total_seconds))| TagSummary {
+            tag: tag.to_owned(),
+            clip_count,
+            total_seconds,
+        })
+        .collect()
+}
+
+/// Existing tags to suggest while the tag field holds `text`.
+///
+/// The fragment after the last comma, trimmed and lowercased, is matched as a
+/// prefix. Tags already in `text` (normalized, which includes an exact match
+/// of the fragment) are excluded, as on macOS. At most [`MAX_SUGGESTIONS`],
+/// sorted. An empty fragment suggests nothing.
+pub fn tag_suggestions(summaries: &[TagSummary], text: &str) -> Vec<String> {
+    let fragment = text.rsplit(',').next().unwrap_or("").trim().to_lowercase();
+    if fragment.is_empty() {
+        return Vec::new();
+    }
+    let present = normalize_tags(text);
+    let mut out: Vec<String> = summaries
+        .iter()
+        .map(|s| &s.tag)
+        .filter(|t| t.starts_with(&fragment) && !present.contains(t))
+        .cloned()
+        .collect();
+    out.sort();
+    out.truncate(MAX_SUGGESTIONS);
+    out
 }
 
 #[cfg(test)]
