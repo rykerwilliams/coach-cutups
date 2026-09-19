@@ -78,7 +78,7 @@ pub fn frame_schedule(clip: &Clip, source_duration: f64) -> Vec<FrameSpec>;
 
 - **Frames.** Output frame `n` exists at `t = n/30` for every `n` with `t` inside the segment total. Compute the count as `ceil(total·30 − 1e-6)`, so float noise such as `8.3·30 = 249.00000000000003` doesn't add a frame.
   - A segment gets a frame **if and only if it contains some `n/30`**. A segment shorter than a frame interval can still get one.
-- **Lookup.** Each frame binary-searches the flat segment list, built by one cumulative walk over `playback_segments`.
+- **Lookup.** A forward walk over `playback_segments`, since output times only increase.
 - **Play:** `source_time = source_start + (t − out_start)`.
 - **Freeze:** `source_time` is the freeze's anchor, which is the Pause event's captured source time.
 - **Zoom:** `zoom_at(events, t)`.
@@ -131,34 +131,51 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 - **Phase 8** adds the quality and resolution picker (QP 28/24/20).
 - **The parent spec's bitrate ladder is superseded:** the CQP-only encoder can't reach a bitrate target.
 
-### X4. Control: an export job on the bus
+### X4. Control: an `Exporter` that owns its thread
 
-- **`Command::ExportClip { id, path }`.**
-  - The bus computes the schedule from its project, resolves the source path, and starts an `Exporter` thread with a **job id**.
-  - Refusals arrive as `Event::Error`: a missing source, an export already running, a recording in progress (the existing guard).
-- **Messages.** The exporter reports through its own `Input::Export(job_id, msg)`. The bus drops messages from a finished or cancelled job, so a `Done` that races a `CancelExport` can't do anything.
-- **Events:** `Event::Export(ExportStatus::{Running(f64), Done(PathBuf), Cancelled})`.
-  - `Running` is sent when the whole-percent value changes.
-  - Failures are `Event::Error(UserError::ExportFailed(String))`.
-- **`Command::CancelExport`, and failures:**
-  1. Set the stop flag.
-  2. Set both pipelines to NULL, which unblocks a push or pull.
-  3. Join the thread.
-  4. Delete `<path>.part`.
+`Exporter::start(job, on_msg) -> Result<Exporter, _>` in media owns its thread, the way `Recorder` does.
 
-  There is no EOS: finalizing a file only to delete it is wasted work.
-- **Recording pauses the export.** While a recording is active, the pump waits before its next frame and resumes when the recording stops.
-  - VA contention measurably costs the **recording** frames, and the export is the one that can wait.
-  - `CancelExport` is added to the recording guard's allow-list, so an export can be cancelled mid-recording.
-  - *A product call; the user may overrule it (the alternative is refusing to record while exporting).*
-- **Snapshot.** Export reads only the source video, through a snapshot taken at start. Edits and deletes meanwhile don't affect it.
-- **Shutdown** cancels a running export, as above.
+**Pump rules:**
+- **All GStreamer objects** (the display, the context, both pipelines) are created, used and torn down **on that thread**.
+- **The pump never blocks without a bound.**
+  - `appsrc block=false`. While the queue is full, it waits in a short loop.
+  - It pulls with short timeouts.
+  - Each pass of either loop checks the cancel flag and pops the decode and encode buses for errors (~10 ms).
+  - A blocking push never returns after a downstream error (measured), so this is required, not defensive.
+- **Messages:** the thread sends `Progress(u8)` when the whole percent changes (deduplicated on the thread), and finally exactly one `Finished(Result<Done, ExportError>)`.
+  - `ExportError` is `Cancelled` or `Failed(String)`.
+  - `Done` carries the output path, the encoder name and the decode `Diagnostics`, reusing the player's type.
+- **Cancel** sets an atomic flag. The thread notices within about 10 ms, takes its pipelines to NULL, deletes `.part` and sends `Finished(Err(Cancelled))`. There is no EOS.
+- **`Drop`** cancels and joins, for shutdown.
+
+**On the bus:**
+- **`Command::ExportClip { id, path }`:**
+  - refused, with an `Event::Error`, if the clip or its source is missing, or an export is running;
+  - dropped silently by the recording guard while recording, since the UI greys it out.
+  - Otherwise the bus computes the schedule and starts the exporter.
+- **`Command::CancelExport`** sets the flag, and nothing else.
+- **The outcome.** The bus keeps the exporter until `Finished` arrives, then:
+  - joins it (instantly);
+  - emits `Event::Export(ExportStatus::{Done(PathBuf), Cancelled})`, or `Event::Error(UserError::ExportFailed(msg))`;
+  - logs the diagnostics line.
+
+  Because the thread's own result decides the outcome, a cancel that races a finished export reports `Done`, which is true. There is one sender and a FIFO channel, so there is no job id and no stale message.
+- **Progress** is `Event::Export(ExportStatus::Running(u8))`.
+
+**Recording and export never overlap** (a user decision, 2026-09-19).
+- **Record is refused while an export runs:** `CantRecord("an export is running")`, and the UI greys Record out.
+- **Export is refused while recording**, as above.
+- The reason: sharing the VA engine measurably cost the **recording** frames. An export takes about 17 s per minute of clip on the reference laptop.
+
+**Snapshot:** export reads only the source video, through a snapshot taken at start.
+
+**Shutdown** drops the exporter, which cancels and joins it.
 
 ### X5. UI
 
-- **Clip context menu:** "Export video…". It opens an `rfd` save dialog (default name, `*.mp4` filter), then sends `ExportClip`. It is disabled while an export runs or while recording.
+- **Clip context menu:** "Export video…". It opens an `rfd` save dialog (default name, `*.mp4` filter), then sends `ExportClip`. It is disabled while an export runs or while recording, and Record is disabled while an export runs.
 - **Progress.** An `export-progress` property, hidden when negative, drives a small progress bar with **Cancel** in the transport. It is separate from the timed notice line, so notices can't overwrite it.
-- **Completion:** "Exported to …" goes through the ordinary notice; an error goes through the usual dialog.
+- **Completion:** "Exported to …" goes through the ordinary notice; an error goes through the usual dialog. The bar hides on any terminal outcome.
 
 ---
 
@@ -167,10 +184,10 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 | Crate | Phase 5 contents |
 |---|---|
 | `video-coach-core` | `export.rs`: `OUTPUT_FPS`, `FrameSpec`, `frame_schedule`. |
-| `video-coach-media` | `export/`: `Exporter` (the decode pipeline via the shared `gl_bin`, the pump, the encode pipeline, the encoder probe, the surfaceless EGL display and context sharing, the zoom mapping, `.part` handling, cancel, a pause gate). `gstreamer-gl-egl` (with `v1_24`) moves into media's dependencies. |
-| `video-coach-app` | Bus: `ExportClip`, `CancelExport` (on the allow-list), `Input::Export` with a job id, `Event::Export`, `UserError::ExportFailed`, the pause-while-recording gate, and cancel on shutdown. UI: the menu item, save dialog, progress bar and Cancel. |
+| `video-coach-media` | `export/`: `Exporter` (the decode pipeline via the shared `gl_bin`, the pump, the encode pipeline, the encoder probe, the surfaceless EGL display and context sharing, the zoom mapping, `.part` handling, cancel, and a non-blocking pump). `gstreamer-gl-egl` (with `v1_24`) moves into media's dependencies. |
+| `video-coach-app` | Bus: `ExportClip`, `CancelExport`, `Input::Export`, `Event::Export`, `UserError::ExportFailed`, refusing to record during an export, and dropping the exporter on shutdown. UI: the menu item, save dialog, progress bar and Cancel. |
 | `video-coach-harness` | Export end to end, running on llvmpipe in CI. |
-| CI | Installs Mesa EGL/DRI (`libegl-mesa0 libgl1-mesa-dri`, or whatever `ubuntu-latest` lacks). `openh264dec` comes from plugins-bad, which is already installed. |
+| CI | No change expected. `gstreamer1.0-gl` and `libgl1` already pull in `libegl-mesa0`, `mesa-libgallium` (llvmpipe) and `libgl1-mesa-dri` as hard dependencies on noble. With no `/dev/dri`, `new_surfaceless` falls back to llvmpipe by itself. `openh264dec` comes from plugins-bad. |
 
 ## Testing
 
@@ -203,11 +220,11 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
   - export a real clip and watch it;
   - a slow zoom pan looks smooth;
   - the 2× gate with the log line (the `measure-media` skill);
-  - start a recording during an export: the export pauses, then resumes.
+  - Record is greyed out during an export.
 
 ## Risks
 
-1. **llvmpipe on CI runners** is verified locally but not on `ubuntu-latest`. If the runner's Mesa lacks surfaceless EGL, CI installs it; this is the one place CI could need a new package.
+1. **llvmpipe on CI runners** is verified locally with `/dev/dri` hidden (`bwrap --tmpfs /dev/dri`), but not on a hosted runner. CI hasn't run on this branch yet (it runs on PRs and `main` only).
 2. **Headless EGL on other machines.** `new_surfaceless` needs `EGL_MESA_platform_surfaceless`. Proprietary NVIDIA drivers may lack it; export then fails loudly (BACKLOG).
 3. **CQP bitrate varies with content.** Accepted: YouTube re-encodes.
 
