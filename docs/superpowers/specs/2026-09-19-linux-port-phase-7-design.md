@@ -57,6 +57,7 @@ Select a clip and play it back inside the app: the game video edited by the coac
 |---|---|---|
 | Tail | NV12 → `gldownload` → encoder → `mp4mux` → `filesink` | `glcolorconvert` → `gl_caps()` appsink → the shared `FrameMailbox` |
 | Output | 1920×1080 | **1280×720** (measured: the best UI frame time) |
+| Errors | `CompositeError` (`export/` is renamed `composite/`, with a tail each) | the same |
 | GL | a private surfaceless display | **Slint's context**, from `Command::GlReady` |
 | Pacing | as fast as possible | the sink syncs to the clock |
 
@@ -82,8 +83,9 @@ Select a clip and play it back inside the app: the game video edited by the coac
   - The recording branch seeks natively in the same pipeline seek.
 - **Preview scrubs frame-accurately** (25–40 ms a tick). macOS used infinite tolerance because exact seeks rendered black on long-GOP HEVC.
   - **Audio during a drag:** the commentary is muted while the scrubber is held and unmuted on release, since each tick flushes the audio sink.
-- **Position comes from the pump's frame index** (`n / 30`), published with the preview's events. The existing `PositionHandle` is the source player's pipeline and reports nothing while preview is open.
+- **Position comes from the pump's frame index** (`n / 30`) through an `Arc<AtomicU64>` the existing 30 Hz tick reads. The `PositionHandle` is the source player's pipeline and reports nothing while a preview is open.
 - **Esc closes the preview.**
+- **At the end of the schedule** the preview pauses on its last frame and stays open, with the position at the end. It does not auto-close, and the recording's tail does not play on.
 
 ### P4. The overlay rasterizer
 
@@ -94,7 +96,8 @@ pub fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buf
 ```
 
 - **Phase 7 draws strokes only**, from core's `visible_strokes`. Phase 8 adds the text bar and Phase 9 the scoreboard.
-- **Rasterized at the output size** (measured).
+- **`w`/`h` are the picture rect (`fit_rect`), not the output frame.** Strokes are normalized to the content rect and `line_width` to its height, so rasterizing at the output size would stretch them across the letterbox bars on a non-16:9 source. The overlay pad takes the same rect as the base pad. This closes BACKLOG #20's "revisit at Phase 7".
+- **The overlay is a second `appsrc`**, pushed by the same pump with the same PTS as the base frame; both are `stream-type=seekable`.
 - **No pool.** A fresh buffer per frame, drawn into with `tiny_skia::PixmapMut::from_bytes` over the mapped `gst::Buffer`, is sub-millisecond at 720p. A pooled pixmap would need destroy-notify recycling to avoid overwriting a frame still queued in the mixer.
 - **Premultiplied-over** on the mixer pad: set `blend-function-src-rgb=one` (the destination function already defaults correctly).
 - **Geometry stays in core** (`visible_strokes`, `zoom_at`, the layout ratios); **pixels stay in media**, and so does the font when Phase 8 needs one.
@@ -102,6 +105,7 @@ pub fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buf
 ### P5. Control and lifecycle
 
 - **Commands:** `OpenPreview(clip_id)` and `ClosePreview`.
+- **Opening a preview is explicit:** a Preview button in the inspector and a context-menu item. **Space means "play the game video" until a preview is open;** while one is open the transport drives it. Skips bypass `SkipCoordinator`, which is defined over concat source time.
 - **Exclusivity:** the source player is **paused, not unloaded**, so closing a preview is a no-op restore. Preview is refused while recording or exporting, and recording and export are refused while previewing.
 - **Events:** `Event::Preview(Option<Uuid>)` (the clip being previewed, or closed) plus the existing `Event::Playing`. There is no preview-specific play state and no spinner: the preroll is 100–300 ms.
 - **No cache, no polling.** macOS needed both only because building an AVFoundation composition was slow.
