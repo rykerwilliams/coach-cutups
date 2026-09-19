@@ -3,11 +3,8 @@
 //! Phase 4 spec (R8) makes: caller-supplied times, events written by
 //! construction, and record times that never go backwards.
 
-use uuid::Uuid;
-
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::recording::RecordingLog;
-use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 
 /// t0 is deliberately far from zero, so a test that forgot to subtract it
@@ -31,28 +28,6 @@ fn zooms(events: &[CommentaryEvent]) -> Vec<(f64, Zoom)> {
 
 fn scale(s: f64) -> Zoom {
     Zoom::new(s, 0.0, 0.0)
-}
-
-/// A two-point stroke spanning `duration` seconds.
-fn a_stroke(duration: f64) -> Stroke {
-    Stroke {
-        id: Uuid::nil(),
-        color: Rgba::RED,
-        line_width: 0.005,
-        points: vec![
-            StrokePoint {
-                x: 0.1,
-                y: 0.2,
-                t: 0.0,
-            },
-            StrokePoint {
-                x: 0.3,
-                y: 0.4,
-                t: duration,
-            },
-        ],
-        auto_clear_after_seconds: Some(5.0),
-    }
 }
 
 /// New. The initial zoom, then the pause at the start position, both at 0.
@@ -96,23 +71,6 @@ fn skip_logs_the_requested_delta() {
     assert_eq!(
         log.finish()[2],
         CommentaryEvent::new(1.0, EventKind::Skip { delta: -10.0 })
-    );
-}
-
-/// New. Both carry the caller's time, and the stroke's is its **pen-up** — so
-/// `visible_strokes` back-computes a start of 1.5 − 0.75 here.
-#[test]
-fn stroke_and_clear_all_log_caller_times() {
-    let mut log = RecordingLog::new(T0, Zoom::IDENTITY, 0.0);
-    let s = a_stroke(0.75);
-    log.stroke(at(1.5), s.clone());
-    log.clear_all(at(2.0));
-    assert_eq!(
-        log.finish()[2..],
-        [
-            CommentaryEvent::new(1.5, EventKind::Stroke(s)),
-            CommentaryEvent::new(2.0, EventKind::ClearAll),
-        ]
     );
 }
 

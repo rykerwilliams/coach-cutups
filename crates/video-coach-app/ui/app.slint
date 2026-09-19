@@ -461,6 +461,10 @@ component StrokePath inherits Path {
     fit: preserve;
     // Exactly core's `Rgba::RED`, which export burns in (Phase 8).
     stroke: #ff3333;
+    // Exactly `drawing::LINE_WIDTH`, a fraction of the picture's height,
+    // which is what the logged stroke carries and export burns in. `self` is
+    // the content rect, by the 100% above.
+    stroke-width: self.height * 0.005;
     // Round caps also make a single point (`M x y L x y`) a dot.
     stroke-line-cap: round;
     stroke-line-join: round;
@@ -491,6 +495,11 @@ export component AppWindow inherits Window {
     in property <[float]> zoom-notches;
     out property <length> player-width: player.width;
     out property <length> player-height: player.height;
+    /// The content rect: the letterboxed picture at 1×, which the drawing
+    /// area is sized to and strokes are normalized against (Phase 6 D2).
+    /// Zero before the first layout, or with nothing loaded.
+    out property <length> content-width: player.content.width;
+    out property <length> content-height: player.content.height;
     /// The picture's rect at `zoom`. Pure, so the binding that calls it is
     /// re-evaluated whenever an argument changes.
     pure callback place-picture(ZoomState, float, float, length, length) -> PictureRect;
@@ -682,6 +691,9 @@ export component AppWindow inherits Window {
     callback draw-press(length, length);
     callback draw-move(length, length);
     callback draw-release(length, length);
+    /// The grab was taken away mid-stroke (see the drawing area): whatever is
+    /// under the pen is dropped, unlogged.
+    callback draw-cancel();
     /// Clear: the button, or C.
     callback clear-drawings();
     /// Drag-to-reorder payload: a row index of the named list ("sources" or
@@ -1138,13 +1150,11 @@ export component AppWindow inherits Window {
                         // don't move with the zoom.
                         for cmds in root.live-paths: StrokePath {
                             commands: cmds;
-                            stroke-width: parent.height * 0.005;
                         }
                         // The one under the pen. An empty `commands` draws
                         // nothing, so it needs no `if`.
                         StrokePath {
                             commands: root.drawing-path;
-                            stroke-width: parent.height * 0.005;
                         }
                     }
 
@@ -1219,6 +1229,16 @@ export component AppWindow inherits Window {
                         enabled: root.can-draw;
                         mouse-cursor: crosshair;
                         pointer-event(event) => {
+                            // Slint drops the grab and sends a cancel when a
+                            // grabbing area sees an exit or is disabled
+                            // mid-stroke — the recording stopping, say. It
+                            // carries `button: other`, so it has to come
+                            // before the test below, or the stroke would be
+                            // left on screen and never logged.
+                            if (event.kind == PointerEventKind.cancel) {
+                                root.draw-cancel();
+                                return;
+                            }
                             if (event.button != PointerEventButton.left) {
                                 return;
                             }

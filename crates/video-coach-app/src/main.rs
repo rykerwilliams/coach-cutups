@@ -42,9 +42,12 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// How long a notice stays up.
 const NOTICE: Duration = Duration::from_secs(6);
 /// How long after the pen lifts a drawing clears, with Auto-clear on (Phase 6
-/// spec D3). The same value goes into the stroke, so replay clears with the
-/// overlay.
-const AUTO_CLEAR: f64 = 5.0;
+/// spec D3). The overlay's expiry is on `now_ns()`'s clock — the same anchor
+/// the logged rule counts from — and the same span goes into the stroke, so
+/// replay clears with the overlay.
+const AUTO_CLEAR_NS: u64 = 5_000_000_000;
+/// ... in seconds, which is the unit the stroke carries.
+const AUTO_CLEAR: f64 = AUTO_CLEAR_NS as f64 / 1e9;
 
 /// What the UI thread knows of the bus's state, from its events, and the
 /// zoom, which is the UI's own.
@@ -65,11 +68,12 @@ struct UiState {
     /// The recording's t0 on `now_ns()`'s clock, once its video started,
     /// for the elapsed-time readout.
     recording_t0: Option<u64>,
-    /// The drawings on screen, each with the moment it auto-clears (Phase 6
-    /// spec D3). Live, "now" only moves forward and a finished stroke is
+    /// The drawings on screen, each with the `now_ns()` moment it auto-clears
+    /// (Phase 6 spec D3) — the pen-up the logged rule counts from, on the
+    /// same clock. Live, "now" only moves forward and a finished stroke is
     /// always fully drawn, so this is the whole of the replay rule for the
     /// live case; `visible_strokes` is for saved clips.
-    live_strokes: Vec<(Stroke, Option<Instant>)>,
+    live_strokes: Vec<(Stroke, Option<u64>)>,
     /// The drawing under the pen, if the coach is mid-stroke.
     drawing: Option<InProgress>,
     /// The content rect the window's `live-paths` were built for: their
@@ -698,19 +702,26 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             // Without a content rect there's nothing to normalize against;
             // the stroke is dropped rather than stored wrong. The player has
             // one whenever a press could reach the drawing area.
-            let Some((rect, (host_ns, stroke))) = UI.with_borrow_mut(|ui| {
+            let Some((host_ns, stroke)) = UI.with_borrow_mut(|ui| {
                 let ip = ui.drawing.take()?;
                 let rect = content_size(&w)?;
-                Some((rect, ip.release(x, y, now_ns, rect, auto)))
+                let (host_ns, stroke) = ip.release(x, y, now_ns, rect, auto);
+                let expiry = auto.is_some().then(|| host_ns + AUTO_CLEAR_NS);
+                ui.live_strokes.push((stroke.clone(), expiry));
+                show_strokes(&w, ui, rect);
+                Some((host_ns, stroke))
             }) else {
                 return;
             };
-            let expiry = auto.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
-            UI.with_borrow_mut(|ui| {
-                ui.live_strokes.push((stroke.clone(), expiry));
-                show_strokes(&w, ui, rect);
-            });
             bus.borrow().send(Command::Stroke { host_ns, stroke });
+        }
+    });
+    window.on_draw_cancel({
+        let weak = window.as_weak();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            w.set_drawing_path(SharedString::new());
+            UI.with_borrow_mut(|ui| ui.drawing = None);
         }
     });
     window.on_clear_drawings({
@@ -718,21 +729,28 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         move || {
             let host_ns = now_ns();
             let Some(w) = weak.upgrade() else { return };
-            clear_drawings(&w);
-            bus.borrow().send(Command::ClearAll { host_ns });
+            // Nothing on screen, nothing to log: a Clear on an empty picture
+            // would otherwise put an event in the log that replays as a
+            // no-op.
+            if clear_drawings(&w) {
+                bus.borrow().send(Command::ClearAll { host_ns });
+            }
         }
     });
 }
 
 /// Wipes the live overlay: the drawings on screen and the one under the pen,
-/// which is discarded rather than logged (spec D2, macOS parity).
-fn clear_drawings(w: &AppWindow) {
+/// which is discarded rather than logged (spec D2, macOS parity). Returns
+/// whether anything was there to wipe.
+fn clear_drawings(w: &AppWindow) -> bool {
     w.set_drawing_path(SharedString::new());
     w.set_live_paths(ModelRc::default());
     UI.with_borrow_mut(|ui| {
+        let had_any = !ui.live_strokes.is_empty() || ui.drawing.is_some();
         ui.live_strokes.clear();
         ui.drawing = None;
-    });
+        had_any
+    })
 }
 
 /// Rebuilds the window's live `Path` layer from [`UiState::live_strokes`],
@@ -749,18 +767,13 @@ fn show_strokes(w: &AppWindow, ui: &mut UiState, rect: (f64, f64)) {
     w.set_live_paths(ModelRc::new(VecModel::from(paths)));
 }
 
-/// The content rect's size: the letterboxed picture at 1×, which the window's
-/// drawing area is sized to and strokes are normalized against. `None` before
-/// the first layout, or with nothing loaded.
+/// The content rect's size, as the window lays it out: the letterboxed
+/// picture at 1×, which the drawing area is sized to and strokes are
+/// normalized against. `None` before the first layout, or with nothing
+/// loaded — there is nothing to normalize against then.
 fn content_size(w: &AppWindow) -> Option<(f64, f64)> {
-    let vp = Viewport::new(
-        w.get_frame_width().into(),
-        w.get_frame_height().into(),
-        w.get_player_width().into(),
-        w.get_player_height().into(),
-    )?;
-    let r = vp.picture(Zoom::IDENTITY);
-    Some((r.width, r.height))
+    let (width, height): (f64, f64) = (w.get_content_width().into(), w.get_content_height().into());
+    (width > 0.0 && height > 0.0).then_some((width, height))
 }
 
 /// Applies a bus event on the UI thread.
@@ -793,8 +806,9 @@ fn on_event(w: &AppWindow, event: Event) {
         Event::Recording(status) => {
             // On every transition, start and stop alike: drawings belong to
             // one recording, and the phase change disables the drawing area
-            // under whatever is mid-stroke.
-            clear_drawings(w);
+            // under whatever is mid-stroke. Nothing is logged: the recording
+            // this would belong to is over.
+            let _ = clear_drawings(w);
             UI.with_borrow_mut(|ui| {
                 ui.recording_t0 = match status {
                     RecordingStatus::Recording { t0_ns } => Some(t0_ns),
@@ -982,10 +996,10 @@ fn tick(w: &AppWindow, position: &PositionHandle) {
     let content = content_size(w);
     UI.with_borrow_mut(|ui| {
         if let Some(rect) = content {
-            let now = Instant::now();
+            let now_ns = now_ns();
             let before = ui.live_strokes.len();
             ui.live_strokes
-                .retain(|(_, at)| at.is_none_or(|at| at > now));
+                .retain(|(_, at)| at.is_none_or(|at| at > now_ns));
             // Something auto-cleared, or the player resized and every
             // stroke moved with it: the commands are in content px.
             let resized = !ui.live_strokes.is_empty() && ui.paths_rect != rect;

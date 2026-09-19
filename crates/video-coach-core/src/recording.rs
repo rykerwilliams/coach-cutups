@@ -129,6 +129,12 @@ impl RecordingLog {
     /// `host_ns` is the moment of the stroke's **last** point, not its first:
     /// replay back-computes the start from the point times, and auto-clear
     /// counts from here (`stroke_replay`).
+    ///
+    /// So if the monotonic clamp in `record_time` ever fired for a
+    /// stroke, the back-computed start would move with it and the whole
+    /// drawing would shift. It can't today — the UI captures `host_ns` at the
+    /// pen-up, after every event it could be clamped against — and a guard
+    /// here would only hide that.
     pub fn stroke(&mut self, host_ns: u64, stroke: Stroke) {
         let t = self.record_time(host_ns);
         self.push(t, EventKind::Stroke(stroke));

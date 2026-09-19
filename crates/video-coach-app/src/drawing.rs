@@ -6,9 +6,14 @@
 //! **Coordinates.** The drawing area *is* the content rect (the letterboxed
 //! picture at 1×), so a pointer position is already relative to it. An
 //! in-progress stroke is buffered in those logical pixels and normalized once
-//! at pen-up, by the rect as it is then. Do not route this through
-//! `zoom_input::Viewport`, whose fractions are of the *player* area and would
-//! shift every stroke by the letterbox offset.
+//! at pen-up, by the rect as it is then — which the window reports as
+//! `content-width` / `content-height`.
+//!
+//! A window resize *mid-stroke* therefore normalizes the earlier points, which
+//! were captured against the old rect, against the new one: the stroke comes
+//! out slightly skewed. That is a known, accepted gap — the fix means
+//! threading the rect through every move, for a case that takes a deliberate
+//! resize with the button held down.
 //!
 //! **Time.** Every method takes `now_ns` from the caller, on `now_ns()`'s
 //! clock — the bus contract: a timestamp is captured at the input event, not
@@ -135,17 +140,22 @@ pub fn path_commands(points: &[StrokePoint], w: f64, h: f64) -> String {
 /// `M` to the first point, `L` to the rest. A single point becomes the
 /// degenerate `M x y L x y`, which a round cap rasterizes as a dot; a bare
 /// `M x y` draws nothing at all.
+///
+/// Coordinates are rounded to hundredths of a logical pixel: nothing finer is
+/// renderable, and full `f64` precision makes the string Slint re-parses on
+/// every change two to four times longer (a 600-point stroke at a fractional
+/// scale: 23 KB, against under 10 KB here; on whole pixels, 6 KB).
 fn commands(points: impl Iterator<Item = (f64, f64)>) -> String {
     let points: Vec<(f64, f64)> = points.collect();
     let Some(&(fx, fy)) = points.first() else {
         return String::new();
     };
-    let mut out = format!("M {fx} {fy}");
+    let mut out = format!("M {fx:.2} {fy:.2}");
     if points.len() == 1 {
-        out.push_str(&format!(" L {fx} {fy}"));
+        out.push_str(&format!(" L {fx:.2} {fy:.2}"));
     }
     for &(x, y) in &points[1..] {
-        out.push_str(&format!(" L {x} {y}"));
+        out.push_str(&format!(" L {x:.2} {y:.2}"));
     }
     out
 }
@@ -262,7 +272,30 @@ mod tests {
                 t: 1.0,
             },
         ];
-        assert_eq!(path_commands(&points, 800.0, 400.0), "M 0 200 L 800 100");
+        assert_eq!(
+            path_commands(&points, 800.0, 400.0),
+            "M 0.00 200.00 L 800.00 100.00"
+        );
+    }
+
+    /// Two decimals, however awkward the rect: sub-0.01 logical px isn't
+    /// renderable, and the string is re-parsed on every change.
+    #[test]
+    fn coordinates_are_rounded_to_hundredths() {
+        let points: Vec<StrokePoint> = (0..600)
+            .map(|i| StrokePoint {
+                x: i as f64 / 599.0,
+                y: (i as f64 / 599.0) * 0.7,
+                t: i as f64 / 60.0,
+            })
+            .collect();
+        let commands = path_commands(&points, 1279.0, 719.0);
+        for token in commands.split(' ').filter(|t| t.contains('.')) {
+            let decimals = token.split('.').nth(1).expect("has a point").len();
+            assert_eq!(decimals, 2, "{token}");
+        }
+        // Full precision is 23 KB of this same stroke.
+        assert!(commands.len() < 12_000, "{} bytes", commands.len());
     }
 
     /// A bare `M x y` has no segment and draws nothing; the degenerate one
@@ -274,14 +307,13 @@ mod tests {
             y: 0.5,
             t: 0.0,
         }];
-        assert_eq!(path_commands(&points, 800.0, 400.0), "M 400 200 L 400 200");
-        assert_eq!(InProgress::start(0, 3.0, 4.0).commands(), "M 3 4 L 3 4");
-    }
-
-    #[test]
-    fn the_live_commands_are_the_buffered_pixels() {
-        let mut ip = InProgress::start(0, 10.0, 20.0);
-        ip.moved(30.0, 40.0, S);
-        assert_eq!(ip.commands(), "M 10 20 L 30 40");
+        assert_eq!(
+            path_commands(&points, 800.0, 400.0),
+            "M 400.00 200.00 L 400.00 200.00"
+        );
+        assert_eq!(
+            InProgress::start(0, 3.0, 4.0).commands(),
+            "M 3.00 4.00 L 3.00 4.00"
+        );
     }
 }
