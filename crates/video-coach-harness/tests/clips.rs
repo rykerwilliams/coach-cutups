@@ -100,10 +100,6 @@ fn edit(h: &Harness, id: Uuid, edit: ClipEdit) {
     h.send(Command::EditClip { id, edit });
 }
 
-fn ids(p: &Project) -> Vec<Uuid> {
-    p.clips.iter().map(|c| c.id).collect()
-}
-
 /// The latest `Position` the bus published: source index and target.
 fn latest_position(h: &Harness) -> Option<(usize, Option<f64>)> {
     h.log().iter().rev().find_map(|e| match e {
@@ -138,11 +134,10 @@ fn an_edit_saves_and_is_one_undo_step() {
 
     edit(&h, p.id(0), ClipEdit::Name("Corner".into()));
     assert_eq!(h.wait_changed().project.clips[0].name, "Corner");
-    // Tags arrive as the field's raw text and are normalized.
     edit(
         &h,
         p.id(0),
-        ClipEdit::Tags(vec![" Press, set piece ,PRESS".into()]),
+        ClipEdit::Tags(vec!["press".into(), "set piece".into()]),
     );
     assert_eq!(
         h.wait_changed().project.clips[0].tags,
@@ -160,10 +155,10 @@ fn an_edit_saves_and_is_one_undo_step() {
     assert_eq!(h.wait_changed().project.clips[0].name, "Corner");
     assert_eq!(h.wait_select(), id);
 
-    // Unchanged after normalization: no save, and no undo step, so the
-    // redo stack survives and the next change is the redone tags.
+    // Unchanged: no save, and no undo step, so the redo stack survives and
+    // the next change is the redone tags.
     edit(&h, p.id(0), ClipEdit::Name("Corner".into()));
-    edit(&h, p.id(0), ClipEdit::Tags(vec![String::new()]));
+    edit(&h, p.id(0), ClipEdit::Tags(Vec::new()));
     h.send(Command::Redo);
     assert_eq!(
         h.wait_changed().project.clips[0].tags,
@@ -180,29 +175,29 @@ fn an_edit_saves_and_is_one_undo_step() {
 #[test]
 fn deletes_go_to_the_trash_and_each_undo_restores_one_in_place() {
     let (mut h, p) = Proj::open(&["a.webm"], &[0, 0, 0]);
-    let all = ids(&p.saved());
+    let all = p.saved().clip_order();
 
     h.send(Command::DeleteClip(p.id(1)));
     h.wait_changed();
     h.send(Command::DeleteClip(p.id(0)));
-    assert_eq!(ids(&h.wait_changed().project), [p.id(2)]);
-    assert_eq!(ids(&p.saved()), [p.id(2)]);
+    assert_eq!(h.wait_changed().project.clip_order(), [p.id(2)]);
+    assert_eq!(p.saved().clip_order(), [p.id(2)]);
     assert!(!p.in_recordings(0) && !p.in_recordings(1));
 
     h.send(Command::Undo);
-    assert_eq!(ids(&h.wait_changed().project), [p.id(0), p.id(2)]);
+    assert_eq!(h.wait_changed().project.clip_order(), [p.id(0), p.id(2)]);
     assert_eq!(h.wait_select(), p.id(0));
     h.send(Command::Undo);
-    assert_eq!(ids(&h.wait_changed().project), all);
+    assert_eq!(h.wait_changed().project.clip_order(), all);
     assert_eq!(h.wait_select(), p.id(1));
-    assert_eq!(ids(&p.saved()), all);
+    assert_eq!(p.saved().clip_order(), all);
     assert!(p.in_recordings(0) && p.in_recordings(1));
 
     h.send(Command::Redo);
-    assert_eq!(ids(&h.wait_changed().project), [p.id(0), p.id(2)]);
+    assert_eq!(h.wait_changed().project.clip_order(), [p.id(0), p.id(2)]);
     h.shutdown();
     assert!(!p.in_recordings(1) && p.in_recordings(0));
-    assert_eq!(ids(&p.saved()), [p.id(0), p.id(2)]);
+    assert_eq!(p.saved().clip_order(), [p.id(0), p.id(2)]);
 }
 
 #[test]
@@ -218,7 +213,7 @@ fn a_delete_whose_save_fails_leaves_the_recording_in_place() {
     assert!(matches!(h.wait_for_error(), UserError::Io(_)));
     // The in-memory change stands, as for any failed save.
     assert!(h.wait_changed().project.clips.is_empty());
-    assert_eq!(ids(&p.saved()), [p.id(0)]);
+    assert_eq!(p.saved().clip_order(), [p.id(0)]);
     assert!(
         p.in_recordings(0),
         "the file moved although the save failed"
@@ -227,9 +222,9 @@ fn a_delete_whose_save_fails_leaves_the_recording_in_place() {
     // Undo still brings it back, and saves once it can.
     drop(read_only);
     h.send(Command::Undo);
-    assert_eq!(ids(&h.wait_changed().project), [p.id(0)]);
+    assert_eq!(h.wait_changed().project.clip_order(), [p.id(0)]);
     h.shutdown();
-    assert_eq!(ids(&p.saved()), [p.id(0)]);
+    assert_eq!(p.saved().clip_order(), [p.id(0)]);
     assert!(p.in_recordings(0));
 }
 
@@ -293,30 +288,30 @@ fn a_redone_delete_restores_the_remapped_clip() {
 fn reorder_and_sort_are_undoable() {
     // Clips on b, a, b: sorted is 1, 0, 2.
     let (mut h, p) = Proj::open(&["a.webm", "b.webm"], &[1, 0, 1]);
-    let original = ids(&p.saved());
+    let original = p.saved().clip_order();
     let [c0, c1, c2] = [p.id(0), p.id(1), p.id(2)];
 
     h.send(Command::MoveClip { from: 0, to: 2 });
-    assert_eq!(ids(&h.wait_changed().project), [c1, c2, c0]);
+    assert_eq!(h.wait_changed().project.clip_order(), [c1, c2, c0]);
     h.send(Command::Undo);
-    assert_eq!(ids(&h.wait_changed().project), original);
+    assert_eq!(h.wait_changed().project.clip_order(), original);
 
     h.send(Command::SortClipsBySource);
-    assert_eq!(ids(&h.wait_changed().project), [c1, c0, c2]);
+    assert_eq!(h.wait_changed().project.clip_order(), [c1, c0, c2]);
     // Already sorted, and a move onto itself: nothing to do.
     h.send(Command::SortClipsBySource);
     h.send(Command::MoveClip { from: 1, to: 1 });
     h.send(Command::Undo);
-    assert_eq!(ids(&h.wait_changed().project), original);
+    assert_eq!(h.wait_changed().project.clip_order(), original);
     h.send(Command::Redo);
     let sorted = h.wait_changed().project;
-    assert_eq!(ids(&sorted), [c1, c0, c2]);
+    assert_eq!(sorted.clip_order(), [c1, c0, c2]);
     let indices: Vec<i64> = sorted.clips.iter().map(|c| c.sort_index).collect();
     assert_eq!(indices, [0, 1, 2]);
 
     let rest = h.shutdown();
     no_project_changed(&rest);
-    assert_eq!(ids(&p.saved()), [c1, c0, c2]);
+    assert_eq!(p.saved().clip_order(), [c1, c0, c2]);
 }
 
 #[test]
@@ -387,4 +382,28 @@ fn clip_commands_are_refused_while_recording() {
     h.shutdown();
     assert_eq!(p.saved().clips.len(), 2);
     assert!(p.in_recordings(0));
+}
+
+/// A field's focus-loss commit arrives after the Record click that took its
+/// focus, so an edit is let through while recording.
+#[test]
+fn an_edit_while_recording_is_applied_and_saved() {
+    let (mut h, p) = Proj::open(&["a.webm"], &[0]);
+    settle_at(&mut h, 0, 0.0);
+    h.send(Command::ToggleRecording {
+        zoom: Zoom::IDENTITY,
+    });
+    assert_eq!(h.wait_recording(), RecordingStatus::Starting);
+    assert!(matches!(
+        h.wait_recording(),
+        RecordingStatus::Recording { .. }
+    ));
+
+    edit(&h, p.id(0), ClipEdit::Name("Corner".into()));
+    assert_eq!(h.wait_changed().project.clips[0].name, "Corner");
+    assert_eq!(p.saved().clips[0].name, "Corner");
+    h.send(Command::StopRecording);
+    assert_eq!(h.wait_changed().project.clips.len(), 2);
+    h.shutdown();
+    assert_eq!(p.saved().clips[0].name, "Corner");
 }

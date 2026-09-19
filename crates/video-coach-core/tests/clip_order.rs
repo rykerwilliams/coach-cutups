@@ -67,11 +67,6 @@ fn apply_clip_order_skips_stale_ids_and_keeps_the_rest() {
     assert_numbered(&p);
 }
 
-#[test]
-fn clip_order_lists_ids() {
-    assert_eq!(project(2).clip_order(), [id(1), id(2)]);
-}
-
 // ------------------------------------------------------------ moved_order
 
 #[test]
@@ -162,16 +157,16 @@ fn insert_of_a_present_clip_is_a_no_op() {
     assert_eq!(p.clips[2].name, "c3");
 }
 
-// ------------------------------------------------------------ apply_edit
+// ------------------------------------------------------------ edits
 
 /// Every variant sets its one field and returns the previous value as the
 /// same variant; nothing else on the clip changes (C2).
 #[test]
-fn apply_edit_sets_one_field_and_returns_the_old_value() {
+fn set_sets_one_field_and_returns_the_old_value() {
     let cases = [
         (
             ClipEdit::Name("new".into()),
-            ClipEdit::Name("c2".into()),
+            ClipEdit::Name("c1".into()),
             (|c: &Clip| c.name == "new") as fn(&Clip) -> bool,
         ),
         (
@@ -189,15 +184,16 @@ fn apply_edit_sets_one_field_and_returns_the_old_value() {
         }),
     ];
     for (edit, old, applied) in cases {
-        let mut p = project(3);
-        let before = p.clips[1].clone();
-        assert_eq!(p.apply_edit(id(2), edit.clone()), Some(old.clone()));
-        assert!(applied(&p.clips[1]), "{edit:?} applied");
+        let before = clip(1, 0, 0.0);
+        let mut c = before.clone();
+        assert_eq!(c.set(edit.clone()), old);
+        assert!(applied(&c), "{edit:?} applied");
 
-        // Applying the old value restores the clip exactly.
-        assert_eq!(p.apply_edit(id(2), old), Some(edit));
-        assert_eq!(p.clips[1], before);
-        assert_eq!(names(&p), [1, 2, 3]);
+        // Setting the old value restores the clip exactly, and setting a
+        // value again returns it: unchanged.
+        assert_eq!(c.set(old.clone()), edit);
+        assert_eq!(c, before);
+        assert_eq!(c.set(old.clone()), old);
     }
 }
 

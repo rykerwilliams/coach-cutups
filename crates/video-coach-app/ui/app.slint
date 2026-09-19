@@ -318,7 +318,10 @@ component Inspector inherits Rectangle {
             enabled: root.enabled;
             placeholder-text: "Comma-separated";
             text <=> root.tags-text;
-            accepted(text) => { root.commit(ClipField.tags, text); }
+            accepted(text) => {
+                root.suggestions = [];
+                root.commit(ClipField.tags, text);
+            }
             changed has-focus => { root.focus-changed(ClipField.tags, self.has-focus, self.text); }
             edited(text) => {
                 root.suggestions-dismissed = false;
@@ -1207,7 +1210,13 @@ export component AppWindow inherits Window {
                             text: root.recording ? "Stop" : "Record";
                             enabled: root.can-play || root.recording;
                             min-width: 72px;
-                            clicked => { root.toggle-recording(); }
+                            // Off any field first: a click doesn't take focus
+                            // from one, and a field disabled while it has
+                            // focus would keep blocking the recording keys.
+                            clicked => {
+                                keys.focus();
+                                root.toggle-recording();
+                            }
 
                             Tooltip {
                                 text: root.recording

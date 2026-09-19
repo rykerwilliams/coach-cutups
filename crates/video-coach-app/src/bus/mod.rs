@@ -58,8 +58,7 @@ pub enum Command {
 
     // Clips (Phase 3 spec C5). Each mutation is one undo step, and none is
     // one if it changes nothing.
-    /// Set one field of a clip. Tags arrive as the field's raw text, as one
-    /// element, and are normalized here.
+    /// Set one field of a clip. Tags arrive normalized.
     EditClip {
         id: Uuid,
         edit: ClipEdit,
@@ -376,7 +375,7 @@ impl Bus {
             capture,
             recording: None,
             generation: 0,
-            history: UndoController::new(),
+            history: UndoController::default(),
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -462,6 +461,10 @@ impl Bus {
                     | Command::ToggleRecording { .. }
                     | Command::StopRecording
                     | Command::GlReady { .. }
+                    // A metadata edit can't disturb a recording, and a
+                    // field's focus-loss commit arrives after the
+                    // `ToggleRecording` that took its focus.
+                    | Command::EditClip { .. }
             )
         {
             return eprintln!("bus: refused while recording: {cmd:?}");

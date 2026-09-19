@@ -85,8 +85,12 @@ impl Bus {
         // skip burst, nor its frame.
         self.unload();
         // Undo is in-memory only, so the trash it held is unreachable now
-        // (Phase 3 spec C4).
+        // (Phase 3 spec C4). That includes the previous project's: its
+        // history is being cleared, so its trash can never be restored.
         self.history.clear();
+        if let Some(open) = &self.open {
+            super::clips::empty_trash(&open.folder);
+        }
         super::clips::empty_trash(&folder);
         self.player.set_volume(project.preferences.scan_volume);
         self.current = 0;

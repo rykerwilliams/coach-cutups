@@ -25,7 +25,7 @@ use video_coach_app::bus::{
 };
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
-use video_coach_core::project::{Clip, Project};
+use video_coach_core::project::Project;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
@@ -270,9 +270,10 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
 fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let by_id = |bus: &Rc<RefCell<BusHandle>>, command: fn(Uuid) -> Command| {
         let bus = bus.clone();
-        move |id: SharedString| match Uuid::parse_str(&id) {
-            Ok(id) => bus.borrow().send(command(id)),
-            Err(_) => eprintln!("ui: not a clip id: {id:?}"),
+        move |id: SharedString| {
+            if let Some(id) = parse_clip_id(&id) {
+                bus.borrow().send(command(id));
+            }
         }
     };
     window.on_jump_to_clip(by_id(bus, Command::JumpToClip));
@@ -320,16 +321,17 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             let Some(w) = weak.upgrade() else { return };
             let edit = match field {
                 ClipField::Name => ClipEdit::Name(text.into()),
-                // Raw: the bus normalizes.
-                ClipField::Tags => ClipEdit::Tags(vec![text.into()]),
+                ClipField::Tags => ClipEdit::Tags(normalize_tags(&text)),
                 ClipField::Notes => ClipEdit::Notes(text.into()),
             };
-            let id = Uuid::parse_str(&id).ok();
+            let id = parse_clip_id(&id);
+            // Whether the bus will apply it: it skips an edit that sets the
+            // value already there.
             let changes = UI.with_borrow(|ui| {
                 ui.snapshot
                     .as_ref()
                     .and_then(|s| s.project.clips.iter().find(|c| Some(c.id) == id))
-                    .is_some_and(|clip| changes(clip, &edit))
+                    .is_some_and(|clip| clip.clone().set(edit.clone()) != edit)
             });
             match id {
                 // Its `ProjectChanged` re-renders the fields. Rendering them
@@ -344,12 +346,13 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
     window.on_set_show_pip({
         let bus = bus.clone();
-        move |id, on| match Uuid::parse_str(&id) {
-            Ok(id) => bus.borrow().send(Command::EditClip {
-                id,
-                edit: ClipEdit::ShowPip(on),
-            }),
-            Err(_) => eprintln!("ui: not a clip id: {id:?}"),
+        move |id, on| {
+            if let Some(id) = parse_clip_id(&id) {
+                bus.borrow().send(Command::EditClip {
+                    id,
+                    edit: ClipEdit::ShowPip(on),
+                });
+            }
         }
     });
     window.on_show_clip({
@@ -372,15 +375,12 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_take_suggestion(|text, tag| take_suggestion(&text, &tag).into());
 }
 
-/// Whether `edit` would change `clip`: the bus skips it otherwise, and so
-/// sends no `ProjectChanged`. Tags compare normalized, as the bus stores them.
-fn changes(clip: &Clip, edit: &ClipEdit) -> bool {
-    match edit {
-        ClipEdit::Name(name) => clip.name != *name,
-        ClipEdit::Tags(raw) => clip.tags != normalize_tags(&raw.join(",")),
-        ClipEdit::Notes(notes) => clip.notes != *notes,
-        ClipEdit::ShowPip(on) => clip.show_pip != *on,
-    }
+/// A clip id from the UI, which always sends valid ones: a bad one is
+/// logged, as a bug.
+fn parse_clip_id(id: &str) -> Option<Uuid> {
+    Uuid::parse_str(id)
+        .inspect_err(|_| eprintln!("ui: not a clip id: {id:?}"))
+        .ok()
 }
 
 /// The Devices popover (R2): listed on a short-lived thread each time it
@@ -634,9 +634,23 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
-        // After the operation's `ProjectChanged`, so the clip is listed. The
-        // window re-renders the inspector when the selection changes.
-        Event::Select(id) => w.set_selected_clip(id.to_string().into()),
+        // After the operation's `ProjectChanged`, so the clip is in the
+        // project; a tag filter that hides it is cleared, so it's listed too.
+        // The window re-renders the inspector when the selection changes.
+        Event::Select(id) => {
+            let filter = w.get_tag_filter();
+            let hidden = !filter.is_empty()
+                && UI.with_borrow(|ui| {
+                    ui.snapshot
+                        .as_ref()
+                        .and_then(|s| s.project.clips.iter().find(|c| c.id == id))
+                        .is_some_and(|c| !c.tags.iter().any(|t| *t == filter.as_str()))
+                });
+            if hidden {
+                w.set_tag_filter(SharedString::new());
+            }
+            w.set_selected_clip(id.to_string().into());
+        }
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {

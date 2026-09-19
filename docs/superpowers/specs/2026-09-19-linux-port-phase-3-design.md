@@ -56,9 +56,9 @@ pub enum UndoAction {
 impl UndoController {
     pub fn push(&mut self, a: UndoAction) -> Vec<Clip>;       // clears redo; returns evicted deletes
     pub fn take_undo(&mut self) -> Option<UndoAction>;        // removes; caller applies, then…
-    pub fn undone(&mut self, a: UndoAction);                  // …files it on redo
+    pub fn file_redo(&mut self, a: UndoAction);               // …files it on redo
     pub fn take_redo(&mut self) -> Option<UndoAction>;
-    pub fn redone(&mut self, a: UndoAction);                  // files it on undo (no redo clear)
+    pub fn file_undo(&mut self, a: UndoAction);               // files it on undo (no redo clear)
     pub fn evict_deletes(&mut self) -> Vec<Clip>;             // for source changes (C4)
     pub fn clear(&mut self);
 }
@@ -78,7 +78,7 @@ It returns any `DeleteClip` the cap drops. The caller shreds its file.
 **Eviction** is one routine, used by the cap and by `evict_deletes`: remove the delete, and **purge every `EditClip` for that clip id** from both stacks. The clip can never return, so those entries could only no-op. macOS kept them, and Ctrl+Z silently consumed them.
 
 **Take and file.**
-- `take_undo`/`take_redo` hand the action to the bus, which applies it and then files it with `undone`/`redone`.
+- `take_undo`/`take_redo` hand the action to the bus, which applies it and then files it with `file_redo`/`file_undo`. A failed undo is put back with `file_undo`.
 - The bus may file an **updated** action. A redo of a delete files the clip exactly as it was when trashed, with source indices remapped since and any edits that saved without pushing. Re-filing the old snapshot would restore stale data.
 - An action whose target is gone (can't happen once eviction purges, but defensively) is dropped: not filed.
 
@@ -141,8 +141,8 @@ There are no ties, gaps or collisions for export (Phase 8) to meet.
 | Action | Steps |
 |---|---|
 | `DeleteClip` command | `trash_clip`, then `push(DeleteClip)`, then shred any returned clips' `.trash/<file>` |
-| Undo of a delete | `restore_clip`, then `undone` |
-| Redo of a delete | `trash_clip` (no push), then `redone` with the clip `trash_clip` removed |
+| Undo of a delete | `restore_clip`, then `file_redo` (or `file_undo` if the file couldn't be moved back) |
+| Redo of a delete | `trash_clip` (no push), then `file_undo` with the clip `trash_clip` removed |
 
 **Why save first on delete.** macOS moved the file first, so a crash in between left `project.json` listing a clip whose recording the next open's shred-on-open deleted. With save first, a crash leaves at worst an **unreferenced** recording in `recordings/`: an orphan, which is harmless (BACKLOG #38). The restore order (move back, then save) is safe the same way: the reverse order would let the open-time shred delete a referenced file.
 
@@ -158,14 +158,14 @@ There are no ties, gaps or collisions for export (Phase 8) to meet.
 - Source changes are rare, and edits and reorders hold no source indices.
 - A delete on the redo stack is a live clip, and is refreshed when redone.
 
-**At project open**, on every path including the startup restore (`Bus::commit`): remove `recordings/.trash/` entirely and clear the history. Undo is in-memory only (macOS parity). Orphans in `recordings/` are not touched, which stays BACKLOG #38; update its "When to revisit".
+**At project open**, on every path including the startup restore (`Bus::commit`): remove `recordings/.trash/` entirely, and the previous project's too, and clear the history. Undo is in-memory only (macOS parity). Orphans in `recordings/` are not touched, which stays BACKLOG #38; update its "When to revisit".
 
 `write` doesn't fsync, so after a power loss the two renames could land out of order. That is noted, not handled.
 
 ### C5. Commands and events
 
 **New commands:**
-- `EditClip { id, edit: ClipEdit }`, where tags arrive as raw text and are normalized by the bus;
+- `EditClip { id, edit: ClipEdit }`, where tags arrive normalized (the UI normalizes the field's text);
 - `DeleteClip(Uuid)`;
 - `MoveClip { from, to }`;
 - `SortClipsBySource`;
@@ -178,7 +178,7 @@ There are no ties, gaps or collisions for export (Phase 8) to meet.
 3. Save via `project_changed`.
 4. Push.
 
-The Phase 4 recording guard refuses all of these while recording, because they aren't on its allow-list.
+The Phase 4 recording guard refuses all of these while recording, because they aren't on its allow-list, except `EditClip`: a metadata edit can't disturb a recording, and a field's focus-loss commit arrives after the `ToggleRecording` that took its focus.
 
 **`JumpToClip`:**
 1. `reset_skip()`, so a pending skip debounce can't move the video afterwards.
@@ -271,7 +271,7 @@ An empty name is allowed; the list shows "Untitled". Transcript is Phase 10.
 
 | Crate | Phase 3 contents |
 |---|---|
-| `video-coach-core` | `undo.rs` (`UndoController`, `UndoAction`, `ClipEdit`). `tag.rs`: `tag_summaries`, `tag_suggestions`. `project.rs`: `renumber`, `apply_clip_order`, `moved_order`, `source_sorted_order`, `remove_clip`, `insert_clip`, `apply_edit` (returns the old value); `store::read` normalizes clip order; `add_recorded_clip` appends. |
+| `video-coach-core` | `undo.rs` (`UndoController`, `UndoAction`, `ClipEdit`). `tag.rs`: `tag_summaries`, `tag_suggestions`. `project.rs`: `renumber`, `apply_clip_order`, `moved_order`, `source_sorted_order`, `remove_clip`, `insert_clip`, `Clip::set` (returns the old value) and `apply_edit`; `store::read` normalizes clip order; `add_recorded_clip` appends. |
 | `video-coach-media` | Nothing. |
 | `video-coach-app` | Bus: the clip commands, the history, `trash_clip`/`restore_clip`, shredding, eviction on source changes, clearing at open, `Event::Select`. UI: the `text-editing` yield, selection, inspector, tag field with suggestions, overview and filter, context menu, double-click jump, drag reorder, sort button, keys. |
 | `video-coach-harness` | End-to-end clip management. |

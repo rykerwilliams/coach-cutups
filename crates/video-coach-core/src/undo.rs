@@ -9,7 +9,8 @@
 //! - **Any number of deletes can be undone.** macOS kept at most one delete
 //!   across both stacks and evicted the previous one on every delete. Here a
 //!   delete leaves the history only when the cap drops it or
-//!   [`UndoController::evict_deletes`] removes it.
+//!   [`UndoController::evict_deletes`] removes it, so there is one `push`:
+//!   deletes need no separate entry point.
 //! - **Eviction purges the clip's edits.** An evicted clip can never return,
 //!   so its `EditClip` entries could only no-op; macOS kept them, and Ctrl+Z
 //!   silently consumed them.
@@ -19,8 +20,6 @@
 //!   it was when trashed), or nothing if its target is gone.
 //! - **Edits snapshot one field** ([`ClipEdit`]), not the whole clip, so
 //!   undoing an edit can't revert a later reorder.
-//! - There is one `push`: with no one-delete invariant, deletes need no
-//!   separate entry point.
 
 use uuid::Uuid;
 
@@ -31,7 +30,8 @@ use crate::project::Clip;
 /// was on the undo stack.
 pub const STACK_CAP: usize = 100;
 
-/// One user-editable clip field and its value.
+/// One user-editable clip field and its value. Tags are normalized
+/// ([`normalize_tags`](crate::tag::normalize_tags)).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClipEdit {
     Name(String),
@@ -65,24 +65,12 @@ pub struct UndoController {
 }
 
 impl UndoController {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn undo_stack(&self) -> &[UndoAction] {
         &self.undo
     }
 
     pub fn redo_stack(&self) -> &[UndoAction] {
         &self.redo
-    }
-
-    pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
-    }
-
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
     }
 
     /// Record a new action: clears redo, appends, and enforces
@@ -100,25 +88,27 @@ impl UndoController {
     }
 
     /// Remove the newest undo action for the caller to apply in reverse, then
-    /// file with [`undone`](Self::undone).
+    /// file with [`file_redo`](Self::file_redo) (or back with
+    /// [`file_undo`](Self::file_undo) if it failed).
     pub fn take_undo(&mut self) -> Option<UndoAction> {
         self.undo.pop()
     }
 
-    /// File an action the caller has just undone onto the redo stack.
-    pub fn undone(&mut self, action: UndoAction) {
+    /// File an action onto the redo stack: one the caller has just undone.
+    pub fn file_redo(&mut self, action: UndoAction) {
         self.redo.push(action);
     }
 
     /// Remove the newest redo action for the caller to apply forward, then
-    /// file with [`redone`](Self::redone).
+    /// file with [`file_undo`](Self::file_undo).
     pub fn take_redo(&mut self) -> Option<UndoAction> {
         self.redo.pop()
     }
 
-    /// File an action the caller has just redone onto the undo stack. Unlike
-    /// [`push`](Self::push), this keeps the rest of the redo stack.
-    pub fn redone(&mut self, action: UndoAction) {
+    /// File an action onto the undo stack: one the caller has just redone,
+    /// or an undo that failed. Unlike [`push`](Self::push), this keeps the
+    /// redo stack.
+    pub fn file_undo(&mut self, action: UndoAction) {
         self.undo.push(action);
     }
 

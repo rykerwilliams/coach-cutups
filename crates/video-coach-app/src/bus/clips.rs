@@ -2,8 +2,10 @@
 //! reorder and sort, jump, and the undo history they share.
 //!
 //! Every mutation is diffed first (unchanged ⇒ no save, no undo step), then
-//! applied, saved and recorded. Every push goes through [`Bus::record`], so a
-//! delete the history drops always has its trashed file shredded.
+//! applied, saved, recorded and published: recorded before it's published,
+//! so an event always follows any shred the push caused. Every push goes
+//! through [`Bus::record`], so a delete the history drops always has its
+//! trashed file shredded.
 //!
 //! **The trash.** A deleted clip's recording moves to
 //! `recordings/.trash/<file>` only once the project without it has saved, and
@@ -18,7 +20,6 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use video_coach_core::project::Clip;
 use video_coach_core::store::RECORDINGS_DIRNAME;
-use video_coach_core::tag::normalize_tags;
 use video_coach_core::undo::{ClipEdit, UndoAction};
 use video_coach_media::Origin;
 
@@ -29,10 +30,6 @@ const TRASH_DIRNAME: &str = ".trash";
 
 impl Bus {
     pub(super) fn edit_clip(&mut self, id: Uuid, edit: ClipEdit) {
-        let edit = match edit {
-            ClipEdit::Tags(text) => ClipEdit::Tags(normalize_tags(&text.join(","))),
-            edit => edit,
-        };
         let Some(open) = &mut self.open else {
             return;
         };
@@ -42,17 +39,21 @@ impl Bus {
         if before == edit {
             return;
         }
-        self.project_changed();
+        self.save();
         self.record(UndoAction::EditClip {
             id,
             before,
             after: edit,
         });
+        self.publish_project();
     }
 
     pub(super) fn delete_clip(&mut self, id: Uuid) {
         match self.trash_clip(id) {
-            Some(clip) => self.record(UndoAction::DeleteClip(clip)),
+            Some(clip) => {
+                self.record(UndoAction::DeleteClip(clip));
+                self.publish_project();
+            }
             None => eprintln!("bus: DeleteClip on a clip that isn't there: {id}"),
         }
     }
@@ -86,8 +87,9 @@ impl Bus {
             return;
         }
         open.project.apply_clip_order(&after);
-        self.project_changed();
+        self.save();
         self.record(UndoAction::ReorderClips { before, after });
+        self.publish_project();
     }
 
     /// Pauses the game video at the clip's start: an accurate user seek, like
@@ -114,27 +116,20 @@ impl Bus {
             return;
         };
         match action {
-            UndoAction::EditClip { id, before, after } => {
-                if self.set_field(id, before.clone()) {
-                    self.history
-                        .undone(UndoAction::EditClip { id, before, after });
-                    self.emit(Event::Select(id));
-                }
-            }
             UndoAction::DeleteClip(clip) => {
                 let id = clip.id;
                 if self.restore_clip(&clip) {
-                    self.history.undone(UndoAction::DeleteClip(clip));
+                    self.history.file_redo(UndoAction::DeleteClip(clip));
                     self.emit(Event::Select(id));
                 } else {
                     // Still trashed: it stays undoable.
-                    self.history.redone(UndoAction::DeleteClip(clip));
+                    self.history.file_undo(UndoAction::DeleteClip(clip));
                 }
             }
-            UndoAction::ReorderClips { before, after } => {
-                self.set_order(&before);
-                self.history
-                    .undone(UndoAction::ReorderClips { before, after });
+            action => {
+                if let Some(action) = self.replay(action, false) {
+                    self.history.file_redo(action);
+                }
             }
         }
     }
@@ -144,28 +139,51 @@ impl Bus {
             return;
         };
         match action {
-            UndoAction::EditClip { id, before, after } => {
-                if self.set_field(id, after.clone()) {
-                    self.history
-                        .redone(UndoAction::EditClip { id, before, after });
-                    self.emit(Event::Select(id));
-                }
-            }
             // Files the clip as it is now, not the old snapshot: its source
             // index may have been remapped since it was restored.
             UndoAction::DeleteClip(clip) => match self.trash_clip(clip.id) {
-                Some(clip) => self.history.redone(UndoAction::DeleteClip(clip)),
+                Some(clip) => {
+                    self.history.file_undo(UndoAction::DeleteClip(clip));
+                    self.publish_project();
+                }
                 None => eprintln!(
                     "bus: redo: dropped the delete of a missing clip {}",
                     clip.id
                 ),
             },
-            UndoAction::ReorderClips { before, after } => {
-                self.set_order(&after);
-                self.history
-                    .redone(UndoAction::ReorderClips { before, after });
+            action => {
+                if let Some(action) = self.replay(action, true) {
+                    self.history.file_undo(action);
+                }
             }
         }
+    }
+
+    /// Applies an edit or a reorder for a redo (`forward`) or an undo, saves
+    /// it, and returns it to be filed. `None` (and nothing saved) for an edit
+    /// of a clip that's gone, which eviction's purge makes unreachable. A
+    /// delete moves a file, so `undo` and `redo` handle it themselves.
+    fn replay(&mut self, action: UndoAction, forward: bool) -> Option<UndoAction> {
+        let open = self.open.as_mut()?;
+        match &action {
+            UndoAction::EditClip { id, before, after } => {
+                let value = if forward { after } else { before };
+                if open.project.apply_edit(*id, value.clone()).is_none() {
+                    eprintln!("bus: dropped an edit of a missing clip {id}");
+                    return None;
+                }
+                let id = *id;
+                self.project_changed();
+                self.emit(Event::Select(id));
+            }
+            UndoAction::ReorderClips { before, after } => {
+                open.project
+                    .apply_clip_order(if forward { after } else { before });
+                self.project_changed();
+            }
+            UndoAction::DeleteClip(_) => unreachable!("deletes aren't replayed"),
+        }
+        Some(action)
     }
 
     /// Evicts every delete on the undo stack and shreds its file, after a
@@ -183,31 +201,10 @@ impl Bus {
         self.shred(dropped);
     }
 
-    /// Sets one field for an undo or redo and saves. False (and nothing
-    /// saved) if the clip is gone, which eviction's purge makes unreachable.
-    fn set_field(&mut self, id: Uuid, value: ClipEdit) -> bool {
-        let Some(open) = &mut self.open else {
-            return false;
-        };
-        if open.project.apply_edit(id, value).is_none() {
-            eprintln!("bus: dropped an edit of a missing clip {id}");
-            return false;
-        }
-        self.project_changed();
-        true
-    }
-
-    /// Applies a clip order for an undo or redo and saves.
-    fn set_order(&mut self, order: &[Uuid]) {
-        if let Some(open) = &mut self.open {
-            open.project.apply_clip_order(order);
-            self.project_changed();
-        }
-    }
-
     /// Removes clip `id` and saves; only if the save succeeded, moves its
-    /// recording into `.trash`. Then publishes, so the snapshot follows the
-    /// file. Returns the clip as removed, or `None` if it isn't there.
+    /// recording into `.trash`. Returns the clip as removed, or `None` if it
+    /// isn't there. The caller files it, then publishes, so the snapshot
+    /// follows the file.
     fn trash_clip(&mut self, id: Uuid) -> Option<Clip> {
         let open = self.open.as_mut()?;
         let clip = open.project.remove_clip(id)?;
@@ -225,21 +222,17 @@ impl Bus {
                 eprintln!("bus: couldn't trash {}: {e}", clip.recording_filename);
             }
         }
-        self.publish_project();
         Some(clip)
     }
 
     /// Moves the clip's recording back from `.trash`, then reinserts the clip
-    /// at its position and saves. A no-op if the clip is present. False if
-    /// the file couldn't be moved back: the clip stays out, since the next
-    /// open would shred a restored clip's file.
+    /// at its position and saves. False if the file couldn't be moved back:
+    /// the clip stays out, since the next open would shred a restored clip's
+    /// file.
     fn restore_clip(&mut self, clip: &Clip) -> bool {
         let Some(open) = &mut self.open else {
             return false;
         };
-        if open.project.clips.iter().any(|c| c.id == clip.id) {
-            return true;
-        }
         let recordings = open.folder.join(RECORDINGS_DIRNAME);
         let restored = rename_if_present(
             &trash_path(&open.folder, clip),

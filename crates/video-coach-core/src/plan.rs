@@ -20,7 +20,7 @@ use crate::timeline::{playback_segments, PlaybackSegment};
 /// two near-duplicate entry points into one function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportTarget {
-    /// Every clip in the project, in sort order.
+    /// Every clip in the project, in stored order.
     AllClips,
     /// Only clips carrying this tag.
     Tag(String),
@@ -67,21 +67,13 @@ pub struct CompilationPlan {
 /// to cover any in-range position the clip visits at rate 1, so the segment
 /// builder never clamps a forward skip it should not have.
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
-    let mut clips: Vec<_> = project
-        .clips
-        .iter()
-        .filter(|c| match target {
-            ExportTarget::AllClips => true,
-            ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
-        })
-        .collect();
+    // The stored order is the order (Phase 3 spec C3).
+    let clips = project.clips.iter().filter(|c| match target {
+        ExportTarget::AllClips => true,
+        ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
+    });
 
-    // `sort_by_key` is stable, so ties resolve to insertion order. Swift's
-    // `sorted(by:)` is not documented stable, making this a free determinism
-    // improvement over the original.
-    clips.sort_by_key(|c| c.sort_index);
-
-    let mut entries = Vec::with_capacity(clips.len());
+    let mut entries = Vec::new();
     let mut total = 0.0;
 
     for clip in clips {

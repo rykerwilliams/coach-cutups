@@ -52,31 +52,14 @@ fn a_single_clip_plans_one_entry() {
     assert_eq!(plan.total_duration_seconds, 5.0);
 }
 
+/// The stored order is the order (Phase 3 spec C3): `store::read` keeps
+/// `clips` sorted, so the plan doesn't re-sort by `sort_index`.
 #[test]
-fn clips_are_ordered_by_sort_index_not_insertion_order() {
+fn clips_are_planned_in_stored_order() {
     let p = project_with(vec![
         clip("third", 30, &[]),
         clip("first", 10, &[]),
         clip("second", 20, &[]),
-    ]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips);
-    let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
-    let expect: Vec<_> = {
-        let mut c = p.clips.clone();
-        c.sort_by_key(|c| c.sort_index);
-        c.iter().map(|c| c.id).collect()
-    };
-    assert_eq!(ids, expect);
-}
-
-/// Stable sort, so equal `sort_index` resolves to insertion order. Swift's
-/// `sorted(by:)` is not documented stable; this is a free determinism win.
-#[test]
-fn ties_in_sort_index_resolve_to_insertion_order() {
-    let p = project_with(vec![
-        clip("a", 5, &[]),
-        clip("b", 5, &[]),
-        clip("c", 5, &[]),
     ]);
     let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();

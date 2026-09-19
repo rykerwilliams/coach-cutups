@@ -153,6 +153,19 @@ pub struct Clip {
     pub transcript: String,
 }
 
+impl Clip {
+    /// Set one field, returning its previous value as the same variant: the
+    /// one definition of a field change. Unchanged if the two are equal.
+    pub fn set(&mut self, edit: ClipEdit) -> ClipEdit {
+        match edit {
+            ClipEdit::Name(v) => ClipEdit::Name(std::mem::replace(&mut self.name, v)),
+            ClipEdit::Tags(v) => ClipEdit::Tags(std::mem::replace(&mut self.tags, v)),
+            ClipEdit::Notes(v) => ClipEdit::Notes(std::mem::replace(&mut self.notes, v)),
+            ClipEdit::ShowPip(v) => ClipEdit::ShowPip(std::mem::replace(&mut self.show_pip, v)),
+        }
+    }
+}
+
 /// The project document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -480,16 +493,9 @@ impl Project {
         self.renumber();
     }
 
-    /// Set one field of clip `id`, returning its previous value as the same
-    /// variant, or `None` if there is no such clip. The caller normalizes
-    /// (tags go through `normalize_tags`) and compares for "unchanged".
+    /// Set one field of clip `id` (see [`Clip::set`]), or `None` if there is
+    /// no such clip.
     pub fn apply_edit(&mut self, id: Uuid, edit: ClipEdit) -> Option<ClipEdit> {
-        let c = self.clips.iter_mut().find(|c| c.id == id)?;
-        Some(match edit {
-            ClipEdit::Name(v) => ClipEdit::Name(std::mem::replace(&mut c.name, v)),
-            ClipEdit::Tags(v) => ClipEdit::Tags(std::mem::replace(&mut c.tags, v)),
-            ClipEdit::Notes(v) => ClipEdit::Notes(std::mem::replace(&mut c.notes, v)),
-            ClipEdit::ShowPip(v) => ClipEdit::ShowPip(std::mem::replace(&mut c.show_pip, v)),
-        })
+        Some(self.clips.iter_mut().find(|c| c.id == id)?.set(edit))
     }
 }
