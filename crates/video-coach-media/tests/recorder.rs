@@ -11,32 +11,28 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
-use video_coach_media::{CaptureSources, Recorder, RecorderMessage};
+use video_coach_media::{now_ns, CaptureSources, Recorder, RecorderMessage};
 
 const FRAME: f64 = 1.0 / 30.0;
 
 struct Recording {
     recorder: Recorder,
+    /// Each message with `now_ns()` when it was sent.
     messages: mpsc::Receiver<(u64, RecorderMessage)>,
     path: PathBuf,
     /// How long `Recorder::start` took.
     started_in: Duration,
 }
 
-fn start(dir: &Path, video_delay: Duration, generation: u64) -> Recording {
+fn start(dir: &Path, video_delay: Duration) -> Recording {
     gst::init().unwrap();
     let path = dir.join("rec.mkv");
     let (tx, messages) = mpsc::channel();
     let tx = Mutex::new(tx);
     let begun = Instant::now();
-    let recorder = Recorder::start(
-        CaptureSources::Test { video_delay },
-        &path,
-        generation,
-        move |g, msg| {
-            let _ = tx.lock().unwrap().send((g, msg));
-        },
-    )
+    let recorder = Recorder::start(CaptureSources::Test { video_delay }, &path, move |msg| {
+        let _ = tx.lock().unwrap().send((now_ns(), msg));
+    })
     .unwrap();
     Recording {
         recorder,
@@ -55,7 +51,7 @@ fn wait_for(
     let deadline = Instant::now() + timeout;
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match rx.recv_timeout(left) {
-            Ok((g, msg)) if want(&msg) => return Some((g, msg)),
+            Ok((at, msg)) if want(&msg) => return Some((at, msg)),
             Ok(_) => {}
             Err(_) => return None,
         }
@@ -116,7 +112,7 @@ fn first_pts(path: &Path) -> (Option<f64>, Option<f64>) {
 #[test]
 fn records_h264_and_opus_with_the_file_duration() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::ZERO, 1);
+    let rec = start(dir.path(), Duration::ZERO);
     std::thread::sleep(Duration::from_secs(2));
     let outcome = rec.recorder.stop(Duration::from_secs(5));
     assert!(outcome.clean);
@@ -151,21 +147,24 @@ fn records_h264_and_opus_with_the_file_duration() {
     assert!(outcome.duration > 1.5, "{} s", outcome.duration);
 }
 
-/// A camera that warms up for 0.5 s: `start` returns at once, audio starts at
-/// file time 0 and video at 0.5 s, since file time 0 is `base_time` (R5).
+/// A camera that warms up for 0.5 s: `start` returns at once, `FirstVideo`
+/// comes 0.5 s after t0, and in the file audio starts at time 0 and video at
+/// 0.5 s, since file time 0 is `base_time` (R5).
 #[test]
 fn delayed_video_starts_at_its_running_time() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::from_millis(500), 1);
+    let rec = start(dir.path(), Duration::from_millis(500));
     assert!(
         rec.started_in < Duration::from_millis(200),
         "start took {:?}: it waited for PLAYING",
         rec.started_in
     );
-    let first = wait_for(&rec.messages, Duration::from_secs(3), |m| {
+    let (first_ns, _) = wait_for(&rec.messages, Duration::from_secs(3), |m| {
         *m == RecorderMessage::FirstVideo
-    });
-    assert!(first.is_some(), "no FirstVideo");
+    })
+    .expect("no FirstVideo");
+    let first_at = (first_ns - rec.recorder.t0_ns()) as f64 / 1e9;
+    assert!((first_at - 0.5).abs() <= 0.1, "FirstVideo at {first_at} s");
     std::thread::sleep(Duration::from_millis(500));
     assert!(rec.recorder.stop(Duration::from_secs(5)).clean);
 
@@ -176,26 +175,12 @@ fn delayed_video_starts_at_its_running_time() {
     assert!(audio < 0.040, "first audio at {audio} s");
 }
 
-#[test]
-fn level_arrives_with_the_generation() {
-    let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::ZERO, 7);
-    let level = wait_for(&rec.messages, Duration::from_secs(1), |m| {
-        matches!(m, RecorderMessage::Level { .. })
-    });
-    let Some((generation, RecorderMessage::Level { peak_db })) = level else {
-        panic!("no Level within 1 s");
-    };
-    assert_eq!(generation, 7);
-    assert!(peak_db.is_finite() && peak_db <= 0.0, "{peak_db} dB");
-}
-
 /// An EOS that never reaches the mux: `stop` gives up at its timeout, unclean,
 /// with what was written so far.
 #[test]
 fn stop_times_out_when_eos_never_arrives() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::ZERO, 1);
+    let rec = start(dir.path(), Duration::ZERO);
     assert!(wait_for(&rec.messages, Duration::from_secs(3), |m| {
         *m == RecorderMessage::FirstVideo
     })

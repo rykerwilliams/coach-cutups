@@ -139,12 +139,12 @@ impl Bus {
             .player
             .target_secs()
             .or(ui_secs)
-            .unwrap_or_else(|| self.current_secs());
+            .unwrap_or_else(|| self.position.query_position().unwrap_or(0.0));
         (self.current, secs)
     }
 
     /// Whether seeks are allowed: some sources, none missing.
-    pub(super) fn seekable(&self) -> bool {
+    fn seekable(&self) -> bool {
         self.open
             .as_ref()
             .is_some_and(|open| !open.project.source_videos.is_empty())
@@ -200,6 +200,9 @@ impl Bus {
                     // the next seek reloads it. One failure often posts
                     // several errors.
                     self.reset_skip();
+                    // While recording this pause isn't logged, as at EOS: it
+                    // would need a bus-side time. Replay keeps playing until
+                    // the next anchor. Rare, and accepted.
                     if self.playing {
                         self.set_playing(false);
                     }

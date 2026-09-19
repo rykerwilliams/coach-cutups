@@ -25,6 +25,9 @@ export struct ClipRow {
 
 /// One row of the Devices popover's camera or microphone list.
 export struct DeviceRow {
+    /// PipeWire's `node.name`, the stored preference; empty for "System
+    /// default".
+    node-name: string,
     label: string,
     /// The project's current choice.
     chosen: bool,
@@ -124,6 +127,7 @@ component EmptyCard inherits Rectangle {
     in property <string> title;
     in property <string> message;
     in property <string> action;
+    in property <bool> enabled: true;
     callback clicked();
 
     background: black;
@@ -157,6 +161,7 @@ component EmptyCard inherits Rectangle {
             Button {
                 text: root.action;
                 primary: true;
+                enabled: root.enabled;
                 clicked => { root.clicked(); }
             }
         }
@@ -195,6 +200,31 @@ component DeviceChoice inherits Rectangle {
             overflow: elide;
             vertical-alignment: center;
         }
+    }
+}
+
+/// One of the Devices popover's lists, under its title. Picking a row reports
+/// its `node-name`.
+component DeviceList inherits VerticalLayout {
+    in property <string> title;
+    in property <[DeviceRow]> rows;
+    callback chosen(string);
+
+    spacing: 4px;
+
+    Text {
+        text: root.title;
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+    }
+    if root.rows.length == 0: Text {
+        text: "Looking for devices…";
+        color: Palette.alternate-foreground;
+    }
+    for row in root.rows: DeviceChoice {
+        label: row.label;
+        chosen: row.chosen;
+        clicked => { root.chosen(row.node-name); }
     }
 }
 
@@ -289,6 +319,9 @@ export component AppWindow inherits Window {
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
     in property <[DeviceRow]> mics;
+    /// The latest notice (a device fallback, an unclean stop), shown in the
+    /// transport bar without blocking; empty hides it.
+    in property <string> notice;
 
     /// The error dialog's message; empty hides it.
     in-out property <string> error-message;
@@ -306,15 +339,17 @@ export component AppWindow inherits Window {
     callback skip(float);
     callback scrub-move(float);
     callback scrub-release(float);
-    /// R: start recording when idle, else stop.
+    /// R, Record or Stop: the bus starts a recording when idle, else stops
+    /// (or aborts) it.
     callback toggle-recording();
-    /// Esc, or Stop while starting: stop (or abort) the recording.
+    /// Esc: stop (or abort) the recording.
     callback stop-recording();
     /// The Devices popover opened: look the devices up.
     callback list-devices();
-    /// A row of the popover's camera or microphone list was picked.
-    callback choose-camera(int);
-    callback choose-mic(int);
+    /// A row of the popover's camera or microphone list was picked: its
+    /// `node-name`, empty for the system default.
+    callback choose-camera(string);
+    callback choose-mic(string);
     callback volume-changed(float);
     callback volume-released(float);
     /// Zoom keys (spec D9): `1`/`Ctrl+0` reset; `2`/`3` step the scale about
@@ -363,8 +398,9 @@ export component AppWindow inherits Window {
             }
             return reject;
         }
+        // R and Space toggle, so an auto-repeat would toggle straight back.
         if (event.text == "r" || event.text == "R") {
-            if (pressed) {
+            if (pressed && !event.repeat) {
                 root.toggle-recording();
             }
             return accept;
@@ -376,7 +412,7 @@ export component AppWindow inherits Window {
             return accept;
         }
         if (event.text == " ") {
-            if (pressed) {
+            if (pressed && !event.repeat) {
                 root.toggle-play();
             }
             return accept;
@@ -645,100 +681,22 @@ export component AppWindow inherits Window {
                         title: "Source video is missing: " + root.missing-name;
                         message: "Coach Cuts can't find this video. It may have been moved, renamed or deleted. Pick its current location to continue.";
                         action: "Relink…";
+                        // The bus refuses it while recording (R6's guard).
+                        enabled: !root.recording;
                         clicked => { root.relink-source(root.missing-index); }
                     }
                 }
             }
 
-            // --- Transport bar ---
+            // --- Transport bar: the scrubber on a row of its own, full width,
+            // with the controls under it ---
             Rectangle {
                 background: Palette.alternate-background;
 
-                HorizontalLayout {
+                VerticalLayout {
                     padding: 8px;
-                    spacing: 8px;
+                    spacing: 4px;
 
-                    Button {
-                        text: "Open Project…";
-                        enabled: !root.recording;
-                        clicked => { root.open-project(); }
-                    }
-                    Button {
-                        text: "Add Source Video…";
-                        enabled: root.has-project && !root.recording;
-                        clicked => { root.add-source(); }
-                    }
-                    Button {
-                        text: root.playing ? "Pause" : "Play";
-                        enabled: root.can-play;
-                        min-width: 72px;
-                        clicked => { root.toggle-play(); }
-                    }
-                    Button {
-                        text: root.recording ? "Stop" : "Record";
-                        enabled: root.can-play || root.recording;
-                        min-width: 72px;
-                        clicked => { root.toggle-recording(); }
-
-                        Tooltip {
-                            text: root.recording
-                                ? @markdown("Stop recording (R or Esc)")
-                                : @markdown("Record (R)");
-                        }
-                    }
-                    if root.recording-phase == RecordingPhase.starting: Text {
-                        text: "Preparing recording…";
-                        color: Palette.alternate-foreground;
-                        vertical-alignment: center;
-                    }
-                    if root.recording-phase == RecordingPhase.recording: HorizontalLayout {
-                        spacing: 6px;
-
-                        VerticalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 10px;
-                                height: 10px;
-                                border-radius: 5px;
-                                background: #ff3b30;
-                            }
-                        }
-                        Text {
-                            text: "Recording";
-                            color: Palette.foreground;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: root.recording-elapsed;
-                            color: Palette.foreground;
-                            font-family: "monospace";
-                            vertical-alignment: center;
-                            min-width: 48px;
-                        }
-                        if !root.level-seen: Text {
-                            text: "Waiting for audio…";
-                            color: Palette.alternate-foreground;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                        if root.level-seen: VerticalLayout {
-                            alignment: center;
-                            // The mic's peak over −60…0 dBFS.
-                            Rectangle {
-                                width: 90px;
-                                height: 6px;
-                                border-radius: 3px;
-                                background: #ffffff26;
-
-                                Rectangle {
-                                    x: 0;
-                                    width: parent.width * root.level;
-                                    border-radius: 3px;
-                                    background: root.level > 0.95 ? #ff3b30 : #34c759;
-                                }
-                            }
-                        }
-                    }
                     Slider {
                         enabled: root.can-scrub;
                         minimum: 0;
@@ -753,32 +711,129 @@ export component AppWindow inherits Window {
                             root.scrub-release(value);
                         }
                     }
-                    Text {
-                        text: root.readout;
-                        color: Palette.foreground;
-                        vertical-alignment: center;
-                        min-width: 130px;
-                        horizontal-alignment: right;
-                    }
-                    Text {
-                        text: "Volume";
-                        color: Palette.alternate-foreground;
-                        vertical-alignment: center;
-                    }
-                    Slider {
-                        width: 100px;
-                        minimum: 0;
-                        maximum: 1;
-                        value <=> root.volume;
-                        changed(value) => { root.volume-changed(value); }
-                        released(value) => { root.volume-released(value); }
-                    }
-                    Button {
-                        text: "Devices…";
-                        enabled: root.has-project && !root.recording;
-                        clicked => {
-                            root.list-devices();
-                            devices-popup.show();
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Button {
+                            text: "Open Project…";
+                            enabled: !root.recording;
+                            clicked => { root.open-project(); }
+                        }
+                        Button {
+                            text: "Add Source Video…";
+                            enabled: root.has-project && !root.recording;
+                            clicked => { root.add-source(); }
+                        }
+                        Button {
+                            text: root.playing ? "Pause" : "Play";
+                            enabled: root.can-play;
+                            min-width: 72px;
+                            clicked => { root.toggle-play(); }
+                        }
+                        Button {
+                            text: root.recording ? "Stop" : "Record";
+                            enabled: root.can-play || root.recording;
+                            min-width: 72px;
+                            clicked => { root.toggle-recording(); }
+
+                            Tooltip {
+                                text: root.recording
+                                    ? @markdown("Stop recording (R or Esc)")
+                                    : @markdown("Record (R)");
+                            }
+                        }
+                        if root.recording-phase == RecordingPhase.starting: Text {
+                            text: "Preparing recording…";
+                            color: Palette.alternate-foreground;
+                            vertical-alignment: center;
+                        }
+                        if root.recording-phase == RecordingPhase.recording: HorizontalLayout {
+                            spacing: 6px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    border-radius: 5px;
+                                    background: #ff3b30;
+                                }
+                            }
+                            Text {
+                                text: "Recording";
+                                color: Palette.foreground;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.recording-elapsed;
+                                color: Palette.foreground;
+                                font-family: "monospace";
+                                vertical-alignment: center;
+                                min-width: 48px;
+                            }
+                            if !root.level-seen: Text {
+                                text: "Waiting for audio…";
+                                color: Palette.alternate-foreground;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            if root.level-seen: VerticalLayout {
+                                alignment: center;
+                                // The mic's peak over −60…0 dBFS.
+                                Rectangle {
+                                    width: 90px;
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: #ffffff26;
+
+                                    Rectangle {
+                                        x: 0;
+                                        width: parent.width * root.level;
+                                        border-radius: 3px;
+                                        background: root.level > 0.95 ? #ff3b30 : #34c759;
+                                    }
+                                }
+                            }
+                        }
+                        // The one stretch item: it takes the row's slack, and
+                        // elides rather than squeeze the controls.
+                        Text {
+                            text: root.notice;
+                            color: #ffcc00;
+                            font-size: 11px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            min-width: 0;
+                        }
+                        Text {
+                            text: root.readout;
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                            min-width: 130px;
+                            horizontal-alignment: right;
+                        }
+                        Text {
+                            text: "Volume";
+                            color: Palette.alternate-foreground;
+                            vertical-alignment: center;
+                        }
+                        Slider {
+                            width: 100px;
+                            minimum: 0;
+                            maximum: 1;
+                            value <=> root.volume;
+                            changed(value) => { root.volume-changed(value); }
+                            released(value) => { root.volume-released(value); }
+                        }
+                        Button {
+                            text: "Devices…";
+                            enabled: root.has-project && !root.recording;
+                            clicked => {
+                                root.list-devices();
+                                devices-popup.show();
+                            }
                         }
                     }
                 }
@@ -797,38 +852,17 @@ export component AppWindow inherits Window {
 
                         VerticalLayout {
                             padding: 12px;
-                            spacing: 4px;
+                            spacing: 12px;
 
-                            Text {
-                                text: "Camera";
-                                color: Palette.alternate-foreground;
-                                font-size: 11px;
+                            DeviceList {
+                                title: "Camera";
+                                rows: root.cameras;
+                                chosen(node-name) => { root.choose-camera(node-name); }
                             }
-                            if root.cameras.length == 0: Text {
-                                text: "Looking for devices…";
-                                color: Palette.alternate-foreground;
-                            }
-                            for camera[index] in root.cameras: DeviceChoice {
-                                label: camera.label;
-                                chosen: camera.chosen;
-                                clicked => { root.choose-camera(index); }
-                            }
-
-                            Rectangle { height: 8px; }
-
-                            Text {
-                                text: "Microphone";
-                                color: Palette.alternate-foreground;
-                                font-size: 11px;
-                            }
-                            if root.mics.length == 0: Text {
-                                text: "Looking for devices…";
-                                color: Palette.alternate-foreground;
-                            }
-                            for mic[index] in root.mics: DeviceChoice {
-                                label: mic.label;
-                                chosen: mic.chosen;
-                                clicked => { root.choose-mic(index); }
+                            DeviceList {
+                                title: "Microphone";
+                                rows: root.mics;
+                                chosen(node-name) => { root.choose-mic(node-name); }
                             }
                         }
                     }

@@ -351,3 +351,11 @@ Each entry: what, why deferred, when to revisit.
   flash and the meter's 1 s peak hold and colour gradient are macOS polish.
 - **When to revisit:** the checkbox with Phase 8 or the Phase 3 inspector;
   the polish at the end of the port.
+
+### 43. `a_player_error_is_reported_and_play_recovers` is timing-sensitive under load
+- **Why deferred:** during the Phase 4 review it failed twice in full
+  workspace runs with the machine at load ~19 (a second typefind error
+  arrived after the reload), then passed repeatedly on the same tree and on
+  a clean checkout. Not touched by Phase 4.
+- **When to revisit:** if it fails in CI; make the test tolerate repeated
+  errors from one failure, or wait for the reload's `Loaded` before asserting.

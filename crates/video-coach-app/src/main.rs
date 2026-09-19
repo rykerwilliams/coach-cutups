@@ -15,7 +15,7 @@ mod video;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 
@@ -33,6 +33,8 @@ slint::include_modules!();
 
 /// How often the readout and scrubber follow the player (spec D8).
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// How long a notice stays up.
+const NOTICE: Duration = Duration::from_secs(6);
 
 /// What the UI thread knows of the bus's state, from its events, and the
 /// zoom, which is the UI's own.
@@ -50,16 +52,11 @@ struct UiState {
     zoom: Zoom,
     /// The primary-button drag over the player, from its last press.
     drag: Option<DragPan>,
-    /// The recording, from the bus's latest `Recording` event: R starts one
-    /// only from Idle.
-    recording: RecordingStatus,
-    /// What each row of the Devices popover's lists stores as the
-    /// preference (`None` is the system default).
-    camera_choices: Vec<Option<String>>,
-    mic_choices: Vec<Option<String>>,
-    /// Where zoom changes go: [`set_zoom`] is called from bus events too,
-    /// which have no other way to reach the bus.
-    bus: Option<Rc<RefCell<BusHandle>>>,
+    /// The recording's t0 on `now_ns()`'s clock, once its video started,
+    /// for the elapsed-time readout.
+    recording_t0: Option<u64>,
+    /// When the notice line clears, if one is up.
+    notice_until: Option<Instant>,
 }
 
 impl Default for UiState {
@@ -71,10 +68,8 @@ impl Default for UiState {
             last_secs: 0.0,
             zoom: Zoom::IDENTITY,
             drag: None,
-            recording: RecordingStatus::Idle,
-            camera_choices: Vec::new(),
-            mic_choices: Vec::new(),
-            bus: None,
+            recording_t0: None,
+            notice_until: None,
         }
     }
 }
@@ -107,10 +102,9 @@ fn main() {
     );
     let position = bus.position_handle().clone();
     let bus = Rc::new(RefCell::new(bus));
-    UI.with_borrow_mut(|ui| ui.bus = Some(bus.clone()));
     video::install(&window, bus.clone());
     wire_callbacks(&window, &bus);
-    wire_zoom(&window);
+    wire_zoom(&window, &bus);
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, TICK, {
@@ -234,14 +228,12 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         value,
         commit: true,
     }));
+    // The bus decides start or stop: the UI's status can lag it.
     window.on_toggle_recording({
         let send = send(bus);
         move || {
-            let (status, zoom) = UI.with_borrow(|ui| (ui.recording, ui.zoom));
-            send(match status {
-                RecordingStatus::Idle => Command::StartRecording { zoom },
-                _ => Command::StopRecording,
-            })
+            let zoom = UI.with_borrow(|ui| ui.zoom);
+            send(Command::ToggleRecording { zoom })
         }
     });
     window.on_stop_recording({
@@ -260,8 +252,9 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
 }
 
 /// The Devices popover (R2): listed on a short-lived thread each time it
-/// opens, since the first enumeration takes ~250 ms; picking a row saves the
-/// pair of choices.
+/// opens, since the first enumeration takes ~250 ms. A row carries its
+/// `node_name`, empty for the system default, and picking it saves that one
+/// preference.
 fn wire_devices(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_list_devices({
         let weak = window.as_weak();
@@ -277,40 +270,22 @@ fn wire_devices(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             });
         }
     });
-    let choose = |bus: &Rc<RefCell<BusHandle>>, camera: bool| {
+    let choice = |node_name: SharedString| (!node_name.is_empty()).then(|| node_name.into());
+    window.on_choose_camera({
         let bus = bus.clone();
-        move |index: i32| {
-            let command = UI.with_borrow(|ui| {
-                let prefs = &ui.snapshot.as_ref()?.project.preferences;
-                let (mut chosen_camera, mut chosen_mic) = (
-                    prefs.preferred_camera_id.clone(),
-                    prefs.preferred_mic_id.clone(),
-                );
-                let (choices, slot) = if camera {
-                    (&ui.camera_choices, &mut chosen_camera)
-                } else {
-                    (&ui.mic_choices, &mut chosen_mic)
-                };
-                *slot = choices.get(usize::try_from(index).ok()?)?.clone();
-                Some(Command::SetDevices {
-                    camera: chosen_camera,
-                    mic: chosen_mic,
-                })
-            });
-            if let Some(command) = command {
-                bus.borrow().send(command);
-            }
-        }
-    };
-    window.on_choose_camera(choose(bus, true));
-    window.on_choose_mic(choose(bus, false));
+        move |node_name| bus.borrow().send(Command::SetCamera(choice(node_name)))
+    });
+    window.on_choose_mic({
+        let bus = bus.clone();
+        move |node_name| bus.borrow().send(Command::SetMic(choice(node_name)))
+    });
 }
 
 /// Fills the Devices popover's lists: "System default" first, then what was
 /// found, with the project's choice checked. A chosen device that isn't
 /// connected keeps a row of its own, since the choice is kept (R2).
 fn show_devices(w: &AppWindow, devices: Devices) {
-    UI.with_borrow_mut(|ui| {
+    UI.with_borrow(|ui| {
         let Some(prefs) = ui.snapshot.as_ref().map(|s| &s.project.preferences) else {
             return;
         };
@@ -318,49 +293,40 @@ fn show_devices(w: &AppWindow, devices: Devices) {
             .cameras
             .iter()
             .map(|c| (c.node_name.as_str(), c.label.as_str()));
-        let (rows, choices) = device_rows(cameras, prefs.preferred_camera_id.as_deref(), "camera");
+        let rows = device_rows(cameras, prefs.preferred_camera_id.as_deref(), "camera");
         w.set_cameras(ModelRc::new(VecModel::from(rows)));
-        ui.camera_choices = choices;
         let mics = devices
             .mics
             .iter()
             .map(|m| (m.node_name.as_str(), m.label.as_str()));
-        let (rows, choices) = device_rows(mics, prefs.preferred_mic_id.as_deref(), "microphone");
+        let rows = device_rows(mics, prefs.preferred_mic_id.as_deref(), "microphone");
         w.set_mics(ModelRc::new(VecModel::from(rows)));
-        ui.mic_choices = choices;
     });
 }
 
-/// One list's rows and the preference each stands for, from `(node_name,
-/// label)` pairs and the current choice.
+/// One list's rows, from `(node_name, label)` pairs and the current choice.
 fn device_rows<'a>(
     found: impl Iterator<Item = (&'a str, &'a str)>,
     chosen: Option<&str>,
     what: &str,
-) -> (Vec<DeviceRow>, Vec<Option<String>>) {
-    let mut rows = vec![DeviceRow {
-        label: "System default".into(),
-        chosen: chosen.is_none(),
-    }];
-    let mut choices = vec![None];
+) -> Vec<DeviceRow> {
+    let row = |node_name: &str, label: SharedString, chosen: bool| DeviceRow {
+        node_name: node_name.into(),
+        label,
+        chosen,
+    };
+    let mut rows = vec![row("", "System default".into(), chosen.is_none())];
     let mut listed = false;
     for (node_name, label) in found {
         let is_chosen = chosen == Some(node_name);
         listed |= is_chosen;
-        rows.push(DeviceRow {
-            label: label.into(),
-            chosen: is_chosen,
-        });
-        choices.push(Some(node_name.to_owned()));
+        rows.push(row(node_name, label.into(), is_chosen));
     }
     if let (Some(chosen), false) = (chosen, listed) {
-        rows.push(DeviceRow {
-            label: format!("The chosen {what} (not connected)").into(),
-            chosen: true,
-        });
-        choices.push(Some(chosen.to_owned()));
+        let label = format!("The chosen {what} (not connected)");
+        rows.push(row(chosen, label.into(), true));
     }
-    (rows, choices)
+    rows
 }
 
 /// A callback taking one Slint `float` that sends `command(value)`.
@@ -372,7 +338,7 @@ fn cmd(bus: &Rc<RefCell<BusHandle>>, command: impl Fn(f64) -> Command + 'static)
 /// Zoom and pan (spec D9). The state lives in [`UiState`]; the window gets
 /// a copy to draw from. Everything is recomputed from input: no snapping, no
 /// throttle, always clamped (by `zoom_input`, through core's `Zoom`).
-fn wire_zoom(window: &AppWindow) {
+fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let notches: Vec<f32> = SNAP_NOTCHES.iter().map(|&n| n as f32).collect();
     window.set_zoom_notches(ModelRc::new(VecModel::from(notches)));
 
@@ -391,14 +357,14 @@ fn wire_zoom(window: &AppWindow) {
         }
     });
     window.on_zoom_scroll({
-        let weak = window.as_weak();
+        let (weak, bus) = (window.as_weak(), bus.clone());
         move |x, y, dx, dy, ctrl, shift| {
             let (Some(w), Some(x), Some(y), Some(dx), Some(dy)) =
                 (weak.upgrade(), finite(x), finite(y), finite(dx), finite(dy))
             else {
                 return;
             };
-            update_zoom(&w, |zoom, vp| {
+            update_zoom(&w, &bus, |zoom, vp| {
                 zoom_input::scrolled(zoom, vp, (x, y), dx, dy, ctrl, shift)
             });
         }
@@ -409,27 +375,27 @@ fn wire_zoom(window: &AppWindow) {
         }
     });
     window.on_zoom_drag({
-        let weak = window.as_weak();
+        let (weak, bus) = (window.as_weak(), bus.clone());
         move |x, y| {
             let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
                 return;
             };
             let delta = UI.with_borrow_mut(|ui| ui.drag.as_mut().and_then(|d| d.moved(x, y)));
             if let Some((dx, dy)) = delta {
-                update_zoom(&w, |zoom, vp| zoom_input::panned(zoom, vp, dx, dy));
+                update_zoom(&w, &bus, |zoom, vp| zoom_input::panned(zoom, vp, dx, dy));
             }
         }
     });
     window.on_zoom_reset({
-        let weak = window.as_weak();
+        let (weak, bus) = (window.as_weak(), bus.clone());
         move || {
             if let Some(w) = weak.upgrade() {
-                set_zoom(&w, Zoom::IDENTITY);
+                update_zoom(&w, &bus, |_, _| Zoom::IDENTITY);
             }
         }
     });
     window.on_zoom_step({
-        let weak = window.as_weak();
+        let (weak, bus) = (window.as_weak(), bus.clone());
         move |delta, over_player, x, y| {
             let (Some(w), Some(delta)) = (weak.upgrade(), finite(delta)) else {
                 return;
@@ -438,13 +404,22 @@ fn wire_zoom(window: &AppWindow) {
                 (true, Some(x), Some(y)) => Some((x, y)),
                 _ => None,
             };
-            update_zoom(&w, |zoom, vp| zoom_input::stepped(zoom, vp, pointer, delta));
+            update_zoom(&w, &bus, |zoom, vp| {
+                zoom_input::stepped(zoom, vp, pointer, delta)
+            });
         }
     });
 }
 
-/// Applies `change` to the zoom, if the player has a size yet.
-fn update_zoom(w: &AppWindow, change: impl FnOnce(Zoom, &Viewport) -> Zoom) {
+/// Applies a gesture's `change` to the zoom, if the player has a size yet,
+/// and sends it to the bus, which logs it while recording and ignores it
+/// otherwise.
+fn update_zoom(
+    w: &AppWindow,
+    bus: &RefCell<BusHandle>,
+    change: impl FnOnce(Zoom, &Viewport) -> Zoom,
+) {
+    let host_ns = now_ns();
     let Some(vp) = Viewport::new(
         w.get_frame_width().into(),
         w.get_frame_height().into(),
@@ -453,20 +428,14 @@ fn update_zoom(w: &AppWindow, change: impl FnOnce(Zoom, &Viewport) -> Zoom) {
     ) else {
         return;
     };
-    let zoom = UI.with_borrow(|ui| ui.zoom);
-    set_zoom(w, change(zoom, &vp));
+    let zoom = change(UI.with_borrow(|ui| ui.zoom), &vp);
+    set_zoom(w, zoom);
+    bus.borrow().send(Command::Zoom { host_ns, zoom });
 }
 
-/// The one place the zoom changes. Every change goes to the bus, which logs
-/// it while recording and ignores it otherwise.
+/// The one place the zoom changes.
 fn set_zoom(w: &AppWindow, zoom: Zoom) {
-    let host_ns = now_ns();
-    UI.with_borrow_mut(|ui| {
-        ui.zoom = zoom;
-        if let Some(bus) = &ui.bus {
-            bus.borrow().send(Command::Zoom { host_ns, zoom });
-        }
-    });
+    UI.with_borrow_mut(|ui| ui.zoom = zoom);
     w.set_zoom(ZoomState {
         scale: zoom.scale as f32,
         pan_x: zoom.pan_x as f32,
@@ -509,7 +478,12 @@ fn on_event(w: &AppWindow, event: Event) {
         }),
         Event::Playing(playing) => w.set_playing(playing),
         Event::Recording(status) => {
-            UI.with_borrow_mut(|ui| ui.recording = status);
+            UI.with_borrow_mut(|ui| {
+                ui.recording_t0 = match status {
+                    RecordingStatus::Recording { t0_ns } => Some(t0_ns),
+                    _ => None,
+                }
+            });
             w.set_recording_phase(match status {
                 RecordingStatus::Idle => RecordingPhase::Idle,
                 RecordingStatus::Starting => RecordingPhase::Starting,
@@ -523,13 +497,19 @@ fn on_event(w: &AppWindow, event: Event) {
         }
         // −60…0 dBFS across the bar (R11).
         Event::Level(peak_db) => {
-            let fraction = ((peak_db + 60.0) / 60.0).clamp(0.0, 1.0);
-            w.set_level(if fraction.is_nan() {
-                0.0
-            } else {
-                fraction as f32
-            });
+            // `max` then `min`, not `clamp`, which passes a NaN through: here
+            // it reads as 0.
+            #[allow(clippy::manual_clamp)]
+            let fraction = ((peak_db + 60.0) / 60.0).max(0.0).min(1.0);
+            w.set_level(fraction as f32);
             w.set_level_seen(true);
+        }
+        // Never the modal dialog: it would swallow a recording's transport
+        // keys.
+        Event::Error(e) if e.is_notice() => {
+            eprintln!("ui: notice: {e}");
+            w.set_notice(sentence(&e.to_string()).into());
+            UI.with_borrow_mut(|ui| ui.notice_until = Some(Instant::now() + NOTICE));
         }
         Event::Error(e) => {
             eprintln!("ui: error: {e}");
@@ -586,12 +566,17 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
 
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value
 /// while it's dragged, else the outstanding seek's target, else the player's
-/// position on the current source. Also the recording's elapsed time (R11).
+/// position on the current source. Also the recording's elapsed time (R11)
+/// and the notice's expiry.
 fn tick(w: &AppWindow, position: &PositionHandle) {
     UI.with_borrow_mut(|ui| {
-        if let RecordingStatus::Recording { t0_ns } = ui.recording {
+        if let Some(t0_ns) = ui.recording_t0 {
             let elapsed = now_ns().saturating_sub(t0_ns) as f64 / 1e9;
             w.set_recording_elapsed(format_hms(elapsed).into());
+        }
+        if ui.notice_until.is_some_and(|until| until <= Instant::now()) {
+            ui.notice_until = None;
+            w.set_notice(SharedString::new());
         }
         let Some(project) = ui.snapshot.as_ref().map(|s| s.project.clone()) else {
             return;

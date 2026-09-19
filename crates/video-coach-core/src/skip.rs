@@ -124,12 +124,12 @@ impl SkipCoordinator {
     ) -> SkipDecision {
         let base = self.target.unwrap_or(current_seconds);
         let (lo, hi) = range.into_inner();
-        // `.max(lo)` on the upper bound is load-bearing: `f64::clamp` asserts
-        // `min <= max`, so an inverted or NaN upper bound -- derived straight
-        // from durations in a user-editable project.json with no validation --
-        // would panic on the first arrow-key press. Swift used nested min/max
-        // and never trapped.
-        let t = (base + delta).clamp(lo, hi.max(lo));
+        // Nested min/max, as Swift did, never `f64::clamp`: both bounds derive
+        // straight from durations in a user-editable project.json with no
+        // validation, and `clamp` panics on an inverted or NaN range at the
+        // first arrow-key press. An inverted or NaN upper bound yields `lo`;
+        // a NaN lower bound leaves the low side unclamped.
+        let t = (base + delta).min(hi.max(lo)).max(lo);
         self.target = Some(t);
         self.exact_pending = false;
 

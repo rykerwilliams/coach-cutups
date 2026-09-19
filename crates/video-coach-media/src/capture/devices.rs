@@ -15,7 +15,7 @@ const MAX_WIDTH: i32 = 1280;
 
 /// What the camera sends, which decides the head of the encode chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Input {
+pub(crate) enum Input {
     /// `image/jpeg`: needs a JPEG decode.
     Mjpeg,
     /// `video/x-raw` in any format but GRAY8: needs a `videoconvert`.
@@ -24,16 +24,16 @@ pub enum Input {
 
 /// The mode a camera is recorded in: always 30/1 and exactly 16:9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CameraMode {
-    pub width: i32,
-    pub height: i32,
-    pub input: Input,
+pub(crate) struct CameraMode {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) input: Input,
 }
 
 /// The largest exactly-16:9 mode no wider than 1280 that offers 30/1 (R3), or
 /// `None` if the camera has none. GRAY8 is never usable, so the IR camera gets
 /// `None`. On a tie the device's first listing wins.
-pub fn choose_camera_mode(caps: &gst::Caps) -> Option<CameraMode> {
+pub(crate) fn choose_camera_mode(caps: &gst::Caps) -> Option<CameraMode> {
     let mut best: Option<CameraMode> = None;
     for s in caps.iter() {
         let input = match s.name().as_str() {
@@ -78,7 +78,7 @@ fn offers_30fps(s: &gst::StructureRef) -> bool {
 
 /// Which H.264 encoder a recording uses (R4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncoderChain {
+pub(crate) enum EncoderChain {
     /// `vah264lpenc`, 8% CPU at 720p30 on the reference laptop.
     Va,
     /// `x264enc`, 110% CPU at 720p30: the fallback where VA is missing (CI).
@@ -88,7 +88,7 @@ pub enum EncoderChain {
 /// VA when `vah264lpenc` exists, plus `vajpegdec` for MJPEG; software
 /// otherwise. A presence check only: a chain that fails at start takes the
 /// recording error path. `vaapih264enc` is never used (it hung a harness).
-pub fn choose_encoder(has: impl Fn(&str) -> bool, input: Input) -> EncoderChain {
+pub(crate) fn choose_encoder(has: impl Fn(&str) -> bool, input: Input) -> EncoderChain {
     let va = has("vah264lpenc") && (input == Input::Raw || has("vajpegdec"));
     if va {
         EncoderChain::Va
@@ -103,7 +103,7 @@ impl EncoderChain {
     /// The chain's elements, camera side first, with the properties each is
     /// given (as strings, so enum and flag nicks parse the way `gst-launch`
     /// parses them).
-    pub fn elements(self, input: Input) -> Vec<(&'static str, Props)> {
+    pub(crate) fn elements(self, input: Input) -> Vec<(&'static str, Props)> {
         // `vah264lpenc` is CQP-only on the reference driver: bitrate settings
         // are ignored there.
         const VA: Props = &[
@@ -132,7 +132,7 @@ impl EncoderChain {
 
     /// Makes the chain's elements, adds them to `bin` and links them. Returns
     /// the `(head, tail)` for the caller to link the camera and parser to.
-    pub fn build(
+    pub(crate) fn build(
         self,
         input: Input,
         bin: &gst::Bin,
@@ -168,9 +168,9 @@ pub struct Camera {
     /// `/dev/videoN` for `v4l2src`. Volatile: resolved at record time, never
     /// stored.
     pub v4l2_path: String,
-    pub mode: CameraMode,
+    pub(crate) mode: CameraMode,
     /// PipeWire's `priority.session`. The highest is the system default.
-    pub priority: i32,
+    pub(crate) priority: i32,
 }
 
 /// A microphone.

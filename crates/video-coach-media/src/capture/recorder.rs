@@ -2,8 +2,8 @@
 //! clock, with file time 0 at its `base_time` (R5).
 //!
 //! It is a second pipeline next to the `SourcePlayer`, and its messages reach
-//! the owner only through `on_message`, tagged with a generation, never
-//! through the player's message path (R1).
+//! the owner only through `on_message`, never through the player's message
+//! path (R1).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,7 +70,7 @@ pub struct Recorder {
     last_end: Arc<AtomicU64>,
 }
 
-type OnMessage = Arc<dyn Fn(u64, RecorderMessage) + Send + Sync>;
+type OnMessage = Arc<dyn Fn(RecorderMessage) + Send + Sync>;
 
 impl Recorder {
     /// Builds, sets PLAYING, reads t0 = base_time as soon as set_state returns
@@ -78,16 +78,15 @@ impl Recorder {
     /// first frame).
     /// On Err the caller deletes `path` (filesink has created it).
     ///
-    /// `on_message` is called on GStreamer's threads with `generation`.
+    /// `on_message` is called on GStreamer's threads.
     pub fn start(
         sources: CaptureSources,
         path: &Path,
-        generation: u64,
-        on_message: impl Fn(u64, RecorderMessage) + Send + Sync + 'static,
+        on_message: impl Fn(RecorderMessage) + Send + Sync + 'static,
     ) -> Result<Recorder, String> {
         let on_message: OnMessage = Arc::new(on_message);
         let last_end = Arc::new(AtomicU64::new(0));
-        let pipeline = build(&sources, path, generation, &on_message, &last_end)
+        let pipeline = build(&sources, path, &on_message, &last_end)
             .map_err(|e| format!("could not build the recording pipeline: {e}"))?;
 
         let bus = pipeline.bus().expect("a pipeline has a bus");
@@ -95,14 +94,14 @@ impl Recorder {
             let on_message = on_message.clone();
             move |_, msg| match msg.view() {
                 gst::MessageView::Error(err) => {
-                    on_message(generation, RecorderMessage::Error(error_text(err)));
+                    on_message(RecorderMessage::Error(error_text(err)));
                     // Kept for `stop()` and `start()` to pop.
                     gst::BusSyncReply::Pass
                 }
                 gst::MessageView::Eos(_) => gst::BusSyncReply::Pass,
                 gst::MessageView::Element(el) => {
                     if let Some(peak_db) = el.structure().and_then(level_peak) {
-                        on_message(generation, RecorderMessage::Level { peak_db });
+                        on_message(RecorderMessage::Level { peak_db });
                     }
                     gst::BusSyncReply::Drop
                 }
@@ -117,11 +116,16 @@ impl Recorder {
         let started = pipeline.set_state(gst::State::Playing);
         let t0 = pipeline.base_time();
         match (started, t0) {
-            (Ok(_), Some(t0)) => Ok(Recorder {
-                pipeline,
-                t0_ns: t0.nseconds(),
-                last_end,
-            }),
+            (Ok(_), Some(t0)) => {
+                // CLOCK_MONOTONIC is never 0 by the time a pipeline runs; a 0
+                // would mean the forced clock didn't take.
+                debug_assert!(t0.nseconds() > 0);
+                Ok(Recorder {
+                    pipeline,
+                    t0_ns: t0.nseconds(),
+                    last_end,
+                })
+            }
             (started, _) => {
                 let _ = pipeline.set_state(gst::State::Null);
                 Err(match bus.pop_filtered(&[gst::MessageType::Error]) {
@@ -142,7 +146,9 @@ impl Recorder {
         self.t0_ns
     }
 
-    /// The pipeline, for tests and diagnostics.
+    /// The pipeline. For tests only (they reach into it to simulate
+    /// failures); not part of the API.
+    #[doc(hidden)]
     pub fn pipeline(&self) -> &gst::Pipeline {
         &self.pipeline
     }
@@ -177,7 +183,6 @@ impl Drop for Recorder {
 fn build(
     sources: &CaptureSources,
     path: &Path,
-    generation: u64,
     on_message: &OnMessage,
     last_end: &Arc<AtomicU64>,
 ) -> Result<gst::Pipeline, glib::BoolError> {
@@ -314,7 +319,7 @@ fn build(
         track_end(
             &pad,
             last_end.clone(),
-            first_video.then(|| (generation, on_message.clone())),
+            first_video.then(|| on_message.clone()),
         );
     }
     Ok(pipeline)
@@ -340,7 +345,7 @@ fn drop_before(src: &gst::Element, delay: Duration) {
 /// Tracks the latest buffer end reaching mux pad `pad`, in running time from
 /// its sticky SEGMENT, into `last_end`. With `first`, also sends `FirstVideo`
 /// once.
-fn track_end(pad: &gst::Pad, last_end: Arc<AtomicU64>, first: Option<(u64, OnMessage)>) {
+fn track_end(pad: &gst::Pad, last_end: Arc<AtomicU64>, first: Option<OnMessage>) {
     let sent = AtomicBool::new(false);
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         let Some(buffer) = info.buffer() else {
@@ -357,9 +362,9 @@ fn track_end(pad: &gst::Pad, last_end: Arc<AtomicU64>, first: Option<(u64, OnMes
             let end = running + buffer.duration().unwrap_or(gst::ClockTime::ZERO);
             last_end.fetch_max(end.nseconds(), Ordering::SeqCst);
         }
-        if let Some((generation, on_message)) = &first {
+        if let Some(on_message) = &first {
             if !sent.swap(true, Ordering::SeqCst) {
-                on_message(*generation, RecorderMessage::FirstVideo);
+                on_message(RecorderMessage::FirstVideo);
             }
         }
         gst::PadProbeReturn::Ok

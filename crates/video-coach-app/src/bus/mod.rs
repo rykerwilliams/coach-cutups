@@ -83,9 +83,10 @@ pub enum Command {
     },
 
     // Recording (spec R6).
-    /// Starts a recording from where the player is heading, with the UI's
-    /// current zoom as the log's first event.
-    StartRecording {
+    /// R: while idle, starts a recording from where the player is heading,
+    /// with `zoom` (the UI's) as the log's first event; while recording,
+    /// [`Command::StopRecording`].
+    ToggleRecording {
         zoom: Zoom,
     },
     /// Stops the recording, or aborts it if no video has arrived yet.
@@ -95,12 +96,11 @@ pub enum Command {
         host_ns: u64,
         zoom: Zoom,
     },
-    /// The project's preferred devices, by PipeWire `node.name`; `None` is
+    /// The project's preferred camera, by PipeWire `node.name`; `None` is
     /// the system default.
-    SetDevices {
-        camera: Option<String>,
-        mic: Option<String>,
-    },
+    SetCamera(Option<String>),
+    /// The project's preferred microphone, likewise.
+    SetMic(Option<String>),
 
     // Lifecycle.
     /// The UI's wrapped GL display and context (spec D3). Until it arrives, a
@@ -148,6 +148,7 @@ pub enum Event {
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
     Level(f64),
+    /// A failure, or a notice (see [`UserError::is_notice`]).
     Error(UserError),
 }
 
@@ -180,9 +181,9 @@ pub enum UserError {
     /// Recording is refused: the project isn't ready for it.
     #[error("can't record: {0}")]
     CantRecord(&'static str),
-    /// Recording is refused: there is no usable device.
-    #[error("no {what} was found")]
-    NoDevice { what: &'static str },
+    /// Recording is refused: no camera meets R3's rule.
+    #[error("no camera with a 16:9, 30 fps mode up to 1280 wide was found")]
+    NoCamera,
     #[error("recording failed: {0}")]
     RecordingFailed(String),
     /// A notice: the chosen device is absent, and the recording goes ahead on
@@ -196,6 +197,17 @@ pub enum UserError {
     StopNotClean,
     #[error("{0}")]
     Io(String),
+}
+
+impl UserError {
+    /// Something the user should know that needs no answer: the UI shows it
+    /// without blocking, since it can arrive mid-recording.
+    pub fn is_notice(&self) -> bool {
+        matches!(
+            self,
+            UserError::DeviceFallback { .. } | UserError::StopNotClean
+        )
+    }
 }
 
 impl From<StoreError> for UserError {
@@ -266,8 +278,6 @@ pub struct Bus {
     skip: SkipCoordinator,
     /// When the skip debounce fires, if armed.
     skip_deadline: Option<Instant>,
-    /// When a recording that has had no video gives up, if one is starting.
-    start_deadline: Option<Instant>,
     /// Where recordings come from.
     capture: CaptureKind,
     /// The recording in progress.
@@ -327,7 +337,6 @@ impl Bus {
             missing: Arc::new([]),
             skip: SkipCoordinator::default(),
             skip_deadline: None,
-            start_deadline: None,
             capture,
             recording: None,
             generation: 0,
@@ -349,7 +358,7 @@ impl Bus {
             let deadline = self
                 .skip_deadline
                 .into_iter()
-                .chain(self.start_deadline)
+                .chain(self.start_deadline())
                 .min();
             let input = match deadline {
                 Some(deadline) => {
@@ -397,8 +406,7 @@ impl Bus {
             self.skip_deadline = None;
             self.skip_debounce_passed();
         }
-        if self.start_deadline.is_some_and(|d| d <= now) {
-            self.start_deadline = None;
+        if self.start_deadline().is_some_and(|d| d <= now) {
             self.start_timed_out();
         }
     }
@@ -414,6 +422,7 @@ impl Bus {
                     | Command::Skip { .. }
                     | Command::SetVolume { .. }
                     | Command::Zoom { .. }
+                    | Command::ToggleRecording { .. }
                     | Command::StopRecording
                     | Command::GlReady { .. }
             )
@@ -436,10 +445,11 @@ impl Bus {
             Command::ScrubMove { abs } => self.scrub(abs, false),
             Command::ScrubRelease { abs } => self.scrub(abs, true),
             Command::SetVolume { value, commit } => self.set_volume(value, commit),
-            Command::StartRecording { zoom } => self.start_recording(zoom),
+            Command::ToggleRecording { zoom } => self.toggle_recording(zoom),
             Command::StopRecording => self.stop_recording(),
             Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
-            Command::SetDevices { camera, mic } => self.set_devices(camera, mic),
+            Command::SetCamera(camera) => self.set_camera(camera),
+            Command::SetMic(mic) => self.set_mic(mic),
             Command::GlReady { display, context } => {
                 let events = self.player.set_gl_context(display, context);
                 self.player_events(events);

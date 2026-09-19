@@ -5,10 +5,9 @@
 //! or the start timeout) aborts: no clip, and the file is deleted. Stopping
 //! after it always keeps the clip, even if finalizing didn't go cleanly.
 //!
-//! The recorder's messages arrive as their own input, tagged with the
-//! generation of the `Recorder::start` that produced them, and never reach
-//! the player: its EOS would advance the source and its ERROR reset the
-//! player.
+//! The recorder's messages arrive as their own input, tagged here with the
+//! generation of the recording that produced them, and never reach the
+//! player: its EOS would advance the source and its ERROR reset the player.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,9 +27,6 @@ use super::{Bus, Event, Input, UserError};
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a stop waits for the file to finalize.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The camera rule of R3, as the "no device" message names it.
-const CAMERA: &str = "camera with a 16:9, 30 fps mode up to 1280 wide";
 
 /// Where recordings come from.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,15 +58,28 @@ pub(super) struct Active {
     pub(super) log: RecordingLog,
     /// The file, deleted on an abort.
     path: PathBuf,
+    /// When it started, for [`START_TIMEOUT`].
+    started: Instant,
     /// The first video buffer reached the muxer: stopping keeps the clip.
     video_seen: bool,
 }
 
 impl Bus {
+    /// R: starts a recording while idle, else stops (or aborts) it. The UI's
+    /// status can lag the bus's, so the bus decides: a second R during
+    /// start-up cancels, as the user means.
+    pub(super) fn toggle_recording(&mut self, zoom: Zoom) {
+        if self.recording.is_some() {
+            self.stop_recording();
+        } else {
+            self.start_recording(zoom);
+        }
+    }
+
     /// Starts recording from where the player is heading (R6). Refused with
     /// an error unless a project with sources, none missing, is open and its
     /// current source is loaded or loading.
-    pub(super) fn start_recording(&mut self, zoom: Zoom) {
+    fn start_recording(&mut self, zoom: Zoom) {
         if let Err(e) = self.can_record() {
             return self.emit(Event::Error(e));
         }
@@ -78,7 +87,11 @@ impl Bus {
             return;
         };
         let folder = open.folder.join("recordings");
-        let preferences = open.project.preferences.clone();
+        // Before anything changes: a refusal leaves the player as it was.
+        let sources = match self.capture_sources(&open.project.preferences) {
+            Ok(sources) => sources,
+            Err(e) => return self.emit(Event::Error(e)),
+        };
 
         // Every clip starts on a still frame.
         if self.playing {
@@ -90,10 +103,6 @@ impl Bus {
             source_index,
             start_source_seconds,
         };
-        let sources = match self.capture_sources(&preferences) {
-            Ok(sources) => sources,
-            Err(e) => return self.emit(Event::Error(e)),
-        };
         if let Err(e) = std::fs::create_dir_all(&folder) {
             return self.emit(Event::Error(UserError::Io(format!(
                 "{}: {e}",
@@ -103,8 +112,8 @@ impl Bus {
         let path = folder.join(format!("{}.mkv", pending.id));
 
         self.generation += 1;
-        let tx = self.tx.clone();
-        let started = Recorder::start(sources, &path, self.generation, move |generation, msg| {
+        let (tx, generation) = (self.tx.clone(), self.generation);
+        let started = Recorder::start(sources, &path, move |msg| {
             // Fails only once the bus thread has exited.
             let _ = tx.send(Input::Recorder(generation, msg));
         });
@@ -121,9 +130,9 @@ impl Bus {
             log: RecordingLog::new(recorder.t0_ns(), zoom, start_source_seconds),
             recorder,
             path,
+            started: Instant::now(),
             video_seen: false,
         });
-        self.start_deadline = Some(Instant::now() + START_TIMEOUT);
         self.emit(Event::Recording(RecordingStatus::Starting));
     }
 
@@ -148,7 +157,6 @@ impl Bus {
             RecorderMessage::FirstVideo => {
                 active.video_seen = true;
                 let t0_ns = active.recorder.t0_ns();
-                self.start_deadline = None;
                 self.emit(Event::Recording(RecordingStatus::Recording { t0_ns }));
             }
             RecorderMessage::Level { peak_db } => self.emit(Event::Level(peak_db)),
@@ -160,22 +168,25 @@ impl Bus {
         }
     }
 
-    /// No video within [`START_TIMEOUT`].
+    /// When a recording that has had no video gives up, if one is starting.
+    pub(super) fn start_deadline(&self) -> Option<Instant> {
+        self.recording
+            .as_ref()
+            .filter(|active| !active.video_seen)
+            .map(|active| active.started + START_TIMEOUT)
+    }
+
+    /// No video by [`Bus::start_deadline`].
     pub(super) fn start_timed_out(&mut self) {
-        if self.recording.as_ref().is_some_and(|a| !a.video_seen) {
-            self.emit(Event::Error(UserError::RecordingFailed(format!(
-                "no video from the camera within {} seconds",
-                START_TIMEOUT.as_secs()
-            ))));
-            self.abort_recording();
-        }
+        self.emit(Event::Error(UserError::RecordingFailed(format!(
+            "no video from the camera within {} seconds",
+            START_TIMEOUT.as_secs()
+        ))));
+        self.abort_recording();
     }
 
     /// Logs the play state just entered at `host_ns`, while recording.
     pub(super) fn log_playing(&mut self, host_ns: u64, ui_secs: Option<f64>) {
-        if self.recording.is_none() {
-            return;
-        }
         let (_, anchor) = self.heading(ui_secs);
         let playing = self.playing;
         if let Some(active) = &mut self.recording {
@@ -195,13 +206,18 @@ impl Bus {
         }
     }
 
-    pub(super) fn set_devices(&mut self, camera: Option<String>, mic: Option<String>) {
-        let Some(open) = &mut self.open else {
-            return;
-        };
-        open.project.preferences.preferred_camera_id = camera;
-        open.project.preferences.preferred_mic_id = mic;
-        self.project_changed();
+    pub(super) fn set_camera(&mut self, camera: Option<String>) {
+        if let Some(open) = &mut self.open {
+            open.project.preferences.preferred_camera_id = camera;
+            self.project_changed();
+        }
+    }
+
+    pub(super) fn set_mic(&mut self, mic: Option<String>) {
+        if let Some(open) = &mut self.open {
+            open.project.preferences.preferred_mic_id = mic;
+            self.project_changed();
+        }
     }
 
     /// Start's preconditions (R6). A skip or scrub in flight is not a reason
@@ -229,7 +245,7 @@ impl Bus {
         let devices = list_devices();
         let (camera, camera_fell_back) =
             resolve_camera(&devices.cameras, preferences.preferred_camera_id.as_deref())
-                .ok_or(UserError::NoDevice { what: CAMERA })?;
+                .ok_or(UserError::NoCamera)?;
         let (mic, mic_fell_back) =
             resolve_mic(&devices.mics, preferences.preferred_mic_id.as_deref());
         if camera_fell_back {
@@ -252,7 +268,6 @@ impl Bus {
         let Some(active) = self.recording.take() else {
             return;
         };
-        self.start_deadline = None;
         let events = active.log.finish();
         let outcome = active.recorder.stop(STOP_TIMEOUT);
         if let Some(open) = &mut self.open {
@@ -271,7 +286,6 @@ impl Bus {
         let Some(active) = self.recording.take() else {
             return;
         };
-        self.start_deadline = None;
         // NULL first, so nothing still writes the file.
         drop(active.recorder);
         remove_recording(&active.path);
@@ -279,9 +293,13 @@ impl Bus {
     }
 }
 
+/// Deletes a recording's file. One that was never created is already gone.
 fn remove_recording(path: &std::path::Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        eprintln!("bus: could not delete {}: {e}", path.display());
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("bus: could not delete {}: {e}", path.display());
+        }
+        _ => {}
     }
 }
 

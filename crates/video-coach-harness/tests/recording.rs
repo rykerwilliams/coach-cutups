@@ -80,7 +80,7 @@ impl Rig {
 
     /// Starts recording and waits for its first video frame. Returns t0.
     fn record(&mut self) -> u64 {
-        self.h.send(Command::StartRecording {
+        self.h.send(Command::ToggleRecording {
             zoom: Zoom::IDENTITY,
         });
         assert_eq!(self.h.wait_recording(), RecordingStatus::Starting);
@@ -175,14 +175,17 @@ fn a_recording_makes_a_clip_where_the_player_was() {
     rig.h.shutdown();
 }
 
+/// A second R during start-up cancels.
 #[test]
 fn stopping_before_the_first_video_frame_leaves_no_clip_and_no_file() {
     let mut rig = Rig::open_with(&[("a.webm", 2)], SLOW_CAMERA);
-    rig.h.send(Command::StartRecording {
+    rig.h.send(Command::ToggleRecording {
         zoom: Zoom::IDENTITY,
     });
     assert_eq!(rig.h.wait_recording(), RecordingStatus::Starting);
-    rig.h.send(Command::StopRecording);
+    rig.h.send(Command::ToggleRecording {
+        zoom: Zoom::IDENTITY,
+    });
     assert_eq!(rig.h.wait_recording(), RecordingStatus::Idle);
 
     let rest = rig.h.shutdown();
@@ -197,7 +200,7 @@ fn stopping_before_the_first_video_frame_leaves_no_clip_and_no_file() {
 #[test]
 fn play_during_the_camera_warm_up_is_logged() {
     let mut rig = Rig::open_with(&[("a.webm", 6)], SLOW_CAMERA);
-    rig.h.send(Command::StartRecording {
+    rig.h.send(Command::ToggleRecording {
         zoom: Zoom::IDENTITY,
     });
     assert_eq!(rig.h.wait_recording(), RecordingStatus::Starting);
@@ -215,8 +218,12 @@ fn play_during_the_camera_warm_up_is_logged() {
         "{:?}",
         clip.events
     );
-    // Pressed well before the video's first frame at 2 s.
-    assert!(play.record_time < 1.5, "{}", play.record_time);
+    // Pressed after t0, and well before the video's first frame at 2 s.
+    assert!(
+        play.record_time > 0.0 && play.record_time < 1.5,
+        "{}",
+        play.record_time
+    );
     rig.h.shutdown();
 }
 
@@ -234,7 +241,7 @@ fn recording_is_refused_while_a_source_is_missing() {
     let mut h = Harness::new(&tmp.path().join("config"));
     h.send(Command::OpenProject(folder.clone()));
     assert_eq!(*h.wait_opened().missing, [true]);
-    h.send(Command::StartRecording {
+    h.send(Command::ToggleRecording {
         zoom: Zoom::IDENTITY,
     });
     assert!(matches!(h.wait_for_error(), UserError::CantRecord(_)));

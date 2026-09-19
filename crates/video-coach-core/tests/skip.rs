@@ -190,16 +190,20 @@ fn a_completion_arriving_after_reset_is_a_safe_no_op() {
     assert_eq!(c.seek_completed(), SkipDecision::default());
 }
 
-/// The range's upper bound derives from a user-editable project.json with no
-/// validation. An inverted or NaN one must not take down the UI thread on the
-/// first arrow-key press — which `f64::clamp` would, since it asserts
-/// `min <= max`.
+/// Both bounds derive from a user-editable project.json with no validation.
+/// An inverted or NaN range must not take down the UI thread on the first
+/// arrow-key press — which `f64::clamp` would, since it asserts `min <= max`.
 #[test]
-fn an_inverted_or_nan_upper_bound_does_not_panic() {
-    let mut c = SkipCoordinator::default();
-    assert_eq!(c.request_skip(3.0, 10.0, 0.0..=-1.0).seek, exact(0.0));
-
-    let mut c = SkipCoordinator::default();
-    let d = c.request_skip(3.0, 10.0, 0.0..=f64::NAN);
-    assert_eq!(d.seek.map(|s| s.target_seconds), Some(0.0));
+fn an_inverted_or_nan_range_does_not_panic() {
+    let target = |range| {
+        let mut c = SkipCoordinator::default();
+        c.request_skip(3.0, 10.0, range)
+            .seek
+            .map(|s| s.target_seconds)
+    };
+    assert_eq!(target(0.0..=-1.0), Some(0.0));
+    assert_eq!(target(0.0..=f64::NAN), Some(0.0));
+    // A NaN lower bound still clamps to the upper one.
+    assert_eq!(target(f64::NAN..=20.0), Some(13.0));
+    assert_eq!(target(f64::NAN..=5.0), Some(5.0));
 }

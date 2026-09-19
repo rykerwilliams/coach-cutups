@@ -8,10 +8,7 @@ mod recorder;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-pub use devices::{
-    choose_camera_mode, choose_encoder, list_devices, resolve_camera, resolve_mic, Camera,
-    CameraMode, Devices, EncoderChain, Input, Mic,
-};
+pub use devices::{list_devices, resolve_camera, resolve_mic, Camera, Devices, Mic};
 pub use recorder::{CaptureSources, Recorder, RecorderMessage, StopOutcome};
 
 /// Now on `GstSystemClock` (CLOCK_MONOTONIC), in nanoseconds. The only clock
