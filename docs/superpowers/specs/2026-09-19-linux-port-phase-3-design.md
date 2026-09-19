@@ -66,7 +66,7 @@ impl UndoController {
 
 **Any number of deletes can be undone.** This is a **deliberate change from macOS**, which kept at most one delete in its history and shredded the previous file on every delete. Multi-level undo is what Ctrl+Z means everywhere else, and it removes macOS's eviction-on-delete machinery.
 
-The cost: `.trash` holds one recording per undoable delete until the project is next opened, when it's emptied (C4). *User may overrule; it's a product call.*
+The cost: `.trash` holds one recording per undoable delete until the project is next opened, when it's emptied (C4). *Confirmed by the user, 2026-09-19.*
 
 **`push`:**
 1. Clear redo.
