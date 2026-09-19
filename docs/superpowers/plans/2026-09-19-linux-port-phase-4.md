@@ -390,6 +390,39 @@ Commit: `feat(app): recording controls, clips list and device picker`.
    - `kill -9` mid-recording leaves a playable file.
 3. Run the adversarial review on the shipped diff, apply, and backlog any deferrals.
 
+### Task 6 notes (closeout, 2026-09-19)
+
+**Status: Phase 4 complete** apart from the hands-on checks below.
+
+**Code review** (`aab2967`, `ea56265`), both passes applied:
+- **Scrubber:** it collapsed when the transport row overflowed. It now has its own row.
+- **R key repeat:** holding R toggled recording on and off.
+- **`ToggleRecording`:** the bus decides, so a second R during start-up cancels.
+- **Notices:** they no longer open a modal that swallowed transport keys mid-recording.
+- **Skip bursts while playing:** they landed ~150 ms behind replay and jumped backward. The bus now advances the burst's seeks by the play time since the burst began. Measured drift went from 0.156 s to 0.005 s.
+- **Two Phase 2 player fixes** landed during execution:
+  - a pause's preroll showed the next frame (`0a0bed5`);
+  - a pause during flushing-seek recovery was lost (`dbc031d`).
+
+**Hands-on checklist for the user** (a real keyboard, pointer, camera and eyes; batched with Phase 2's list):
+1. **R and Esc:**
+   - R starts recording and R again stops it;
+   - R during "Preparing…" cancels;
+   - Esc stops;
+   - R while the project-name field is focused types an "r".
+2. **Record/Stop button:** its tooltips, and the "Preparing recording…" and "Waiting for audio…" labels.
+3. **The webcam light** is on only while recording.
+4. **Lip sync:** play a recording in any player and check that it looks right.
+5. **The level bar** moves with speech.
+6. **Devices popover:**
+   - where it appears, and "Looking for devices…";
+   - picking a camera or mic persists, and is re-checked on reopen;
+   - the IR camera is absent.
+7. **A notice line:** unplug a chosen USB mic or camera and record, if you have one.
+8. **QP tuning:** record in a lit room and judge the picture. The test file was only 57 KB, because the room was dim.
+9. **Crash safety:** `kill -9` the app mid-recording, and check the `.mkv` in `recordings/` still plays.
+10. **A skip burst while playing** (hold →) doesn't visibly jump backward when it settles.
+
 ## Deliberately not in this phase
 
 - Clip selection, editing, delete, tags, undo: Phase 3.
