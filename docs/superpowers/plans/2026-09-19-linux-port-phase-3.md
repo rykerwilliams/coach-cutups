@@ -243,6 +243,38 @@ Screenshot pass, 2026-09-19, reference laptop: a release build with `vblank_mode
    - the filter;
    - several deletes, then undoing all of them.
 
+### Task 5 notes (closeout, 2026-09-19)
+
+**Status: Phase 3 complete** apart from the hands-on checks below.
+
+**Code review** (`366f6c8`), both passes applied:
+- **Clicking Record while editing a field** lost the edit and swallowed R/Space. Fixed: the button takes focus first, and edits are allowed during recording.
+- **Switching projects** now empties the old project's `.trash`.
+- **Undo's `Select`** clears a tag filter that would hide the clip.
+- **Mutations** save, record, then publish.
+- **Simplifications:**
+  - `Clip::set` is the one field swap;
+  - `replay()`;
+  - `file_undo`/`file_redo`;
+  - the test pruning.
+
+The reviewer's seven extra undo and trash sequence tests all held: `project.json` never listed a clip whose file was in `.trash`.
+
+**Hands-on checklist for the user** (real pointer, keys and eyes; batched with Phases 2 and 4):
+1. **Clicking a clip** selects it and shows the inspector. **Double-click** jumps the game video to the clip's start (paused). The **right-click menu** jumps or deletes.
+2. **Dragging a clip** reorders the list. **"Sort by position"** orders it by game position.
+3. **Typing any letter** in name, tags or notes fires no shortcut. "r" doesn't record, and space doesn't play.
+4. **Ctrl+Z inside a field** undoes typing. **Outside a field**, it undoes the last clip change. **Ctrl+Shift+Z / Ctrl+Y** redo.
+5. **Rename clip A, then click clip B** without pressing Enter: A keeps the new name, and B shows its own.
+6. **Tags:**
+   - suggestions appear as you type;
+   - **Tab** takes the top one, and clicking takes any;
+   - **Esc** closes them, and a second Esc leaves the field.
+7. **Tag overview:** clicking a tag filters the list, and the chip's ✕ clears it.
+8. **Delete several clips** (Delete key), then **Ctrl+Z** repeatedly: each comes back in place, with its recording.
+9. **Enter** keeps focus in name and tags. **Esc** leaves the notes field. **Clicking the player** or empty space leaves a field.
+10. **Click Record while typing** in a field: the edit is kept, and R/Space still work during the recording.
+
 ## Deliberately not in this phase
 
 - Clip preview on selection: Phase 7.

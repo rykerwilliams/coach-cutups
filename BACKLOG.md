@@ -350,8 +350,8 @@ Each entry: what, why deferred, when to revisit.
 - **Why deferred:** `show_pip` has no consumer until export (Phase 8), so it
   takes `pip_for_new_recordings` (default true) with no UI. The red start
   flash and the meter's 1 s peak hold and colour gradient are macOS polish.
-- **When to revisit:** the checkbox with Phase 8 or the Phase 3 inspector;
-  the polish at the end of the port.
+- **When to revisit:** the checkbox shipped in the Phase 3 inspector
+  (per clip); the polish at the end of the port.
 
 ### 43. `a_player_error_is_reported_and_play_recovers` is timing-sensitive under load
 - **Why deferred:** during the Phase 4 review it failed twice in full
