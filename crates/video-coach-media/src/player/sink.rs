@@ -1,5 +1,6 @@
 //! The injected video sink and the frame mailbox it fills (spec D1, D3).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
@@ -42,9 +43,11 @@ struct MailboxInner {
 }
 
 /// Single-slot, latest-wins handoff from the appsink's streaming thread to
-/// whoever draws. Both `new_sample` and `new_preroll` fill it, so a frame
-/// reached by a seek while paused arrives too. Cheap to clone; clones share
-/// the slot.
+/// whoever draws. Every `new_sample` fills it. A preroll fills it only when it
+/// is the first frame since a flush or a new stream (a seek or a load), so a
+/// frame reached by a seek while paused arrives too. A pause's preroll is the
+/// *next* frame while the position stays on the displayed one, so it is not
+/// shown (spec R10). Cheap to clone; clones share the slot.
 #[derive(Clone, Default)]
 pub struct FrameMailbox {
     inner: Arc<MailboxInner>,
@@ -176,12 +179,44 @@ fn install_callbacks(appsink: &gst_app::AppSink, mailbox: FrameMailbox) {
     };
     let deliver = Arc::new(deliver);
     let on_preroll = deliver.clone();
+
+    // Set by a flush or a new stream, cleared by the first sample after it.
+    // PLAYING→PAUSED prerolls the frame after the displayed one, while a
+    // flushing seek (even one while PLAYING) prerolls the frame it landed on:
+    // only the latter is shown.
+    let fresh = Arc::new(AtomicBool::new(true));
+    appsink
+        .static_pad("sink")
+        .expect("appsink has a sink pad")
+        .add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH,
+            {
+                let fresh = fresh.clone();
+                move |_, info| {
+                    if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+                        if matches!(
+                            ev.type_(),
+                            gst::EventType::FlushStop | gst::EventType::StreamStart
+                        ) {
+                            fresh.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                }
+            },
+        );
+    let preroll_fresh = fresh.clone();
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
-                deliver(sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?)
+                let result = deliver(sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?);
+                fresh.store(false, Ordering::SeqCst);
+                result
             })
             .new_preroll(move |sink| {
+                if !preroll_fresh.load(Ordering::SeqCst) {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
                 on_preroll(sink.pull_preroll().map_err(|_| gst::FlowError::Flushing)?)
             })
             .build(),

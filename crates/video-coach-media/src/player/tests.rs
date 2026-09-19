@@ -393,6 +393,38 @@ fn a_seek_right_after_a_pause_is_not_completed_by_the_pause() {
 }
 
 #[test]
+fn a_pause_keeps_the_displayed_frame() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 4, 320, 180);
+    rig.load(&a, 0.0);
+    rig.player.set_playing(true);
+    rig.drain(Duration::from_millis(1000));
+
+    // Empty the slot, so anything in it afterwards came from the pause.
+    rig.mailbox.take();
+    rig.player.set_playing(false);
+    let (settled, current, _) = rig.player.pipeline.state(gst::ClockTime::from_seconds(5));
+    assert_eq!(
+        (settled, current),
+        (Ok(gst::StateChangeSuccess::Success), gst::State::Paused)
+    );
+    rig.drain(Duration::from_millis(200));
+
+    // PLAYING→PAUSED prerolls the frame after the displayed one; the position
+    // stays on the displayed one, so that preroll must not be shown.
+    let position = rig.player.position_handle().query_position().unwrap();
+    if let Some(frame) = rig.mailbox.take() {
+        let pts = seconds(frame.buffer.pts().expect("frame has a PTS"));
+        let dur = frame.buffer.duration().map_or(FRAME, seconds);
+        assert!(
+            pts <= position + 1e-6 && position < pts + dur,
+            "frame [{pts}, {}) does not cover position {position}",
+            pts + dur
+        );
+    }
+}
+
+#[test]
 fn a_seek_while_playing_completes_and_playback_continues() {
     let mut rig = Rig::new();
     let a = rig.fixture("a.webm", 4, 320, 180);
