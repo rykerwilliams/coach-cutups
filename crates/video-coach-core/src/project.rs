@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::event::CommentaryEvent;
+use crate::recording::PendingClip;
 use crate::scoreboard_config::{MatchEventRecord, ScoreboardConfig};
 
 /// Export frame size. `source` is deliberately absent — it was ill-defined
@@ -53,10 +54,10 @@ pub struct Preferences {
     pub preview_commentary_volume: f64,
     pub last_export_resolution: Resolution,
     pub last_export_quality: Quality,
-    /// Stable identifier for the preferred camera (PipeWire node name or a
-    /// `/dev/v4l/by-id` path). A hint: if the device is absent at launch the
-    /// app falls back to the default **without clearing this**, so the
-    /// preference is restored if the device reappears.
+    /// Stable identifier for the preferred camera: its PipeWire `node.name`.
+    /// A hint: if the device is absent at launch the app falls back to the
+    /// default **without clearing this**, so the preference is restored if the
+    /// device reappears.
     pub preferred_camera_id: Option<String>,
     /// Same semantics as `preferred_camera_id`.
     pub preferred_mic_id: Option<String>,
@@ -351,5 +352,52 @@ impl Project {
                 attempted: b,
             })
         }
+    }
+
+    /// Appends the clip a finished recording produced and returns it.
+    ///
+    /// The name is macOS's `defaultClipName`: the 1-based source number and
+    /// the floored start, `"2-01:02:05"`. `sort_index` is one past the largest
+    /// existing one; macOS used the clip count, which repeats an index after a
+    /// delete. `created_at` is passed in because core has no clock.
+    pub fn add_recorded_clip(
+        &mut self,
+        pending: PendingClip,
+        duration: f64,
+        events: Vec<CommentaryEvent>,
+        created_at: String,
+    ) -> &Clip {
+        // `as` truncates toward zero and saturates, so a negative or NaN start
+        // names as 00:00:00, like macOS's `max(0, ...)`.
+        let total = pending.start_source_seconds as u64;
+        let name = format!(
+            "{}-{:02}:{:02}:{:02}",
+            pending.source_index + 1,
+            total / 3600,
+            total % 3600 / 60,
+            total % 60
+        );
+        let sort_index = self
+            .clips
+            .iter()
+            .map(|c| c.sort_index)
+            .max()
+            .map_or(0, |m| m + 1);
+        self.clips.push(Clip {
+            id: pending.id,
+            name,
+            notes: String::new(),
+            tags: Vec::new(),
+            source_index: pending.source_index,
+            start_source_seconds: pending.start_source_seconds,
+            recording_duration: duration,
+            recording_filename: format!("{}.mkv", pending.id),
+            events,
+            show_pip: self.preferences.pip_for_new_recordings,
+            sort_index,
+            created_at,
+            transcript: String::new(),
+        });
+        self.clips.last().expect("just pushed")
     }
 }

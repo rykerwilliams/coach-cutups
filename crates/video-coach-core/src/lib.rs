@@ -9,6 +9,7 @@
 pub mod event;
 pub mod plan;
 pub mod project;
+pub mod recording;
 pub mod scoreboard_config;
 pub mod skip;
 pub mod store;

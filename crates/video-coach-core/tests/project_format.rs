@@ -6,7 +6,9 @@ use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::recording::PendingClip;
 use video_coach_core::scoreboard_config::{
     MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
 };
@@ -427,4 +429,70 @@ fn abs_seconds_projects_onto_the_concat_timeline() {
     }
     assert_eq!(p.abs_seconds(0, 5.0), 5.0);
     assert_eq!(p.abs_seconds(1, 5.0), 105.0);
+}
+
+// ---- add_recorded_clip (new; macOS built clips inline in ContentView) ----
+
+fn pending(start_source_seconds: f64) -> PendingClip {
+    PendingClip {
+        id: Uuid::from_u128(0x1234),
+        source_index: 1,
+        start_source_seconds,
+    }
+}
+
+#[test]
+fn a_recorded_clip_is_built_from_the_pending_clip() {
+    let mut p = Project::new("p");
+    let events = vec![CommentaryEvent::new(0.0, EventKind::ClearAll)];
+    let c = p
+        .add_recorded_clip(
+            pending(3725.9),
+            42.5,
+            events.clone(),
+            "2026-09-19T12:00:00Z".into(),
+        )
+        .clone();
+    assert_eq!(c.id, Uuid::from_u128(0x1234));
+    // 3725.9 s floors to 1 h 2 min 5 s; the source number is 1-based.
+    assert_eq!(c.name, "2-01:02:05");
+    assert_eq!(
+        c.recording_filename,
+        "00000000-0000-0000-0000-000000001234.mkv"
+    );
+    assert_eq!(c.source_index, 1);
+    assert_eq!(c.start_source_seconds, 3725.9);
+    assert_eq!(c.recording_duration, 42.5);
+    assert_eq!(c.events, events);
+    assert_eq!(c.created_at, "2026-09-19T12:00:00Z");
+    assert!(c.notes.is_empty() && c.tags.is_empty() && c.transcript.is_empty());
+    assert_eq!(c.sort_index, 0, "the first clip");
+    assert_eq!(p.clips, vec![c]);
+}
+
+/// macOS used `clips.count`, which repeats an index after a delete.
+#[test]
+fn sort_index_is_one_past_the_largest_even_after_a_gap() {
+    let mut p = Project::new("p");
+    let mut a = sample_clip();
+    a.sort_index = 0;
+    let mut b = sample_clip();
+    b.sort_index = 5;
+    p.clips = vec![b, a];
+    let c = p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new());
+    assert_eq!(c.sort_index, 6);
+}
+
+#[test]
+fn show_pip_comes_from_preferences() {
+    let mut p = Project::new("p");
+    assert!(
+        p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
+            .show_pip
+    );
+    p.preferences.pip_for_new_recordings = false;
+    assert!(
+        !p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
+            .show_pip
+    );
 }

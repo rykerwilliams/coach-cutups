@@ -1,9 +1,10 @@
 //! The commentary event log.
 //!
 //! One `CommentaryEvent` per thing the coach did while recording, timestamped
-//! in **record time** — seconds since the first frame of the commentary
-//! recording. The log is the only record of what the source video was doing;
-//! `timeline::playback_segments` replays it to reconstruct the edit.
+//! in **record time** — seconds since the recording's time 0, the capture
+//! pipeline's base time (Phase 4 R5). The log is the only record of what the
+//! source video was doing; `timeline::playback_segments` replays it to
+//! reconstruct the edit.
 //!
 //! The log is assumed sorted by `record_time`. An unsorted log is an upstream
 //! bug, not something readers defend against.

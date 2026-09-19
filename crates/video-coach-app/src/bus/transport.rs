@@ -60,9 +60,9 @@ impl Bus {
         if !delta.is_finite() || !self.seekable() {
             return;
         }
-        let clip_duration = (open.project.total_source_duration() - END_MARGIN).max(0.0);
+        let end = (open.project.total_source_duration() - END_MARGIN).max(0.0);
         let now = open.project.abs_seconds(self.current, self.current_secs());
-        let decision = self.skip.request_skip(delta, now, clip_duration);
+        let decision = self.skip.request_skip(delta, now, 0.0..=end);
         self.apply_skip(decision);
     }
 

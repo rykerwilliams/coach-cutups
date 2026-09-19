@@ -16,6 +16,7 @@
 //! only accumulate the target; the coarse seek is issued when the leading exact
 //! *lands*. Once the user stops pressing, an exact seek settles the frame.
 
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 /// A seek for the caller to issue.
@@ -112,20 +113,23 @@ impl SkipCoordinator {
     /// The user pressed a skip key.
     ///
     /// Accumulates from the pending target if a burst is in progress, otherwise
-    /// from the player's current position, and clamps to the clip.
+    /// from the player's current position, and clamps to `range`. The caller
+    /// picks the range: the whole concat timeline when scanning, one source
+    /// while recording (a clip points into one source).
     pub fn request_skip(
         &mut self,
         delta: f64,
         current_seconds: f64,
-        clip_duration_seconds: f64,
+        range: RangeInclusive<f64>,
     ) -> SkipDecision {
         let base = self.target.unwrap_or(current_seconds);
-        // `.max(0.0)` on the upper bound is load-bearing: `f64::clamp` asserts
-        // `min <= max`, so a negative or NaN `clip_duration_seconds` -- which
-        // reaches here straight from a user-editable project.json with no
-        // validation -- would panic on the first arrow-key press. Swift used
-        // nested min/max and never trapped.
-        let t = (base + delta).clamp(0.0, clip_duration_seconds.max(0.0));
+        let (lo, hi) = range.into_inner();
+        // `.max(lo)` on the upper bound is load-bearing: `f64::clamp` asserts
+        // `min <= max`, so an inverted or NaN upper bound -- derived straight
+        // from durations in a user-editable project.json with no validation --
+        // would panic on the first arrow-key press. Swift used nested min/max
+        // and never trapped.
+        let t = (base + delta).clamp(lo, hi.max(lo));
         self.target = Some(t);
         self.exact_pending = false;
 
@@ -213,6 +217,13 @@ impl SkipCoordinator {
             self.exact_pending = true;
         }
         SkipDecision::NONE
+    }
+
+    /// The burst's accumulated target, if a burst is outstanding: where the
+    /// player will end up once the skips settle. `None` once the burst has
+    /// been handed to a final exact seek.
+    pub fn target(&self) -> Option<f64> {
+        self.target
     }
 
     /// Clear transient state when the active player swaps. `burst_window` is
