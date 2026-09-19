@@ -323,8 +323,9 @@ Each entry: what, why deferred, when to revisit.
 ### 38. Orphaned recordings after a crash
 - **Why deferred:** a crash loses the event log, so the `.mkv` can't become a
   clip (R7). The file stays playable but unreferenced in `recordings/`.
-- **When to revisit:** Phase 3, alongside `.trash` handling — list or clean
-  files no clip references.
+- **When to revisit:** after Phase 3 (which deliberately doesn't auto-delete
+  unreferenced media); with a user-visible "clean up unused recordings"
+  action, or at packaging.
 
 ### 39. Fall back to x264 when a VA encoder is present but broken
 - **Why deferred:** R4 picks the encoder by element presence. A VA element
@@ -359,3 +360,16 @@ Each entry: what, why deferred, when to revisit.
   a clean checkout. Not touched by Phase 4.
 - **When to revisit:** if it fails in CI; make the test tolerate repeated
   errors from one failure, or wait for the reload's `Loaded` before asserting.
+
+## Phase 3 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-3-design.md`)
+
+### 44. Clip-edit undo coalescing, tag-overview Duration sort, suggestion ↑/↓
+- **Why deferred:** macOS parity items that add UI state or Slint key
+  plumbing for small gains: one undo step per field session is already
+  predictable; the overview sorts A–Z; Tab takes the top suggestion and
+  typing narrows the list.
+- **When to revisit:** if any is missed in real use.
+
+### 45. Multi-select and bulk tag edits
+- **Why deferred:** macOS had single selection only.
+- **When to revisit:** if tagging many clips at once becomes a chore.
