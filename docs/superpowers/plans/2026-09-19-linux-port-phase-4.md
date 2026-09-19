@@ -209,6 +209,26 @@ Add `crates/video-coach-media/src/capture/recorder.rs` (R1, R4, R5, R6).
 
 Commit: `feat(media): commentary recorder`.
 
+### Task 3 notes
+
+Hardware check, 2026-09-19, reference laptop. The real webcam and default mic were opened once for 3 s. The recording was deleted.
+
+- **Elements:** `v4l2src ! capsfilter ! queue ! vajpegdec ! vah264lpenc ! h264parse ! queue` and `pipewiresrc ! capsfilter ! queue ! audioconvert ! audioresample ! level ! opusenc ! queue`, into `matroskamux ! filesink`. The camera resolved to `/dev/video0` (webcam, priority 1000, 1280×720 Mjpeg).
+- **Timing:**
+  - `start` returned in 69 ms, and `FirstVideo` came 303 ms after the call.
+  - In the file, the first video PTS is 0.157 s and the first audio PTS is 0.027 s.
+  - There are 84 video frames between 0.157 and 2.924 s, which is 30 fps. `exposure_dynamic_framerate` was set.
+  - `stop` took 129 ms, and it was clean.
+- **Duration:** `stop` gave 3.015 s and Discoverer gave 2.987 s. The difference is 28 ms, inside one frame but near its edge. `last_end` covers audio as well, and on the real devices the audio ran about 60 ms past the last video frame. The test-source test (a) was comfortably inside the frame limit.
+- **The file** plays, and it demuxes and decodes to EOS. `gst-discoverer-1.0` reports H.264 High 1280×720 30/1 and Opus 48 kHz stereo. It is only 57 KB for 3 s at QP 24/26, which suggests a dim room. Check the QP at closeout.
+- **`extra-controls` with a bogus name:** the pipeline ran to EOS (`v4l2src ! fakesink`, 5–30 buffers), and strace shows the valid control still sent (`VIDIOC_S_CTRL V4L2_CID_EXPOSURE_AUTO_PRIORITY=0`). The bogus name produces no readable warning at all. 1.24's "Control '%s' does not exist" is logged against a non-GObject, so GStreamer prints only `gst_debug_log_valist: runtime check failed: (object == NULL || G_IS_OBJECT (object))`, at `GST_DEBUG=2`.
+- **The control's state:** `exposure_dynamic_framerate` reads 0 and its driver default is 0, so there was nothing to restore. It was read with VIDIOC_G_CTRL/QUERYCTRL.
+- **Surprises in the tests:**
+  - A probe returning `Drop` for an EOS event triggers a `GStreamer-CRITICAL` (`gst_mini_object_unref: mini_object != NULL`) inside `gst_pad_push_event`. Test (d) returns `Handled` instead.
+  - Demuxing a file for test (b) with two `fakesink`s fed by one demux thread deadlocks in preroll unless the sinks are `async=false`.
+  - A live `videotestsrc`'s frames aren't on a grid from 0, so with a 0.5 s delay the first video PTS lands anywhere in [0.5, 0.533). It measured 0.524, inside the ±40 ms tolerance.
+  - The x264 path (VA plugin hidden via `GST_PLUGIN_SYSTEM_PATH`) passes all four tests too.
+
 ## Task 4 — Bus: recording
 
 Put the state machine in `bus/recording.rs`. `bus/mod.rs` gets the variants and the loop changes. **This task also updates every call site** (main.rs and the harness), so the workspace builds.

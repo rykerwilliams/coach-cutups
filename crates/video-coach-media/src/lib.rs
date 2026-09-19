@@ -11,7 +11,8 @@ pub mod probe;
 
 pub use capture::{
     choose_camera_mode, choose_encoder, list_devices, now_ns, resolve_camera, resolve_mic, Camera,
-    CameraMode, Devices, EncoderChain, Input, Mic,
+    CameraMode, CaptureSources, Devices, EncoderChain, Input, Mic, Recorder, RecorderMessage,
+    StopOutcome,
 };
 pub use player::{
     Diagnostics, Frame, FrameMailbox, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
