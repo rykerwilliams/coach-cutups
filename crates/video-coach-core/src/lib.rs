@@ -7,6 +7,7 @@
 //! design.
 
 pub mod event;
+pub mod export;
 pub mod plan;
 pub mod project;
 pub mod recording;
