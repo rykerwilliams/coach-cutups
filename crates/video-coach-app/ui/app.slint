@@ -448,6 +448,24 @@ component TagOverview inherits VerticalLayout {
     }
 }
 
+/// One live telestration stroke (Phase 6 D5). Its `commands` are in the
+/// content rect's logical pixels, which `fit: preserve` takes as they are:
+/// it short-circuits before any bounding-box or stroke-width fitting, so no
+/// viewbox is needed. The caller sets `commands` and `stroke-width`.
+///
+/// `fill` stays unset on purpose: a fill on an open polyline fills the area
+/// the line encloses.
+component StrokePath inherits Path {
+    width: 100%;
+    height: 100%;
+    fit: preserve;
+    // Exactly core's `Rgba::RED`, which export burns in (Phase 8).
+    stroke: #ff3333;
+    // Round caps also make a single point (`M x y L x y`) a dot.
+    stroke-line-cap: round;
+    stroke-line-join: round;
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     min-width: 1100px;
@@ -577,6 +595,22 @@ export component AppWindow inherits Window {
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
     in property <[DeviceRow]> mics;
+
+    // --- Drawing on the picture (Phase 6 D1, D5, D6) ---
+
+    /// Only while recording, never `starting`: `recording` is the broader
+    /// "not idle".
+    out property <bool> can-draw: root.recording-phase == RecordingPhase.recording;
+    /// A finished drawing clears itself 5 s after the pen lifts. UI state;
+    /// `src/main.rs` reads it at pen-up.
+    in-out property <bool> auto-clear: true;
+    /// The live overlay: one SVG command string per stroke still on screen,
+    /// in content-rect logical pixels. `src/main.rs` rebuilds it only when
+    /// something changes (D5) — Slint re-parses a `Path` on every set.
+    in property <[string]> live-paths;
+    /// The stroke under the pen, likewise; empty when nothing is being drawn.
+    in property <string> drawing-path;
+
     // --- Export (Phase 5 X5) ---
 
     /// The running export's whole percent; negative with none running.
@@ -642,6 +676,14 @@ export component AppWindow inherits Window {
     /// the pointer at (x, y) when it's over the player (the bool).
     callback zoom-reset();
     callback zoom-step(float, bool, length, length);
+    /// Drawing (Phase 6 D2): the pen went down at (x, y) over the picture,
+    /// moved with it down, and came up. Content-rect relative, and the last
+    /// two may be outside it: Slint grabs the pointer on press.
+    callback draw-press(length, length);
+    callback draw-move(length, length);
+    callback draw-release(length, length);
+    /// Clear: the button, or C.
+    callback clear-drawings();
     /// Drag-to-reorder payload: a row index of the named list ("sources" or
     /// "clips") to and from `data-transfer`; -1 when it's another list's.
     pure callback drag-payload(string, int) -> data-transfer;
@@ -698,6 +740,14 @@ export component AppWindow inherits Window {
                 return accept;
             }
             return reject;
+        }
+        // Clear the drawings (D6). After the Ctrl branch, so Ctrl+C isn't it.
+        // A held C would clear over and over, which does nothing but log.
+        if (event.text == "c" || event.text == "C") {
+            if (pressed && !event.repeat && root.can-draw) {
+                root.clear-drawings();
+            }
+            return accept;
         }
         // R and Space toggle, so an auto-repeat would toggle straight back.
         if (event.text == "r" || event.text == "R") {
@@ -1081,6 +1131,21 @@ export component AppWindow inherits Window {
                             transform-scale: root.zoom.scale;
                             image-fit: fill;
                         }
+
+                        // The live telestration layer (D5), above the picture
+                        // and clipped with it. Strokes are drawn where they
+                        // were made, on the zoomed picture as seen, so they
+                        // don't move with the zoom.
+                        for cmds in root.live-paths: StrokePath {
+                            commands: cmds;
+                            stroke-width: parent.height * 0.005;
+                        }
+                        // The one under the pen. An empty `commands` draws
+                        // nothing, so it needs no `if`.
+                        StrokePath {
+                            commands: root.drawing-path;
+                            stroke-width: parent.height * 0.005;
+                        }
                     }
 
                     zoom-area := TouchArea {
@@ -1132,6 +1197,48 @@ export component AppWindow inherits Window {
                         // The bus refuses it while recording (R6's guard).
                         enabled: !root.recording;
                         clicked => { root.relink-source(root.missing-index); }
+                    }
+
+                    // --- Drawing (Phase 6 D1) ---
+                    // The player's LAST child: Slint visits children front to
+                    // back and a TouchArea grabs the pointer on press, so
+                    // declared any earlier the presses would go to `zoom-area`
+                    // and pan instead. Sized to the content rect, so a press
+                    // in the letterbox bars still pans, and `mouse-x/y` are
+                    // already content-relative.
+                    //
+                    // It accepts no scroll event, so wheels fall through to
+                    // `zoom-area` behind it and pan and Ctrl-zoom keep
+                    // working. Disabled it forwards everything and shows no
+                    // cursor of its own.
+                    TouchArea {
+                        x: player.content.x;
+                        y: player.content.y;
+                        width: player.content.width;
+                        height: player.content.height;
+                        enabled: root.can-draw;
+                        mouse-cursor: crosshair;
+                        pointer-event(event) => {
+                            if (event.button != PointerEventButton.left) {
+                                return;
+                            }
+                            if (event.kind == PointerEventKind.down) {
+                                keys.focus();
+                                root.draw-press(self.mouse-x, self.mouse-y);
+                            }
+                            if (event.kind == PointerEventKind.up) {
+                                root.draw-release(self.mouse-x, self.mouse-y);
+                            }
+                        }
+                        // Only while a button is down; `pressed` is the
+                        // primary one. The pointer is grabbed on press, so
+                        // this keeps arriving off the picture; the stroke
+                        // clamps to the edge.
+                        moved => {
+                            if (self.pressed) {
+                                root.draw-move(self.mouse-x, self.mouse-y);
+                            }
+                        }
                     }
                 }
 
@@ -1240,6 +1347,31 @@ export component AppWindow inherits Window {
                                     : root.exporting
                                         ? @markdown("Not while exporting")
                                         : @markdown("Record (R)");
+                            }
+                        }
+                        // Drawing's two controls (D6). Always mounted, and
+                        // only disabled off a recording: mounting them with
+                        // the recording would change the player's height,
+                        // and with it the content rect strokes are
+                        // normalized against. macOS learned this one.
+                        VerticalLayout {
+                            alignment: center;
+                            CheckBox {
+                                text: "Auto-clear";
+                                enabled: root.can-draw;
+                                checked <=> root.auto-clear;
+                            }
+                        }
+                        Button {
+                            text: "Clear";
+                            enabled: root.can-draw;
+                            clicked => {
+                                keys.focus();
+                                root.clear-drawings();
+                            }
+
+                            Tooltip {
+                                text: @markdown("Clear the drawings (C)");
                             }
                         }
                         if root.recording-phase == RecordingPhase.starting: Text {

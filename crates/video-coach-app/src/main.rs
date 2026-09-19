@@ -23,9 +23,11 @@ use uuid::Uuid;
 use video_coach_app::bus::{
     Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot, UserError,
 };
+use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::project::Project;
+use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
@@ -39,6 +41,10 @@ slint::include_modules!();
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// How long a notice stays up.
 const NOTICE: Duration = Duration::from_secs(6);
+/// How long after the pen lifts a drawing clears, with Auto-clear on (Phase 6
+/// spec D3). The same value goes into the stroke, so replay clears with the
+/// overlay.
+const AUTO_CLEAR: f64 = 5.0;
 
 /// What the UI thread knows of the bus's state, from its events, and the
 /// zoom, which is the UI's own.
@@ -59,6 +65,16 @@ struct UiState {
     /// The recording's t0 on `now_ns()`'s clock, once its video started,
     /// for the elapsed-time readout.
     recording_t0: Option<u64>,
+    /// The drawings on screen, each with the moment it auto-clears (Phase 6
+    /// spec D3). Live, "now" only moves forward and a finished stroke is
+    /// always fully drawn, so this is the whole of the replay rule for the
+    /// live case; `visible_strokes` is for saved clips.
+    live_strokes: Vec<(Stroke, Option<Instant>)>,
+    /// The drawing under the pen, if the coach is mid-stroke.
+    drawing: Option<InProgress>,
+    /// The content rect the window's `live-paths` were built for: their
+    /// commands are in its pixels, so a resize has to rebuild them.
+    paths_rect: (f64, f64),
     /// When the notice line clears, if one is up.
     notice_until: Option<Instant>,
 }
@@ -73,6 +89,9 @@ impl Default for UiState {
             zoom: Zoom::IDENTITY,
             drag: None,
             recording_t0: None,
+            live_strokes: Vec::new(),
+            drawing: None,
+            paths_rect: (0.0, 0.0),
             notice_until: None,
         }
     }
@@ -109,6 +128,7 @@ fn main() {
     video::install(&window, bus.clone());
     wire_callbacks(&window, &bus);
     wire_zoom(&window, &bus);
+    wire_drawing(&window, &bus);
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, TICK, {
@@ -632,6 +652,117 @@ fn finite(value: f32) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// Drawing on the picture while recording (Phase 6 spec D2). The window's
+/// drawing area is the content rect, so its coordinates already are; the
+/// clock is read here, at the input event, as the bus contract requires.
+fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_draw_press({
+        let weak = window.as_weak();
+        move |x, y| {
+            let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
+                return;
+            };
+            let start = InProgress::start(now_ns(), x, y);
+            // A press already draws its dot.
+            w.set_drawing_path(start.commands().into());
+            UI.with_borrow_mut(|ui| ui.drawing = Some(start));
+        }
+    });
+    window.on_draw_move({
+        let weak = window.as_weak();
+        move |x, y| {
+            let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
+                return;
+            };
+            let now_ns = now_ns();
+            // Only when the point was kept: Slint re-parses the path and
+            // rebuilds it in Skia on every set.
+            let commands = UI.with_borrow_mut(|ui| {
+                let ip = ui.drawing.as_mut()?;
+                ip.moved(x, y, now_ns).then(|| ip.commands())
+            });
+            if let Some(commands) = commands {
+                w.set_drawing_path(commands.into());
+            }
+        }
+    });
+    window.on_draw_release({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move |x, y| {
+            let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
+                return;
+            };
+            let now_ns = now_ns();
+            let auto = w.get_auto_clear().then_some(AUTO_CLEAR);
+            w.set_drawing_path(SharedString::new());
+            // Without a content rect there's nothing to normalize against;
+            // the stroke is dropped rather than stored wrong. The player has
+            // one whenever a press could reach the drawing area.
+            let Some((rect, (host_ns, stroke))) = UI.with_borrow_mut(|ui| {
+                let ip = ui.drawing.take()?;
+                let rect = content_size(&w)?;
+                Some((rect, ip.release(x, y, now_ns, rect, auto)))
+            }) else {
+                return;
+            };
+            let expiry = auto.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
+            UI.with_borrow_mut(|ui| {
+                ui.live_strokes.push((stroke.clone(), expiry));
+                show_strokes(&w, ui, rect);
+            });
+            bus.borrow().send(Command::Stroke { host_ns, stroke });
+        }
+    });
+    window.on_clear_drawings({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move || {
+            let host_ns = now_ns();
+            let Some(w) = weak.upgrade() else { return };
+            clear_drawings(&w);
+            bus.borrow().send(Command::ClearAll { host_ns });
+        }
+    });
+}
+
+/// Wipes the live overlay: the drawings on screen and the one under the pen,
+/// which is discarded rather than logged (spec D2, macOS parity).
+fn clear_drawings(w: &AppWindow) {
+    w.set_drawing_path(SharedString::new());
+    w.set_live_paths(ModelRc::default());
+    UI.with_borrow_mut(|ui| {
+        ui.live_strokes.clear();
+        ui.drawing = None;
+    });
+}
+
+/// Rebuilds the window's live `Path` layer from [`UiState::live_strokes`],
+/// over a content rect of `rect`. Only on a change (spec D5): Slint re-parses
+/// every command string it's given, and a finished stroke's geometry is
+/// static.
+fn show_strokes(w: &AppWindow, ui: &mut UiState, rect: (f64, f64)) {
+    let paths: Vec<SharedString> = ui
+        .live_strokes
+        .iter()
+        .map(|(s, _)| path_commands(&s.points, rect.0, rect.1).into())
+        .collect();
+    ui.paths_rect = rect;
+    w.set_live_paths(ModelRc::new(VecModel::from(paths)));
+}
+
+/// The content rect's size: the letterboxed picture at 1×, which the window's
+/// drawing area is sized to and strokes are normalized against. `None` before
+/// the first layout, or with nothing loaded.
+fn content_size(w: &AppWindow) -> Option<(f64, f64)> {
+    let vp = Viewport::new(
+        w.get_frame_width().into(),
+        w.get_frame_height().into(),
+        w.get_player_width().into(),
+        w.get_player_height().into(),
+    )?;
+    let r = vp.picture(Zoom::IDENTITY);
+    Some((r.width, r.height))
+}
+
 /// Applies a bus event on the UI thread.
 fn on_event(w: &AppWindow, event: Event) {
     match event {
@@ -660,6 +791,10 @@ fn on_event(w: &AppWindow, event: Event) {
         }),
         Event::Playing(playing) => w.set_playing(playing),
         Event::Recording(status) => {
+            // On every transition, start and stop alike: drawings belong to
+            // one recording, and the phase change disables the drawing area
+            // under whatever is mid-stroke.
+            clear_drawings(w);
             UI.with_borrow_mut(|ui| {
                 ui.recording_t0 = match status {
                     RecordingStatus::Recording { t0_ns } => Some(t0_ns),
@@ -840,10 +975,24 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
 
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value
 /// while it's dragged, else the outstanding seek's target, else the player's
-/// position on the current source. Also the recording's elapsed time (R11)
-/// and the notice's expiry.
+/// position on the current source. Also the recording's elapsed time (R11),
+/// the notice's expiry, and the drawings' (Phase 6 D5, which reuses this
+/// timer rather than adding one).
 fn tick(w: &AppWindow, position: &PositionHandle) {
+    let content = content_size(w);
     UI.with_borrow_mut(|ui| {
+        if let Some(rect) = content {
+            let now = Instant::now();
+            let before = ui.live_strokes.len();
+            ui.live_strokes
+                .retain(|(_, at)| at.is_none_or(|at| at > now));
+            // Something auto-cleared, or the player resized and every
+            // stroke moved with it: the commands are in content px.
+            let resized = !ui.live_strokes.is_empty() && ui.paths_rect != rect;
+            if ui.live_strokes.len() != before || resized {
+                show_strokes(w, ui, rect);
+            }
+        }
         if let Some(t0_ns) = ui.recording_t0 {
             let elapsed = now_ns().saturating_sub(t0_ns) as f64 / 1e9;
             w.set_recording_elapsed(format_hms(elapsed).into());
