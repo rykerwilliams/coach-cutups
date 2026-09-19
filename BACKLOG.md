@@ -188,6 +188,12 @@ Each entry: what, why deferred, when to revisit.
 - **Why deferred:** Flatpak sandboxing complicates camera, microphone and
   arbitrary-path file access — all three of which this app needs. Spec
   recommends AppImage first.
+- **User expectation (2026-09-19):** the user pictured something like the macOS
+  `.app` (one self-contained thing to download and run), which maps to
+  AppImage, not Flatpak. The tension: GStreamer and the VA drivers live in the
+  OS on Linux, so an AppImage must bundle GStreamer carefully and borrow the
+  host's VA drivers. A `.deb` depending on Ubuntu's GStreamer is the simplest
+  option for the user's own laptop. Weigh both against that expectation.
 - **When to revisit:** Phase 11.
 
 ### 25. Wayland vs X11 for the drawing overlay
