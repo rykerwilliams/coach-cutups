@@ -105,16 +105,40 @@ fn a_point_exactly_at_elapsed_is_drawn() {
 
 // ------------------------------------------------------------- auto-clear
 
-/// Inclusive cutoff: hidden once `t >= first_t + auto`.
+/// Inclusive cutoff, counted from pen-up: hidden once
+/// `t >= record_time + auto`.
 #[test]
 fn auto_clear_boundary_is_inclusive() {
     let c = clip(vec![stroke_ev(10.0, 4.0, 5, Some(3.0))]);
-    // Starts at 6.0, auto-clears at 9.0.
-    assert_eq!(visible_strokes(&c, 8.999).len(), 1);
+    // Pen-up at 10.0, so it auto-clears at 13.0 — not at 9.0, which is what
+    // counting from the 6.0 start would give.
+    assert_eq!(visible_strokes(&c, 12.999).len(), 1);
     assert!(
-        visible_strokes(&c, 9.0).is_empty(),
-        "inclusive at exactly first_t + auto"
+        visible_strokes(&c, 13.0).is_empty(),
+        "inclusive at exactly record_time + auto"
     );
+}
+
+/// **The test that fails under the old, first-point-anchored rule.** A stroke
+/// held for 7 seconds with a 5-second auto-clear used to vanish at
+/// `first_t + 5` — two seconds before the coach even lifted the pen, and five
+/// seconds before the live overlay dropped it.
+#[test]
+fn auto_clear_counts_from_pen_up_not_from_the_first_point() {
+    let c = clip(vec![stroke_ev(10.0, 7.0, 8, Some(5.0))]);
+    // Points at t = 0..=7 relative to a start of 3.0; pen-up at 10.0.
+    assert_eq!(
+        visible_strokes(&c, 9.5)[0].drawn_point_count,
+        7,
+        "still mid-draw, well past the old cutoff of 8.0"
+    );
+    assert_eq!(visible_strokes(&c, 10.0)[0].drawn_point_count, 8);
+    assert_eq!(
+        visible_strokes(&c, 14.999)[0].drawn_point_count,
+        8,
+        "fully drawn for the whole auto-clear window after pen-up"
+    );
+    assert!(visible_strokes(&c, 15.0).is_empty());
 }
 
 #[test]
@@ -186,8 +210,8 @@ fn a_future_clear_all_is_ignored() {
 
 // ----------------------------------------------------------------- shapes
 
-/// A single-point stroke is legitimate — the compositor renders it as a filled
-/// circle, since a zero-length path does not rasterize with a round cap.
+/// A single-point stroke is legitimate — a plain click. A renderer draws it as
+/// a degenerate segment with a round cap, which rasterizes as a dot.
 #[test]
 fn a_single_point_stroke_is_visible_with_one_point() {
     let c = clip(vec![stroke_ev(4.0, 0.0, 1, None)]);

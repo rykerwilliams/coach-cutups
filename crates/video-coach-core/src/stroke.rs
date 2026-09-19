@@ -49,6 +49,8 @@ pub struct Stroke {
     /// Normalized to frame height.
     pub line_width: f64,
     pub points: Vec<StrokePoint>,
-    /// `None` = persist until a `ClearAll`.
+    /// Seconds after **pen-up** — the event's `record_time`, not the stroke's
+    /// first point — at which this stroke disappears. `None` = persist until a
+    /// `ClearAll`.
     pub auto_clear_after_seconds: Option<f64>,
 }

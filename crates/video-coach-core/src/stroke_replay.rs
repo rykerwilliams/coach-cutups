@@ -10,6 +10,9 @@
 //! proportional to how long the coach held the pen, so long strokes are
 //! visibly wrong while quick flicks look fine. That asymmetry makes it a
 //! genuinely nasty bug to catch by eye.
+//!
+//! **Auto-clear counts from pen-up**, i.e. from the event's own `record_time`,
+//! which is the one time here that is not back-computed. Only the start is.
 
 use crate::event::EventKind;
 use crate::project::Clip;
@@ -23,9 +26,9 @@ pub struct VisibleStroke<'a> {
     pub first_point_record_time: f64,
     /// How many of `stroke.points` have been drawn by now.
     ///
-    /// Zero-length strokes are possible; the compositor renders a
-    /// single-point stroke as a **filled circle** of diameter `line_width`,
-    /// because a zero-length path does not rasterize with a round cap.
+    /// Zero-length strokes are possible: a plain click is one point. A
+    /// renderer draws it as the degenerate segment `M x y L x y` with a round
+    /// cap, which rasterizes as a dot — a bare move-to draws nothing.
     pub drawn_point_count: usize,
 }
 
@@ -64,9 +67,13 @@ pub fn visible_strokes(clip: &Clip, at_record_time: f64) -> Vec<VisibleStroke<'_
         if at_record_time < first_t {
             continue;
         }
-        // Auto-clear is an INCLUSIVE cutoff.
+        // Auto-clear counts from PEN-UP — the event's own record time — and is
+        // an INCLUSIVE cutoff. Counting from `first_t` instead would erase a
+        // stroke held longer than `auto` while the coach was still drawing it,
+        // and would clear every stroke earlier in replay than the live overlay
+        // did. That mismatch is the macOS bug this rule fixes.
         if let Some(auto) = stroke.auto_clear_after_seconds {
-            if at_record_time >= first_t + auto {
+            if at_record_time >= ev.record_time + auto {
                 continue;
             }
         }

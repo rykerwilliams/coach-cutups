@@ -18,6 +18,7 @@
 use uuid::Uuid;
 
 use crate::event::{debug_assert_sorted, CommentaryEvent, EventKind};
+use crate::stroke::Stroke;
 use crate::zoom::Zoom;
 
 /// A clip whose recording is running: everything `Project::add_recorded_clip`
@@ -121,6 +122,22 @@ impl RecordingLog {
         self.push(t, EventKind::Zoom(zoom));
         self.last_zoom = zoom;
         self.last_zoom_time = t;
+    }
+
+    /// A stroke that finished at `host_ns`.
+    ///
+    /// `host_ns` is the moment of the stroke's **last** point, not its first:
+    /// replay back-computes the start from the point times, and auto-clear
+    /// counts from here (`stroke_replay`).
+    pub fn stroke(&mut self, host_ns: u64, stroke: Stroke) {
+        let t = self.record_time(host_ns);
+        self.push(t, EventKind::Stroke(stroke));
+    }
+
+    /// The coach wiped every drawing at `host_ns`.
+    pub fn clear_all(&mut self, host_ns: u64) {
+        let t = self.record_time(host_ns);
+        self.push(t, EventKind::ClearAll);
     }
 
     /// The finished log, sorted by record time.
