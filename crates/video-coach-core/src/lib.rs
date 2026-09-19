@@ -12,4 +12,5 @@ pub mod scoreboard_config;
 pub mod store;
 pub mod stroke;
 pub mod tag;
+pub mod timeline;
 pub mod zoom;
