@@ -59,7 +59,11 @@ fn a_single_clip_plans_one_entry() {
 
 #[test]
 fn clips_are_ordered_by_sort_index_not_insertion_order() {
-    let p = project_with(vec![clip("third", 30, &[]), clip("first", 10, &[]), clip("second", 20, &[])]);
+    let p = project_with(vec![
+        clip("third", 30, &[]),
+        clip("first", 10, &[]),
+        clip("second", 20, &[]),
+    ]);
     let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
     let expect: Vec<_> = {
@@ -74,7 +78,11 @@ fn clips_are_ordered_by_sort_index_not_insertion_order() {
 /// `sorted(by:)` is not documented stable; this is a free determinism win.
 #[test]
 fn ties_in_sort_index_resolve_to_insertion_order() {
-    let p = project_with(vec![clip("a", 5, &[]), clip("b", 5, &[]), clip("c", 5, &[])]);
+    let p = project_with(vec![
+        clip("a", 5, &[]),
+        clip("b", 5, &[]),
+        clip("c", 5, &[]),
+    ]);
     let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
     let expect: Vec<_> = p.clips.iter().map(|c| c.id).collect();
@@ -165,11 +173,18 @@ fn total_duration_comes_from_segments_not_recording_duration() {
     c.recording_duration = 5.0;
     // An event beyond the recording's end — a recorder bug, but the plan must
     // stay self-consistent.
-    c.events = vec![CommentaryEvent::new(9.0, EventKind::Pause { source_time: 12.0 })];
+    c.events = vec![CommentaryEvent::new(
+        9.0,
+        EventKind::Pause { source_time: 12.0 },
+    )];
     let p = project_with(vec![c]);
 
     let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
-    let seg_sum: f64 = plan.entries[0].segments.iter().map(|s| s.out_duration).sum();
+    let seg_sum: f64 = plan.entries[0]
+        .segments
+        .iter()
+        .map(|s| s.out_duration)
+        .sum();
 
     assert_eq!(plan.total_duration_seconds, seg_sum);
     assert_ne!(

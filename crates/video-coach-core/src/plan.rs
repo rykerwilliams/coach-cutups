@@ -88,7 +88,12 @@ pub fn compilation_plan(
         let source_duration = source_durations
             .get(&clip.source_index)
             .copied()
-            .or_else(|| project.source_videos.get(clip.source_index).map(|s| s.duration_seconds))
+            .or_else(|| {
+                project
+                    .source_videos
+                    .get(clip.source_index)
+                    .map(|s| s.duration_seconds)
+            })
             .unwrap_or(clip.start_source_seconds + clip.recording_duration);
 
         let segments = playback_segments(clip, source_duration);
@@ -101,5 +106,8 @@ pub fn compilation_plan(
         });
     }
 
-    CompilationPlan { total_duration_seconds: total, entries }
+    CompilationPlan {
+        total_duration_seconds: total,
+        entries,
+    }
 }

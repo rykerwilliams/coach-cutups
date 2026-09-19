@@ -10,6 +10,7 @@ pub mod event;
 pub mod plan;
 pub mod project;
 pub mod scoreboard_config;
+pub mod skip;
 pub mod store;
 pub mod stroke;
 pub mod stroke_replay;
