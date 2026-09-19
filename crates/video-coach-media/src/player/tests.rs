@@ -30,15 +30,11 @@ struct Rig {
 impl Rig {
     fn new() -> Self {
         gst::init().unwrap();
-        let (video, mailbox) = video_sink(SinkKind::System);
-        let audio = gst::ElementFactory::make("fakesink")
-            .property("sync", true)
-            .build()
-            .unwrap();
         let (tx, rx) = mpsc::channel();
-        let player = SourcePlayer::new(video, mailbox.clone(), audio, move |m| {
+        let player = SourcePlayer::new(SinkKind::System, move |m| {
             let _ = tx.send(m);
         });
+        let mailbox = player.mailbox().clone();
         Rig {
             player,
             mailbox,
@@ -366,6 +362,90 @@ fn unload_drops_the_source_and_its_frame_and_nothing_plays() {
 }
 
 #[test]
+fn a_seek_right_after_a_pause_is_not_completed_by_the_pause() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 4, 320, 180);
+    rig.load(&a, 0.0);
+    // Whether the pause's ASYNC_DONE beats the seek's flush is a race, so
+    // several rounds.
+    for target in [2.5, 1.0, 3.0, 0.5] {
+        rig.player.set_playing(true);
+        rig.drain(Duration::from_millis(150));
+
+        // Nothing drained in between: the pause's own ASYNC_DONE is still
+        // to come when the seek is requested.
+        rig.player.set_playing(false);
+        rig.seek(&a, target, true, Origin::Skip);
+        assert_eq!(rig.player.target_secs(), Some(target));
+        rig.wait_done(Origin::Skip);
+
+        let position = rig.player.position_handle().query_position();
+        assert!(
+            position.is_some_and(|p| (p - target).abs() < FRAME),
+            "position {position:?} for target {target}"
+        );
+        assert_lands(rig.frame().0, target);
+        assert!(rig.player.is_idle());
+        assert_eq!(rig.player.target_secs(), None);
+    }
+    let late = rig.drain(Duration::from_millis(300));
+    assert!(late.is_empty(), "{late:?}");
+}
+
+#[test]
+fn a_seek_while_playing_completes_and_playback_continues() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 4, 320, 180);
+    rig.load(&a, 0.0);
+    rig.player.set_playing(true);
+    rig.drain(Duration::from_millis(200));
+
+    rig.seek(&a, 1.0, true, Origin::Skip);
+    rig.wait_done(Origin::Skip);
+    rig.drain(Duration::from_millis(400));
+    let position = rig.player.position_handle().query_position().unwrap();
+    assert!(position > 1.2, "playback stalled at {position}");
+    assert_eq!(rig.player.pipeline.current_state(), gst::State::Playing);
+
+    // Not wedged: the next request is issued at once and completes.
+    assert!(rig.player.is_idle());
+    rig.seek(&a, 0.5, true, Origin::Scrub);
+    rig.wait_done(Origin::Scrub);
+}
+
+#[test]
+fn clear_during_a_seek_settles_before_the_next_request() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 2, 320, 180);
+    rig.load(&a, 0.0);
+
+    for (dropped, target) in [(1.0, 1.5), (0.2, 0.8), (1.8, 0.4)] {
+        rig.seek(&a, dropped, true, Origin::Scrub);
+        rig.player.clear();
+        assert!(matches!(rig.player.flight, Flight::Settling));
+        assert_eq!(rig.player.target_secs(), None);
+        assert!(rig.player.holds(&a), "clear keeps a landed source");
+
+        // Waits for the dropped seek's ASYNC_DONE, then is issued.
+        assert!(rig.seek(&a, target, true, Origin::Skip).is_empty());
+        assert_eq!(rig.player.target_secs(), Some(target));
+        rig.wait_done(Origin::Skip);
+        assert_lands(rig.frame().0, target);
+    }
+
+    // The dropped seek was never reported.
+    assert!(
+        !rig.log.contains(&PlayerEvent::SeekDone {
+            origin: Origin::Scrub
+        }),
+        "{:?}",
+        rig.log
+    );
+    let late = rig.drain(Duration::from_millis(300));
+    assert!(late.is_empty(), "{late:?}");
+}
+
+#[test]
 fn volume_is_the_cube_of_the_slider() {
     let rig = Rig::new();
     let volume = || rig.player.pipeline.property::<f64>("volume");
@@ -386,9 +466,7 @@ fn a_gl_sink_holds_the_pipeline_in_null_until_the_context_arrives() {
         eprintln!("skipped: glupload is not installed (gstreamer1.0-gl)");
         return;
     }
-    let (video, mailbox) = video_sink(SinkKind::Gl);
-    let audio = gst::ElementFactory::make("fakesink").build().unwrap();
-    let mut player = SourcePlayer::new(video, mailbox, audio, |_| {});
+    let mut player = SourcePlayer::new(SinkKind::Gl, |_| {});
     let dir = tempfile::tempdir().unwrap();
     let a = uri(&fixtures::webm(dir.path(), "a.webm", 1, 320, 180, 30, 15));
 

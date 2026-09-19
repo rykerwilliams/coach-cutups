@@ -337,6 +337,27 @@ fn write_creates_the_recordings_directory() {
 }
 
 #[test]
+fn write_into_a_missing_folder_fails_and_creates_nothing() {
+    let dir = TempDir::new().unwrap();
+    let gone = dir.path().join("gone");
+    let mut p = sample_project();
+    match store::write(&gone, &mut p) {
+        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+    assert!(!gone.exists(), "the project folder was recreated");
+}
+
+#[test]
+fn write_tolerates_an_existing_recordings_directory() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("recordings")).unwrap();
+    let mut p = sample_project();
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(store::read(dir.path()).unwrap(), p);
+}
+
+#[test]
 fn second_write_does_not_corrupt_the_file() {
     let dir = TempDir::new().unwrap();
     let mut p = sample_project();

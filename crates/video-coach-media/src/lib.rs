@@ -9,7 +9,6 @@ pub mod player;
 pub mod probe;
 
 pub use player::{
-    video_sink, Diagnostics, Frame, FrameMailbox, Origin, PlayerEvent, PositionHandle, SinkKind,
-    SourcePlayer,
+    Diagnostics, Frame, FrameMailbox, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
 };
-pub use probe::{check_orientation, probe, Probe, ProbeError};
+pub use probe::{probe, Probe, ProbeError};

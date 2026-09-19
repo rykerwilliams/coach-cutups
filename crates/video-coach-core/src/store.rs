@@ -138,13 +138,21 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
 
 /// Write the project into `project_dir`, creating `recordings/` if needed.
 ///
+/// `project_dir` must already exist. Only the leaf `recordings/` is created,
+/// never its parents, so a save into a deleted or unmounted project folder
+/// fails with `NotFound` rather than quietly recreating the folder (on the
+/// mount point, for an unmounted drive).
+///
 /// Stamps `format_version` to current, and writes atomically — an interrupted
 /// save must not leave a truncated `project.json`, since that is the file the
 /// refuse-to-overwrite rule keys on.
 pub fn write(project_dir: &Path, project: &mut Project) -> Result<(), StoreError> {
     project.format_version = CURRENT_FORMAT_VERSION;
 
-    std::fs::create_dir_all(project_dir.join(RECORDINGS_DIRNAME))?;
+    match std::fs::create_dir(project_dir.join(RECORDINGS_DIRNAME)) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+        _ => {}
+    }
 
     let mut text =
         serde_json::to_string_pretty(project).map_err(|e| StoreError::Malformed(e.to_string()))?;

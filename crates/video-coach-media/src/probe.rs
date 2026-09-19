@@ -99,7 +99,7 @@ pub fn probe(path: &Path) -> Result<Probe, ProbeError> {
 /// or `rotate-0`. Anything else — `rotate-90`, `flip-rotate-0`, a value this
 /// code has never seen — is refused, because the display path applies none of
 /// them.
-pub fn check_orientation(tag: Option<&str>) -> Result<(), ProbeError> {
+fn check_orientation(tag: Option<&str>) -> Result<(), ProbeError> {
     match tag {
         None | Some("rotate-0") => Ok(()),
         Some(other) => Err(ProbeError::Rotated(other.to_owned())),

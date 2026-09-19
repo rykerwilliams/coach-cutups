@@ -8,14 +8,17 @@ use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
 
-/// Which video sink [`video_sink`] builds.
+/// Which sinks a [`SourcePlayer`](super::SourcePlayer) builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkKind {
-    /// `glupload ! glcolorconvert ! appsink` with GL-memory RGBA 2D caps: the
-    /// zero-copy display path. A player built with it stays in NULL until
+    /// Production. Video is `glupload ! glcolorconvert ! appsink` with
+    /// GL-memory RGBA 2D caps, the zero-copy display path; audio is
+    /// `autoaudiosink`. A player built with it stays in NULL until
     /// [`SourcePlayer::set_gl_context`](super::SourcePlayer::set_gl_context).
     Gl,
-    /// A system-memory `appsink`, for headless tests: no GL, no display.
+    /// Headless tests. Video is a system-memory `appsink` (no GL, no
+    /// display); audio is `fakesink sync=true`, so playback still runs in real
+    /// time without a sound device.
     System,
 }
 
@@ -69,12 +72,20 @@ impl FrameMailbox {
     }
 }
 
-/// Builds the video sink to inject into [`SourcePlayer::new`](super::SourcePlayer::new),
-/// and the mailbox it delivers frames to.
+/// A built video sink and the handles the player keeps into it.
+pub(super) struct VideoSink {
+    pub element: gst::Element,
+    pub mailbox: FrameMailbox,
+    /// `glupload` inside a [`SinkKind::Gl`] sink; `None` for
+    /// [`SinkKind::System`].
+    pub glupload: Option<gst::Element>,
+}
+
+/// Builds the video sink for `kind`, and the mailbox it delivers frames to.
 ///
 /// Every sample is pulled, so the sink always reaches EOS (an appsink whose
 /// samples are never pulled never posts it).
-pub fn video_sink(kind: SinkKind) -> (gst::Element, FrameMailbox) {
+pub(super) fn video_sink(kind: SinkKind) -> VideoSink {
     let mailbox = FrameMailbox::default();
     let appsink = gst_app::AppSink::builder()
         .caps(&match kind {
@@ -92,16 +103,37 @@ pub fn video_sink(kind: SinkKind) -> (gst::Element, FrameMailbox) {
         .build();
     install_callbacks(&appsink, mailbox.clone());
 
-    let element = match kind {
-        SinkKind::System => appsink.upcast(),
-        SinkKind::Gl => gl_bin(&appsink),
+    match kind {
+        SinkKind::System => VideoSink {
+            element: appsink.upcast(),
+            mailbox,
+            glupload: None,
+        },
+        SinkKind::Gl => {
+            let (element, glupload) = gl_bin(&appsink);
+            VideoSink {
+                element,
+                mailbox,
+                glupload: Some(glupload),
+            }
+        }
+    }
+}
+
+/// The audio sink that goes with `kind` (see [`SinkKind`]).
+pub(super) fn audio_sink(kind: SinkKind) -> gst::Element {
+    let builder = match kind {
+        SinkKind::Gl => gst::ElementFactory::make("autoaudiosink"),
+        SinkKind::System => gst::ElementFactory::make("fakesink").property("sync", true),
     };
-    (element, mailbox)
+    builder
+        .build()
+        .expect("audio sink is missing (gst-plugins-base/good)")
 }
 
 /// `glupload ! glcolorconvert ! appsink` as one bin, ghosting `glupload`'s
-/// sink pad (spec D1).
-fn gl_bin(appsink: &gst_app::AppSink) -> gst::Element {
+/// sink pad (spec D1). Returns the bin and its `glupload`.
+fn gl_bin(appsink: &gst_app::AppSink) -> (gst::Element, gst::Element) {
     let make = |name: &str| {
         gst::ElementFactory::make(name)
             .build()
@@ -116,7 +148,7 @@ fn gl_bin(appsink: &gst_app::AppSink) -> gst::Element {
     let pad = upload.static_pad("sink").expect("glupload has a sink pad");
     bin.add_pad(&gst::GhostPad::with_target(&pad).expect("ghost glupload sink"))
         .expect("add ghost pad");
-    bin.upcast()
+    (bin.upcast(), upload)
 }
 
 fn install_callbacks(appsink: &gst_app::AppSink, mailbox: FrameMailbox) {

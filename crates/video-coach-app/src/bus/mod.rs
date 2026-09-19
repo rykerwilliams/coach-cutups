@@ -23,9 +23,7 @@ use gstreamer_gl as gst_gl;
 use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
-use video_coach_media::{
-    video_sink, FrameMailbox, PositionHandle, ProbeError, SinkKind, SourcePlayer,
-};
+use video_coach_media::{FrameMailbox, PositionHandle, ProbeError, SinkKind, SourcePlayer};
 
 pub use state::StateFile;
 
@@ -240,8 +238,7 @@ impl Bus {
     ) -> BusHandle {
         gst::init().expect("GStreamer failed to initialize");
         let (tx, rx) = mpsc::channel();
-        let (video, mailbox) = video_sink(sinks);
-        let player = SourcePlayer::new(video, mailbox.clone(), audio_sink(sinks), {
+        let player = SourcePlayer::new(sinks, {
             let tx = tx.clone();
             move |msg| {
                 // Fails only once the bus thread has exited.
@@ -249,6 +246,7 @@ impl Bus {
             }
         });
         let position = player.position_handle();
+        let mailbox = player.mailbox().clone();
         let bus = Bus {
             events,
             player,
@@ -337,17 +335,6 @@ impl Bus {
     fn emit(&self, event: Event) {
         (self.events)(event);
     }
-}
-
-/// The audio sink that goes with a video sink kind (see [`Bus::spawn`]).
-fn audio_sink(kind: SinkKind) -> gst::Element {
-    let builder = match kind {
-        SinkKind::Gl => gst::ElementFactory::make("autoaudiosink"),
-        SinkKind::System => gst::ElementFactory::make("fakesink").property("sync", true),
-    };
-    builder
-        .build()
-        .expect("audio sink is missing (gst-plugins-base/good)")
 }
 
 /// The UI's side of the bus. Dropping it shuts the bus down and waits for it.

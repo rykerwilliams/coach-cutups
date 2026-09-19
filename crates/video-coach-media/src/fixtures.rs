@@ -7,7 +7,7 @@
 //!
 //! These are test helpers, so they **panic** on any failure — a pipeline that
 //! fails to build, posts an `ERROR`, or does not reach EOS within
-//! [`TIMEOUT`]. A fixture that silently came out short would make every
+//! `TIMEOUT`. A fixture that silently came out short would make every
 //! assertion built on it meaningless.
 
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 /// How long a fixture pipeline may run before it is declared hung.
-pub const TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(30);
+const TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(30);
 
 /// Audio sample rate for fixtures that carry audio.
 const AUDIO_RATE: u32 = 44_100;

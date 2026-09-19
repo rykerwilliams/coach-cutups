@@ -11,6 +11,12 @@
 //! **Why a slot.** `ASYNC_DONE` carries no seek seqnum, so the only way to know
 //! which seek finished is to have one in flight. A request made while one is
 //! in flight waits in `pending`, where a newer request replaces it.
+//!
+//! **Why `Settling`.** A pause (PLAYING → PAUSED) prerolls and posts an
+//! `ASYNC_DONE` of its own. Were a seek issued right behind it, that
+//! `ASYNC_DONE` would complete the seek before it landed. So a pause that goes
+//! async occupies the slot until its `ASYNC_DONE` arrives, and a request made
+//! meanwhile waits in `pending` like any other.
 
 mod sink;
 #[cfg(test)]
@@ -23,7 +29,7 @@ use gstreamer::prelude::*;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
 
-pub use sink::{video_sink, Frame, FrameMailbox, SinkKind};
+pub use sink::{Frame, FrameMailbox, SinkKind};
 
 /// Who asked for a seek. Reported back on completion, displacement and
 /// failure, so the bus can tell a skip's outcome from a scrub's.
@@ -109,6 +115,10 @@ enum Flight {
     Loading(Request),
     /// Seek issued; the next `ASYNC_DONE` completes it.
     Seeking(Request),
+    /// An `ASYNC_DONE` that answers no request is on its way — from a pause
+    /// that went async, or from a seek [`SourcePlayer::clear`] dropped. It is
+    /// absorbed, and reports nothing.
+    Settling,
 }
 
 /// `playbin3` flags: video | audio | soft-volume | native-video (spec D1).
@@ -132,26 +142,16 @@ pub struct SourcePlayer {
 }
 
 impl SourcePlayer {
-    /// Creates the `playbin3` with the injected sinks, in NULL. `mailbox` is
-    /// the one [`video_sink`] returned with `video_sink`.
+    /// Creates the `playbin3` with the sinks `kind` names, in NULL. Frames
+    /// arrive in [`SourcePlayer::mailbox`].
     ///
     /// `on_message` receives every bus message except GL context requests,
     /// which are answered here. It is called on GStreamer's threads.
-    pub fn new(
-        video_sink: gst::Element,
-        mailbox: FrameMailbox,
-        audio_sink: gst::Element,
-        on_message: impl Fn(gst::Message) + Send + Sync + 'static,
-    ) -> Self {
-        let glupload = video_sink.downcast_ref::<gst::Bin>().and_then(|bin| {
-            bin.iterate_elements()
-                .into_iter()
-                .flatten()
-                .find(|e| e.factory().is_some_and(|f| f.name().as_str() == "glupload"))
-        });
+    pub fn new(kind: SinkKind, on_message: impl Fn(gst::Message) + Send + Sync + 'static) -> Self {
+        let video = sink::video_sink(kind);
         let pipeline = gst::ElementFactory::make("playbin3")
-            .property("video-sink", &video_sink)
-            .property("audio-sink", &audio_sink)
+            .property("video-sink", &video.element)
+            .property("audio-sink", sink::audio_sink(kind))
             .build()
             .expect("playbin3 is missing (gst-plugins-base)")
             .downcast::<gst::Pipeline>()
@@ -175,9 +175,9 @@ impl SourcePlayer {
 
         SourcePlayer {
             pipeline,
-            glupload,
+            glupload: video.glupload,
             gl_slot,
-            mailbox,
+            mailbox: video.mailbox,
             flight: Flight::Idle,
             pending: None,
             loaded_uri: None,
@@ -220,7 +220,7 @@ impl SourcePlayer {
             origin,
         };
         let mut events = Vec::new();
-        if self.busy() {
+        if !self.is_idle() {
             if let Some(displaced) = self.pending.replace(request) {
                 events.push(PlayerEvent::SeekDisplaced {
                     origin: displaced.origin,
@@ -236,18 +236,26 @@ impl SourcePlayer {
     /// so a load never flashes its first frame by playing early.
     pub fn set_playing(&mut self, playing: bool) {
         self.want_playing = playing;
-        if !self.busy() {
+        if self.is_idle() {
             self.apply_playing();
         }
     }
 
-    /// Drops the flight and the pending request. The pipeline keeps its
-    /// source unless a load was cut short.
+    /// Drops the flight and the pending request: neither is reported again.
+    /// The pipeline keeps its source unless a load was cut short. A dropped
+    /// seek's `ASYNC_DONE` is still coming, so the slot settles on it before
+    /// issuing the next request.
     pub fn clear(&mut self) {
-        if matches!(self.flight, Flight::Loading(_)) {
-            self.loaded_uri = None;
-        }
-        self.flight = Flight::Idle;
+        self.flight = match std::mem::replace(&mut self.flight, Flight::Idle) {
+            Flight::Loading(_) => {
+                // Reloaded by the next request; a stale ASYNC_DONE is
+                // filtered by the `Loading` arm.
+                self.loaded_uri = None;
+                Flight::Idle
+            }
+            Flight::Seeking(_) | Flight::Settling => Flight::Settling,
+            Flight::Idle => Flight::Idle,
+        };
         self.pending = None;
     }
 
@@ -262,9 +270,7 @@ impl SourcePlayer {
             // and can't refill the mailbox once this returns.
             let _ = self.pipeline.set_state(gst::State::Ready);
         }
-        self.flight = Flight::Idle;
-        self.pending = None;
-        self.loaded_uri = None;
+        self.reset();
         self.mailbox.take();
     }
 
@@ -277,6 +283,40 @@ impl SourcePlayer {
             0.0
         };
         self.pipeline.set_property("volume", x.powi(3));
+    }
+
+    /// Where the video sink delivers frames. Clone it to hand to the drawing
+    /// thread.
+    pub fn mailbox(&self) -> &FrameMailbox {
+        &self.mailbox
+    }
+
+    /// The source time the slot is heading for: the pending request's, else
+    /// the in-flight one's. `None` once it has landed (or with nothing
+    /// requested).
+    pub fn target_secs(&self) -> Option<f64> {
+        match (&self.pending, &self.flight) {
+            (Some(request), _) => Some(request.secs),
+            (None, Flight::Loading(request) | Flight::Seeking(request)) => Some(request.secs),
+            (None, Flight::Idle | Flight::Settling) => None,
+        }
+    }
+
+    /// Whether the pipeline holds `uri` (loaded, or loading), so a request for
+    /// it seeks rather than reloads.
+    pub fn holds(&self, uri: &str) -> bool {
+        self.loaded_uri.as_deref() == Some(uri)
+    }
+
+    /// The `uri` the pipeline holds, for logging.
+    pub fn loaded_uri(&self) -> Option<&str> {
+        self.loaded_uri.as_deref()
+    }
+
+    /// No flight is busy, so no request is pending either: a request now is
+    /// issued at once.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.flight, Flight::Idle)
     }
 
     pub fn position_handle(&self) -> PositionHandle {
@@ -311,19 +351,20 @@ impl SourcePlayer {
                             self.flight = Flight::Loading(request);
                         }
                     }
-                    Flight::Seeking(request) => self.finish(
-                        PlayerEvent::SeekDone {
+                    Flight::Seeking(request) => {
+                        events.push(PlayerEvent::SeekDone {
                             origin: request.origin,
-                        },
-                        &mut events,
-                    ),
+                        });
+                        self.advance(&mut events);
+                    }
+                    Flight::Settling => self.advance(&mut events),
                 }
             }
-            gst::MessageView::Eos(_) if !self.busy() => events.push(PlayerEvent::Eos),
+            gst::MessageView::Eos(_) if self.is_idle() => events.push(PlayerEvent::Eos),
             gst::MessageView::Error(err) => {
-                self.flight = Flight::Idle;
-                self.pending = None;
-                self.loaded_uri = None;
+                // Unlike `clear`, nothing is left to settle on: the error
+                // ends whatever transition was under way.
+                self.reset();
                 events.push(PlayerEvent::Error(format!(
                     "{} (from {}; {})",
                     err.error(),
@@ -338,8 +379,11 @@ impl SourcePlayer {
         events
     }
 
-    fn busy(&self) -> bool {
-        !matches!(self.flight, Flight::Idle)
+    /// Forgets the flight, the pending request and the loaded source.
+    fn reset(&mut self) {
+        self.flight = Flight::Idle;
+        self.pending = None;
+        self.loaded_uri = None;
     }
 
     /// With a GL sink, nothing may preroll before the UI's context arrives:
@@ -372,12 +416,10 @@ impl SourcePlayer {
         if self.pipeline.set_state(gst::State::Paused).is_err() {
             if let Flight::Loading(request) = std::mem::replace(&mut self.flight, Flight::Idle) {
                 self.loaded_uri = None;
-                self.finish(
-                    PlayerEvent::SeekFailed {
-                        origin: request.origin,
-                    },
-                    events,
-                );
+                events.push(PlayerEvent::SeekFailed {
+                    origin: request.origin,
+                });
+                self.advance(events);
             }
         }
     }
@@ -396,26 +438,31 @@ impl SourcePlayer {
         match self.pipeline.seek_simple(flags, position) {
             Ok(()) => self.flight = Flight::Seeking(request),
             Err(_) => {
-                self.flight = Flight::Idle;
-                self.finish(PlayerEvent::SeekFailed { origin }, events);
+                events.push(PlayerEvent::SeekFailed { origin });
+                self.advance(events);
             }
         }
     }
 
-    /// Completes the current flight with `event`, then issues the pending
-    /// request, or applies `want_playing` if there is none.
-    fn finish(&mut self, event: PlayerEvent, events: &mut Vec<PlayerEvent>) {
+    /// Frees the slot, then issues the pending request, or applies
+    /// `want_playing` if there is none.
+    fn advance(&mut self, events: &mut Vec<PlayerEvent>) {
         self.flight = Flight::Idle;
-        events.push(event);
         match self.pending.take() {
             Some(next) => self.issue(next, events),
             None => self.apply_playing(),
         }
     }
 
-    /// Nothing is played (or paused) with no source loaded: the pipeline
-    /// stays where `unload` or a failed load left it.
-    fn apply_playing(&self) {
+    /// Called with the slot idle. Nothing is played (or paused) with no
+    /// source loaded: the pipeline stays where `unload` or a failed load left
+    /// it.
+    ///
+    /// A pause that goes async posts an `ASYNC_DONE`, so the slot settles on
+    /// it (see the module docs). Only a pause: going to PLAYING can return
+    /// async too, but posts no `ASYNC_DONE`, and waiting for one would wedge
+    /// the slot.
+    fn apply_playing(&mut self) {
         if self.loaded_uri.is_none() || self.gl_gated() {
             return;
         }
@@ -424,8 +471,12 @@ impl SourcePlayer {
         } else {
             gst::State::Paused
         };
-        if self.pipeline.current_state() != target {
-            let _ = self.pipeline.set_state(target);
+        if self.pipeline.current_state() == target {
+            return;
+        }
+        let change = self.pipeline.set_state(target);
+        if target == gst::State::Paused && change == Ok(gst::StateChangeSuccess::Async) {
+            self.flight = Flight::Settling;
         }
     }
 
