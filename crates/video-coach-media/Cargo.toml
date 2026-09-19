@@ -8,7 +8,10 @@ repository.workspace = true
 
 [dependencies]
 gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-gl.workspace = true
 gstreamer-pbutils.workspace = true
+gstreamer-video.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

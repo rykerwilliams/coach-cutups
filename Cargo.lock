@@ -4628,7 +4628,10 @@ name = "video-coach-media"
 version = "0.1.0"
 dependencies = [
  "gstreamer",
+ "gstreamer-app",
+ "gstreamer-gl",
  "gstreamer-pbutils",
+ "gstreamer-video",
  "tempfile",
  "thiserror 2.0.20",
 ]
