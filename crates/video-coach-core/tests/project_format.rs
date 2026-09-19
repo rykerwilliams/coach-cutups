@@ -7,7 +7,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::scoreboard_config::{
+    MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
+};
 use video_coach_core::store::{self, StoreError, CURRENT_FORMAT_VERSION};
+use video_coach_core::stroke::Rgba;
 
 fn sample_clip() -> Clip {
     Clip {
@@ -35,6 +39,36 @@ fn sample_project() -> Project {
         duration_seconds: 2700.0,
     });
     p.clips.push(sample_clip());
+    p.scoreboard = Some(ScoreboardConfig {
+        home: TeamConfig::new(
+            "Rovers",
+            Rgba::RED,
+            Rgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ),
+        away: TeamConfig::new(
+            "United",
+            Rgba::RED,
+            Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        ),
+        format: MatchFormat::default(),
+    });
+    p.match_events.push(MatchEventRecord {
+        id: Uuid::nil(),
+        kind: MatchEventKind::StartStop,
+        source_index: 0,
+        source_seconds: 0.0,
+        is_auto_back_anchor: false,
+    });
     p
 }
 
@@ -91,6 +125,45 @@ fn missing_clips_is_an_error_not_an_empty_project() {
 }
 
 // ----------------------------------------------------------- version guard
+
+/// On-disk enum spellings. Nothing else pins them, and a rename would make
+/// every existing project unreadable.
+#[test]
+fn resolution_and_quality_have_the_expected_wire_spellings() {
+    assert_eq!(
+        serde_json::to_string(&Resolution::R720).unwrap(),
+        r#""r720""#
+    );
+    assert_eq!(
+        serde_json::to_string(&Resolution::R1080).unwrap(),
+        r#""r1080""#
+    );
+    assert_eq!(
+        serde_json::to_string(&Resolution::R2160).unwrap(),
+        r#""r2160""#
+    );
+    assert_eq!(serde_json::to_string(&Quality::Low).unwrap(), r#""low""#);
+    assert_eq!(
+        serde_json::to_string(&Quality::Medium).unwrap(),
+        r#""medium""#
+    );
+    assert_eq!(serde_json::to_string(&Quality::High).unwrap(), r#""high""#);
+}
+
+/// A JSON document whose root is not an object is not a project at all, and
+/// must not be reported as a macOS-era file — `Value::get` returns None for a
+/// non-object, which the absent-key rule would otherwise read as v1.
+#[test]
+fn a_non_object_root_is_malformed_not_legacy() {
+    for body in ["[]", "\"hello\"", "42", "null"] {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("project.json"), body).unwrap();
+        match store::read(dir.path()) {
+            Err(StoreError::Malformed(_)) => {}
+            other => panic!("root {body}: expected Malformed, got {other:?}"),
+        }
+    }
+}
 
 #[test]
 fn round_trips_through_the_store() {

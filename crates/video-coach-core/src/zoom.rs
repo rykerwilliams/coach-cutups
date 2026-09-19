@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 /// the viewport. The visible centre is the normalized source point
 /// `(0.5 + pan_x, 0.5 + pan_y)`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Zoom {
     pub scale: f64,
     pub pan_x: f64,
@@ -95,8 +96,17 @@ impl Zoom {
     /// exactly 1. At `pan = ±(s−1)/(2s)` the visible window's edge lands
     /// exactly on the source edge, which is what lets the compositor treat
     /// zoom as a plain crop with no edge handling.
+    #[allow(
+        clippy::manual_clamp,
+        reason = "clamp() panics when a bound is NaN; min/max degrade like Swift's"
+    )]
     pub fn clamped(self) -> Zoom {
-        let s = self.scale.clamp(1.0, 10.0);
+        // `f64::min`/`max` rather than `clamp`: `clamp` asserts `min <= max` and
+        // so PANICS on a NaN scale (NaN.clamp gives NaN, the `<= 1.0` guard is
+        // then false, and `pan.clamp(-NaN, NaN)` trips the assertion). These
+        // return the non-NaN operand, which is bit-identical to the Swift
+        // original for every input including NaN.
+        let s = self.scale.min(10.0).max(1.0);
         if s <= 1.0 {
             return Zoom::IDENTITY;
         }
@@ -156,8 +166,12 @@ impl Zoom {
     ///
     /// `content_x` / `content_y` carry the same meaning as in
     /// [`Zoom::source_point`].
+    #[allow(
+        clippy::manual_clamp,
+        reason = "clamp() panics when a bound is NaN; min/max degrade like Swift's"
+    )]
     pub fn zoomed_to_cursor(self, new_scale: f64, content_x: f64, content_y: f64) -> Zoom {
-        let s2 = new_scale.clamp(1.0, 10.0);
+        let s2 = new_scale.min(10.0).max(1.0); // NaN-safe; see `clamped`
         if s2 <= 1.0 {
             return Zoom::IDENTITY;
         }
@@ -215,6 +229,8 @@ impl Zoom {
 /// must be sorted.
 pub fn zoom_at(events: &[crate::event::CommentaryEvent], record_time: f64) -> Zoom {
     use crate::event::EventKind;
+
+    crate::event::debug_assert_sorted(events);
 
     let mut prev: Option<(f64, Zoom)> = None;
     let mut next: Option<(f64, Zoom)> = None;

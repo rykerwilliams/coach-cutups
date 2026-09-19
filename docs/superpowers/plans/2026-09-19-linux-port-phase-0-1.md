@@ -268,7 +268,7 @@ pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegme
 **Clamping — state the placement, because it changes the answer.** Clamp at **each mutation**, mirroring `playback_segments`, not once on the returned value:
 
 - `.skip` → clamp the cursor to `[0, source_duration]` (`PlaybackTimeline.swift:130`)
-- `.play`/`.pause` anchors → **not clamped**, matching the Swift builder
+- `.play`/`.pause` anchors → **clamped** (revised after code review; the plan originally said "not clamped, matching Swift"). Leaving them raw let a negative anchor hand the decoder `source_start: -5.0` and put the two functions 5 seconds apart, falsifying the module's own "exactly everywhere else" claim. Clamping changes nothing for an in-range anchor or one past the end.
 - the trailing rate integration → clamped to `[0, source_duration]`
 
 An end-of-function clamp diverges: with duration 1000, `skip(+1e6)` then `skip(-10)` gives 990 from the segment walk and 1000 from a return-value clamp.
@@ -352,8 +352,7 @@ pub struct PlanEntry { pub clip_id: Uuid, pub segments: Vec<PlaybackSegment>, pu
 pub struct CompilationPlan { pub total_duration_seconds: f64, pub entries: Vec<PlanEntry> }
 
 pub enum ExportTarget { AllClips, Tag(String) }
-pub fn compilation_plan(project: &Project, target: &ExportTarget,
-                        source_durations: &HashMap<usize, f64>) -> CompilationPlan;
+pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan;
 ```
 
 **`composition_start` is deleted, not documented.** Across the whole Swift tree it has exactly one non-constructor read — `CompilationExporter.swift:377`, as a fallback at precisely the site the spec forbids using it. A field whose doc comment says "do not use this for the thing it looks like" should not exist; Phase 8's flat segment list is the authoritative cumulative walk. **`index_in_output` is deleted too** — it is just the entry's index in `entries`, used as a dictionary key and for `"i+1 / N"` display.
@@ -362,7 +361,7 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget,
 
 Clips are filtered by target, ordered by `sort_index` via **`sort_by_key`** (stable, so ties resolve to insertion order — Swift's `sorted(by:)` is not documented stable, so this is a free determinism improvement worth stating as an invariant and testing).
 
-**Duration authority.** `SourceRef.duration_seconds` is the single authority, and Phase 2's `gst_discoverer` probe **writes it back** into the project on add and relink. The `source_durations` map parameter exists only for the missing-source fallback and for tests. Otherwise preview clamping against the persisted value and export clamping against a probed value give different clock readings at EOF for the same clip — the exact bug class the spec's golden rule exists to kill. The fallback when a source is missing stays `start_source_seconds + recording_duration`.
+**Duration authority.** `SourceRef.duration_seconds` is the single authority, and Phase 2's `gst_discoverer` probe **writes it back** into the project on add and relink. The `source_durations` map parameter was **dropped after code review**: as implemented it took precedence over `SourceRef`, inverting the rule stated two lines above it in its own doc comment, and a test enshrined the inverted precedence. There is nothing for it to do that writing the probed value into `SourceRef` does not do better. Otherwise preview clamping against the persisted value and export clamping against a probed value give different clock readings at EOF for the same clip — the exact bug class the spec's golden rule exists to kill. The fallback when a source is missing stays `start_source_seconds + recording_duration`.
 
 `ExportTarget` replaces macOS's `"__all-clips__"` sentinel compared in five places, and collapses two near-duplicate entry points into one function — strictly less code than it replaces.
 

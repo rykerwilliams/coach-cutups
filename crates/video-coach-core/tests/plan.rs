@@ -1,7 +1,5 @@
 //! Compilation planning: target filtering, ordering, and duration accounting.
 
-use std::collections::HashMap;
-
 use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
@@ -37,14 +35,10 @@ fn project_with(clips: Vec<Clip>) -> Project {
     p
 }
 
-fn no_overrides() -> HashMap<usize, f64> {
-    HashMap::new()
-}
-
 #[test]
 fn an_empty_project_plans_nothing() {
     let p = project_with(vec![]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert!(plan.entries.is_empty());
     assert_eq!(plan.total_duration_seconds, 0.0);
 }
@@ -52,7 +46,7 @@ fn an_empty_project_plans_nothing() {
 #[test]
 fn a_single_clip_plans_one_entry() {
     let p = project_with(vec![clip("a", 0, &["shot"])]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert_eq!(plan.entries.len(), 1);
     assert_eq!(plan.total_duration_seconds, 5.0);
 }
@@ -64,7 +58,7 @@ fn clips_are_ordered_by_sort_index_not_insertion_order() {
         clip("first", 10, &[]),
         clip("second", 20, &[]),
     ]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
     let expect: Vec<_> = {
         let mut c = p.clips.clone();
@@ -83,7 +77,7 @@ fn ties_in_sort_index_resolve_to_insertion_order() {
         clip("b", 5, &[]),
         clip("c", 5, &[]),
     ]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
     let expect: Vec<_> = p.clips.iter().map(|c| c.id).collect();
     assert_eq!(ids, expect);
@@ -96,7 +90,7 @@ fn a_tag_target_selects_only_matching_clips() {
         clip("b", 1, &["transition"]),
         clip("c", 2, &["set piece"]),
     ]);
-    let plan = compilation_plan(&p, &ExportTarget::Tag("transition".into()), &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::Tag("transition".into()));
     assert_eq!(plan.entries.len(), 2);
     assert_eq!(plan.total_duration_seconds, 10.0);
 }
@@ -104,14 +98,14 @@ fn a_tag_target_selects_only_matching_clips() {
 #[test]
 fn a_tag_matching_nothing_plans_nothing() {
     let p = project_with(vec![clip("a", 0, &["shot"])]);
-    let plan = compilation_plan(&p, &ExportTarget::Tag("nope".into()), &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::Tag("nope".into()));
     assert!(plan.entries.is_empty());
 }
 
 #[test]
 fn all_clips_ignores_tags_entirely() {
     let p = project_with(vec![clip("a", 0, &[]), clip("b", 1, &["shot"])]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert_eq!(plan.entries.len(), 2);
 }
 
@@ -122,7 +116,7 @@ fn source_duration_comes_from_the_project_by_default() {
     c.start_source_seconds = 995.0;
     c.recording_duration = 20.0;
     let p = project_with(vec![c]); // source is 1000s long
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
 
     // Only 5s of source remains, so it plays 5s then freezes for 15s.
     let segs = &plan.entries[0].segments;
@@ -138,7 +132,7 @@ fn a_missing_source_falls_back_to_a_covering_duration() {
     let mut c = clip("a", 0, &[]);
     c.source_index = 7; // no such source
     let p = project_with(vec![c]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
 
     // start 10 + duration 5 = 15 of covering source, so the whole clip plays.
     let segs = &plan.entries[0].segments;
@@ -147,17 +141,18 @@ fn a_missing_source_falls_back_to_a_covering_duration() {
     assert_eq!(plan.total_duration_seconds, 5.0);
 }
 
+/// The duration comes from `SourceRef` and nowhere else. An earlier draft took
+/// a map of probed durations that took precedence over it, which is exactly the
+/// two-duration-sources disagreement the design exists to prevent.
 #[test]
-fn an_explicit_override_wins_over_the_project_value() {
+fn a_shorter_source_truncates_the_clip() {
     let mut c = clip("a", 0, &[]);
     c.start_source_seconds = 0.0;
     c.recording_duration = 20.0;
-    let p = project_with(vec![c]);
+    let mut p = project_with(vec![c]);
+    p.source_videos[0].duration_seconds = 8.0;
 
-    let mut overrides = HashMap::new();
-    overrides.insert(0usize, 8.0); // pretend the real file is only 8s
-
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &overrides);
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let segs = &plan.entries[0].segments;
     assert_eq!(segs[0].out_duration, 8.0, "plays the available 8s");
     assert_eq!(segs[1].out_duration, 12.0, "then freezes for the rest");
@@ -179,7 +174,7 @@ fn total_duration_comes_from_segments_not_recording_duration() {
     )];
     let p = project_with(vec![c]);
 
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let seg_sum: f64 = plan.entries[0]
         .segments
         .iter()
@@ -198,7 +193,7 @@ fn entries_carry_their_clip_id_and_recording_duration() {
     let c = clip("a", 0, &[]);
     let id = c.id;
     let p = project_with(vec![c]);
-    let plan = compilation_plan(&p, &ExportTarget::AllClips, &no_overrides());
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert_eq!(plan.entries[0].clip_id, id);
     assert_eq!(plan.entries[0].recording_duration, 5.0);
 }

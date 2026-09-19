@@ -157,3 +157,17 @@ fn a_completion_arriving_after_reset_is_a_safe_no_op() {
     c.reset();
     assert_eq!(c.seek_completed(), SkipDecision::default());
 }
+
+/// `clip_duration_seconds` arrives from a user-editable project.json with no
+/// validation. A negative or NaN value must not take down the UI thread on the
+/// first arrow-key press — which `f64::clamp` would, since it asserts
+/// `min <= max`.
+#[test]
+fn a_negative_or_nan_clip_duration_does_not_panic() {
+    let mut c = SkipCoordinator::default();
+    assert_eq!(c.request_skip(3.0, 10.0, -1.0).seek, exact(0.0));
+
+    let mut c = SkipCoordinator::default();
+    let d = c.request_skip(3.0, 10.0, f64::NAN);
+    assert_eq!(d.seek.map(|s| s.target_seconds), Some(0.0));
+}

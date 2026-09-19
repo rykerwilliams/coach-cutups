@@ -3,9 +3,11 @@
 //! A project is a folder: `project.json` plus a `recordings/` subdirectory of
 //! commentary `.mkv` files. Sources are referenced, never copied.
 //!
-//! **Defaults are per-field, never blanket.** `#[serde(default)]` resolves to
-//! `Default::default()`, which is `0.0` for `f64` and `false` for `bool` — a
-//! blanket rule silently mutes every volume and turns PiP off. And only
+//! **Field-level `#[serde(default)]` is a hazard**: it resolves to
+//! `Default::default()`, which is `0.0` for `f64` and `false` for `bool`, so
+//! applying it per field would silently mute every volume and turn PiP off.
+//! `Preferences` puts `default` on the container instead, which fills from its
+//! own `Default` impl. And only
 //! genuinely optional keys get a default at all: defaulting `clips` would let a
 //! truncated `project.json` load as an empty project, after which the next save
 //! destroys the user's work.
@@ -37,37 +39,27 @@ pub enum Quality {
     High,
 }
 
-fn unit_volume() -> f64 {
-    1.0
-}
-fn yes() -> bool {
-    true
-}
-
 /// User preferences, persisted with the project.
+///
+/// `default` is on the **container**, so a missing key is filled from the
+/// hand-written `Default` impl below — one copy of the defaults, not two.
+/// (Field-level `#[serde(default)]` is the hazard: it resolves to
+/// `Default::default()`, i.e. `0.0` and `false`.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Preferences {
-    #[serde(default = "unit_volume")]
     pub scan_volume: f64,
-    #[serde(default = "unit_volume")]
     pub preview_source_volume: f64,
-    #[serde(default = "unit_volume")]
     pub preview_commentary_volume: f64,
-    #[serde(default)]
     pub last_export_resolution: Resolution,
-    #[serde(default)]
     pub last_export_quality: Quality,
     /// Stable identifier for the preferred camera (PipeWire node name or a
     /// `/dev/v4l/by-id` path). A hint: if the device is absent at launch the
     /// app falls back to the default **without clearing this**, so the
     /// preference is restored if the device reappears.
-    #[serde(default)]
     pub preferred_camera_id: Option<String>,
     /// Same semantics as `preferred_camera_id`.
-    #[serde(default)]
     pub preferred_mic_id: Option<String>,
-    #[serde(default = "yes")]
     pub pip_for_new_recordings: bool,
 }
 
@@ -132,22 +124,6 @@ pub struct Clip {
 
     #[serde(default)]
     pub transcript: String,
-}
-
-impl Clip {
-    /// Debug-time guard: every reader of the event log assumes it is sorted by
-    /// `record_time`. An unsorted log is an upstream bug — `playback_segments`
-    /// silently loses a segment for an out-of-order event, and `zoom_at` stops
-    /// its scan at the first keyframe past the target.
-    #[inline]
-    pub fn debug_assert_sorted_events(&self) {
-        debug_assert!(
-            self.events
-                .windows(2)
-                .all(|w| w[0].record_time <= w[1].record_time),
-            "commentary event log must be sorted by record_time"
-        );
-    }
 }
 
 /// The project document.

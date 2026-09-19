@@ -92,3 +92,120 @@ pub struct MatchEventRecord {
     #[serde(default)]
     pub is_auto_back_anchor: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> ScoreboardConfig {
+        ScoreboardConfig {
+            home: TeamConfig::new(
+                "Rovers",
+                Rgba {
+                    r: 0.1,
+                    g: 0.2,
+                    b: 0.8,
+                    a: 1.0,
+                },
+                Rgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+            ),
+            away: TeamConfig::new(
+                "United",
+                Rgba {
+                    r: 0.8,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                },
+                Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+            ),
+            format: MatchFormat::default(),
+        }
+    }
+
+    #[test]
+    fn scoreboard_config_round_trips() {
+        let c = sample();
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<ScoreboardConfig>(&s).unwrap(), c);
+    }
+
+    /// `font_color` defaults to `secondary_color`, matching the Swift
+    /// initializer. Serde cannot express "default to another field", so the
+    /// field is required on disk and this constructor supplies the default.
+    #[test]
+    fn team_font_color_defaults_to_secondary() {
+        let white = Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
+        let t = TeamConfig::new("X", Rgba::RED, white);
+        assert_eq!(t.font_color, white);
+    }
+
+    /// These strings are the on-disk format. A rename would silently make every
+    /// existing project unreadable, and nothing else pins them.
+    #[test]
+    fn match_event_kinds_have_the_expected_wire_spellings() {
+        for (kind, spelling) in [
+            (MatchEventKind::StartStop, r#""startStop""#),
+            (MatchEventKind::HomeGoal, r#""homeGoal""#),
+            (MatchEventKind::AwayGoal, r#""awayGoal""#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), spelling);
+        }
+    }
+
+    #[test]
+    fn match_event_record_round_trips_and_defaults_the_anchor_flag() {
+        let r = MatchEventRecord {
+            id: uuid::Uuid::nil(),
+            kind: MatchEventKind::HomeGoal,
+            source_index: 1,
+            source_seconds: 123.5,
+            is_auto_back_anchor: false,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""sourceSeconds":123.5"#), "got {s}");
+        assert_eq!(serde_json::from_str::<MatchEventRecord>(&s).unwrap(), r);
+
+        // The flag is additive, so a record without it must still load.
+        let without = r#"{"id":"00000000-0000-0000-0000-000000000000","kind":"awayGoal","sourceIndex":0,"sourceSeconds":1.0}"#;
+        assert!(
+            !serde_json::from_str::<MatchEventRecord>(without)
+                .unwrap()
+                .is_auto_back_anchor
+        );
+    }
+
+    /// Soccer: two 45-minute halves, no overtime.
+    #[test]
+    fn match_format_defaults_to_soccer() {
+        let f = MatchFormat::default();
+        assert_eq!(
+            (f.regulation_periods, f.regulation_period_seconds),
+            (2, 2700)
+        );
+        assert_eq!(f.overtime_periods, 0);
+    }
+
+    /// `format` is additive on `ScoreboardConfig`, so a config without it loads.
+    #[test]
+    fn scoreboard_config_defaults_its_format() {
+        let json = r#"{"home":{"name":"A","primaryColor":{"r":0,"g":0,"b":0,"a":1},"secondaryColor":{"r":1,"g":1,"b":1,"a":1},"fontColor":{"r":1,"g":1,"b":1,"a":1}},"away":{"name":"B","primaryColor":{"r":0,"g":0,"b":0,"a":1},"secondaryColor":{"r":1,"g":1,"b":1,"a":1},"fontColor":{"r":1,"g":1,"b":1,"a":1}}}"#;
+        let c: ScoreboardConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.format, MatchFormat::default());
+    }
+}

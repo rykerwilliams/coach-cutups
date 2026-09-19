@@ -319,3 +319,20 @@ fn unknown_kinds_do_not_appear_in_the_lookup() {
     assert_eq!(zoom_at(&evs, 2.0), Zoom::new(2.0, 0.0, 0.0));
     assert_eq!(zoom_at(&evs[..1], 2.0), Zoom::IDENTITY);
 }
+
+/// `f64::clamp` asserts `min <= max`, so a NaN scale would panic: NaN survives
+/// the scale clamp, the `<= 1.0` guard is then false, and the pan limit becomes
+/// NaN. Swift's nested min/max degrades to 10x instead. Reachable from a live
+/// pinch gesture in Phase 6.
+#[test]
+fn a_nan_zoom_does_not_panic() {
+    let z = Zoom::new(f64::NAN, 0.0, 0.0).clamped();
+    assert_eq!(z.scale, 10.0, "matches Swift's min/max degradation");
+
+    let z = Zoom::new(2.0, 0.1, 0.0).zoomed_to_cursor(f64::NAN, 0.5, 0.5);
+    assert!(
+        z.scale.is_finite(),
+        "scale must stay finite, got {}",
+        z.scale
+    );
+}

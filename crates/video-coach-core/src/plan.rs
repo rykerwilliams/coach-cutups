@@ -3,14 +3,16 @@
 //! Pure data: no media dependency. The export layer consumes this to drive its
 //! frame pump.
 
-use std::collections::HashMap;
-
 use uuid::Uuid;
 
 use crate::project::Project;
 use crate::timeline::{playback_segments, PlaybackSegment};
 
 /// Which clips an export covers.
+///
+/// `Tag` compares the tag verbatim. Tags are normalized by
+/// [`crate::tag::normalize_tags`] on the way in (trimmed and lowercased), so a
+/// caller passing `"Transition"` selects nothing — normalize first.
 ///
 /// Replaces the macOS sentinel tag string `"__all-clips__"`, which was threaded
 /// through the export sheet and compared in five separate places. This is the
@@ -53,20 +55,18 @@ pub struct CompilationPlan {
 
 /// Build a plan for `target`.
 ///
-/// `source_durations` is a fallback lookup only — `SourceRef::duration_seconds`
-/// is the duration authority, written back by the probe when a source is added
-/// or relinked. Two duration sources would let the preview clock and the export
-/// clock disagree at end-of-source for the same clip.
+/// **`SourceRef::duration_seconds` is the single duration authority.** Phase 2's
+/// probe writes it back when a source is added or relinked, so there is nothing
+/// to override it with. An earlier draft took a `HashMap` of probed durations
+/// that took precedence, which reintroduced exactly the two-duration-sources
+/// disagreement the spec's golden rule exists to kill — preview clamping
+/// against the persisted value while export clamped against the map.
 ///
 /// When a clip's source is missing entirely, the fallback is
 /// `start_source_seconds + recording_duration`: the smallest value guaranteed
 /// to cover any in-range position the clip visits at rate 1, so the segment
 /// builder never clamps a forward skip it should not have.
-pub fn compilation_plan(
-    project: &Project,
-    target: &ExportTarget,
-    source_durations: &HashMap<usize, f64>,
-) -> CompilationPlan {
+pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
     let mut clips: Vec<_> = project
         .clips
         .iter()
@@ -85,15 +85,10 @@ pub fn compilation_plan(
     let mut total = 0.0;
 
     for clip in clips {
-        let source_duration = source_durations
-            .get(&clip.source_index)
-            .copied()
-            .or_else(|| {
-                project
-                    .source_videos
-                    .get(clip.source_index)
-                    .map(|s| s.duration_seconds)
-            })
+        let source_duration = project
+            .source_videos
+            .get(clip.source_index)
+            .map(|s| s.duration_seconds)
             .unwrap_or(clip.start_source_seconds + clip.recording_duration);
 
         let segments = playback_segments(clip, source_duration);

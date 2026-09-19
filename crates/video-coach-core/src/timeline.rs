@@ -12,6 +12,14 @@
 //! The 50 ms cap is a decoder-safety pullback, not a semantic answer, so the
 //! two agree to within 50 ms past EOF and exactly everywhere else. That gap is
 //! pinned by a test on purpose; do not "fix" one side to match the other.
+//!
+//! For that claim to hold, **both functions clamp the play/pause anchor to
+//! `[0, source_duration]` at assignment.** The Swift original assigns anchors
+//! raw, which lets a negative anchor hand the decoder a `source_start` of -5 s
+//! and put the two functions seconds apart — the same class of bug the freeze
+//! cap prevents at the other end of the range. Clamping changes nothing for an
+//! in-range anchor, and nothing for an anchor past the end (which the cap and
+//! the available-source floor already handle).
 
 use crate::event::EventKind;
 use crate::project::Clip;
@@ -64,9 +72,9 @@ fn clamp_source(t: f64, source_duration: f64) -> f64 {
 /// `skip(+1e6)` then `skip(-10)` gives 990 from a per-mutation clamp and 1000
 /// from a return-value clamp.
 pub fn source_time(clip: &Clip, at_record_time: f64, source_duration: f64) -> f64 {
-    clip.debug_assert_sorted_events();
+    crate::event::debug_assert_sorted(&clip.events);
 
-    let mut source = clip.start_source_seconds;
+    let mut source = clamp_source(clip.start_source_seconds, source_duration);
     let mut record_cursor = 0.0;
     let mut rate = 1.0;
 
@@ -81,14 +89,13 @@ pub fn source_time(clip: &Clip, at_record_time: f64, source_duration: f64) -> f6
         );
         record_cursor = ev.record_time;
         match ev.kind {
-            // Anchors are assigned raw, exactly as the segment builder does.
             EventKind::Play { source_time } => {
                 rate = 1.0;
-                source = source_time;
+                source = clamp_source(source_time, source_duration);
             }
             EventKind::Pause { source_time } => {
                 rate = 0.0;
-                source = source_time;
+                source = clamp_source(source_time, source_duration);
             }
             EventKind::Skip { delta } => source = clamp_source(source + delta, source_duration),
             EventKind::Stroke(_)
@@ -112,26 +119,26 @@ pub fn source_time(clip: &Clip, at_record_time: f64, source_duration: f64) -> f6
 /// second, and splitting on each would explode the segment count into the
 /// hundreds for no change in output. Zoom still reaches the compositor through
 /// the keyframe lookup, which is independent of segment boundaries.
-pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegment> {
-    clip.debug_assert_sorted_events();
+/// Mutable state of one pass over the event log.
+///
+/// A struct rather than a closure with four `&mut` parameters: the loop and the
+/// emitter both mutate the same cursors, which a closure cannot express without
+/// threading every field through the call.
+struct Walk {
+    segments: Vec<PlaybackSegment>,
+    source_cursor: f64,
+    record_cursor: f64,
+    rate: f64,
+    source_duration: f64,
+    /// Applied as a cap (`min`) on freeze anchors, with no lower bound needed
+    /// now that anchors are clamped at assignment. `max(0.0)` matters for
+    /// sub-50 ms sources, which is exactly what synthetic test fixtures are.
+    freeze_max_source: f64,
+}
 
-    let mut segments: Vec<PlaybackSegment> = Vec::new();
-    let mut source_cursor = clip.start_source_seconds;
-    let mut record_cursor = 0.0_f64;
-    let mut rate = 1.0_f64;
-
-    // Applied as a cap (`min`) on freeze anchors only, with no lower bound —
-    // a negative pause anchor yields a negative freeze anchor, matching the
-    // original. `max(0.0)` matters for sub-50 ms sources, which is exactly
-    // what synthetic test fixtures are.
-    let freeze_max_source = (source_duration - FREEZE_EOF_BACKOFF).max(0.0);
-
-    let emit = |record_end: f64,
-                segments: &mut Vec<PlaybackSegment>,
-                source_cursor: &mut f64,
-                record_cursor: &mut f64,
-                rate: f64| {
-        let dur = record_end - *record_cursor;
+impl Walk {
+    fn emit(&mut self, record_end: f64) {
+        let dur = record_end - self.record_cursor;
         // NOTE: the early return also skips the `record_cursor` update. Hoisting
         // that assignment out of the guard — the natural refactor — changes
         // behavior for two events sharing a `record_time`.
@@ -139,72 +146,67 @@ pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegme
             return;
         }
 
-        if rate == 1.0 {
+        if self.rate == 1.0 {
             // Source advances here. If it would read past the end, split into a
             // `Play` tail covering the available source plus a `Freeze` on the
             // last frame for whatever record time remains — mirroring a player,
             // which holds the last decoded frame rather than showing nothing.
-            let available = (source_duration - *source_cursor).max(0.0);
+            let available = (self.source_duration - self.source_cursor).max(0.0);
             let play_dur = dur.min(available);
             if play_dur > 0.0 {
-                segments.push(PlaybackSegment {
+                self.segments.push(PlaybackSegment {
                     kind: SegmentKind::Play,
-                    source_start: *source_cursor,
+                    source_start: self.source_cursor,
                     out_duration: play_dur,
                 });
-                *source_cursor += play_dur;
+                self.source_cursor += play_dur;
             }
             let freeze_dur = dur - play_dur;
             if freeze_dur > 0.0 {
-                segments.push(PlaybackSegment {
+                self.segments.push(PlaybackSegment {
                     kind: SegmentKind::Freeze,
-                    source_start: source_cursor.min(freeze_max_source),
+                    source_start: self.source_cursor.min(self.freeze_max_source),
                     out_duration: freeze_dur,
                 });
             }
         } else {
-            segments.push(PlaybackSegment {
+            self.segments.push(PlaybackSegment {
                 kind: SegmentKind::Freeze,
-                source_start: source_cursor.min(freeze_max_source),
+                source_start: self.source_cursor.min(self.freeze_max_source),
                 out_duration: dur,
             });
         }
-        *record_cursor = record_end;
+        self.record_cursor = record_end;
+    }
+}
+
+pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegment> {
+    crate::event::debug_assert_sorted(&clip.events);
+
+    let mut w = Walk {
+        segments: Vec::new(),
+        source_cursor: clamp_source(clip.start_source_seconds, source_duration),
+        record_cursor: 0.0,
+        rate: 1.0,
+        source_duration,
+        freeze_max_source: (source_duration - FREEZE_EOF_BACKOFF).max(0.0),
     };
 
     for ev in &clip.events {
         match ev.kind {
             EventKind::Play { source_time } => {
-                emit(
-                    ev.record_time,
-                    &mut segments,
-                    &mut source_cursor,
-                    &mut record_cursor,
-                    rate,
-                );
-                rate = 1.0;
-                source_cursor = source_time;
+                w.emit(ev.record_time);
+                w.rate = 1.0;
+                w.source_cursor = clamp_source(source_time, source_duration);
             }
             EventKind::Pause { source_time } => {
-                emit(
-                    ev.record_time,
-                    &mut segments,
-                    &mut source_cursor,
-                    &mut record_cursor,
-                    rate,
-                );
-                rate = 0.0;
-                source_cursor = source_time;
+                w.emit(ev.record_time);
+                w.rate = 0.0;
+                w.source_cursor = clamp_source(source_time, source_duration);
             }
             EventKind::Skip { delta } => {
-                emit(
-                    ev.record_time,
-                    &mut segments,
-                    &mut source_cursor,
-                    &mut record_cursor,
-                    rate,
-                );
-                source_cursor = clamp_source(source_cursor + delta, source_duration);
+                w.emit(ev.record_time);
+                w.source_cursor = clamp_source(w.source_cursor + delta, source_duration);
             }
             EventKind::Stroke(_)
             | EventKind::ClearAll
@@ -212,13 +214,7 @@ pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegme
             | EventKind::Unknown(_) => {}
         }
     }
-    emit(
-        clip.recording_duration,
-        &mut segments,
-        &mut source_cursor,
-        &mut record_cursor,
-        rate,
-    );
+    w.emit(clip.recording_duration);
 
-    segments
+    w.segments
 }

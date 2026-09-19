@@ -34,7 +34,7 @@ pub struct VisibleStroke<'a> {
 /// Borrows out of the clip rather than cloning: this runs once per output
 /// frame on the export path, and the point vectors are the bulk of the data.
 pub fn visible_strokes(clip: &Clip, at_record_time: f64) -> Vec<VisibleStroke<'_>> {
-    clip.debug_assert_sorted_events();
+    crate::event::debug_assert_sorted(&clip.events);
 
     // FIRST PASS. Collecting clear-all times up front is not an optimization —
     // it is required for correctness. A single forward pass that clears as it
@@ -42,12 +42,15 @@ pub fn visible_strokes(clip: &Clip, at_record_time: f64) -> Vec<VisibleStroke<'_
     // the later `ClearAll` that should have removed it. A correct algorithm has
     // to know about every clear-all up to `t` before deciding any stroke's
     // visibility.
-    let clear_all_times: Vec<f64> = clip
+    // A stroke is cleared iff SOME clear-all landed after it began, i.e. iff the
+    // latest one at or before `t` is later than the stroke's start. That is a
+    // fold to one value, not a collection — this runs once per output frame.
+    let last_clear_all = clip
         .events
         .iter()
         .filter(|e| matches!(e.kind, EventKind::ClearAll) && e.record_time <= at_record_time)
         .map(|e| e.record_time)
-        .collect();
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let mut out = Vec::new();
     for ev in &clip.events {
@@ -69,10 +72,7 @@ pub fn visible_strokes(clip: &Clip, at_record_time: f64) -> Vec<VisibleStroke<'_
         }
         // A clear-all cancels this stroke only if it landed STRICTLY after the
         // stroke began — one arriving at the same instant does not erase it.
-        if clear_all_times
-            .iter()
-            .any(|&c| c > first_t && c <= at_record_time)
-        {
+        if last_clear_all > first_t {
             continue;
         }
 

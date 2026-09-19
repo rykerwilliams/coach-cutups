@@ -215,3 +215,22 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** Only if the macOS app ships again. The scoreboard fix is
   small — pass `clip` instead of `clipStartAbsSeconds` into
   `CompilationInstruction` and call the preview formula.
+
+### 28. Non-finite floats silently corrupt a project on save
+- **Why deferred:** `serde_json` does not error on NaN or infinity — it writes
+  `null`. A non-finite value in an *event* payload then re-decodes as
+  `EventKind::Unknown`, so the event vanishes from replay, is re-emitted
+  verbatim on the next save, and never produces a diagnostic. In a non-event
+  field it becomes `null`, which no `f64` accepts, so the whole project reports
+  `Malformed` and refuses to open. Either way the user loses work silently.
+  Not fixed in `video-coach-core` because a serializer-side validator that walks
+  the document for nulls is more machinery than the problem warrants, and
+  because the crate has no producer of NaN today — `Zoom::clamped` and
+  `SkipCoordinator::request_skip` were the two panic-or-corrupt paths and both
+  are fixed. `CommentaryEvent::new` now carries a `debug_assert` on finiteness
+  so a producer bug is loud in development.
+- **When to revisit:** Phase 2 and Phase 6, which introduce the first real
+  producers (player positions, gesture coordinates normalized against a
+  possibly-zero-height rect). The bus contract already localizes capture to one
+  place, so sanitize there. Consider also surfacing a count of `Unknown` events
+  from `store::read` so corruption is observable rather than quiet.

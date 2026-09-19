@@ -152,6 +152,35 @@ fn initial_pause_at_zero_makes_the_first_segment_a_freeze() {
     assert_eq!(segs[1].out_duration, 6.0);
 }
 
+/// The ordinary shape: play, a pause that splits it, then a resume. Every
+/// other fixture here pauses at record time 0, where the opening emit
+/// short-circuits — so without this, the normal path that `emit`'s early
+/// return guards is pinned nowhere.
+#[test]
+fn a_pause_mid_play_produces_play_freeze_play() {
+    let c = clip(10.0, 10.0, vec![pause(2.0, 12.0), play(4.0, 12.0)]);
+    let segs = playback_segments(&c, DUR);
+    assert_eq!(
+        segs.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        [SegmentKind::Play, SegmentKind::Freeze, SegmentKind::Play]
+    );
+    assert_eq!(
+        segs.iter().map(|s| s.out_duration).collect::<Vec<_>>(),
+        [2.0, 2.0, 6.0]
+    );
+}
+
+/// An out-of-range anchor must not hand the decoder a negative position — the
+/// same class of bug the freeze cap prevents at the other end of the range.
+#[test]
+fn a_negative_anchor_is_clamped_in_both_functions() {
+    let c = clip(10.0, 10.0, vec![pause(1.0, -5.0)]);
+    for s in playback_segments(&c, 100.0) {
+        assert!(s.source_start >= 0.0, "negative source_start: {s:?}");
+    }
+    assert_eq!(source_time(&c, 5.0, 100.0), 0.0);
+}
+
 /// Playing past the end splits into a play tail plus a freeze on the last
 /// frame, mirroring a player holding rather than showing nothing.
 #[test]
@@ -277,12 +306,23 @@ fn source_time_agrees_with_the_segment_walk() {
         let walked = walked.unwrap_or_else(|| panic!("no segment covers t={t}"));
         let direct = source_time(&c, t, 100.0);
 
-        // They agree exactly, except past EOF where the freeze cap pulls the
-        // segment answer back by up to FREEZE_EOF_BACKOFF.
-        assert!(
-            (walked - direct).abs() <= 0.05 + 1e-9,
-            "t={t}: segment walk {walked} vs source_time {direct}"
-        );
+        // They agree EXACTLY, with one named exception: a freeze sitting on the
+        // EOF cap, where the segment answer is pulled back by the backoff. A
+        // blanket 50 ms tolerance would let a uniform drift regression — the
+        // exact class the anchor mechanism exists to kill — pass at every
+        // sample point.
+        let at_eof_cap = (walked - (100.0 - 0.05)).abs() < 1e-9;
+        if at_eof_cap {
+            assert!(
+                (walked - direct).abs() <= 0.05 + 1e-9,
+                "t={t}: walk {walked} vs source_time {direct}"
+            );
+        } else {
+            assert!(
+                (walked - direct).abs() < 1e-9,
+                "t={t}: walk {walked} != source_time {direct} (exact agreement required)"
+            );
+        }
         t += 0.25;
     }
 }

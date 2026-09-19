@@ -23,8 +23,36 @@ pub struct CommentaryEvent {
 
 impl CommentaryEvent {
     pub fn new(record_time: f64, kind: EventKind) -> Self {
+        // A non-finite value here is silent corruption, not a loud failure:
+        // serde_json writes it as `null`, which no f64 field accepts on the way
+        // back, so the event re-decodes as `Unknown` and disappears from replay.
+        // Catch it at the producer, where the value is still traceable.
+        debug_assert!(
+            record_time.is_finite(),
+            "record_time must be finite, got {record_time}"
+        );
         CommentaryEvent { record_time, kind }
     }
+}
+
+/// Debug-time guard: every reader of an event log assumes it is sorted by
+/// `record_time`.
+///
+/// An unsorted log is an upstream bug. `playback_segments` silently loses a
+/// segment for an out-of-order event, and `zoom_at` stops its scan at the first
+/// keyframe past the target — both fail quietly, which is why this is asserted
+/// rather than defended against.
+///
+/// Takes a slice rather than a `Clip` so `zoom_at`, which works on the event
+/// list alone, can call it too.
+#[inline]
+pub(crate) fn debug_assert_sorted(events: &[CommentaryEvent]) {
+    debug_assert!(
+        events
+            .windows(2)
+            .all(|w| w[0].record_time <= w[1].record_time),
+        "commentary event log must be sorted by record_time"
+    );
 }
 
 /// What happened at a given record time.
@@ -77,24 +105,6 @@ enum KnownKind {
     Zoom(Zoom),
 }
 
-impl From<&EventKind> for Option<KnownKind> {
-    fn from(k: &EventKind) -> Self {
-        match k {
-            EventKind::Play { source_time } => Some(KnownKind::Play {
-                source_time: *source_time,
-            }),
-            EventKind::Pause { source_time } => Some(KnownKind::Pause {
-                source_time: *source_time,
-            }),
-            EventKind::Skip { delta } => Some(KnownKind::Skip { delta: *delta }),
-            EventKind::Stroke(s) => Some(KnownKind::Stroke(s.clone())),
-            EventKind::ClearAll => Some(KnownKind::ClearAll {}),
-            EventKind::Zoom(z) => Some(KnownKind::Zoom(*z)),
-            EventKind::Unknown(_) => None,
-        }
-    }
-}
-
 impl From<KnownKind> for EventKind {
     fn from(k: KnownKind) -> Self {
         match k {
@@ -110,15 +120,32 @@ impl From<KnownKind> for EventKind {
 
 impl Serialize for EventKind {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        match Option::<KnownKind>::from(self) {
-            Some(known) => known.serialize(ser),
-            // Unknown: re-emit the original payload verbatim.
-            None => match self {
-                EventKind::Unknown(v) => v.serialize(ser),
-                _ => unreachable!("only Unknown maps to None"),
-            },
+        // One match, with the `Unknown` arm inline. Routing through an
+        // `Option<KnownKind>` would throw away the information the second match
+        // needs and force an `unreachable!()` to put it back.
+        match self {
+            EventKind::Play { source_time } => KnownKind::Play {
+                source_time: *source_time,
+            }
+            .serialize(ser),
+            EventKind::Pause { source_time } => KnownKind::Pause {
+                source_time: *source_time,
+            }
+            .serialize(ser),
+            EventKind::Skip { delta } => KnownKind::Skip { delta: *delta }.serialize(ser),
+            // Borrowed so the point vector is not cloned on the export hot path.
+            EventKind::Stroke(s) => BorrowedStroke { stroke: s }.serialize(ser),
+            EventKind::ClearAll => KnownKind::ClearAll {}.serialize(ser),
+            EventKind::Zoom(z) => KnownKind::Zoom(*z).serialize(ser),
+            EventKind::Unknown(v) => v.serialize(ser),
         }
     }
+}
+
+/// Serializes as `{"stroke": {...}}` without cloning the stroke.
+#[derive(Serialize)]
+struct BorrowedStroke<'a> {
+    stroke: &'a Stroke,
 }
 
 impl<'de> Deserialize<'de> for EventKind {
@@ -175,6 +202,61 @@ mod tests {
             rt(EventKind::Pause { source_time: 9.25 }),
             EventKind::Pause { source_time: 9.25 }
         );
+    }
+
+    /// A round-trip test cannot catch a wrong field name — it serializes
+    /// whatever was constructed and reads it back. `Zoom` shipped as snake_case
+    /// for exactly that reason, so both payload shapes are pinned literally.
+    #[test]
+    fn zoom_and_stroke_have_the_expected_wire_shapes() {
+        let z = serde_json::to_string(&EventKind::Zoom(Zoom::new(2.0, 0.1, -0.05))).unwrap();
+        assert_eq!(z, r#"{"zoom":{"scale":2.0,"panX":0.1,"panY":-0.05}}"#);
+
+        let s = serde_json::to_string(&EventKind::Stroke(Stroke {
+            id: Uuid::nil(),
+            color: Rgba {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            line_width: 0.006,
+            points: vec![StrokePoint {
+                x: 0.25,
+                y: 0.5,
+                t: 0.0,
+            }],
+            auto_clear_after_seconds: Some(3.0),
+        }))
+        .unwrap();
+        assert!(s.contains(r#""lineWidth":0.006"#), "got {s}");
+        assert!(s.contains(r#""autoClearAfterSeconds":3.0"#), "got {s}");
+    }
+
+    /// Absent and explicit null both decode to `None`. Recorded because it is
+    /// the reason no `skip_serializing_if` is used.
+    #[test]
+    fn absent_and_null_auto_clear_both_decode_to_none() {
+        let absent: Stroke = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","color":{"r":1,"g":0,"b":0,"a":1},"lineWidth":0.1,"points":[]}"#,
+        )
+        .unwrap();
+        let null: Stroke = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","color":{"r":1,"g":0,"b":0,"a":1},"lineWidth":0.1,"points":[],"autoClearAfterSeconds":null}"#,
+        )
+        .unwrap();
+        assert_eq!(absent.auto_clear_after_seconds, None);
+        assert_eq!(null.auto_clear_after_seconds, None);
+    }
+
+    /// A camelCase zoom must decode as a real zoom, not fall through to
+    /// `Unknown` — where it would vanish from replay and be re-emitted verbatim
+    /// forever with no error.
+    #[test]
+    fn a_camel_case_zoom_does_not_decode_as_unknown() {
+        let v = json!({"zoom": {"scale": 2.0, "panX": 0.1, "panY": -0.05}});
+        let decoded: EventKind = serde_json::from_value(v).unwrap();
+        assert_eq!(decoded, EventKind::Zoom(Zoom::new(2.0, 0.1, -0.05)));
     }
 
     #[test]

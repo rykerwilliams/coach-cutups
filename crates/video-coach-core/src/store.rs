@@ -44,6 +44,9 @@ pub enum StoreError {
     #[error("{PROJECT_FILENAME} is unreadable: {0}")]
     Malformed(String),
 
+    #[error("could not write {PROJECT_FILENAME}: {0}")]
+    NotSerializable(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -83,12 +86,29 @@ fn format_version_of(value: &serde_json::Value) -> Result<u32, StoreError> {
 /// Read the project in `project_dir`.
 pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
     let path = project_dir.join(PROJECT_FILENAME);
-    if !path.exists() {
-        return Err(StoreError::MissingProjectJson(project_dir.to_path_buf()));
-    }
-    let text = std::fs::read_to_string(&path)?;
+    // Map NotFound on the read itself rather than testing `exists()` first:
+    // one syscall, no TOCTOU window, and the distinction is made in one place.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoreError::MissingProjectJson(project_dir.to_path_buf()))
+        }
+        Err(e) => return Err(StoreError::Io(e)),
+    };
+
     let mut value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| StoreError::Malformed(e.to_string()))?;
+
+    // Guard the root shape before looking for a version. `Value::get` returns
+    // None for a non-object, which the absent-key rule would read as v1 — and
+    // then tell the user their `[]` or `"hello"` was made by the macOS app.
+    // That is precisely the confidently-wrong error this function exists to
+    // avoid.
+    if !value.is_object() {
+        return Err(StoreError::Malformed(format!(
+            "{PROJECT_FILENAME} root is not an object"
+        )));
+    }
 
     let found = format_version_of(&value)?;
     if found < CURRENT_FORMAT_VERSION {
@@ -106,10 +126,12 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
 
     // Normalize the version we just validated back into the document. It may
     // have arrived as an integral float (`7.0`), which is a legitimate JSON
-    // spelling that a `u32` field cannot deserialize from directly.
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("formatVersion".into(), serde_json::Value::from(found));
-    }
+    // spelling that a `u32` field cannot deserialize from directly. The root
+    // was checked above, so the object access cannot fail.
+    value
+        .as_object_mut()
+        .expect("root shape checked above")
+        .insert("formatVersion".into(), serde_json::Value::from(found));
 
     Project::deserialize(&value).map_err(|e| StoreError::Malformed(e.to_string()))
 }
