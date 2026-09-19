@@ -7,3 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+video-coach-app = { path = "../video-coach-app" }
+video-coach-core = { path = "../video-coach-core" }
+video-coach-media = { path = "../video-coach-media" }
+gstreamer.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

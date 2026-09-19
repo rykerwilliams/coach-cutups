@@ -4605,7 +4605,13 @@ dependencies = [
  "gstreamer-gl",
  "gstreamer-gl-egl",
  "gstreamer-video",
+ "serde",
+ "serde_json",
  "slint",
+ "tempfile",
+ "thiserror 2.0.20",
+ "video-coach-core",
+ "video-coach-media",
 ]
 
 [[package]]
@@ -4622,6 +4628,15 @@ dependencies = [
 [[package]]
 name = "video-coach-harness"
 version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "video-coach-app",
+ "video-coach-core",
+ "video-coach-media",
+]
 
 [[package]]
 name = "video-coach-media"

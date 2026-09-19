@@ -6,14 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The library (the bus) builds and tests without Slint or a display.
 [dependencies]
-
-# Used only by examples/zero_copy_spike.rs until the app itself needs them.
-[dev-dependencies]
-slint.workspace = true
+video-coach-core = { path = "../video-coach-core" }
+video-coach-media = { path = "../video-coach-media" }
 gstreamer.workspace = true
+gstreamer-gl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Used only by examples/zero_copy_spike.rs until the app itself needs them.
+slint.workspace = true
 gstreamer-video.workspace = true
 gstreamer-app.workspace = true
-gstreamer-gl.workspace = true
 gstreamer-gl-egl.workspace = true
 glutin_egl_sys.workspace = true
