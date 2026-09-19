@@ -204,6 +204,30 @@ Commit: `feat(app): clip selection, context menu, reorder and undo keys`.
 
 Commit: `feat(app): clip inspector, tag suggestions, overview and filter`.
 
+### Task 4 notes
+
+Screenshot pass, 2026-09-19, reference laptop: a release build with `vblank_mode=0`, a scratch project (one `videotestsrc` WebM source, 3 tagged clips with empty `.mkv` files) and `XDG_CONFIG_HOME` in the scratchpad. No real input was injected. A temporary env-var driver called the same Slint functions and callbacks the input handlers do, and it has been removed along with the scratch data.
+
+- **Verified:**
+  - **Commit against the edited clip.** Focus A's name field, type "Renamed A", then do what a click on row B does (`selected-clip = B; keys.focus()`). `project.json` got A's name, B was untouched, and the inspector showed B's fields. When the row click ran, `editing-clip-id` was still A: the focus-loss handler runs later, as expected.
+  - **Tags.** Typing "set piece, defence, p" in B's tags field shows the overlay with "pass", over the checkbox. Taking it gives "set piece, defence, pass, ". Leaving the field (the bubbled-Esc path, `keys.focus()`) commits `["set piece", "defence", "pass"]`, and the field re-renders `", "`-joined.
+  - **No-op edit.** A tags commit that normalizes to the stored value sends nothing, and the field re-renders itself.
+  - **PiP.** The PiP toggle committed `showPip: true` against B, even with the tags field focused.
+  - **Overview and filter.** Deselecting shows the overview: "pass · 3 clips · 1:47", alphabetical. The "pass" filter highlights its row, shows the chip and lists only the matching clips. A tag with no clips shows "No clips tagged 'zzz'".
+- **Deviations:**
+  - A focus-loss commit re-renders the fields only when the edit changes nothing, since the bus then sends nothing back. A real change waits for its `ProjectChanged`, because re-rendering straight away would flash the old value. `changes()` in `main.rs` mirrors the bus's diff to decide which case applies.
+  - `main.rs` no longer checks the name field. The window copies `saved-project-name` into the field whenever it changes, unless the field has focus.
+  - Clearing the selection calls `keys.focus()`, so a field can't keep focus while the inspector hides it.
+  - `take_suggestion` is in core `tag.rs`, with a test.
+  - The overview stays clickable while recording, since the filter is UI state only.
+- **For the user's checklist:**
+  - Real clicks and keys: Tab and Esc in the tags field (the driver couldn't send keys).
+  - Enter in the name and tags fields keeps focus.
+  - Esc leaves the notes field.
+  - Clicks on the player and on empty sidebar or inspector space leave a field.
+  - The cursor lands at the end after taking a suggestion.
+  - Letters typed in the inspector fields fire no shortcut.
+
 ## Task 5 — Closeout
 
 1. Adversarial review of the Phase 3 code diff; apply the fixes and backlog any deferrals.

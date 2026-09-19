@@ -4,7 +4,9 @@
 use uuid::Uuid;
 
 use video_coach_core::project::Clip;
-use video_coach_core::tag::{tag_suggestions, tag_summaries, TagSummary, MAX_SUGGESTIONS};
+use video_coach_core::tag::{
+    tag_suggestions, tag_summaries, take_suggestion, TagSummary, MAX_SUGGESTIONS,
+};
 
 fn clip(tags: &[&str], duration: f64) -> Clip {
     Clip {
@@ -132,4 +134,14 @@ fn caps_the_suggestions() {
     let s = tag_suggestions(&all, "t");
     assert_eq!(s.len(), MAX_SUGGESTIONS);
     assert_eq!(s[0], "t00", "sorted before the cap");
+}
+
+#[test]
+fn taking_a_suggestion_replaces_the_last_fragment() {
+    assert_eq!(take_suggestion("tra", "transition"), "transition, ");
+    assert_eq!(
+        take_suggestion("shot, Se", "set piece"),
+        "shot, set piece, "
+    );
+    assert_eq!(take_suggestion("shot,se", "set piece"), "shot, set piece, ");
 }

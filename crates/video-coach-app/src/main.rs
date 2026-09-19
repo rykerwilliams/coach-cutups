@@ -25,6 +25,9 @@ use video_coach_app::bus::{
 };
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
+use video_coach_core::project::{Clip, Project};
+use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
+use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{list_devices, now_ns, Devices, PositionHandle, SinkKind};
 
@@ -294,6 +297,90 @@ fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let bus = bus.clone();
         move || bus.borrow().send(Command::Redo)
     });
+    wire_inspector(window, bus);
+    window.on_filter_changed({
+        let weak = window.as_weak();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            UI.with_borrow(|ui| {
+                if let Some(s) = &ui.snapshot {
+                    show_clips(&w, &s.project);
+                }
+            });
+        }
+    });
+}
+
+/// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
+/// field was editing, which needn't be the selection any more.
+fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_edit_clip({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move |id, field, text| {
+            let Some(w) = weak.upgrade() else { return };
+            let edit = match field {
+                ClipField::Name => ClipEdit::Name(text.into()),
+                // Raw: the bus normalizes.
+                ClipField::Tags => ClipEdit::Tags(vec![text.into()]),
+                ClipField::Notes => ClipEdit::Notes(text.into()),
+            };
+            let id = Uuid::parse_str(&id).ok();
+            let changes = UI.with_borrow(|ui| {
+                ui.snapshot
+                    .as_ref()
+                    .and_then(|s| s.project.clips.iter().find(|c| Some(c.id) == id))
+                    .is_some_and(|clip| changes(clip, &edit))
+            });
+            match id {
+                // Its `ProjectChanged` re-renders the fields. Rendering them
+                // now would flash the old value.
+                Some(id) if changes => bus.borrow().send(Command::EditClip { id, edit }),
+                // The bus would send nothing back, so the field shows the
+                // clip again itself: an edit that normalizes away, or of a
+                // clip that has gone.
+                _ => show_clip(&w),
+            }
+        }
+    });
+    window.on_set_show_pip({
+        let bus = bus.clone();
+        move |id, on| match Uuid::parse_str(&id) {
+            Ok(id) => bus.borrow().send(Command::EditClip {
+                id,
+                edit: ClipEdit::ShowPip(on),
+            }),
+            Err(_) => eprintln!("ui: not a clip id: {id:?}"),
+        }
+    });
+    window.on_show_clip({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                show_clip(&w);
+            }
+        }
+    });
+    window.on_suggest_tags(|text| {
+        let tags = UI.with_borrow(|ui| {
+            ui.snapshot.as_ref().map_or_else(Vec::new, |s| {
+                tag_suggestions(&tag_summaries(&s.project.clips), &text)
+            })
+        });
+        let tags: Vec<SharedString> = tags.into_iter().map(SharedString::from).collect();
+        ModelRc::new(VecModel::from(tags))
+    });
+    window.on_take_suggestion(|text, tag| take_suggestion(&text, &tag).into());
+}
+
+/// Whether `edit` would change `clip`: the bus skips it otherwise, and so
+/// sends no `ProjectChanged`. Tags compare normalized, as the bus stores them.
+fn changes(clip: &Clip, edit: &ClipEdit) -> bool {
+    match edit {
+        ClipEdit::Name(name) => clip.name != *name,
+        ClipEdit::Tags(raw) => clip.tags != normalize_tags(&raw.join(",")),
+        ClipEdit::Notes(notes) => clip.notes != *notes,
+        ClipEdit::ShowPip(on) => clip.show_pip != *on,
+    }
 }
 
 /// The Devices popover (R2): listed on a short-lived thread each time it
@@ -504,17 +591,14 @@ fn on_event(w: &AppWindow, event: Event) {
             });
             set_zoom(w, Zoom::IDENTITY);
             w.set_selected_clip(SharedString::new());
+            w.set_tag_filter(SharedString::new());
             w.set_volume(snapshot.project.preferences.scan_volume as f32);
             w.set_project_name(snapshot.project.name.as_str().into());
             show_project(w, snapshot);
         }
-        Event::ProjectChanged(snapshot) => {
-            // Never overwrite a name that's being typed.
-            if !w.get_name_editing() {
-                w.set_project_name(snapshot.project.name.as_str().into());
-            }
-            show_project(w, snapshot);
-        }
+        // The name field follows `saved-project-name`, set here, unless
+        // it's being typed in.
+        Event::ProjectChanged(snapshot) => show_project(w, snapshot),
         Event::Position {
             source_index,
             target_abs,
@@ -550,7 +634,8 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
-        // After the operation's `ProjectChanged`, so the clip is listed.
+        // After the operation's `ProjectChanged`, so the clip is listed. The
+        // window re-renders the inspector when the selection changes.
         Event::Select(id) => w.set_selected_clip(id.to_string().into()),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
@@ -570,8 +655,8 @@ fn on_event(w: &AppWindow, event: Event) {
     }
 }
 
-/// The sidebar, the missing-source card and whether playback is possible,
-/// from `snapshot`.
+/// The sidebar, the missing-source card, whether playback is possible and
+/// the inspector's column, from `snapshot`.
 fn show_project(w: &AppWindow, snapshot: Snapshot) {
     let project = &snapshot.project;
     let missing = |i: usize| snapshot.missing.get(i).copied().unwrap_or(false);
@@ -599,10 +684,36 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     );
     w.set_can_play(!rows.is_empty() && first_missing.is_none());
     w.set_sources(ModelRc::new(VecModel::from(rows)));
-    // Stored order is the order (C3).
+    // A selection whose clip is gone (deleted, or undone away) is dropped.
+    if selected_id(w).is_some_and(|id| !project.clips.iter().any(|c| c.id == id)) {
+        w.set_selected_clip(SharedString::new());
+    }
+    w.set_clip_count(project.clips.len() as i32);
+    show_clips(w, project);
+    let tags: Vec<TagRow> = tag_summaries(&project.clips)
+        .into_iter()
+        .map(|s| {
+            let clips = if s.clip_count == 1 { "clip" } else { "clips" };
+            TagRow {
+                tag: s.tag.into(),
+                detail: format!("{} {clips} · {}", s.clip_count, format_hms(s.total_seconds))
+                    .into(),
+            }
+        })
+        .collect();
+    w.set_tag_rows(ModelRc::new(VecModel::from(tags)));
+    UI.with_borrow_mut(|ui| ui.snapshot = Some(snapshot));
+    show_clip(w);
+}
+
+/// The Clips list: all of `project`'s clips in stored order (C3), or those
+/// tagged with the window's `tag-filter` (C8).
+fn show_clips(w: &AppWindow, project: &Project) {
+    let filter = w.get_tag_filter();
     let clips: Vec<ClipRow> = project
         .clips
         .iter()
+        .filter(|c| filter.is_empty() || c.tags.iter().any(|t| *t == filter.as_str()))
         .map(|c| ClipRow {
             id: c.id.to_string().into(),
             name: if c.name.is_empty() {
@@ -614,13 +725,31 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
             duration: format_hms(c.recording_duration).into(),
         })
         .collect();
-    // A selection whose clip is gone (deleted, or undone away) is dropped.
-    let selected = w.get_selected_clip();
-    if !selected.is_empty() && !clips.iter().any(|c| c.id == selected) {
-        w.set_selected_clip(SharedString::new());
-    }
     w.set_clips(ModelRc::new(VecModel::from(clips)));
-    UI.with_borrow_mut(|ui| ui.snapshot = Some(snapshot));
+}
+
+/// The inspector's fields, from the selected clip (C7), and empty with none.
+/// Not while a field is being edited: that would overwrite what's typed.
+fn show_clip(w: &AppWindow) {
+    if !w.get_editing_clip_id().is_empty() {
+        return;
+    }
+    let selected = selected_id(w);
+    UI.with_borrow(|ui| {
+        let clip = ui
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.project.clips.iter().find(|c| Some(c.id) == selected));
+        w.set_clip_name(clip.map_or("", |c| &c.name).into());
+        w.set_clip_tags(clip.map_or_else(String::new, |c| c.tags.join(", ")).into());
+        w.set_clip_notes(clip.map_or("", |c| &c.notes).into());
+        w.set_clip_show_pip(clip.is_some_and(|c| c.show_pip));
+    });
+}
+
+/// The selected clip's id; `None` for no selection.
+fn selected_id(w: &AppWindow) -> Option<Uuid> {
+    Uuid::parse_str(&w.get_selected_clip()).ok()
 }
 
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value

@@ -77,6 +77,16 @@ pub fn tag_suggestions(summaries: &[TagSummary], text: &str) -> Vec<String> {
     out
 }
 
+/// The tag field's text once `tag` is taken from the suggestions: `tag`
+/// replaces the fragment after the last comma, followed by `", "` so the
+/// next one can be typed straight away.
+pub fn take_suggestion(text: &str, tag: &str) -> String {
+    match text.rfind(',') {
+        Some(comma) => format!("{} {tag}, ", &text[..=comma]),
+        None => format!("{tag}, "),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

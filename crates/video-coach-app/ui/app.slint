@@ -4,7 +4,7 @@
 // Everything here is presentation. `src/main.rs` turns the callbacks into bus
 // commands and feeds bus events back in through the `in` properties.
 
-import { Button, LineEdit, ListView, Palette, Slider } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, Palette, Slider, TextEdit } from "std-widgets.slint";
 
 /// One row of the sidebar's Sources list.
 export struct SourceRow {
@@ -24,6 +24,20 @@ export struct ClipRow {
     name: string,
     /// The recording's length, already formatted.
     duration: string,
+}
+
+/// One row of the tag overview (Phase 3 C8).
+export struct TagRow {
+    tag: string,
+    /// "3 clips · 1:24", already formatted.
+    detail: string,
+}
+
+/// The inspector's text fields, for `edit-clip`.
+export enum ClipField {
+    name,
+    tags,
+    notes,
 }
 
 /// One row of the Devices popover's camera or microphone list.
@@ -231,6 +245,206 @@ component DeviceList inherits VerticalLayout {
     }
 }
 
+/// A caption over one of the inspector's fields.
+component FieldLabel inherits Text {
+    color: Palette.alternate-foreground;
+    font-size: 11px;
+}
+
+/// The selected clip's fields (Phase 3 C7). The window renders them through
+/// the `in-out` properties, and the fields report focus and commits; which
+/// clip a commit is for is the window's business.
+component Inspector inherits Rectangle {
+    in property <bool> enabled;
+    in-out property <string> name-text;
+    in-out property <string> tags-text;
+    in-out property <string> notes-text;
+    in-out property <bool> show-pip;
+    /// A field has focus: the window's shortcuts yield to it.
+    out property <bool> editing: name.has-focus || tags.has-focus || notes.has-focus;
+
+    /// A field gained focus ...
+    callback begin-edit();
+    /// ... pressed Enter (a commit that keeps focus) ...
+    callback commit(ClipField, string);
+    /// ... or lost focus, which commits.
+    callback end-edit(ClipField, string);
+    callback pip-toggled(bool);
+    /// Existing tags to suggest for the tag field's text (C8).
+    pure callback suggest-tags(string) -> [string];
+    /// The tag field's text with the suggestion taken.
+    pure callback take-suggestion(string, string) -> string;
+
+    /// For the tag field's current fragment, from its last edit.
+    property <[string]> suggestions;
+    /// Esc closed them; the next edit reopens them.
+    property <bool> suggestions-dismissed;
+    property <bool> suggesting: tags.has-focus && root.suggestions.length > 0 && !root.suggestions-dismissed;
+
+    function focus-changed(field: ClipField, focused: bool, text: string) {
+        root.suggestions = [];
+        if (focused) {
+            root.begin-edit();
+        } else {
+            root.end-edit(field, text);
+        }
+    }
+
+    /// Takes `tag` into the tag field, keeping focus, with the cursor at the
+    /// end. It doesn't commit: Enter or leaving the field does.
+    function take(tag: string) {
+        root.tags-text = root.take-suggestion(root.tags-text, tag);
+        root.suggestions = [];
+        // Past the end, which clamps to it.
+        tags.set-selection-offsets(2147483647, 2147483647);
+    }
+
+    layout := VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+
+        FieldLabel { text: "Name"; }
+        name := LineEdit {
+            enabled: root.enabled;
+            placeholder-text: "Untitled";
+            text <=> root.name-text;
+            accepted(text) => { root.commit(ClipField.name, text); }
+            changed has-focus => { root.focus-changed(ClipField.name, self.has-focus, self.text); }
+        }
+
+        FieldLabel { text: "Tags"; }
+        // A direct child of the layout, so its x and y place the suggestions.
+        tags := LineEdit {
+            enabled: root.enabled;
+            placeholder-text: "Comma-separated";
+            text <=> root.tags-text;
+            accepted(text) => { root.commit(ClipField.tags, text); }
+            changed has-focus => { root.focus-changed(ClipField.tags, self.has-focus, self.text); }
+            edited(text) => {
+                root.suggestions-dismissed = false;
+                root.suggestions = root.suggest-tags(text);
+            }
+            // Tab takes the top suggestion; Esc closes them. Otherwise Tab
+            // moves focus on, and Esc bubbles to the window, which leaves the
+            // field.
+            key-pressed(event) => {
+                if (root.suggesting && event.text == Key.Tab) {
+                    root.take(root.suggestions[0]);
+                    return accept;
+                }
+                if (root.suggesting && event.text == Key.Escape) {
+                    root.suggestions-dismissed = true;
+                    return accept;
+                }
+                reject
+            }
+        }
+
+        CheckBox {
+            text: "Show webcam in export";
+            enabled: root.enabled;
+            checked <=> root.show-pip;
+            toggled => { root.pip-toggled(self.checked); }
+        }
+
+        FieldLabel { text: "Notes"; }
+        notes := TextEdit {
+            enabled: root.enabled;
+            vertical-stretch: 1;
+            text <=> root.notes-text;
+            changed has-focus => { root.focus-changed(ClipField.notes, self.has-focus, self.text); }
+        }
+    }
+
+    // Over the fields below, not a `PopupWindow`, whose `show()` would take
+    // focus from the field and commit it (C8).
+    if root.suggesting: Rectangle {
+        x: tags.x;
+        y: tags.y + tags.height + 2px;
+        width: tags.width;
+        height: suggestion-list.preferred-height;
+        background: Palette.background;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Palette.border;
+
+        suggestion-list := VerticalLayout {
+            padding: 4px;
+
+            for tag in root.suggestions: Rectangle {
+                height: 26px;
+                border-radius: 4px;
+                background: suggestion-touch.has-hover ? Palette.selection-background : transparent;
+
+                // A click doesn't take focus from the field.
+                suggestion-touch := TouchArea {
+                    clicked => { root.take(tag); }
+                }
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    Text {
+                        text: tag;
+                        color: Palette.foreground;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// With nothing selected, the inspector's column lists the project's tags
+/// (C8). Clicking one filters the Clips list by it, or clears that filter.
+component TagOverview inherits VerticalLayout {
+    in property <[TagRow]> rows;
+    in property <int> clip-count;
+    in-out property <string> filter;
+
+    padding: 12px;
+    spacing: 8px;
+
+    FieldLabel { text: "Tags"; }
+    if root.clip-count == 0: Text {
+        text: "No clips yet";
+        color: Palette.alternate-foreground;
+    }
+    if root.clip-count > 0 && root.rows.length == 0: Text {
+        text: "No tags yet — add tags to a clip in the inspector.";
+        color: Palette.alternate-foreground;
+        wrap: word-wrap;
+    }
+    ListView {
+        for row in root.rows: Rectangle {
+            height: 40px;
+            border-radius: 4px;
+            background: row.tag == root.filter || tag-touch.has-hover ? Palette.selection-background : transparent;
+
+            tag-touch := TouchArea {
+                clicked => { root.filter = root.filter == row.tag ? "" : row.tag; }
+            }
+            VerticalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                alignment: center;
+                spacing: 2px;
+
+                Text {
+                    text: row.tag;
+                    color: Palette.foreground;
+                    overflow: elide;
+                }
+                Text {
+                    text: row.detail;
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     min-width: 1100px;
@@ -274,6 +488,12 @@ export component AppWindow inherits Window {
     /// The name the field returns to when it loses focus: the project's, or
     /// a rename just sent.
     in property <string> saved-project-name;
+    changed saved-project-name => {
+        // Never over a name being typed: leaving the field shows it.
+        if (!name-edit.has-focus) {
+            root.project-name = self.saved-project-name;
+        }
+    }
     in property <[SourceRow]> sources;
     /// The first missing source, or -1.
     in property <int> missing-index: -1;
@@ -317,11 +537,39 @@ export component AppWindow inherits Window {
     in property <float> level;
     /// A level has arrived during this recording.
     in property <bool> level-seen;
+    /// The Clips list: the project's clips, or only those tagged
+    /// `tag-filter`.
     in property <[ClipRow]> clips;
+    /// All the project's clips, filtered or not.
+    in property <int> clip-count;
     /// The selected clip's id, empty for none (Phase 3 C7). UI state only:
     /// `src/main.rs` sets it on the bus's `Select`, and clears it on project
     /// open and when its clip leaves the project.
     in-out property <string> selected-clip;
+    changed selected-clip => {
+        // Its clip is gone: off a field the inspector is hiding.
+        if (self.selected-clip == "") {
+            keys.focus();
+        }
+        root.show-clip();
+    }
+    /// The inspector's fields (C7), set imperatively by `show-clip`: a
+    /// `text:` or `checked:` binding breaks once the user types or clicks.
+    in-out property <string> clip-name;
+    in-out property <string> clip-tags;
+    in-out property <string> clip-notes;
+    in-out property <bool> clip-show-pip;
+    /// The clip an inspector field is editing, set when one gains focus and
+    /// cleared when the last one loses it. Commits go to it, not to the
+    /// selection, which a row click has already moved by the time a field's
+    /// focus-loss handler runs. `show-clip` leaves the fields alone while
+    /// it's set.
+    in-out property <string> editing-clip-id;
+    /// The tag overview's rows, alphabetical.
+    in property <[TagRow]> tag-rows;
+    /// Show only the clips with this tag; empty for all (C8). UI state only.
+    in-out property <string> tag-filter;
+    changed tag-filter => { root.filter-changed(); }
     /// The Devices popover's lists, "System default" first. Empty while
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
@@ -332,8 +580,8 @@ export component AppWindow inherits Window {
 
     /// The error dialog's message; empty hides it.
     in-out property <string> error-message;
-    /// The project-name field has focus: shortcuts yield to it.
-    out property <bool> name-editing: name-edit.has-focus;
+    /// A text field has focus: every shortcut yields to it (C6).
+    property <bool> text-editing: name-edit.has-focus || inspector.editing;
 
     callback open-project();
     callback add-source();
@@ -364,6 +612,16 @@ export component AppWindow inherits Window {
     callback sort-clips();
     callback undo();
     callback redo();
+    /// An inspector field's commit for clip `id`.
+    callback edit-clip(string, ClipField, string);
+    callback set-show-pip(string, bool);
+    /// Render the inspector's fields from the selected clip, unless one is
+    /// being edited.
+    callback show-clip();
+    /// `tag-filter` changed: list the clips it lets through.
+    callback filter-changed();
+    pure callback suggest-tags(string) -> [string];
+    pure callback take-suggestion(string, string) -> string;
     callback volume-changed(float);
     callback volume-released(float);
     /// Zoom keys (spec D9): `1`/`Ctrl+0` reset; `2`/`3` step the scale about
@@ -391,7 +649,9 @@ export component AppWindow inherits Window {
             }
             return accept;
         }
-        if (name-edit.has-focus) {
+        // The field gets them all, Esc included: it bubbles back to
+        // `key-pressed` below.
+        if (root.text-editing) {
             return reject;
         }
         // No shortcut, but a touched slider would take them.
@@ -490,6 +750,15 @@ export component AppWindow inherits Window {
         capture-key-released(event) => {
             root.handle-key(event, false)
         }
+        // Esc a field didn't take leaves it, which commits it (C6). The only
+        // way out of the notes field by keyboard.
+        key-pressed(event) => {
+            if (root.text-editing && event.text == Key.Escape) {
+                keys.focus();
+                return accept;
+            }
+            reject
+        }
 
         VerticalLayout {
             HorizontalLayout {
@@ -497,6 +766,12 @@ export component AppWindow inherits Window {
                 Rectangle {
                     width: 240px;
                     background: Palette.alternate-background;
+
+                    // Empty space: off any field (C6), which Slint doesn't do
+                    // on a click.
+                    TouchArea {
+                        clicked => { keys.focus(); }
+                    }
 
                     VerticalLayout {
                         padding: 12px;
@@ -618,7 +893,7 @@ export component AppWindow inherits Window {
                             }
                             Button {
                                 text: "Sort by position";
-                                enabled: root.clips.length >= 2 && !root.recording;
+                                enabled: root.clip-count >= 2 && !root.recording;
                                 clicked => { root.sort-clips(); }
 
                                 Tooltip {
@@ -627,11 +902,47 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        // The overview's filter (C8), cleared by a click.
+                        if root.tag-filter != "": Rectangle {
+                            height: 26px;
+                            border-radius: 13px;
+                            background: chip-touch.has-hover ? Palette.selection-background : Palette.control-background;
+
+                            chip-touch := TouchArea {
+                                clicked => { root.tag-filter = ""; }
+                            }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "Filtered: " + root.tag-filter;
+                                    color: Palette.foreground;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: "✕";
+                                    color: Palette.alternate-foreground;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        if root.tag-filter != "" && root.clips.length == 0: Text {
+                            text: "No clips tagged '" + root.tag-filter + "'";
+                            color: Palette.alternate-foreground;
+                            wrap: word-wrap;
+                        }
+
                         // Phase 3 C9. A click selects (never toggles: a
                         // double-click is two clicks first), a double-click
                         // jumps, a right-click opens the row's own menu without
                         // selecting, and a drag reorders. All off while
-                        // recording, which the bus refuses.
+                        // recording, which the bus refuses. No drag while
+                        // filtered: a filtered row's index isn't its place in
+                        // the full order.
                         ListView {
                             for clip[index] in root.clips: Rectangle {
                                 height: 28px;
@@ -641,7 +952,7 @@ export component AppWindow inherits Window {
                                     : transparent;
 
                                 clip-drop := DropArea {
-                                    enabled: !root.recording;
+                                    enabled: !root.recording && root.tag-filter == "";
                                     can-drop(event) => {
                                         root.dropped-index("clips", event.data) >= 0 ? DragAction.move : DragAction.none
                                     }
@@ -651,7 +962,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     DragArea {
-                                        enabled: !root.recording;
+                                        enabled: !root.recording && root.tag-filter == "";
                                         allow-move: true;
                                         data: root.drag-payload("clips", index);
 
@@ -721,6 +1032,12 @@ export component AppWindow inherits Window {
                     background: black;
                     clip: true;
 
+                    // Off any field (C6), with nothing to zoom; `zoom-area`
+                    // does it otherwise.
+                    TouchArea {
+                        clicked => { keys.focus(); }
+                    }
+
                     Rectangle {
                         x: player.content.x;
                         y: player.content.y;
@@ -755,6 +1072,9 @@ export component AppWindow inherits Window {
                             accept
                         }
                         pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down) {
+                                keys.focus();
+                            }
                             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                 root.zoom-press(self.mouse-x, self.mouse-y);
                             }
@@ -793,6 +1113,49 @@ export component AppWindow inherits Window {
                         // The bus refuses it while recording (R6's guard).
                         enabled: !root.recording;
                         clicked => { root.relink-source(root.missing-index); }
+                    }
+                }
+
+                // --- Inspector: the selected clip, else the tag overview
+                // (C7, C8) ---
+                Rectangle {
+                    width: 280px;
+                    background: Palette.alternate-background;
+
+                    // Empty space: off any field (C6).
+                    TouchArea {
+                        clicked => { keys.focus(); }
+                    }
+
+                    // Hidden rather than removed, so `editing` always binds.
+                    inspector := Inspector {
+                        visible: root.selected-clip != "";
+                        enabled: !root.recording;
+                        name-text <=> root.clip-name;
+                        tags-text <=> root.clip-tags;
+                        notes-text <=> root.clip-notes;
+                        show-pip <=> root.clip-show-pip;
+                        begin-edit => { root.editing-clip-id = root.selected-clip; }
+                        commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
+                        end-edit(field, text) => {
+                            let id = root.editing-clip-id;
+                            // Unless focus moved to another field, which
+                            // goes on editing the same clip.
+                            if (!self.editing) {
+                                root.editing-clip-id = "";
+                            }
+                            root.edit-clip(id, field, text);
+                        }
+                        // The selection, since a click doesn't take focus
+                        // from a field.
+                        pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
+                        suggest-tags(text) => { return root.suggest-tags(text); }
+                        take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
+                    }
+                    if root.selected-clip == "": TagOverview {
+                        rows: root.tag-rows;
+                        clip-count: root.clip-count;
+                        filter <=> root.tag-filter;
                     }
                 }
             }
