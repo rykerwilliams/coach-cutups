@@ -7,6 +7,7 @@
 //! design.
 
 pub mod event;
+pub mod plan;
 pub mod project;
 pub mod scoreboard_config;
 pub mod store;
