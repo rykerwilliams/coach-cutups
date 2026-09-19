@@ -401,3 +401,23 @@ Each entry: what, why deferred, when to revisit.
   scratchpad (`shutdown-hang/wip.diff`), not committed.
 - **When to revisit:** if closing the app ever hangs, or during the end-of-port
   hardening pass.
+
+## Phase 6 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-6-design.md`)
+
+### 48. Live drawing overlay has no automated coverage; two accepted gaps
+- **Why deferred:** `wire_drawing`, `show_strokes`, `clear_drawings` and the
+  tick's expiry/rebuild live in `main.rs`, which no test binary links, so the
+  live rule, the rebuild-on-change rule and "cleared on every recording
+  transition" are covered only by the user's hands-on checks. Two behaviours
+  are accepted rather than fixed: a mid-stroke window resize normalizes
+  earlier points against the release rect, and while drawing is enabled the
+  2/3 zoom keys pivot on the picture's centre (hover no longer reaches
+  `zoom-area`).
+- **When to revisit:** if the drawing overlay grows (a palette, shapes), move
+  its state into a testable module; fix the hover pivot if it annoys in use.
+
+### 49. `records_h264_and_opus_with_the_file_duration` is timing-flaky
+- **Why deferred:** failed once at 2.033 s vs an expected 2.000 s during the
+  Phase 6 review, and passed on re-run. Live test sources plus a loaded
+  machine.
+- **When to revisit:** if CI flakes; widen the tolerance to a few frames.

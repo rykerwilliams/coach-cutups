@@ -93,6 +93,27 @@ Commit: `feat(app): draw on the picture while recording`.
    - drawing is impossible when not recording, where drag still pans;
    - export a clip with drawings (Phase 8 burns them in; Phase 6 only logs them).
 
+### Task 4 notes (closeout, 2026-09-19)
+
+**Status: Phase 6 complete** apart from the hands-on checks below.
+
+**Code review** (`86630ed`), both passes applied: path coordinates rounded (a 600-point stroke's command string went from 23 KB to 9.5 KB at fractional scale), `PointerEventKind::Cancel` handled, the stroke width declared once, the content rect read from Slint, one clock for the live expiry, and no `ClearAll` logged when nothing is on screen.
+
+**Reviews found no bug in the capture rules,** the log or the core rule change. Two behaviours are accepted and documented (BACKLOG #48): a mid-stroke resize normalizes earlier points against the release rect, and the 2/3 zoom keys pivot on the centre while drawing is enabled.
+
+**The live overlay has no automated coverage** (it lives in `main.rs`), so these checks are the gate, not a formality.
+
+**Hands-on checklist for the user** (batched with Phases 2–5):
+1. **Draw while recording:** press and drag on the picture; the red line follows the pointer.
+2. **A plain click** leaves a dot.
+3. **Auto-clear on** (the default): a drawing fades 5 s after you lift. **Off:** it stays.
+4. **Clear** (the button) and the **C** key wipe drawings, including one you're mid-way through.
+5. **While recording,** two-finger scroll still pans and Ctrl+scroll still zooms.
+6. **Not recording:** drag pans as before and nothing draws; Clear and Auto-clear are greyed out.
+7. **Drag past the edge** of the picture: the line follows along the edge and doesn't spill into the black bars.
+8. **Stop mid-stroke:** the half-drawn line disappears and isn't saved.
+9. After Phase 8, **export a clip with drawings** and check they appear at the same moments and positions.
+
 ## Deliberately not in this phase
 
 - A palette, stroke undo, shapes: macOS had none.
