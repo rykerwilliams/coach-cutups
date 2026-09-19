@@ -1,44 +1,49 @@
 # Linux Port — Phase 7: Clip Preview
 
 **Date:** 2026-09-19
-**Status:** Draft, pre-review
+**Status:** Reviewed (simplify and correctness passes applied; the GL topology, the composite and the decode branches were measured on the reference laptop)
 **Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` ("The compositor decision", "Export frame driver", Phasing → Phase 7)
-**Builds on:** Phase 5 (the export graph and frame schedule), Phase 6 (strokes), Phase 4 (recordings), Phase 3 (clip selection)
-**Evidence:** the macOS inventory of `ClipPreviewBuilder.swift`, `PreviewCompositor.swift` and `ContentView.swift`'s preview flow; and the Phase 7 research measurements on the reference laptop.
+**Builds on:** Phase 5 (the composite graph, the frame schedule, the pump), Phase 6 (strokes), Phase 4 (recordings), Phase 3 (clip selection)
+**Evidence:** the macOS inventory of `ClipPreviewBuilder.swift` and `ContentView.swift`; the Phase 7 research and review measurements, recorded below.
 
 ---
 
 ## Goal
 
-Select a clip and play it back inside the app **as it will export**: the game video edited by the coach's plays, freezes and skips, zoomed as they zoomed, with their webcam inset, their drawings, and both audio tracks. This is the first time the whole composite runs.
+Select a clip and play it back inside the app: the game video edited by the coach's plays, freezes and skips, zoomed as they zoomed, with their webcam inset, their drawings, and the commentary audio.
 
-The scoreboard (Phase 9) and the text bar (Phase 8) join the same overlay later.
+**Game audio, its splice and its ramps move to Phase 8,** where the export mixer forces them anyway. The scoreboard (Phase 9) and the text bar (Phase 8) join the same overlay later.
 
 ## Done when
 
-1. **Play.** Selecting a clip and pressing Play (or Space) previews it: source video, zoom, webcam PiP and drawings, with commentary and source audio.
+1. **Play.** Selecting a clip and pressing Play (or Space) previews it: source video, zoom, webcam PiP, drawings and commentary audio.
 2. **Transport.** Space toggles, the scrubber seeks **frame-accurately** within the clip, skips work, and Esc closes the preview and returns to scanning.
-3. **Fidelity.** What preview shows is what export burns in: the same frame schedule, the same zoom, the same overlay geometry, the same PiP rule (`show_pip`).
-4. **Performance.** 1080p sources preview at 30 fps with no dropped frames on the reference laptop, and the app's own UI stays responsive.
-5. **No waiting.** A preview starts in a few hundred milliseconds. There is no cache and no timeout.
+3. **Shared path.** Preview is built from the same composite builder as export; Phase 8 changes only the tail. Nothing preview-specific describes geometry.
+4. **Performance.** The user's HEVC 1440p footage previews at 30 fps with no dropped frames, and the UI's frame time stays inside the budget in "Gates".
+5. **No waiting.** A preview starts in a few hundred milliseconds. There is no cache, no polling and no timeout.
 
 ---
 
-## Measured facts (research, reference laptop)
+## Measured facts (reference laptop)
 
-- **The composite has headroom.** A 3-pad `glvideomixer` (base 1080p + 720p PiP + full-frame RGBA overlay) ran at **113 fps** free-running, and at exactly **30.04 fps with 0 dropped frames** when the sink synced to the clock, costing about **18% of one core**. At 720p output it is 14%.
-  - **Measurement trap:** an overlay pad fed by `videotestsrc pattern=ball` measures the pattern generator (37 fps), not the mixer. Use `pattern=solid-color` or a real appsrc.
-- **Not yet measured:** the mixer running on **Slint's shared GL context** while Skia draws the UI, and the user's real HEVC 1440p footage through the mixer. Both are Phase 7 gates.
-- **The recording format** (H.264 + Opus in Matroska) decodes cleanly for the PiP.
-- **macOS preview facts:**
-  - AVPlayer strips custom compositors, so preview was rebuilt on the built-in one, which ignores transform ramps; zoom had to be stepwise per keyframe.
-  - Preview capped its render size at a 1920 long side.
-  - Preview audio was flat volumes with **no ramps**, so every freeze boundary clicked.
-  - Preview scrubbed with **infinite seek tolerance**, because exact seeks rendered black on long-GOP HEVC.
-  - The 50 ms poll and ~20 s timeout existed because building an AVFoundation composition is slow.
-- **Corrections to older docs** (fold in while editing):
-  - **BACKLOG #27(c) and parent spec lines 201 and 437 are stale:** macOS preview *does* honour `show_pip`, at build and live. Don't "fix" a non-bug.
-  - **Parent spec line 389 says the overlay font is bundled in `video-coach-core`.** That contradicts CLAUDE.md, which bans a font or image crate there. The rasterizer and its font live in `video-coach-media`.
+**The composite,** a 3-pad `glvideomixer` (base + PiP + full-frame RGBA overlay), 1440p HEVC source, frames reaching Slint through the existing mailbox and `BorrowedOpenGLTextureBuilder`, with the UI drawing at 60 Hz:
+
+| Preview output / overlay raster | Composite | UI frame time p50 / p95 / max |
+|---|---|---|
+| 720p / 1080p overlay | 30.01 fps | 0.90 / 6.65 / 37.7 ms |
+| **720p / 720p overlay** | **30.00 fps** | **0.75 / 2.65 / 10.9 ms** |
+| 1080p / 1080p overlay | 30.01 fps | 1.53 / 10.1 / 46.9 ms |
+| Control (no pipeline) | — | 0.76 / 1.34 / 6.1 ms |
+
+- **Sharing Slint's GL context is the *better* topology.** A private surfaceless display measured 0.97 / **28.3** / 45.2 ms, about 4× worse at p95, before adding a system-memory copy. The bottleneck is the 15 W iGPU, not the context. **There is no private-context fallback.**
+- **Rasterize the overlay at the output size.** A 1080p overlay into a 720p preview costs 2.5× the p95 and 3.5× the max.
+- **`glupload` takes a system-memory RGBA buffer per frame at 30 fps** without trouble. `glvideomixer`'s `blend-function-dst-rgb` already defaults to `one-minus-src-alpha`, so only `blend-function-src-rgb=one` needs setting.
+- **An audio appsink on a pumped decode branch deadlocks.** With `decodebin3` feeding a GL video appsink (max-buffers 2) plus an audio appsink, pulling only video stalled after 15 frames (0.2 s). Draining audio first, then pulling video, ran clean (3651 video + 5711 audio buffers in 5 s). **This is why the source branch stays video-only in Phase 7** (Phase 8's mixer must adopt the drain-first rule).
+- **A pipeline seek fires `seek-data` on *every* seekable appsrc, on the seeking thread,** not the pump's, and pushes after `FLUSH_STOP` with stale PTS are silently accepted (zero `FLUSHING` returns).
+- **PAUSED stops the pump** through backpressure on its own (0 pushes in 2 s).
+- **Accurate seeks** on the user's footage: 8.8 / 20.5 ms (median/worst), plus one ~15 ms composite pass, so a scrub tick costs 25–40 ms.
+- **macOS preview** capped its render at a **1920** long side, scrubbed with infinite tolerance (exact seeks rendered black on long-GOP HEVC), had **no ramps** (a click at every freeze), and its 50 ms poll and 20 s timeout existed only because AVFoundation compositions are slow to build.
+- **Stale doc corrected:** the parent spec's line 437 still repeats "preview ignores `showPiP`". Line 201 and BACKLOG #27 are already fixed.
 
 ---
 
@@ -50,70 +55,65 @@ The scoreboard (Phase 9) and the text bar (Phase 8) join the same overlay later.
 
 | | Export | Preview |
 |---|---|---|
-| Tail | `glcolorconvert` → NV12 → `gldownload` → encoder → `mp4mux` → `filesink` | `glcolorconvert` → `gl_caps()` appsink → the existing `FrameMailbox` |
-| Output size | 1920×1080 | 1280×720 (fixed) |
-| GL context | a private surfaceless EGL display | **Slint's context**, from `Command::GlReady` |
+| Tail | NV12 → `gldownload` → encoder → `mp4mux` → `filesink` | `glcolorconvert` → `gl_caps()` appsink → the shared `FrameMailbox` |
+| Output | 1920×1080 | **1280×720** (measured: the best UI frame time) |
+| GL | a private surfaceless display | **Slint's context**, from `Command::GlReady` |
 | Pacing | as fast as possible | the sink syncs to the clock |
 
-- **The output size becomes a parameter** of the builder rather than a constant.
-- **`SharedGl` becomes injectable.** Export keeps its private display, which is what keeps the UI's vsync out of export. Preview must use Slint's context, or the texture handed to Slint is invalid.
-- **Preview writes into the existing `FrameMailbox`,** so `video.rs` and `BorrowedOpenGLTextureBuilder` need no change. The bus guarantees that only one of {source player, preview} is PLAYING, so one mailbox suffices.
-- **Fixed 1280×720 output,** with Slint scaling the texture to the window. That avoids renegotiating mixer caps on every resize and keeps preview and export geometry identical apart from one scale factor. macOS likewise capped preview.
+- **Output size and GL context become parameters** of the builder. `SharedGl` becomes injectable.
+- **`FrameMailbox` is hoisted** out of `SourcePlayer` into a standalone shared type, since both the player and preview fill it. The bus guarantees only one is PLAYING, and **closing a preview clears the mailbox**, so the last frame doesn't stay on screen.
+- **The zoom probe is reused verbatim** from Phase 5: a sink-pad buffer probe keyed on PTS, which is flush-proof. Phase 5 uses no control bindings, so there is nothing to re-install after a seek.
 
-### P2. Pacing and transport
+### P2. The two branches, and the clock
 
-- **The sink syncs to the clock.** The pump already stamps `pts = n/30`, so real-time pacing is free, and the pump throttles on the existing queue wait. Nothing sleeps in Rust.
-  - The pump's busy-wait becomes a condvar, since a preview can sit paused for minutes.
-- **The audio sink provides the clock,** so video follows audio (P4).
-- **Pause** sets the pipeline to PAUSED.
-- **Scrub and skip** use `appsrc stream-type=seekable` plus a `seek-data` handler: GStreamer's flush and base-time machinery does the work, and the pump only repositions its frame index.
-  - **Preview scrubs frame-accurately.** macOS used infinite tolerance because exact seeks rendered black on long-GOP HEVC; `Decoder::seek` is accurate by construction at 10–22 ms on the user's footage.
-  - The zoom control bindings are re-installed after a flushing seek if they don't survive it (to be confirmed during the task).
-- **Esc closes the preview** and returns to scanning, as on macOS.
+- **The source branch is pumped, video-only.** `Decoder::frame_at` and the Phase 5 pump feed `appsrc` → `gltransformation` (zoom) → mixer pad 0, stamped `pts = n/30`. No audio appsink: it deadlocks a pumped branch (measured).
+- **The recording branch plays natively.** `filesrc ! decodebin3` → its video to the PiP mixer pad, its audio to `volume` → `autoaudiosink`.
+  - **Record time *is* output time.** `playback_segments` emits `out_duration` in the recording's timeline, so frame `n` is at `t = n/30` in that same timeline. The recording is therefore 1:1 with the output clock and needs **no pump, no re-timestamping and no appsink**. The mixer aligns the pads by running time.
+  - That identity is also why `zoom_at(events, t)` and the overlay's `record_time` are simply `n/30`.
+- **The audio sink provides the clock,** so the composite follows the commentary, which is the track the coach hears.
+- **The PiP pad exists only when `show_pip`.** `glvideomixer` waits indefinitely on every pad, so an unused pad would stall it. When the recording's video ends before the schedule does, the pump stops too (the schedule's length is the recording's duration).
+- **Volume** comes from `preview_commentary_volume`, applied to the `volume` element, so a live change is a property set.
 
-### P3. The overlay rasterizer
+### P3. Transport, pause and scrub
+
+- **The sink syncs to the clock**, so real-time pacing is free. The pump throttles on the appsrc queue; **PAUSED stops it through backpressure** (measured), so there is no sleep loop and no condvar beyond a wake on seek and close.
+- **Scrub and skip** use `appsrc stream-type=seekable` plus a `seek-data` handler:
+  - `seek-data` arrives on the **seeking thread**, not the pump's, so the frame index and a **seek generation counter** live behind one mutex. The pump re-reads the generation under the lock before each push, because a stale push after `FLUSH_STOP` is otherwise accepted silently (measured).
+  - The recording branch seeks natively in the same pipeline seek.
+- **Preview scrubs frame-accurately** (25–40 ms a tick). macOS used infinite tolerance because exact seeks rendered black on long-GOP HEVC.
+  - **Audio during a drag:** the commentary is muted while the scrubber is held and unmuted on release, since each tick flushes the audio sink.
+- **Position comes from the pump's frame index** (`n / 30`), published with the preview's events. The existing `PositionHandle` is the source player's pipeline and reports nothing while preview is open.
+- **Esc closes the preview.**
+
+### P4. The overlay rasterizer
 
 `video-coach-media` gains `overlay.rs`:
 
 ```rust
-pub struct Overlay { /* tiny-skia pixmap pool */ }
-impl Overlay {
-    pub fn render(&mut self, clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buffer; // premultiplied RGBA
-}
+pub fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buffer; // premultiplied RGBA
 ```
 
-- **Phase 7 draws strokes only.** Phase 8 adds the text bar and Phase 9 the scoreboard, without changing the shape.
-- **Premultiplied-over** is configured on the mixer pad (`blend-function-src-rgb=one`, `dst=one-minus-src-alpha`), not by demultiplying in Rust.
-- **The pixmap is pooled** (8.3 MB per 1080p frame).
-- **Geometry stays in core** (`visible_strokes`, `zoom_at`, the layout ratios as pure functions); **pixels stay in media**. The font, when Phase 8 needs one, lives in media too.
-- **Strokes are not zoom-transformed** and are normalized to the content rect, exactly as Phase 6 captures them.
-
-### P4. Audio: a Rust PCM mixer
-
-Two decode branches end in audio appsinks at F32LE/48k/2ch. Rust splices and mixes, and one appsrc feeds `audioconvert` → `autoaudiosink`.
-
-- **Source audio plays only during `play` segments** (freezes are silent), which follows the frame schedule, so one timeline drives both video and audio.
-- **Commentary audio is continuous** and 1:1 with record time.
-- **5 ms linear ramps** at the start and end of every contiguous region on either track. Preview therefore loses the click macOS had at every freeze boundary.
-- **Volumes** come from `preview_source_volume` and `preview_commentary_volume`, read per block, so a live change is a field write.
-- **The ramp and splice maths are pure functions in core,** testable with no GStreamer.
-- **Why not an element graph:** it would be a second timeline that must agree with the video pump exactly. The parent spec already rejected that for export, and Phase 8 reuses this mixer.
+- **Phase 7 draws strokes only**, from core's `visible_strokes`. Phase 8 adds the text bar and Phase 9 the scoreboard.
+- **Rasterized at the output size** (measured).
+- **No pool.** A fresh buffer per frame, drawn into with `tiny_skia::PixmapMut::from_bytes` over the mapped `gst::Buffer`, is sub-millisecond at 720p. A pooled pixmap would need destroy-notify recycling to avoid overwriting a frame still queued in the mixer.
+- **Premultiplied-over** on the mixer pad: set `blend-function-src-rgb=one` (the destination function already defaults correctly).
+- **Geometry stays in core** (`visible_strokes`, `zoom_at`, the layout ratios); **pixels stay in media**, and so does the font when Phase 8 needs one.
 
 ### P5. Control and lifecycle
 
 - **Commands:** `OpenPreview(clip_id)` and `ClosePreview`.
-- **Exclusivity:** opening a preview pauses and unloads the source player; closing it restores scanning at the position it had. Preview is refused while recording or exporting, and recording is refused while previewing.
-- **No cache, no polling.** macOS's 50 ms poll and 20 s timeout existed because AVFoundation compositions are slow to build; opening two decode pipelines is not. A spinner covers the ~100–300 ms preroll.
-- **Events:** `Event::Preview(PreviewStatus::{Opening, Playing, Paused, Closed})`, plus errors through the usual path.
+- **Exclusivity:** the source player is **paused, not unloaded**, so closing a preview is a no-op restore. Preview is refused while recording or exporting, and recording and export are refused while previewing.
+- **Events:** `Event::Preview(Option<Uuid>)` (the clip being previewed, or closed) plus the existing `Event::Playing`. There is no preview-specific play state and no spinner: the preroll is 100–300 ms.
+- **No cache, no polling.** macOS needed both only because building an AVFoundation composition was slow.
 - **A missing source or recording file** refuses with a clear message.
-- **Deleting the previewed clip** closes the preview first (Phase 3 already clears the selection).
+- **Deleting the previewed clip** closes the preview first.
 
 ### P6. UI
 
-- **Selecting a clip** shows the inspector, as today. **Play** (button or Space) opens the preview for the selected clip.
-- **While previewing:** the transport shows the clip's own timeline and the scrubber spans the clip. The Clips list, inspector and sidebar stay usable, except for the actions the guard refuses.
-- **A "Previewing <name>" indicator** with a Close button, and Esc closes.
-- **Drawing is off in preview** (Phase 6 captures only while recording).
+- **Play** (button or Space) opens a preview of the selected clip; the transport then drives the preview, using the existing scrubber and readout over the clip's own duration.
+- **The picture binds identity zoom, and the live stroke layer is hidden, while previewing.** The preview texture already has zoom and strokes baked in, so the scan-time zoom transform and Phase 6's overlay would apply them twice.
+- **A "Previewing <name>" indicator** with a Close button, and Esc.
+- **Drawing is off in preview.**
 
 ---
 
@@ -121,34 +121,34 @@ Two decode branches end in audio appsinks at F32LE/48k/2ch. Rust splices and mix
 
 | Crate | Phase 7 contents |
 |---|---|
-| `video-coach-core` | The audio splice and ramp maths (pure); the PiP and overlay layout ratios as pure functions. |
-| `video-coach-media` | The shared composite builder (output size and GL context as parameters); `overlay.rs` (tiny-skia strokes); the preview tail (appsink into the mailbox); the second decode branch for the recording; the PCM audio mixer; seek handling. |
-| `video-coach-app` | Bus: `OpenPreview` / `ClosePreview`, exclusivity, `Event::Preview`, transport routed to the preview while open. UI: Play opens a preview, the preview indicator and Close, Esc, the spinner. |
-| `video-coach-harness` | Open a preview with fixtures, play, seek, close; the audio mix over a known fixture. |
+| `video-coach-core` | The overlay and PiP layout ratios as pure functions. (The audio splice and ramps move to Phase 8.) |
+| `video-coach-media` | The shared composite builder (output size and GL context as parameters); `overlay.rs`; the preview tail into the mailbox; the natively-played recording branch; seek handling with the generation counter; `FrameMailbox` hoisted. |
+| `video-coach-app` | Bus: `OpenPreview` / `ClosePreview`, exclusivity, `Event::Preview`, position from the pump, transport routed to the preview. UI: Play opens a preview, identity zoom and no stroke layer while previewing, the indicator, Close, Esc. |
+| `video-coach-harness` | Open, play, seek, close; the refusals. |
 
 ## Testing
 
-- **Core:** the splice and ramp maths (sample counts, envelope shape, a segment shorter than a ramp, and the clamp at t=0); the layout ratios.
+- **Core:** the layout ratios.
 - **Media:**
-  - the overlay rasterizer against a golden image (strokes at known positions, and the alpha);
-  - a preview graph running headless into an appsink, checked for frame-exactness against the schedule, exactly as the Phase 5 fiducial does;
-  - the audio mixer's output over a fixture whose two tracks are distinguishable (for example a tone against silence), checking the gate and the ramps.
-- **Harness:** open, play, seek, close; refusals while recording or exporting.
-- **Manual** (batched): preview a real clip and confirm drawings, zoom, PiP and audio all line up with what was recorded.
+  - the overlay rasterizer against a golden image (strokes at known positions, and premultiplied alpha);
+  - **one** composite test: a PiP pad rect and an overlay composited over a synthetic solid base, checking geometry and alpha. The frame-exactness of the schedule and pump is already covered by Phase 5's fiducial, through the same code.
+- **Harness:** open, play, seek, close; refusals while recording or exporting; the position published while previewing.
+- **Manual** (batched): preview a real clip; drawings, zoom, PiP and commentary line up with what was recorded.
 
-## Gates (parent spec, "Phase 7 gate")
+## Gates
 
-1. **The shared-context gate, first.** Before audio and strokes, get a 3-pad mixer's output onto the screen through Slint's GL context and **measure the UI's frame time**. Export sidesteps this with a private display; preview can't.
-2. **Real footage:** the user's HEVC 1440p clip previews at 30 fps with no dropped frames.
+1. **The composite on screen, first**, before the overlay and the PiP work is finished: 30 fps composite with no dropped frames, and a **UI frame time p95 ≤ 4 ms** (the measured 720p/720p figure is 2.65 ms, against a 1.34 ms idle control).
+2. **The user's HEVC 1440p footage** previews at 30 fps with no dropped frames. The review's prototype already meets both; the gate is that the real implementation does.
 
 ## Risks
 
-1. **Sharing Slint's GL context** between the mixer and Skia. This is the phase's main risk; gate 1 exists for it. If it can't hold 30 fps, the fallback is a private context plus a system-memory frame path for preview only, at a measured cost.
-2. **Three timelines** (frame index, appsrc segment, audio mixer position) must agree across pause and scrub. The `seek-data` approach keeps the hand-written state small.
-3. **Spliced source audio** is new code with no Phase 5 precedent, and A/V drift is hard to see in a test. Pure-function tests plus a mixed-PCM harness test mitigate it.
+1. **Three positions must agree** (the pump's frame index, the appsrc segment, and the natively-playing recording) across pause and scrub. The generation counter keeps the hand-written state to one mutex.
+2. **Mixer pad starvation:** every pad must receive frame `n` before the pump advances, and the PiP pad must not exist when `show_pip` is false.
+3. **A stale push after a flush** is accepted silently, so the generation check is load-bearing, not defensive.
 
 ## Deferred
 
-- The text bar and the scoreboard in the overlay: Phases 8 and 9.
+- **Game audio in preview, the splice and the 5 ms ramps: Phase 8,** with the export mixer. Phase 8 must adopt the drain-first rule for audio appsinks measured above.
+- The text bar and scoreboard in the overlay: Phases 8 and 9.
 - Playback-rate control and looping: macOS had neither.
 - Drawing during preview.

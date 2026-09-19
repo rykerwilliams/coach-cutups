@@ -401,7 +401,7 @@ Twelve phases in four milestones. Each gets its own plan document and follows th
 
 **Zero-copy is a seek-latency requirement, not only a throughput one.** An accurate seek decodes forward up to one GOP from the previous keyframe; if the decoder's output is system memory, every one of those frames is copied off the GPU even though all but the last are discarded. On the 2 s-GOP file that copy was 80% of the cost (447 → 92 ms median). Any path that lets decoded frames fall back to system memory — `decodebin`, a stray `videoconvert`, a sink without GL — regresses scrubbing, and it is invisible in a playback test.
 
-**Phase 7 gate — first composite.** End-to-end preview at playback resolution sustains output fps with zoom active and a stroke-heavy overlay.
+**Phase 7 gate — first composite.** End-to-end preview at playback resolution sustains output fps with zoom active and a stroke-heavy overlay, and the UI's own frame time stays inside budget (measured 2.65 ms p95 at 720p; see the Phase 7 spec). Preview honors `showPiP`; the macOS claim that it does not is stale.
 
 **There is no compositing-throughput gate.** It has been run; it failed; that is *why* the architecture is what it is. Do not re-run it.
 
