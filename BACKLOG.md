@@ -390,3 +390,14 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** when someone runs the port on NVIDIA or an AMD/VA
   machine with `vah264enc`; add an EGL-device or GBM display path and the
   encoder entries then, measured.
+
+### 47. Rare hang when a second bus shuts down while its player is prerolling
+- **Why deferred:** seen only in tests: open → shutdown → open → shutdown in
+  one process hung in the second `shutdown()` 3 times in 200 runs under 4×
+  parallel load; a single open/shutdown never hung (240 runs). The bus thread
+  looked stuck while the player was prerolling a load. It may mean closing the
+  window mid-load can freeze the app. User chose to keep moving on the phases
+  (2026-09-19). An unfinished investigation's diff is in the session
+  scratchpad (`shutdown-hang/wip.diff`), not committed.
+- **When to revisit:** if closing the app ever hangs, or during the end-of-port
+  hardening pass.
