@@ -132,6 +132,13 @@ Slint's Skia renderer's, shared with GStreamer.
 Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 `docs/superpowers/spikes/2026-09-19-seek-latency.md`.
 
+**Capture records on the system clock, from time 0 = `base_time`.**
+- **Sources:** the camera is `v4l2src`, for kernel timestamps and the `exposure_dynamic_framerate=0` control that stops low-light drops to 7.5 fps. The mic is `pipewiresrc`.
+- **Clock:** the recorder always forces `SystemClock` (CLOCK_MONOTONIC). `pulsesrc`'s clock was measured days off.
+- **Time 0:** `matroskamux` writes running time as-is, so recording time 0 is the pipeline's `base_time`, read when `set_state(PLAYING)` returns. **Never wait for PLAYING:** the mux holds preroll until the camera's first frame.
+- **Event times:** `host_ns` comes from `video_coach_media::now_ns()`.
+- **Tests:** they use injected test sources (`CaptureKind::Test`) and never the real camera or mic. See `docs/superpowers/specs/2026-09-19-linux-port-phase-4-design.md`.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not
