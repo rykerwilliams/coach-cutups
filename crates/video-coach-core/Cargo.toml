@@ -1,0 +1,23 @@
+[package]
+name = "video-coach-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure logic for Coach Cuts: project format, playback timeline, zoom, stroke replay."
+
+# INVARIANT: this crate declares no media dependency -- not GStreamer, not an
+# image or font crate, not a feature that pulls one in. CI runs
+# `cargo test -p video-coach-core` on a machine with no GStreamer installed,
+# which fails loudly if one is ever added. See docs/superpowers/specs/
+# 2026-09-19-linux-port-design.md, "Core isolation".
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

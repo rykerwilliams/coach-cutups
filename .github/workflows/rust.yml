@@ -1,0 +1,47 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Enforces the core-isolation invariant: video-coach-core must build and
+  # test on a machine with NO GStreamer installed. If a media dependency is
+  # ever added to that crate, this job fails to build. See the spec's
+  # "Core isolation" section -- this is the enforcement, not a lint.
+  core:
+    name: core (no GStreamer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p video-coach-core --verbose
+
+  workspace:
+    name: workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+
+  # Advisory only. Per the spec: a red Windows build does not veto a
+  # dependency that is right for Linux. Windows is not a release target
+  # until Phase 11, and video-coach-media would need GStreamer dev
+  # libraries on the runner to typecheck at all, so only core is checked.
+  windows:
+    name: windows (advisory)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check -p video-coach-core
