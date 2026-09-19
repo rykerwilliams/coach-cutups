@@ -5,3 +5,4 @@
 //! `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md`.
 
 pub mod bus;
+pub mod format;
