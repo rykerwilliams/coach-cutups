@@ -15,6 +15,7 @@ gstreamer-gl-egl.workspace = true
 gstreamer-pbutils.workspace = true
 gstreamer-video.workspace = true
 thiserror.workspace = true
+tiny-skia.workspace = true
 
 [features]
 # The synthetic media in `fixtures`, for tests here and in the harness.

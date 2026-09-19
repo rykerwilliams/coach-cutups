@@ -26,4 +26,7 @@ gstreamer-gl = { version = "0.25", features = ["v1_24"] }
 gstreamer-gl-egl = { version = "0.25", features = ["v1_24"] }
 gstreamer-pbutils = { version = "0.25", features = ["v1_24"] }
 glutin_egl_sys = "0.7"
+# The vector overlay layer, in video-coach-media only: core stays media-free.
+# `png-format` would pull in a PNG codec no shipping path decodes.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 rfd = "0.17"

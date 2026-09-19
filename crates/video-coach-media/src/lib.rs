@@ -8,6 +8,7 @@ pub mod capture;
 pub mod export;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod overlay;
 pub mod player;
 pub mod probe;
 
@@ -16,6 +17,7 @@ pub use capture::{
     Recorder, RecorderMessage, StopOutcome,
 };
 pub use export::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
+pub use overlay::render_overlay;
 pub use player::{
     Diagnostics, Frame, FrameMailbox, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
 };
