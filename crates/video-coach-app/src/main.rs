@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 
-use video_coach_app::bus::{Bus, BusHandle, Command, Event, Snapshot};
+use video_coach_app::bus::{Bus, BusHandle, CaptureKind, Command, Event, Snapshot};
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
-use video_coach_media::{PositionHandle, SinkKind};
+use video_coach_media::{now_ns, PositionHandle, SinkKind};
 
 use pickers::{Pick, Pickers};
 
@@ -48,6 +48,9 @@ struct UiState {
     zoom: Zoom,
     /// The primary-button drag over the player, from its last press.
     drag: Option<DragPan>,
+    /// Where zoom changes go: [`set_zoom`] is called from bus events too,
+    /// which have no other way to reach the bus.
+    bus: Option<Rc<RefCell<BusHandle>>>,
 }
 
 impl Default for UiState {
@@ -59,6 +62,7 @@ impl Default for UiState {
             last_secs: 0.0,
             zoom: Zoom::IDENTITY,
             drag: None,
+            bus: None,
         }
     }
 }
@@ -84,12 +88,14 @@ fn main() {
     let weak = window.as_weak();
     let bus = Bus::spawn(
         SinkKind::Gl,
+        CaptureKind::Devices,
         Box::new(move |event| {
             let _ = weak.upgrade_in_event_loop(move |w| on_event(&w, event));
         }),
     );
     let position = bus.position_handle().clone();
     let bus = Rc::new(RefCell::new(bus));
+    UI.with_borrow_mut(|ui| ui.bus = Some(bus.clone()));
     video::install(&window, bus.clone());
     wire_callbacks(&window, &bus);
     wire_zoom(&window);
@@ -191,9 +197,21 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             w.set_saved_project_name(name.into());
         }
     });
-    let toggle = send(bus);
-    window.on_toggle_play(move || toggle(Command::TogglePlay));
-    window.on_skip(cmd(bus, |delta| Command::Skip { delta }));
+    // Both capture their moment and position here, at the input event (the
+    // bus contract): queue delay would put a recording's log behind.
+    window.on_toggle_play({
+        let (send, position) = (send(bus), bus.borrow().position_handle().clone());
+        move || {
+            send(Command::TogglePlay {
+                host_ns: now_ns(),
+                source_secs: position.query_position(),
+            })
+        }
+    });
+    window.on_skip(cmd(bus, |delta| Command::Skip {
+        delta,
+        host_ns: now_ns(),
+    }));
     window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
     window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
     window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
@@ -308,8 +326,16 @@ fn update_zoom(w: &AppWindow, change: impl FnOnce(Zoom, &Viewport) -> Zoom) {
     set_zoom(w, change(zoom, &vp));
 }
 
+/// The one place the zoom changes. Every change goes to the bus, which logs
+/// it while recording and ignores it otherwise.
 fn set_zoom(w: &AppWindow, zoom: Zoom) {
-    UI.with_borrow_mut(|ui| ui.zoom = zoom);
+    let host_ns = now_ns();
+    UI.with_borrow_mut(|ui| {
+        ui.zoom = zoom;
+        if let Some(bus) = &ui.bus {
+            bus.borrow().send(Command::Zoom { host_ns, zoom });
+        }
+    });
     w.set_zoom(ZoomState {
         scale: zoom.scale as f32,
         pan_x: zoom.pan_x as f32,
@@ -351,6 +377,8 @@ fn on_event(w: &AppWindow, event: Event) {
             ui.target_abs = target_abs;
         }),
         Event::Playing(playing) => w.set_playing(playing),
+        // Not shown yet: the recording controls will draw these.
+        Event::Recording(_) | Event::Level(_) => {}
         Event::Error(e) => {
             eprintln!("ui: error: {e}");
             // The first error stays up: one failure can report several, and

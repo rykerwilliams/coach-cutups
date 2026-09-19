@@ -64,7 +64,7 @@ impl Rig {
         // Back to back: all queued before the first seek lands, so they fall
         // in one burst.
         for &delta in deltas {
-            self.h.send(Command::Skip { delta });
+            self.h.skip(delta);
         }
     }
 }
@@ -122,7 +122,7 @@ fn a_skip_burst_then_a_scrub_release_never_sticks() {
 #[test]
 fn eos_advances_to_the_next_source_and_keeps_playing() {
     let mut rig = Rig::open(&[("a.webm", 1), ("b.webm", 1)]);
-    rig.h.send(Command::TogglePlay);
+    rig.h.toggle_play();
     wait_playing(&mut rig.h, true);
     let started = rig.h.log().len();
 
@@ -140,7 +140,7 @@ fn eos_advances_to_the_next_source_and_keeps_playing() {
 #[test]
 fn eos_on_the_last_source_leaves_it_paused_at_the_end() {
     let mut rig = Rig::open(&[("a.webm", 1)]);
-    rig.h.send(Command::TogglePlay);
+    rig.h.toggle_play();
     wait_playing(&mut rig.h, true);
     wait_playing(&mut rig.h, false);
 

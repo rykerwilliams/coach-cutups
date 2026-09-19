@@ -374,7 +374,7 @@ fn a_missing_source_blocks_play_until_relinked() {
         "the present current source still loads"
     );
 
-    h.send(Command::TogglePlay);
+    h.toggle_play();
     assert!(!h.wait_playing(), "play must be refused while b is missing");
 
     let found = dirs.video("b-found.webm", 320, 180);
@@ -386,7 +386,7 @@ fn a_missing_source_blocks_play_until_relinked() {
     );
     assert_eq!(*changed.missing, [false, false]);
 
-    h.send(Command::TogglePlay);
+    h.toggle_play();
     assert!(h.wait_playing());
     h.shutdown();
 }
@@ -490,7 +490,7 @@ fn a_player_error_is_reported_and_play_recovers() {
 
     // Fixed on disk: play reloads b and plays it.
     std::fs::write(&b, good_b).unwrap();
-    h.send(Command::TogglePlay);
+    h.toggle_play();
     assert!(h.wait_playing());
     h.poll_until("playing in b", |h| {
         let latest = h.log().iter().rev().find_map(|e| match e {
@@ -525,7 +525,7 @@ fn a_source_deleted_mid_session_is_flagged_missing_on_the_player_error() {
     assert!(matches!(h.wait_for_error(), UserError::Playback(_)));
     assert_eq!(*h.wait_changed().missing, [false, true]);
 
-    h.send(Command::TogglePlay);
+    h.toggle_play();
     assert!(!h.wait_playing(), "play must be refused while b is missing");
     h.shutdown();
 }

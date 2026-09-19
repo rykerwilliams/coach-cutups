@@ -10,10 +10,12 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use video_coach_app::bus::{Bus, BusHandle, Command, Event, Snapshot, StateFile, UserError};
+use video_coach_app::bus::{
+    Bus, BusHandle, CaptureKind, Command, Event, RecordingStatus, Snapshot, StateFile, UserError,
+};
 use video_coach_core::project::{Project, SourceRef};
 use video_coach_core::store;
-use video_coach_media::{fixtures, probe, SinkKind};
+use video_coach_media::{fixtures, now_ns, probe, SinkKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -27,11 +29,24 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// A bus whose last-project state file lives under `config_dir`.
+    /// A bus whose last-project state file lives under `config_dir`, recording
+    /// from test sources whose video starts at once.
     pub fn new(config_dir: &Path) -> Self {
+        Self::with_capture(
+            config_dir,
+            CaptureKind::Test {
+                video_delay: Duration::ZERO,
+            },
+        )
+    }
+
+    /// [`Harness::new`] recording from `capture`: test sources with a video
+    /// delay, as a camera warming up.
+    pub fn with_capture(config_dir: &Path, capture: CaptureKind) -> Self {
         let (tx, rx) = mpsc::channel();
         let bus = Bus::spawn_with_state(
             SinkKind::System,
+            capture,
             StateFile::in_config_dir(config_dir),
             Box::new(move |event| {
                 let _ = tx.send(event);
@@ -47,6 +62,22 @@ impl Harness {
 
     pub fn send(&self, cmd: Command) {
         self.bus.send(cmd);
+    }
+
+    /// Play/pause as the UI sends it: the moment and position read now.
+    pub fn toggle_play(&self) {
+        self.send(Command::TogglePlay {
+            host_ns: now_ns(),
+            source_secs: self.position_secs(),
+        });
+    }
+
+    /// A skip as the UI sends it, with the moment read now.
+    pub fn skip(&self, delta: f64) {
+        self.send(Command::Skip {
+            delta,
+            host_ns: now_ns(),
+        });
     }
 
     /// Waits until `f` maps an unconsumed event to `Some`, consumes every
@@ -105,6 +136,14 @@ impl Harness {
     pub fn wait_playing(&mut self) -> bool {
         self.wait_map("Playing", |e| match e {
             Event::Playing(p) => Some(*p),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Recording`.
+    pub fn wait_recording(&mut self) -> RecordingStatus {
+        self.wait_map("Recording", |e| match e {
+            Event::Recording(s) => Some(*s),
             _ => None,
         })
     }

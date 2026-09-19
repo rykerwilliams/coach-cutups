@@ -3,12 +3,14 @@
 //! hears back only through [`Event`]s, so everything here runs headless — the
 //! harness drives it with a system-memory sink and no Slint.
 //!
-//! One input channel carries both commands and the player's forwarded
-//! GStreamer messages, so the thread never has to choose between two queues.
-//! The loop waits with `recv_timeout` on an optional deadline (the skip
-//! debounce); with no deadline it simply blocks.
+//! One input channel carries commands, the player's forwarded GStreamer
+//! messages and the recorder's messages, so the thread never has to choose
+//! between queues. The loop waits with `recv_timeout` on the earlier of two
+//! deadlines (the skip debounce and the recording start timeout); with
+//! neither armed it simply blocks.
 
 mod project;
+mod recording;
 mod sources;
 mod state;
 mod transport;
@@ -23,8 +25,12 @@ use gstreamer_gl as gst_gl;
 use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
-use video_coach_media::{FrameMailbox, PositionHandle, ProbeError, SinkKind, SourcePlayer};
+use video_coach_core::zoom::Zoom;
+use video_coach_media::{
+    FrameMailbox, PositionHandle, ProbeError, RecorderMessage, SinkKind, SourcePlayer,
+};
 
+pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
 
 /// What the UI asks the bus to do.
@@ -47,11 +53,19 @@ pub enum Command {
     },
     RelinkSource(usize, PathBuf),
 
-    // Transport. Positions are concat-timeline seconds.
-    TogglePlay,
+    // Transport. Positions are concat-timeline seconds unless named `source_`.
+    // `host_ns` is `now_ns()` at the input event, captured by the caller
+    // (never by the bus: queue delay would drift the recording's log).
+    /// `source_secs` is the player's position the UI read at the keypress,
+    /// the pause or play anchor when no seek is outstanding (R10).
+    TogglePlay {
+        host_ns: u64,
+        source_secs: Option<f64>,
+    },
     /// Skip by `delta` seconds; presses in quick succession accumulate.
     Skip {
         delta: f64,
+        host_ns: u64,
     },
     /// Live scrub preview: a keyframe seek, latest wins.
     ScrubMove {
@@ -66,6 +80,26 @@ pub enum Command {
     SetVolume {
         value: f64,
         commit: bool,
+    },
+
+    // Recording (spec R6).
+    /// Starts a recording from where the player is heading, with the UI's
+    /// current zoom as the log's first event.
+    StartRecording {
+        zoom: Zoom,
+    },
+    /// Stops the recording, or aborts it if no video has arrived yet.
+    StopRecording,
+    /// The UI's zoom changed. Logged while recording, ignored otherwise.
+    Zoom {
+        host_ns: u64,
+        zoom: Zoom,
+    },
+    /// The project's preferred devices, by PipeWire `node.name`; `None` is
+    /// the system default.
+    SetDevices {
+        camera: Option<String>,
+        mic: Option<String>,
     },
 
     // Lifecycle.
@@ -110,6 +144,10 @@ pub enum Event {
         target_abs: Option<f64>,
     },
     Playing(bool),
+    Recording(RecordingStatus),
+    /// The microphone's loudest channel peak over the last 100 ms, in dB,
+    /// while a recording runs.
+    Level(f64),
     Error(UserError),
 }
 
@@ -139,6 +177,23 @@ pub enum UserError {
     TooNewProject { found: u32 },
     #[error("that video is still used by a clip or match event; delete those first")]
     SourceReferenced { index: usize },
+    /// Recording is refused: the project isn't ready for it.
+    #[error("can't record: {0}")]
+    CantRecord(&'static str),
+    /// Recording is refused: there is no usable device.
+    #[error("no {what} was found")]
+    NoDevice { what: &'static str },
+    #[error("recording failed: {0}")]
+    RecordingFailed(String),
+    /// A notice: the chosen device is absent, and the recording goes ahead on
+    /// the default one. The preference is kept.
+    #[error("the chosen {what} isn't connected, so the default one is recording")]
+    DeviceFallback { what: &'static str },
+    /// A notice: the recording didn't finalize cleanly. The clip was kept.
+    #[error(
+        "the recording didn't finish cleanly; its clip was kept, but its end may be cut short"
+    )]
+    StopNotClean,
     #[error("{0}")]
     Io(String),
 }
@@ -177,6 +232,8 @@ impl From<SourceReferenced> for UserError {
 enum Input {
     Cmd(Command),
     Gst(gst::Message),
+    /// From the recorder with this generation. Never routed to the player.
+    Recorder(u64, RecorderMessage),
 }
 
 /// The project the bus has open: folder and document, committed together.
@@ -190,6 +247,8 @@ struct Open {
 /// only ever holds a [`BusHandle`].
 pub struct Bus {
     events: Box<dyn Fn(Event) + Send>,
+    /// The bus's own input, for the recorder's messages.
+    tx: mpsc::Sender<Input>,
     player: SourcePlayer,
     position: PositionHandle,
     state: StateFile,
@@ -206,7 +265,15 @@ pub struct Bus {
     /// Coalesces skip presses over concat time (spec D8).
     skip: SkipCoordinator,
     /// When the skip debounce fires, if armed.
-    deadline: Option<Instant>,
+    skip_deadline: Option<Instant>,
+    /// When a recording that has had no video gives up, if one is starting.
+    start_deadline: Option<Instant>,
+    /// Where recordings come from.
+    capture: CaptureKind,
+    /// The recording in progress.
+    recording: Option<recording::Active>,
+    /// The latest recorder's generation. Messages from any other are stale.
+    generation: u64,
 }
 
 impl Bus {
@@ -217,14 +284,22 @@ impl Bus {
     /// `autoaudiosink`; `System` is headless tests, with `fakesink sync=true`,
     /// so playback still runs in real time without a sound device.
     ///
+    /// `capture` picks where recordings come from: the camera and microphone,
+    /// or test sources.
+    ///
     /// `events` is called on the bus thread.
-    pub fn spawn(sinks: SinkKind, events: Box<dyn Fn(Event) + Send>) -> BusHandle {
-        Self::spawn_with_state(sinks, StateFile::default_location(), events)
+    pub fn spawn(
+        sinks: SinkKind,
+        capture: CaptureKind,
+        events: Box<dyn Fn(Event) + Send>,
+    ) -> BusHandle {
+        Self::spawn_with_state(sinks, capture, StateFile::default_location(), events)
     }
 
     /// [`Bus::spawn`] with an explicit state file, for tests.
     pub fn spawn_with_state(
         sinks: SinkKind,
+        capture: CaptureKind,
         state: StateFile,
         events: Box<dyn Fn(Event) + Send>,
     ) -> BusHandle {
@@ -241,6 +316,7 @@ impl Bus {
         let mailbox = player.mailbox().clone();
         let bus = Bus {
             events,
+            tx: tx.clone(),
             player,
             position: position.clone(),
             state,
@@ -250,7 +326,11 @@ impl Bus {
             playing: false,
             missing: Arc::new([]),
             skip: SkipCoordinator::default(),
-            deadline: None,
+            skip_deadline: None,
+            start_deadline: None,
+            capture,
+            recording: None,
+            generation: 0,
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -266,7 +346,12 @@ impl Bus {
 
     fn run(mut self, rx: mpsc::Receiver<Input>) {
         loop {
-            let input = match self.deadline {
+            let deadline = self
+                .skip_deadline
+                .into_iter()
+                .chain(self.start_deadline)
+                .min();
+            let input = match deadline {
                 Some(deadline) => {
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(input) => Some(input),
@@ -280,15 +365,16 @@ impl Bus {
                 },
             };
             match input {
-                None => {
-                    self.deadline = None;
-                    self.deadline_passed();
-                }
+                None => {}
                 Some(Input::Gst(msg)) => {
                     let events = self.player.handle(&msg);
                     self.player_events(events);
                 }
+                Some(Input::Recorder(generation, msg)) => self.recorder_message(generation, msg),
                 Some(Input::Cmd(Command::Shutdown { ack })) => {
+                    // A recording keeps its clip (or is aborted while still
+                    // starting) before anything is torn down.
+                    self.stop_recording();
                     // Dropping the player takes the pipeline to NULL before
                     // the ack, which the UI's GL teardown waits for.
                     drop(self);
@@ -297,11 +383,43 @@ impl Bus {
                 }
                 Some(Input::Cmd(cmd)) => self.command(cmd),
             }
+            // After every input, not only on a timeout, so a busy channel
+            // (level messages at 10 Hz) can't starve them.
+            self.dispatch_deadlines();
             self.publish_position();
         }
     }
 
+    /// Runs each deadline that has passed.
+    fn dispatch_deadlines(&mut self) {
+        let now = Instant::now();
+        if self.skip_deadline.is_some_and(|d| d <= now) {
+            self.skip_deadline = None;
+            self.skip_debounce_passed();
+        }
+        if self.start_deadline.is_some_and(|d| d <= now) {
+            self.start_deadline = None;
+            self.start_timed_out();
+        }
+    }
+
     fn command(&mut self, cmd: Command) {
+        // The one guard while recording (R6): everything not listed is
+        // refused, so commands added later are too. The UI greys these out,
+        // so reaching here is a UI bug.
+        if self.recording.is_some()
+            && !matches!(
+                cmd,
+                Command::TogglePlay { .. }
+                    | Command::Skip { .. }
+                    | Command::SetVolume { .. }
+                    | Command::Zoom { .. }
+                    | Command::StopRecording
+                    | Command::GlReady { .. }
+            )
+        {
+            return eprintln!("bus: refused while recording: {cmd:?}");
+        }
         match cmd {
             Command::OpenProject(folder) => self.open_project(folder),
             Command::RestoreLastProject => self.restore_last_project(),
@@ -310,11 +428,18 @@ impl Bus {
             Command::RemoveSource(index) => self.remove_source(index),
             Command::MoveSource { from, to } => self.move_source(from, to),
             Command::RelinkSource(index, path) => self.relink_source(index, path),
-            Command::TogglePlay => self.toggle_play(),
-            Command::Skip { delta } => self.skip(delta),
+            Command::TogglePlay {
+                host_ns,
+                source_secs,
+            } => self.toggle_play(host_ns, source_secs),
+            Command::Skip { delta, host_ns } => self.skip(delta, host_ns),
             Command::ScrubMove { abs } => self.scrub(abs, false),
             Command::ScrubRelease { abs } => self.scrub(abs, true),
             Command::SetVolume { value, commit } => self.set_volume(value, commit),
+            Command::StartRecording { zoom } => self.start_recording(zoom),
+            Command::StopRecording => self.stop_recording(),
+            Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
+            Command::SetDevices { camera, mic } => self.set_devices(camera, mic),
             Command::GlReady { display, context } => {
                 let events = self.player.set_gl_context(display, context);
                 self.player_events(events);

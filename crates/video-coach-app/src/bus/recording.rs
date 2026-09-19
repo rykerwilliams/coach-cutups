@@ -1,0 +1,295 @@
+//! Recording (Phase 4 spec R6): the one Active state, from Start to a clip.
+//!
+//! Active is flagged *starting* until the recorder's first video buffer
+//! reaches the muxer. Stopping before then (StopRecording, a recorder error,
+//! or the start timeout) aborts: no clip, and the file is deleted. Stopping
+//! after it always keeps the clip, even if finalizing didn't go cleanly.
+//!
+//! The recorder's messages arrive as their own input, tagged with the
+//! generation of the `Recorder::start` that produced them, and never reach
+//! the player: its EOS would advance the source and its ERROR reset the
+//! player.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use gstreamer::glib;
+use uuid::Uuid;
+use video_coach_core::project::Preferences;
+use video_coach_core::recording::{PendingClip, RecordingLog};
+use video_coach_core::zoom::Zoom;
+use video_coach_media::{
+    list_devices, resolve_camera, resolve_mic, CaptureSources, Recorder, RecorderMessage,
+};
+
+use super::{Bus, Event, Input, UserError};
+
+/// How long a recording may wait for its first video frame.
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a stop waits for the file to finalize.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The camera rule of R3, as the "no device" message names it.
+const CAMERA: &str = "camera with a 16:9, 30 fps mode up to 1280 wide";
+
+/// Where recordings come from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureKind {
+    /// The project's preferred camera and microphone, or the defaults.
+    Devices,
+    /// Live test sources, with video starting `video_delay` in, as a camera
+    /// warming up. For tests: no camera, microphone or display.
+    Test { video_delay: Duration },
+}
+
+/// What the recording is doing, as the UI shows it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecordingStatus {
+    Idle,
+    /// Recording, but no video has arrived yet: stopping now aborts.
+    Starting,
+    /// `t0_ns` is the recording's time 0 on `now_ns()`'s clock, for the
+    /// elapsed-time readout.
+    Recording {
+        t0_ns: u64,
+    },
+}
+
+/// The recording in progress.
+pub(super) struct Active {
+    pub(super) pending: PendingClip,
+    recorder: Recorder,
+    pub(super) log: RecordingLog,
+    /// The file, deleted on an abort.
+    path: PathBuf,
+    /// The first video buffer reached the muxer: stopping keeps the clip.
+    video_seen: bool,
+}
+
+impl Bus {
+    /// Starts recording from where the player is heading (R6). Refused with
+    /// an error unless a project with sources, none missing, is open and its
+    /// current source is loaded or loading.
+    pub(super) fn start_recording(&mut self, zoom: Zoom) {
+        if let Err(e) = self.can_record() {
+            return self.emit(Event::Error(e));
+        }
+        let Some(open) = &self.open else {
+            return;
+        };
+        let folder = open.folder.join("recordings");
+        let preferences = open.project.preferences.clone();
+
+        // Every clip starts on a still frame.
+        if self.playing {
+            self.set_playing(false);
+        }
+        let (source_index, start_source_seconds) = self.heading(None);
+        let pending = PendingClip {
+            id: Uuid::new_v4(),
+            source_index,
+            start_source_seconds,
+        };
+        let sources = match self.capture_sources(&preferences) {
+            Ok(sources) => sources,
+            Err(e) => return self.emit(Event::Error(e)),
+        };
+        if let Err(e) = std::fs::create_dir_all(&folder) {
+            return self.emit(Event::Error(UserError::Io(format!(
+                "{}: {e}",
+                folder.display()
+            ))));
+        }
+        let path = folder.join(format!("{}.mkv", pending.id));
+
+        self.generation += 1;
+        let tx = self.tx.clone();
+        let started = Recorder::start(sources, &path, self.generation, move |generation, msg| {
+            // Fails only once the bus thread has exited.
+            let _ = tx.send(Input::Recorder(generation, msg));
+        });
+        let recorder = match started {
+            Ok(recorder) => recorder,
+            Err(e) => {
+                // filesink has already created it.
+                remove_recording(&path);
+                return self.emit(Event::Error(UserError::RecordingFailed(e)));
+            }
+        };
+        self.recording = Some(Active {
+            pending,
+            log: RecordingLog::new(recorder.t0_ns(), zoom, start_source_seconds),
+            recorder,
+            path,
+            video_seen: false,
+        });
+        self.start_deadline = Some(Instant::now() + START_TIMEOUT);
+        self.emit(Event::Recording(RecordingStatus::Starting));
+    }
+
+    /// Stops the recording, keeping its clip, or aborts it if no video has
+    /// arrived. Nothing to do while idle.
+    pub(super) fn stop_recording(&mut self) {
+        match &self.recording {
+            None => {}
+            Some(active) if active.video_seen => self.finish_recording(),
+            Some(_) => self.abort_recording(),
+        }
+    }
+
+    pub(super) fn recorder_message(&mut self, generation: u64, msg: RecorderMessage) {
+        if generation != self.generation {
+            return;
+        }
+        let Some(active) = &mut self.recording else {
+            return;
+        };
+        match msg {
+            RecorderMessage::FirstVideo => {
+                active.video_seen = true;
+                let t0_ns = active.recorder.t0_ns();
+                self.start_deadline = None;
+                self.emit(Event::Recording(RecordingStatus::Recording { t0_ns }));
+            }
+            RecorderMessage::Level { peak_db } => self.emit(Event::Level(peak_db)),
+            RecorderMessage::Error(e) => {
+                eprintln!("bus: recorder error: {e}");
+                self.emit(Event::Error(UserError::RecordingFailed(e)));
+                self.stop_recording();
+            }
+        }
+    }
+
+    /// No video within [`START_TIMEOUT`].
+    pub(super) fn start_timed_out(&mut self) {
+        if self.recording.as_ref().is_some_and(|a| !a.video_seen) {
+            self.emit(Event::Error(UserError::RecordingFailed(format!(
+                "no video from the camera within {} seconds",
+                START_TIMEOUT.as_secs()
+            ))));
+            self.abort_recording();
+        }
+    }
+
+    /// Logs the play state just entered at `host_ns`, while recording.
+    pub(super) fn log_playing(&mut self, host_ns: u64, ui_secs: Option<f64>) {
+        if self.recording.is_none() {
+            return;
+        }
+        let (_, anchor) = self.heading(ui_secs);
+        let playing = self.playing;
+        if let Some(active) = &mut self.recording {
+            if playing {
+                active.log.play(host_ns, anchor);
+            } else {
+                active.log.pause(host_ns, anchor);
+            }
+        }
+    }
+
+    /// Logs a zoom change while recording. The UI sends every change, so one
+    /// made before its status caught up isn't lost; while idle it's ignored.
+    pub(super) fn log_zoom(&mut self, host_ns: u64, zoom: Zoom) {
+        if let Some(active) = &mut self.recording {
+            active.log.zoom(host_ns, zoom);
+        }
+    }
+
+    pub(super) fn set_devices(&mut self, camera: Option<String>, mic: Option<String>) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        open.project.preferences.preferred_camera_id = camera;
+        open.project.preferences.preferred_mic_id = mic;
+        self.project_changed();
+    }
+
+    /// Start's preconditions (R6). A skip or scrub in flight is not a reason
+    /// to refuse: the recording starts where the player is heading.
+    fn can_record(&self) -> Result<(), UserError> {
+        let refused = |why| Err(UserError::CantRecord(why));
+        match &self.open {
+            None => refused("no project is open"),
+            Some(open) if open.project.source_videos.is_empty() => {
+                refused("add a game video to record over first")
+            }
+            Some(_) if self.any_missing() => refused("a game video is missing; relink it first"),
+            Some(_) if !self.loaded() => refused("the game video isn't loaded"),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The recorder's sources. For devices: the preferred camera and mic if
+    /// connected, else the defaults with a notice, keeping the preference
+    /// (R2).
+    fn capture_sources(&self, preferences: &Preferences) -> Result<CaptureSources, UserError> {
+        if let CaptureKind::Test { video_delay } = self.capture {
+            return Ok(CaptureSources::Test { video_delay });
+        }
+        let devices = list_devices();
+        let (camera, camera_fell_back) =
+            resolve_camera(&devices.cameras, preferences.preferred_camera_id.as_deref())
+                .ok_or(UserError::NoDevice { what: CAMERA })?;
+        let (mic, mic_fell_back) =
+            resolve_mic(&devices.mics, preferences.preferred_mic_id.as_deref());
+        if camera_fell_back {
+            self.emit(Event::Error(UserError::DeviceFallback { what: "camera" }));
+        }
+        if mic_fell_back {
+            self.emit(Event::Error(UserError::DeviceFallback {
+                what: "microphone",
+            }));
+        }
+        Ok(CaptureSources::Devices {
+            camera: camera.clone(),
+            mic: mic.map(str::to_owned),
+        })
+    }
+
+    /// Stops the recorder and adds the clip (R6's stop): the log is closed
+    /// first, so no event outlasts the file.
+    fn finish_recording(&mut self) {
+        let Some(active) = self.recording.take() else {
+            return;
+        };
+        self.start_deadline = None;
+        let events = active.log.finish();
+        let outcome = active.recorder.stop(STOP_TIMEOUT);
+        if let Some(open) = &mut self.open {
+            open.project
+                .add_recorded_clip(active.pending, outcome.duration, events, created_at());
+        }
+        self.project_changed();
+        self.emit(Event::Recording(RecordingStatus::Idle));
+        if !outcome.clean {
+            self.emit(Event::Error(UserError::StopNotClean));
+        }
+    }
+
+    /// Drops a recording that never got video: no clip, no file.
+    fn abort_recording(&mut self) {
+        let Some(active) = self.recording.take() else {
+            return;
+        };
+        self.start_deadline = None;
+        // NULL first, so nothing still writes the file.
+        drop(active.recorder);
+        remove_recording(&active.path);
+        self.emit(Event::Recording(RecordingStatus::Idle));
+    }
+}
+
+fn remove_recording(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        eprintln!("bus: could not delete {}: {e}", path.display());
+    }
+}
+
+/// Now as RFC3339 in whole seconds, matching the fixtures and macOS. Empty
+/// if the system time can't be read: nothing reads it.
+fn created_at() -> String {
+    glib::DateTime::now_utc()
+        .and_then(|now| now.format("%Y-%m-%dT%H:%M:%SZ"))
+        .map(Into::into)
+        .unwrap_or_default()
+}
