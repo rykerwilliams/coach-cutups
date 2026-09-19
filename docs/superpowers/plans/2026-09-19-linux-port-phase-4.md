@@ -338,6 +338,40 @@ In `ui/app.slint` and `src/main.rs`.
 
 Commit: `feat(app): recording controls, clips list and device picker`.
 
+### Task 5 notes
+
+- **Shape.**
+  - The UI's status is a `RecordingPhase` enum property (idle, starting, recording).
+  - `recording` is derived from it.
+  - The scrubber's mid-drag reset now keys on `can-scrub` (can-play and not recording).
+  - Ctrl+O is guarded as well as the button.
+  - Esc stops only while recording; otherwise it passes through.
+  - The Record button is enabled when `can-play || recording`.
+  - The `PopupWindow` sits in the transport bar's Rectangle, because a std `Button` can't have children other than a `Tooltip`.
+  - A preferred device that isn't connected keeps a checked row, "The chosen camera (not connected)", since R2 keeps the preference.
+  - Notices go through the existing dialog unchanged: their `Display` text already reads as a notice.
+- **Verified on the laptop.** xdotool isn't installed, so a temporary `COACH_AUTODRIVE` timer invoked the window's callbacks. It has been removed. The run was done twice, with a scratch project and config and a generated 30 s fixture. Each run:
+  - added the fixture;
+  - ran the device lookup: camera "System default" (checked) and "Integrated_Webcam_HD (V4L2)", with no IR camera; mic "System default" (checked) and "Built-in Audio Analog Stereo";
+  - started recording, then played, skipped +3, zoomed a step and paused;
+  - stopped after about 9 s.
+
+  Results:
+  - The clip was about 8.8 s.
+  - Its events were `[zoom, pause, play, skip, zoom, zoom, pause]`. The last pause anchors at 4.98 s (0 + about 2 s played + 3 s skipped).
+  - The `.mkv` existed.
+  - Screenshots show:
+    - while recording: the red dot, "Recording", the elapsed time, a moving green level bar and "Stop". Open Project, Add Source, Devices, the name field, the scrubber and the source's × are greyed out;
+    - after the stop: the Clips row "1-00:00:00  0:08", and the source's × disabled because the source is now referenced.
+  - The scratch media was deleted afterwards.
+- **Not verified (user's checklist):**
+  - real R and Esc key presses, including R while the name field has focus;
+  - clicking the Record/Stop button, and its tooltips;
+  - the "Preparing recording…" label. It's brief, and `import` lagged the window by a few seconds;
+  - "Waiting for audio…";
+  - opening the Devices popover, its placement, and picking a device (which sends `SetDevices` and persists);
+  - a notice (`DeviceFallback` / `StopNotClean`) in the dialog while recording.
+
 ## Task 6 — Closeout
 
 1. `CLAUDE.md`, in the Rust port section, gets one paragraph on capture:

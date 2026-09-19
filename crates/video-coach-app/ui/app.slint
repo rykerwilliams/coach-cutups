@@ -16,6 +16,28 @@ export struct SourceRow {
     referenced: bool,
 }
 
+/// One row of the sidebar's Clips list. Read-only until Phase 3.
+export struct ClipRow {
+    name: string,
+    /// The recording's length, already formatted.
+    duration: string,
+}
+
+/// One row of the Devices popover's camera or microphone list.
+export struct DeviceRow {
+    label: string,
+    /// The project's current choice.
+    chosen: bool,
+}
+
+/// The recording as the UI last heard it from the bus (Phase 4 R6).
+export enum RecordingPhase {
+    idle,
+    /// Recording, but the camera hasn't delivered a frame yet.
+    starting,
+    recording,
+}
+
 /// Zoom and pan (spec D9), mirrored from the Rust side, which owns it.
 export struct ZoomState {
     scale: float,
@@ -141,6 +163,41 @@ component EmptyCard inherits Rectangle {
     }
 }
 
+/// A row of the Devices popover: the device, checked if it's the choice.
+/// Clicking it picks it (and closes the popover).
+component DeviceChoice inherits Rectangle {
+    in property <string> label;
+    in property <bool> chosen;
+    callback clicked();
+
+    height: 28px;
+    border-radius: 4px;
+    background: touch.has-hover ? Palette.selection-background : transparent;
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 6px;
+
+        Text {
+            text: root.chosen ? "✓" : "";
+            color: Palette.foreground;
+            width: 14px;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: Palette.foreground;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     min-width: 1100px;
@@ -202,8 +259,10 @@ export component AppWindow inherits Window {
     /// A scrub drag is under way. Cleared if the scrubber is disabled
     /// mid-drag, which never delivers its `released`.
     out property <bool> scrubbing;
-    changed can-play => {
-        if (!self.can-play) {
+    /// Scrubbing is possible: something to play, and not recording.
+    property <bool> can-scrub: root.can-play && !root.recording;
+    changed can-scrub => {
+        if (!self.can-scrub) {
             self.scrubbing = false;
         }
     }
@@ -211,6 +270,25 @@ export component AppWindow inherits Window {
     in property <string> readout: "0:00 / 0:00";
     /// Linear 0..1.
     in-out property <float> volume: 1;
+
+    // --- Recording (Phase 4 R11) ---
+
+    in property <RecordingPhase> recording-phase;
+    /// Not idle. Greys out everything the bus refuses while recording (R6's
+    /// guard): the source list, Open Project, rename, the scrubber and the
+    /// Devices button.
+    out property <bool> recording: root.recording-phase != RecordingPhase.idle;
+    /// Time since the recording's t0, already formatted.
+    in property <string> recording-elapsed: "0:00";
+    /// The microphone's peak as a fraction of the level bar, 0..1.
+    in property <float> level;
+    /// A level has arrived during this recording.
+    in property <bool> level-seen;
+    in property <[ClipRow]> clips;
+    /// The Devices popover's lists, "System default" first. Empty while
+    /// they're being looked up.
+    in property <[DeviceRow]> cameras;
+    in property <[DeviceRow]> mics;
 
     /// The error dialog's message; empty hides it.
     in-out property <string> error-message;
@@ -228,6 +306,15 @@ export component AppWindow inherits Window {
     callback skip(float);
     callback scrub-move(float);
     callback scrub-release(float);
+    /// R: start recording when idle, else stop.
+    callback toggle-recording();
+    /// Esc, or Stop while starting: stop (or abort) the recording.
+    callback stop-recording();
+    /// The Devices popover opened: look the devices up.
+    callback list-devices();
+    /// A row of the popover's camera or microphone list was picked.
+    callback choose-camera(int);
+    callback choose-mic(int);
     callback volume-changed(float);
     callback volume-released(float);
     /// Zoom keys (spec D9): `1`/`Ctrl+0` reset; `2`/`3` step the scale about
@@ -263,7 +350,7 @@ export component AppWindow inherits Window {
         }
         if (event.modifiers.control) {
             if (event.text == "o" || event.text == "O") {
-                if (pressed) {
+                if (pressed && !root.recording) {
                     root.open-project();
                 }
                 return accept;
@@ -275,6 +362,18 @@ export component AppWindow inherits Window {
                 return accept;
             }
             return reject;
+        }
+        if (event.text == "r" || event.text == "R") {
+            if (pressed) {
+                root.toggle-recording();
+            }
+            return accept;
+        }
+        if (event.text == Key.Escape && root.recording) {
+            if (pressed) {
+                root.stop-recording();
+            }
+            return accept;
         }
         if (event.text == " ") {
             if (pressed) {
@@ -335,7 +434,7 @@ export component AppWindow inherits Window {
                         }
 
                         name-edit := LineEdit {
-                            enabled: root.has-project;
+                            enabled: root.has-project && !root.recording;
                             placeholder-text: root.has-project ? "" : "No project";
                             text <=> root.project-name;
                             accepted(name) => {
@@ -365,6 +464,7 @@ export component AppWindow inherits Window {
                                 border-radius: 4px;
 
                                 drop := DropArea {
+                                    enabled: !root.recording;
                                     can-drop(event) => {
                                         root.payload-source(event.data) >= 0 ? DragAction.move : DragAction.none
                                     }
@@ -374,6 +474,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     DragArea {
+                                        enabled: !root.recording;
                                         allow-move: true;
                                         data: root.source-payload(index);
 
@@ -412,7 +513,7 @@ export component AppWindow inherits Window {
                                                 Button {
                                                     text: "×";
                                                     accessible-label: "Remove";
-                                                    enabled: !source.referenced;
+                                                    enabled: !source.referenced && !root.recording;
                                                     clicked => {
                                                         root.remove-source(index);
                                                     }
@@ -426,6 +527,35 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Clips";
+                            color: Palette.alternate-foreground;
+                            font-size: 11px;
+                        }
+
+                        ListView {
+                            for clip in root.clips: HorizontalLayout {
+                                height: 28px;
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: clip.name;
+                                    color: Palette.foreground;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: clip.duration;
+                                    color: Palette.alternate-foreground;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
@@ -530,11 +660,12 @@ export component AppWindow inherits Window {
 
                     Button {
                         text: "Open Project…";
+                        enabled: !root.recording;
                         clicked => { root.open-project(); }
                     }
                     Button {
                         text: "Add Source Video…";
-                        enabled: root.has-project;
+                        enabled: root.has-project && !root.recording;
                         clicked => { root.add-source(); }
                     }
                     Button {
@@ -543,8 +674,73 @@ export component AppWindow inherits Window {
                         min-width: 72px;
                         clicked => { root.toggle-play(); }
                     }
+                    Button {
+                        text: root.recording ? "Stop" : "Record";
+                        enabled: root.can-play || root.recording;
+                        min-width: 72px;
+                        clicked => { root.toggle-recording(); }
+
+                        Tooltip {
+                            text: root.recording
+                                ? @markdown("Stop recording (R or Esc)")
+                                : @markdown("Record (R)");
+                        }
+                    }
+                    if root.recording-phase == RecordingPhase.starting: Text {
+                        text: "Preparing recording…";
+                        color: Palette.alternate-foreground;
+                        vertical-alignment: center;
+                    }
+                    if root.recording-phase == RecordingPhase.recording: HorizontalLayout {
+                        spacing: 6px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: #ff3b30;
+                            }
+                        }
+                        Text {
+                            text: "Recording";
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.recording-elapsed;
+                            color: Palette.foreground;
+                            font-family: "monospace";
+                            vertical-alignment: center;
+                            min-width: 48px;
+                        }
+                        if !root.level-seen: Text {
+                            text: "Waiting for audio…";
+                            color: Palette.alternate-foreground;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        if root.level-seen: VerticalLayout {
+                            alignment: center;
+                            // The mic's peak over −60…0 dBFS.
+                            Rectangle {
+                                width: 90px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: #ffffff26;
+
+                                Rectangle {
+                                    x: 0;
+                                    width: parent.width * root.level;
+                                    border-radius: 3px;
+                                    background: root.level > 0.95 ? #ff3b30 : #34c759;
+                                }
+                            }
+                        }
+                    }
                     Slider {
-                        enabled: root.can-play;
+                        enabled: root.can-scrub;
                         minimum: 0;
                         maximum: max(root.total-seconds, 0.001);
                         value <=> root.position-seconds;
@@ -576,6 +772,65 @@ export component AppWindow inherits Window {
                         value <=> root.volume;
                         changed(value) => { root.volume-changed(value); }
                         released(value) => { root.volume-released(value); }
+                    }
+                    Button {
+                        text: "Devices…";
+                        enabled: root.has-project && !root.recording;
+                        clicked => {
+                            root.list-devices();
+                            devices-popup.show();
+                        }
+                    }
+                }
+
+                // The Devices popover: above the bar's right end, over the player.
+                devices-popup := PopupWindow {
+                    x: parent.width - self.width - 8px;
+                    y: -self.height - 8px;
+                    width: 300px;
+
+                    Rectangle {
+                        background: Palette.background;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Palette.border;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 4px;
+
+                            Text {
+                                text: "Camera";
+                                color: Palette.alternate-foreground;
+                                font-size: 11px;
+                            }
+                            if root.cameras.length == 0: Text {
+                                text: "Looking for devices…";
+                                color: Palette.alternate-foreground;
+                            }
+                            for camera[index] in root.cameras: DeviceChoice {
+                                label: camera.label;
+                                chosen: camera.chosen;
+                                clicked => { root.choose-camera(index); }
+                            }
+
+                            Rectangle { height: 8px; }
+
+                            Text {
+                                text: "Microphone";
+                                color: Palette.alternate-foreground;
+                                font-size: 11px;
+                            }
+                            if root.mics.length == 0: Text {
+                                text: "Looking for devices…";
+                                color: Palette.alternate-foreground;
+                            }
+                            for mic[index] in root.mics: DeviceChoice {
+                                label: mic.label;
+                                chosen: mic.chosen;
+                                clicked => { root.choose-mic(index); }
+                            }
+                        }
                     }
                 }
             }
