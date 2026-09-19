@@ -310,3 +310,44 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** Phase 8, when export runs its own GL pipeline — make
   sure it uses its own context, not the UI's. Or sooner if playback stutters
   when the window is occluded or on another workspace.
+
+## Phase 4 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-4-design.md`)
+
+### 37. Measure and correct the commentary A/V offset
+- **Why deferred:** audio from `pipewiresrc` is stamped on arrival, while
+  `v4l2src` video carries kernel capture times, so audio may sit ~20–40 ms
+  late. Nothing measured it against a real sync source.
+- **When to revisit:** Phase 8 (PiP export), with a clap test on the real
+  camera; correct with a fixed audio `ts-offset` if it's over a frame.
+
+### 38. Orphaned recordings after a crash
+- **Why deferred:** a crash loses the event log, so the `.mkv` can't become a
+  clip (R7). The file stays playable but unreferenced in `recordings/`.
+- **When to revisit:** Phase 3, alongside `.trash` handling — list or clean
+  files no clip references.
+
+### 39. Fall back to x264 when a VA encoder is present but broken
+- **Why deferred:** R4 picks the encoder by element presence. A VA element
+  that exists but fails fails the recording with an error.
+- **When to revisit:** if a user's recording fails at start on a machine with
+  VA elements, or at packaging (Phase 11) when hardware variety grows.
+
+### 40. Camera format and audio-source fallbacks
+- **Why deferred:** R3 refuses cameras without a 16:9 ≤1280 30 fps mode
+  (parent spec and macOS rule); R1 drops the `pulsesrc` fallback (its clock
+  was measured ~473,000 s off monotonic, and the target runs PipeWire).
+- **When to revisit:** Phase 11 packaging, or when a real camera or system
+  hits the refusal.
+
+### 41. Live device list and global device preferences
+- **Why deferred:** devices are enumerated when the popover opens, not
+  watched; preferences are per project (macOS parity).
+- **When to revisit:** if hot-plugging a camera while the popover is open
+  proves annoying, or if re-picking devices per project does.
+
+### 42. PiP checkbox, start flash, level-meter polish
+- **Why deferred:** `show_pip` has no consumer until export (Phase 8), so it
+  takes `pip_for_new_recordings` (default true) with no UI. The red start
+  flash and the meter's 1 s peak hold and colour gradient are macOS polish.
+- **When to revisit:** the checkbox with Phase 8 or the Phase 3 inspector;
+  the polish at the end of the port.

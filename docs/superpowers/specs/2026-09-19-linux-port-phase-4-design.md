@@ -1,7 +1,7 @@
 # Linux Port — Phase 4: Capture (Commentary Recording)
 
 **Date:** 2026-09-19
-**Status:** Draft, pre-review
+**Status:** Reviewed (simplify and correctness passes applied)
 **Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` (Phasing → Phase 4, and the Milestone C note: Phase 4 runs before Phase 3)
 **Builds on:** `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md` (bus, player, transport, zoom)
 **Evidence:** the capture research on the reference laptop, summarized in "Measured facts"; and the macOS inventory of `RecordingController.swift`, `CaptureSessionController.swift`, `DeviceCatalog.swift` and `ContentView.swift`'s recording flow.
@@ -12,51 +12,62 @@
 
 A coach presses **R** while scanning. The app records their webcam and microphone while they talk over the game footage and steer it: play, pause, skip, zoom. Pressing **R** again produces a **clip**: a pointer into the game video, the commentary recording, and the log of what they did. The clip appears in the sidebar.
 
-Clip editing, tags, delete and undo belong to Phase 3. Stroke drawing belongs to Phase 6. Export belongs to Phases 5 and 8.
+Clip editing, tags, delete and undo belong to Phase 3. Stroke drawing belongs to Phase 6. Export (including the picture-in-picture) belongs to Phases 5 and 8.
 
 ## Done when
 
-1. With a project whose sources are all present, **R** starts a recording. The transport shows "Preparing…", then a red **Recording** indicator with elapsed time and a live mic level. The webcam light is on only while recording.
-2. During the recording, Space, skips and zoom all work. Each action lands in the clip's event log with a timestamp that lines up with the recording.
-3. **R** (or Esc, or Stop) ends it. A clip named `<source#>-HH:MM:SS` appears in the sidebar's Clips list. `project.json` holds its source index and start time, its duration read from the recorded file, and an event log that starts `[zoom @0, pause @0]`. `recordings/<uuid>.mkv` plays in any player.
+1. With a project whose sources are all present, **R** starts a recording.
+   - The transport shows "Preparing…", then a red **Recording** indicator with elapsed time and a live mic level.
+   - The webcam light is on only while recording.
+2. During the recording, Space, skips and zoom all work. Each action lands in the clip's event log with a timestamp that lines up with the recording's audio.
+3. **R** (or Esc, or Stop) ends it, and a clip named `<source#>-HH:MM:SS` appears in the sidebar's Clips list.
+   - `project.json` holds the clip's source index and start time, its duration, and an event log that starts `[zoom @0, pause @0]`.
+   - `recordings/<uuid>.mkv` plays in any player.
 4. The camera and microphone can be chosen. The choice persists, and a missing device falls back to the default without forgetting the preference.
 5. Killing the app mid-recording leaves a playable `.mkv` behind. Nothing else is recovered (R7).
-6. Pausing shows the frame at the paused position, not the next one (Phase 2 fix, R10).
+6. Pausing leaves the frame that was on screen, and that is the frame the logged anchor points at (R10).
 
 ---
 
 ## Measured facts (reference laptop, 2026-09-19)
 
-These come from the capture research. They are measured, not assumed.
+These come from the capture research and the spec review. They are measured, not assumed.
 
 - **Devices.** `gst::DeviceMonitor` sees only PipeWire devices by default: the PipeWire provider hides the v4l2 and pulse duplicates.
   - The laptop exposes **two cameras with the same display name**: the RGB webcam (`/dev/video0`, MJPEG and YUY2) and an IR face-unlock camera (`/dev/video2`, GRAY8 only).
-  - **Stable across reboots:** `node.name` (e.g. `v4l2_input.pci-0000_00_14.0-usb-0_6_1.0`, `alsa_input.pci-…analog-stereo`), and the camera's `device.serial`.
-  - **Volatile:** `object.id`/`object.serial`, `node.id`, `/dev/videoN`, and `object.path` (which embeds videoN). `/dev/v4l/by-id` is wrong for this camera: the RGB and IR interfaces share a serial, and the symlink points at the IR camera.
-- **Camera formats.** 16:9 at ≤1280 wide and 30 fps exists only as **1280×720 MJPEG**. YUY2 tops out at 640×480.
-- **Low light drops the frame rate.** The UVC control `exposure_dynamic_framerate=1` let the camera fall to **7.5 fps** in a dark room while the caps still said 30/1. `v4l2src extra-controls="c,exposure_dynamic_framerate=0"` restored 30 fps. `pipewiresrc` can't set V4L2 controls.
-- **Timestamps.** `v4l2src` stamps buffers with the kernel capture time, about 28 ms before arrival. `pipewiresrc` stamps them on arrival. Video reaches the muxer 52–96 ms after capture (median 58 ms), after decode and encode.
+  - `node.name` (e.g. `v4l2_input.pci-0000_00_14.0-usb-0_6_1.0`) is stable across reboots.
+  - `object.id`, `/dev/videoN` and `object.path` are volatile.
+  - `/dev/v4l/by-id` is wrong for this camera: the symlink points at the IR interface.
+- **Camera formats.** 16:9 at ≤1280 wide and 30 fps exists only as **1280×720 MJPEG**.
+- **Low light.**
+  - The UVC control `exposure_dynamic_framerate=1` let the camera fall to **7.5 fps** in a dark room while the caps still said 30/1.
+  - `v4l2src extra-controls="c,exposure_dynamic_framerate=0"` restores 30 fps. `pipewiresrc` can't set V4L2 controls.
+- **Timestamps.** `v4l2src` stamps buffers with the kernel capture time, about 28 ms before arrival. `pipewiresrc` (audio) stamps them on arrival.
 - **Encoders.**
-  - `vajpegdec ! vah264lpenc`: **8% CPU** at 720p30.
-  - `x264enc speed-preset=ultrafast tune=zerolatency`: 110%. `veryfast`: 292%, not usable live.
-  - `vah264lpenc` is the only VA H.264 encoder here, and it is **CQP-only** on this driver: bitrate settings are ignored, so the QPs must be set explicitly.
-  - `vaapih264enc` (the deprecated gstreamer-vaapi plugin) hung a test harness after a negotiation error.
-  - Both `va` elements are rank 0, so they must be named explicitly.
-- **Clock.** `GstSystemClock` is CLOCK_MONOTONIC. The pipeline picks its clock from the audio source. `pipewiresrc`'s clock happens to track monotonic time. **`pulsesrc`'s clock was about 473,000 s off.** With `use_clock(SystemClock)` forced, both line up within milliseconds.
-- **Timestamp values.** `vah264lpenc`'s output PTS carries a +3600 s offset, so use running time, never raw PTS. `t0 = base_time + running_time` of the first video buffer at the muxer equals the file's video start time.
+  - `vajpegdec ! vah264lpenc` costs **8% CPU** at 720p30. `x264enc speed-preset=ultrafast tune=zerolatency` costs 110%.
+  - `vah264lpenc` is **CQP-only** on this driver: bitrate settings are ignored.
+  - `vaapih264enc` (deprecated) hung a test harness.
+  - The `va` elements are rank 0, so they must be named explicitly.
+- **Clock.**
+  - `GstSystemClock` is CLOCK_MONOTONIC.
+  - `pulsesrc`'s clock was about 473,000 s off monotonic. `pipewiresrc`'s tracks monotonic.
+  - With `use_clock(SystemClock)` forced, everything lines up within milliseconds.
+- **File time 0 is the pipeline's `base_time`.**
+  - `matroskamux` writes running time as-is. It does not shift the file to its first video frame.
+  - With video delayed 0.6 s (a simulated camera start-up), audio starts at 0 in the file and video at 0.605. Discoverer's duration includes the video-less lead-in.
+  - Dropping early audio after `opusenc` to "fix" this writes audio at negative time, which desyncs the file.
+  - `vah264lpenc`'s raw PTS carries a +3600 s offset, so only running times are meaningful.
 - **Crash safety.** After `kill -9`:
   - non-streamable `matroskamux` with `filesink buffer-mode=unbuffered` left a playable file;
-  - with the default buffered filesink, `streamable=true` left **0 bytes**;
-  - Discoverer's duration for a crashed file is an estimate and can be badly wrong (1.19 s reported for a 3.2 s file).
-  - A clean stop (EOS → wait for the bus EOS → NULL) writes a correct duration.
-- **Level meter.** `level interval=100ms` posts rms/peak dB per channel on the bus, about every 99 ms.
-- **Two pipelines at once.** VA decode for playback and VA encode for capture ran together in one process with no contention: 27 fps playback, 28 fps capture, 38% CPU total.
-- **No portal needed on X11.** PipeWire access is unrestricted and `/dev/video0` has a uaccess ACL. No prompts.
+  - the default buffered filesink left 0 bytes;
+  - Discoverer's duration for a crashed file can be badly wrong.
+- **Level meter.** `level interval=100ms` posts rms/peak dB per channel, about every 99 ms.
+- **Two pipelines at once.** VA decode for playback and VA encode for capture ran together with no contention.
+- **No portal needed on X11.**
 - **Frame accuracy.**
   - In PAUSED after an ACCURATE seek, `query_position` equals the target exactly.
-  - While PLAYING, it runs 0.6–34 ms (median 20 ms) ahead of the PTS of the displayed frame, and the displayed frame is the one covering that position.
-  - The query takes about 150 µs and is synchronous.
-  - **After a pause, the sink prerolls and shows the next frame** (+33 ms, 12 of 12 trials) while the position stays at the anchor.
+  - While PLAYING, it lies within the displayed frame (0.6–34 ms past its PTS).
+  - **After PLAYING→PAUSED the sink prerolls and shows the next frame** (+1 frame, 12/12 trials) while the position stays put.
 
 ---
 
@@ -64,164 +75,205 @@ These come from the capture research. They are measured, not assumed.
 
 ### R1. Recording is a second pipeline owned by the bus
 
-`video-coach-media` gains a `Recorder`, and the bus owns it next to the `SourcePlayer`. The recording pipeline is separate from the playback pipeline and runs alongside it (measured: no contention).
+`video-coach-media` gains a `Recorder`, and the bus owns it next to the `SourcePlayer`:
 
 ```
 v4l2src device=<path> extra-controls=c,exposure_dynamic_framerate=0
   ! image/jpeg,width=1280,height=720,framerate=30/1        (caps chosen per R3)
-  ! queue ! <jpeg decode> ! <h264 encode> ! h264parse ! queue ! mux.
+  ! queue ! <encode chain per R4> ! h264parse ! queue ! mux.
 pipewiresrc target-object=<mic node.name>
   ! audio/x-raw,rate=48000,channels=2 ! queue ! audioconvert ! audioresample
   ! level interval=100000000 ! opusenc bitrate=96000 ! queue ! mux.
-matroskamux name=mux ! filesink buffer-mode=unbuffered location=recordings/<uuid>.mkv
+matroskamux name=mux offset-to-zero=false ! filesink buffer-mode=unbuffered location=recordings/<uuid>.mkv
 ```
 
-- **Clock:** always `pipeline.use_clock(Some(&gst::SystemClock::obtain()))`. Measured: pulsesrc's clock can be days off monotonic.
-- **Camera source:** `v4l2src`, for its kernel capture timestamps and because it can set V4L2 controls. The device path is resolved from the PipeWire device at record time, never stored.
-- **Microphone source:** `pipewiresrc target-object=<node.name>`, falling back to `pulsesrc` when PipeWire is absent.
-- **Frame rate:** if the camera lacks `exposure_dynamic_framerate`, a `videorate` element holds 30/1 instead.
-- **Sources are injectable,** exactly as the player's sinks are (D1 in Phase 2). Tests build the recorder with `videotestsrc is-live=true` and `audiotestsrc is-live=true`, so media and harness tests run with no camera, no microphone and no display.
+- **Clock:** always `pipeline.use_clock(Some(&gst::SystemClock::obtain()))`, so file time 0 (`base_time`) is a monotonic instant (R5).
+- **`offset-to-zero=false`** is the default. It is set explicitly with a comment, because R5 depends on it.
+- **Camera source:** `v4l2src`, for its kernel timestamps and the exposure control. The device path is resolved from the PipeWire device at record time and never stored.
+  - `extra-controls` is always set. A camera without the control logs a warning and records anyway. The plan's first task verifies this.
+- **Microphone source:** PipeWire only. The parent spec's `pulsesrc` fallback is dropped: its clock was the one measured days off, and the target and Flatpak (Phase 11) both run PipeWire.
+- **Sources are injectable,** as the player's sinks are (Phase 2 D1). Tests use `videotestsrc is-live=true` and `audiotestsrc is-live=true`, so media and harness tests need no camera, microphone or display.
+- **Messages:** the recorder's GStreamer messages go on their **own path** into the bus, never through `SourcePlayer::handle`. There, its EOS would advance the source, its ERROR would reset the player, and its ASYNC_DONE would complete a seek.
+  - Messages carry a recording generation number, and the bus drops those from a recorder it has already stopped.
 
 ### R2. Devices: enumerate via PipeWire, key on `node.name`
 
-- **Enumeration:** `gst::DeviceMonitor` for `Video/Source` and `Audio/Source`. Drop cameras whose caps offer only GRAY8, so the IR camera never shows up as a webcam choice.
-- **Display:** the device's display name. When two remaining devices share a name, append a short distinguisher (for example " (2)"). Never match a device by its name.
-- **Stored key:** `node.name` goes in `Preferences.preferred_camera_id` / `preferred_mic_id`, the fields that already exist. For cameras, `device.serial` plus the interface index is kept as a soft fallback, so a USB camera moved to another port is still found.
-- **Missing device:** if the stored device is absent at record time, record with the default device and show a notice. The preference is **not** cleared (macOS behavior; parent spec).
-- **Scope:** preferences are **per project**. That is macOS parity, and the format already has the fields there.
-- **UI:** a Devices popover (camera list, microphone list, "System default") opened from a transport-bar button. It is disabled while recording. The device list refreshes when devices are added or removed.
+- **Enumeration:** `gst::DeviceMonitor` for `Video/Source` and `Audio/Source`, run when the Devices popover opens and again at record time. There is no long-lived monitor and no hot-plug watching.
+- **IR filter:** cameras whose caps offer only GRAY8 are dropped, so the IR camera never appears.
+- **Stored key:** `node.name`, the only key, goes in the existing `Preferences.preferred_camera_id` / `preferred_mic_id`.
+  - The field doc comment in `project.rs`, which recommends `/dev/v4l/by-id`, is corrected.
+- **Missing device:** if the stored device is absent at record time, record with the default device and show a notice. The preference is **not** cleared.
+- **Scope:** preferences are per project (macOS parity; the fields are already there).
+- **UI:** a Devices popover (camera list, microphone list, "System default"), opened from the transport bar.
 
-### R3. Camera format
+### R3. Camera format: one rule, else refuse
 
-- Choose the largest **16:9** mode that is **≤1280 wide at 30/1** from the device's caps. At equal size, prefer raw over MJPEG. On the reference laptop the only match is 1280×720 MJPEG.
-- If no 16:9 mode exists, use the largest mode ≤1280 wide at 30/1, whatever its shape. The picture-in-picture (Phase 8) letterboxes it.
-- If no 30/1 mode exists at all, use the closest rate with `videorate` to 30/1.
-- Refusing to record is reserved for a camera with no usable format at all. That is macOS's `noSuitableFormat`, but narrower.
+Use the largest **16:9** mode that is **≤1280 wide at 30/1**, raw or MJPEG. The choice only decides whether a JPEG decode goes in the chain.
 
-### R4. Encoder: probe, name explicitly, CQP
+- If there is no such mode, the recording is refused with "This camera has no 16:9 mode at 30 fps up to 1280 wide". This is the parent spec's rule and macOS's `noSuitableFormat`.
+- The choice is a pure function over the device's caps, tested with recorded caps structures.
 
-Probe once per session, in this order, keeping the first chain that negotiates in a short live test:
+### R4. Encoder: a presence check, CQP
 
-1. `vajpegdec ! vah264lpenc rate-control=cqp qpi=<i> qpp=<p> key-int-max=30` (8% CPU measured)
-2. `vah264enc` with the same settings, where the hardware offers it
-3. `jpegdec ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30` (110% CPU measured)
-
-- Raw camera modes skip the JPEG decode.
+- **Hardware chain:** if both `vah264lpenc` and (for MJPEG) `vajpegdec` exist, use `vajpegdec ! vah264lpenc rate-control=cqp qpi=24 qpp=26 key-int-max=30`.
+- **Software chain:** otherwise `jpegdec ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30`.
+- Raw camera modes drop the JPEG decode.
 - **Never** use `vaapih264enc`.
-- **QP values:** start at qpi=24/qpp=26, from the research. Tune them by eye in a lit room during the plan's closeout, and record the result. The driver is CQP-only, so file size isn't bounded by a bitrate.
+- There is no live negotiation probe. A chain that fails at start goes through the recording error path.
+- The choice is a pure function (element availability in, chain description out).
+- The QPs are tuned by eye in a lit room during the plan's closeout, and the result is recorded.
 - **Audio:** Opus at 96 kbit/s.
 
-### R5. One clock for timestamps: CLOCK_MONOTONIC nanoseconds
+### R5. Recording time 0 is the pipeline's `base_time`
 
-Every timestamp in a recording is a CLOCK_MONOTONIC nanosecond count: `gst::SystemClock::obtain().time()`, or `clock_gettime(CLOCK_MONOTONIC)`. `std::time::Instant` uses the same clock, but it exposes no raw value.
+- **One clock.** Every timestamp in a recording is a CLOCK_MONOTONIC nanosecond count read from `gst::SystemClock::obtain().time()`.
+- **Time 0.** `t0_ns = pipeline.base_time()`, read when the pipeline reaches PLAYING. This is the file's time 0 (measured).
+- **Camera warm-up.** The camera's first frame lands 0.25–0.7 s later. That lead-in holds the coach's first words and no video.
+  - The log's `pause @0` covers it, so replay holds the start frame from 0.
+  - Phase 8's PiP must show nothing, or the first webcam frame, until the video stream starts, rather than assume video at 0.
+- **Event times.** Every event's `record_time` is `(host_ns − t0_ns) / 1e9`. `host_ns` is captured **by the caller at the input event** (the Phase 2 bus contract).
+- **Error budget.**
+  - Audio is arrival-stamped, so it may sit about 20–40 ms late relative to v4l2 video.
+  - A keypress's host time is at most one event-loop turn late.
+  - Neither is corrected in Phase 4 (backlog: measure against a real clap).
 
-- **t0:** a buffer probe on the muxer's video sink pad records the first buffer. `t0_ns = pipeline.base_time() + segment.to_running_time(buffer.pts)`. This is the first frame's capture time on the monotonic clock, and it matches the file's video start. Raw PTS is never used: `vah264lpenc` adds a +3600 s offset.
-- **Event times:** every event-log `record_time` is `(host_ns − t0_ns) / 1e9`, where `host_ns` is captured **by the caller at the input event**. That is the Phase 2 bus contract: the UI thread reads the monotonic clock when the key is pressed, not when the bus handles the command.
-- **Stated error budget:**
-  - Audio timestamps come from arrival time (pipewiresrc), so audio may sit about 20–40 ms late relative to v4l2 video.
-  - A keypress's host time is taken on the UI thread, which is at most one event-loop turn late.
-  - Both are well under one video frame at the replay's 30 fps. Neither is corrected in Phase 4 (backlog: measure against a real clap).
-
-### R6. Recording lifecycle and states
+### R6. Recording lifecycle
 
 ```
-Idle ──R──▶ Starting ──first video buffer at mux (t0)──▶ Recording ──R/Esc/Stop──▶ Stopping ──bus EOS──▶ Idle
-              │ R/Esc/Cancel, error, or 5 s with no first frame
-              ▼
-             Idle (partial file deleted, error shown if any)
+Idle ──StartRecording──▶ Starting ──first video buffer at mux──▶ Recording ──StopRecording──▶ (stop, blocking) ──▶ Idle
+                           │ StopRecording, ERROR, or 5 s with no video
+                           ▼
+                          Idle (file deleted, error shown if any)
 ```
 
-- **Preconditions for `StartRecording`:**
-  - a project is open;
-  - it has sources and **none is missing**;
-  - the current source is loaded;
-  - the player's seek slot is idle.
+**Commands.** `StartRecording { zoom }`, `StopRecording` and `Zoom { host_ns, zoom }` are separate commands. The UI's R key toggles between them from its own state, so a queued second R press is a no-op instead of a new recording.
 
-  Otherwise the command is refused with a message. macOS checked none of the source conditions.
-- **When Starting begins:**
-  1. The player is paused, as on macOS, so every clip starts on a still frame.
-  2. The bus captures `pending = { clip_id, source_index, start_source_seconds }` from the **bus-owned** current position. macOS used mpv's `playlistPos`, which was wrong after cross-source seeks.
-  3. The recorder starts.
-- **Starting is cancellable.** R, Esc or a Cancel button abort it (macOS swallowed every key for up to 10 s). So does a 5 s timeout with no first frame. Aborting stops the pipeline and deletes the partial file.
-- **Recording begins at t0.** The bus creates the `RecordingController` (R8) with t0 and the UI's initial zoom. The log gets `zoom(current) @0`, then `pause(start_source_seconds) @0`, in that order.
-- **Stopping ignores further R/Esc.** macOS's double stop leaked a continuation and let events land after the file's end. The bus then:
-  1. sends EOS and waits for the bus EOS, with a 5 s timeout;
-  2. sets NULL;
-  3. reads `recording_duration` from the finished file with Discoverer (reliable after a clean stop);
-  4. builds the clip (R9) and saves.
+**Preconditions for Start:**
+- a project is open;
+- it has sources and none is missing;
+- the current source is loaded;
+- the recorder is Idle.
 
-  If the EOS wait times out, the file is kept but no clip is created, and the user is told (backlog: repair).
-- **Events are not logged after Stop is pressed.** The controller's `finish()` is called when Stopping begins, so no event can outrun the file.
-- **Closing the window while recording** stops cleanly before exit. The teardown acknowledgement waits for the stop.
+Otherwise the command is refused with a message. A skip or scrub in flight is **not** a reason to refuse: the start position is where the player is heading (below).
+
+**Start sequence:**
+1. The bus pauses the player (as on macOS, every clip starts on a still frame).
+2. It records `pending = { clip_id, source_index, start_source_seconds }`. The position follows the same order as the R10 anchor: the burst target, else the in-flight target, else the pipeline's position.
+3. It starts the recorder and reads `t0_ns = base_time`.
+
+**Starting:**
+- lasts until the first video buffer reaches the muxer, which proves the camera is alive;
+- TogglePlay, Skip and scrub are ignored, so the logged `pause(start) @0` stays true;
+- `Zoom` commands update the latest zoom, so the initial keyframe is current;
+- StopRecording, a recorder ERROR, or 5 s with no video abort it: the pipeline goes to NULL and the file is deleted.
+
+**Entering Recording:** the bus creates the `RecordingController` (R8) with t0, the latest zoom and `start_source_seconds`.
+
+**Stopping is synchronous on the bus thread.** `Recorder::stop()` and the bus's closing steps:
+1. **Stop logging:** the controller's `finish()` is called first, so no event can outlast the file.
+2. **Finalize:** `stop()` sends EOS, waits on the recorder's own GStreamer bus for EOS or ERROR (at most 5 s), sets NULL, and returns the duration.
+3. **Duration:** the latest buffer end, in running time, that reached the muxer. A pad probe tracks it. After a clean EOS this is the file's duration, so Discoverer isn't needed. After a timeout or error it is still a good estimate of what was written.
+4. **Save:** the bus builds the clip (R9) and saves. **The clip is always built once Recording was reached.** Losing a coach's commentary over a finalization hiccup is the worst outcome, and the file is playable either way.
+5. **Notify:** if the stop timed out or errored, the user also gets a notice.
+
+A typical stop takes <100 ms, so no Stopping state or "ignore R while stopping" rule is needed.
+
+**Closing the window while recording** runs the same stop, builds the clip and saves before the bus exits.
+
+**One guard while recording.** While the recorder is not Idle, the bus refuses every command except:
+- TogglePlay, Skip, SetVolume;
+- Zoom, StopRecording;
+- GlReady, Shutdown.
+
+This replaces a per-command list, so commands added later (Phase 3's delete and undo) are refused by default. The UI greys out the sidebar, the menus and the scrubber from one `recording` property.
+
+**Timer:** the bus's single `deadline` slot (the skip debounce) becomes a small set of named deadlines, adding the Starting timeout.
 
 ### R7. Crash recovery: none, by design
 
-A crash loses the in-memory event log and the pending start position, so the orphaned `.mkv` can't become a meaningful clip. The file is left on disk and stays playable (measured). The parent spec's "fallback for unknown duration after a crash" is **dropped**: there's no clip to give a duration to. Listing and cleaning up unreferenced recordings belongs with Phase 3's trash handling (backlog).
+A crash loses the in-memory event log and the pending start position, so an orphaned `.mkv` can't become a meaningful clip. The file stays on disk, playable.
+
+The parent spec's "fallback for unknown duration after a crash" is dropped. R6 already covers the non-crash case (timeout or error at stop). Listing and cleaning up unreferenced recordings belongs with Phase 3's trash handling (backlog).
 
 ### R8. `RecordingController` is ported to core, as a pure event log
 
-`video-coach-core` gains `recording.rs`, which ports `RecordingController.swift` with its injected clock replaced by caller-supplied times.
+`video-coach-core` gains `recording.rs`, which ports `RecordingController.swift`. The Swift version's injected clock is replaced by caller-supplied times. The controller lives on the bus.
 
-- `new(t0_ns)`.
-- `append_initial(zoom, start_source_seconds)`: `zoom @0`, then `pause @0`.
-- `append_play(host_ns, source_seconds)` / `append_pause(host_ns, source_seconds)`: **caller-captured** time and source anchor.
-- `append_skip(host_ns, delta)`: records the **requested** delta, as macOS does. Replay clamps within the source, and `playback_segments` already clamps.
-- `append_zoom(host_ns, zoom)`:
+- `new(t0_ns, zoom, start_source_seconds)` writes `zoom @0` then `pause(start) @0`. The order is an invariant of construction, not something the caller must remember.
+- `play(host_ns, source_seconds)` and `pause(host_ns, source_seconds)` take a caller-captured time and the anchor chosen by the bus (R10).
+- `skip(host_ns, delta)` records the **requested** delta, as macOS does. Replay clamps within the source.
+- `zoom(host_ns, zoom)`:
   - drops a value equal to the last one;
-  - if more than 100 ms have passed since the last capture, first emits an anchor keyframe at `t − 1 ms` holding the previous value;
-  - **never throttles.** macOS's 20 Hz workspace throttle had no trailing flush and could drop a gesture's final value (Phase 2 D9).
+  - if more than 100 ms have passed since the last capture, first emits an anchor keyframe holding the previous value at `max(t − 1 ms, last event time)`, so the log stays sorted. macOS could break the order here, which makes `debug_assert_sorted` panic;
+  - never throttles.
 - `finish() -> Vec<CommentaryEvent>`.
-- `record_time` is always clamped at ≥ 0. A key pressed during Starting can't produce a negative time, because events are only accepted in Recording.
-- **Tests:** port `apple/Tests/AppTests/RecordingZoomCaptureTests.swift` and the controller's documented invariants (initial event order, anchor keyframe, dedupe).
+- `record_time` is clamped at ≥ 0. A `host_ns` captured just before t0 can still arrive while Recording.
+- **Tests:** port `apple/Tests/AppTests/RecordingZoomCaptureTests.swift`, plus the construction order, the sorted anchor and dedupe.
 
-### R9. Clip construction is a pure function in core
+### R9. Clip construction lives on `Project`
 
-`Clip::from_recording(pending, duration, events, show_pip, existing_clips) -> Clip`:
+`Project::add_recorded_clip(pending, duration, events, created_at) -> &Clip`:
 
 - `id = pending.clip_id`, and `recording_filename = "<id>.mkv"`.
-- **`name`** is `"<source_index + 1>-HH:MM:SS"`, with `start_source_seconds` floored (macOS `defaultClipName`).
-- **`sort_index = max(existing) + 1`**, or 0 for the first clip. macOS used `clips.count`, which duplicates an index once a delete leaves a gap.
-- `show_pip` is sampled **at stop**, as on macOS.
-- `notes`, `tags` and `transcript` start empty. `created_at` is set at stop (RFC3339).
+- `name = "<source_index + 1>-HH:MM:SS"`, with `start_source_seconds` floored (macOS `defaultClipName`).
+- `sort_index = max(existing) + 1`, or 0 for the first clip. macOS's `clips.count` duplicates after a delete.
+- `show_pip = preferences.pip_for_new_recordings`, which defaults to true. It has no UI until export needs one (backlog).
+- `created_at` is passed in (RFC3339), because core has no clock.
+- `notes`, `tags` and `transcript` start empty.
+- No format bump: every field already exists in v7.
 
-### R10. Transport during recording, and the pause fix
+### R10. Transport during recording
 
-**Allowed while recording:** Space, skips (±3/±10), and zoom (keys, Ctrl+scroll, scroll pan, drag pan). Each is logged through R8 with the UI-captured `host_ns`. Play and pause also carry a **synchronous `query_position`** read on the UI thread before the toggle (Phase 2 bus contract). That position is accurate to the displayed frame (measured).
+**Allowed while recording:** Space, skips (±3/±10) and zoom (keys, Ctrl+scroll, scroll pan, drag pan). Each is logged through R8 with the UI-captured `host_ns`.
 
-**Clamped to the clip's source.** A clip points into one source, so its log can't represent crossing into another:
-- skips are clamped to `[0, source_duration − 0.05]` of the pending source;
-- EOS pauses instead of advancing;
-- the scrubber is **disabled** while recording.
+**The pause and play anchor** is chosen by the bus:
+- If a skip burst is outstanding, the anchor is the SkipCoordinator's burst target. Otherwise, if a seek is in flight, it is `player.target_secs()`. The pipeline hasn't got there yet, but live playback will: the skip ends in an accurate seek to that target.
+- Otherwise it is the `query_position` the UI read synchronously at the keypress. The UI already holds a `PositionHandle`.
 
-**Disabled while recording or starting:** Open Project, Add/Remove/Move/Relink source, rename, the Devices popover, and the scrubber.
+**Clamped to the clip's source.** A clip points into one source.
+- Skips are clamped to `[offset(src), offset(src) + duration(src) − 0.05]` in concat time. `SkipCoordinator::request_skip` takes the range as a parameter.
+  - Replay clamps a skip to the source's full duration, so after an end-clamped skip followed by a backward skip the two can differ by 50 ms. Accepted.
+- **EOS** pauses instead of advancing, and **no Pause event is logged**. Replay's play tail and freeze reproduce it. A bus-side timestamp would break the caller-captured rule.
+- The scrubber is disabled.
 
-**The Phase 2 fix: pausing shows the right frame.** On every pause, recording or not, the bus follows the pause with an **ACCURATE seek to the paused position**. The prerolled frame is then the one at the anchor, not the next one (measured: +1 frame in 12/12 trials). The seek goes through the existing seek slot, and the Settling state already absorbs the pause's own `ASYNC_DONE`.
+**The Phase 2 fix: pausing keeps the frame that was on screen.**
+
+- **The problem.** Going from PLAYING to PAUSED prerolls the frame *after* the one displayed, while `query_position` stays inside the displayed frame. Measured 20/20 on both the system and GL sinks.
+- **The rule.** The sink shows a preroll only when it is the first frame since a flush or a new stream: a seek, a load or a reload. A pause's preroll is not put in the mailbox, and the frame already on screen stays up.
+- **The result.** The displayed frame, the logged anchor and replay's "last frame with PTS ≤ anchor" agree, with no seek. On resume, the prerolled frame is rendered at its own PTS, so playback continues gapless from the held frame (measured 20/20).
+- **Mechanism.** An atomic `fresh` flag in `sink.rs`:
+  - set by a pad probe on `FLUSH_STOP`/`STREAM_START`;
+  - cleared by `new_sample`;
+  - read by `new_preroll`.
+
+  Everything runs on the streaming thread, in order.
+- **What is untouched:** the seek slot, the SkipCoordinator and the bus. The pause still settles on its own `ASYNC_DONE`.
+- **Rejected alternatives:**
+  - an ACCURATE re-seek after every pause. It displaced in-flight skips in the latest-wins slot, fired on EOS and error pauses, and cost a decode per pause.
+  - snapping the anchor to the prerolled PTS. It would log a frame the coach never saw.
+- **Tests:**
+  - after a pause settles, the mailbox is empty or holds a frame covering `query_position`;
+  - an accurate seek while paused still delivers its frame.
+
+This fix applies whenever the user pauses, recording or not, so the plan lands it as its own first task.
 
 ### R11. Recording UI
 
-- **Transport while Starting:** a yellow dot, "Preparing recording…", and **Cancel**.
-- **Transport while Recording:**
-  - a red dot, "Recording", and elapsed time since t0 in `M:SS` (`H:MM:SS` past an hour), updated at 1 Hz;
-  - the mic level meter;
-  - the PiP checkbox;
+- **Starting:** "Preparing recording…". There is no Cancel button: R, Esc or Stop aborts.
+- **Recording:**
+  - a red dot, "Recording", and elapsed time since t0 at 1 Hz, via the existing `format_hms`;
+  - a mic level bar;
   - **Stop**, with the tooltip "Stop recording (R or Esc)".
-- **Level meter:**
-  - fed by the `level` element's messages;
-  - uses the **maximum over channels** of peak dB, mapped from −60…0 dBFS onto a 90×6 bar with a green/yellow/red gradient;
-  - holds the peak for 1 s;
-  - shows "Waiting for audio…" when there are no messages or everything is below −60 dB.
-- **Start flash:** a red overlay fades in and out over about 400 ms.
+- **Level bar:**
+  - the maximum over channels of peak dB from the `level` element, mapped from −60…0 dBFS onto the bar's width;
+  - shows "Waiting for audio…" until the first level message arrives.
 - **No live camera preview** (macOS parity).
-- **Clips list:** the sidebar gains a **Clips** section below Sources, showing each clip's name and duration (`M:SS`), ordered by `sort_index`. There's no selection, editing or deletion yet (Phase 3).
-- **PiP checkbox:** "Show webcam in export" (`pip_for_new_recordings`), in the transport bar while scanning and while recording, saved on change.
-- **Errors:** one dialog each for:
-  - device missing or unusable;
+- **Clips list:** the sidebar gains a **Clips** section below Sources, with each clip's name and duration (`format_hms`), ordered by `sort_index`. There is no selection or editing yet (Phase 3).
+- **Errors:** new `UserError` variants, shown through the existing error display. They cover:
+  - device missing (a notice; the recording still goes ahead);
   - no suitable camera format;
-  - encoder or pipeline failure;
-  - no first frame within 5 s;
-  - EOS timeout on stop.
-
-  Every path returns to Idle.
+  - recording failed (pipeline error, or no video within 5 s);
+  - the stop didn't finalize cleanly (a notice; the clip is kept).
 
 ---
 
@@ -229,55 +281,67 @@ A crash loses the in-memory event log and the pending start position, so the orp
 
 | Crate | Phase 4 contents |
 |---|---|
-| `video-coach-core` | `recording.rs` (the controller: log, anchors, zoom anchor/dedupe); `Clip::from_recording`, including the default name and `sort_index = max + 1`. |
-| `video-coach-media` | `Recorder`: the pipeline from R1 with injected sources, the clock forced, the t0 probe, a clean stop, and level messages. `devices`: DeviceMonitor enumeration, `node.name` keying, dropping GRAY8-only cameras, the camera caps choice (R3), and the encoder probe (R4). |
-| `video-coach-app` | Bus: the recording state machine (R6), recording commands and events, the start preconditions, clamping during recording, and the pause re-seek fix. UI: R key, recording transport, level meter, Devices popover, Clips list, PiP checkbox, flash. |
-| `video-coach-harness` | Record with test sources; clip creation; logged events; cancel during Starting; stop while stopping ignored; a start refused when a source is missing. |
+| `video-coach-core` | `recording.rs` (the controller); `Project::add_recorded_clip`; `SkipCoordinator` range parameter. |
+| `video-coach-media` | `Recorder`: the pipeline from R1 with injected sources, the forced clock, t0 = base_time, a first-video-buffer signal, a last-buffer-end probe, a synchronous `stop()`, level and error messages, and a generation tag. `devices`: enumeration, IR filter, the caps choice (R3), the encoder choice (R4). |
+| `video-coach-app` | Bus: the recording state machine (R6), Start/Stop/Zoom commands, the one guard, anchor choice, clamping, named deadlines, stop on shutdown. UI: R/Esc, the recording transport, the level bar, the Devices popover, the Clips list. |
+| `video-coach-harness` | End-to-end recording with test sources. |
 
 ---
 
 ## Testing
 
 - **Core.**
-  - Controller: initial order `zoom, pause @0`; play and pause use caller times and anchors; skip logs the requested delta; zoom dedupe; the anchor keyframe after 100 ms of quiet; no throttling (a dense zoom stream is kept whole); `record_time` clamped to ≥ 0.
-  - `from_recording`: name formatting, `sort_index` after a gap, `show_pip` sampled at stop.
+  - Controller:
+    - construction writes `zoom, pause @0`;
+    - play and pause use caller times and anchors;
+    - skip logs the requested delta;
+    - zoom dedupe;
+    - anchor keyframe after 100 ms of quiet, and never before the last event;
+    - no throttling;
+    - `record_time` ≥ 0.
+  - `add_recorded_clip`: name formatting, `sort_index` after a gap, `show_pip` from preferences.
+  - SkipCoordinator range clamp.
 - **Media** (test sources, no hardware):
-  - a 2 s recording produces an `.mkv` with H.264 and Opus streams, and Discoverer reports a duration within one frame of the requested length;
-  - t0 equals `base_time` plus the first video buffer's running time, and is on the monotonic clock (compare with the system clock);
-  - clean stop within the timeout;
-  - level messages arrive;
-  - encoder probe fallback: with the VA elements' rank forced to NONE, the probe picks `x264enc`;
-  - device enumeration and caps choice through pure functions over recorded caps structures, with no hardware.
+  - A 2 s recording yields an `.mkv` with H.264 and Opus. The returned duration is within one frame of the file's duration as measured by Discoverer.
+  - **Delayed video** (a valve held closed 0.5 s): the first video PTS in the file equals the first video buffer's running time from `base_time`, and audio starts at 0. This is the test that would have caught the t0 bug; instant test sources can't.
+  - Stop returns within the timeout. Stop on a pipeline whose EOS never arrives returns after the timeout with a duration.
+  - Level messages arrive, and messages carry their generation.
+  - Encoder and caps choices are pure-function tests.
 - **Harness** (bus end to end, test sources):
-  - R → Recording → R → a clip appears with the right `source_index`, `start_source_seconds`, duration, and a log starting `[zoom, pause]`;
-  - the file exists;
-  - `sort_index` is `max + 1` after a manual gap;
-  - cancel during Starting leaves no clip and no file;
-  - a second stop during Stopping is ignored;
-  - starting with a missing source is refused;
-  - a skip during recording is clamped to the source;
-  - pause re-seek: after a pause, the mailbox frame's PTS covers the paused position.
-- **Manual** (reference laptop, in the plan's closeout, batched with the other hands-on checks):
-  - the real webcam and mic;
-  - the webcam light is on only while recording;
-  - a recording plays back with lip sync that looks right;
-  - the level meter moves;
-  - the camera and mic choices persist;
-  - the IR camera is absent from the list;
+  - Start → Recording → Stop → a clip appears with the right `source_index`, `start_source_seconds`, duration, and a log starting `[zoom, pause]`. The file exists.
+  - `sort_index` is `max + 1` after a manual gap.
+  - Stop during Starting leaves no clip and no file.
+  - TogglePlay during Starting is ignored.
+  - Start with a missing source is refused.
+  - A command outside the guard (e.g. AddSource) is refused while recording.
+  - A skip is clamped to the source.
+  - Skip then an immediate pause logs the skip target as the anchor.
+  - Shutdown while recording saves the clip.
+- **Manual** (reference laptop, batched with the other hands-on checks):
+  - the real webcam and mic, and the webcam light;
+  - playback of a recording looks lip-synced;
+  - the level bar moves;
+  - the device choice persists, and the IR camera is absent;
   - QP tuning in a lit room;
-  - killing the app mid-recording leaves a playable file.
+  - `kill -9` mid-recording leaves a playable file.
 
 ## Risks
 
-1. **CQP-only hardware encoding.** File size isn't bounded, so the QPs are tuned by eye (R4). A long recording in a busy scene can be large.
-2. **The UVC exposure control** needs `v4l2src`. Under Flatpak (Phase 11) that means device access; the portal path, `pipewiresrc` with an fd, can't set the control.
-3. **Audio is arrival-stamped:** about 20–40 ms of A/V offset, unmeasured against a real clap (backlog).
-4. **Wayland and portals** are untested; the reference laptop runs X11.
-5. **Camera start-up** takes 0.25–0.7 s before the first frame. t0 absorbs it, and Starting shows "Preparing…".
+1. **CQP-only hardware encoding:** file size isn't bounded by a bitrate.
+2. **The UVC exposure control** needs `v4l2src`. Under Flatpak (Phase 11) that means device access; the portal path can't set it.
+3. **Audio is arrival-stamped:** about 20–40 ms of A/V offset, unmeasured.
+4. **Wayland and portals** are untested.
+5. **A present-but-broken VA encoder** fails the recording instead of falling back to x264 (backlog).
+6. **Stop blocks the bus thread** for up to 5 s in the failure case. The UI keeps rendering, and the commands queue.
 
 ## Deferred (→ BACKLOG)
 
-- Measuring and correcting the A/V offset against a real clap.
-- Listing and cleaning up orphaned recordings (with Phase 3's trash).
-- Repairing a recording whose stop timed out.
-- Global rather than per-project device preferences, if the user wants them.
+- Measure and correct the A/V offset against a real clap.
+- List and clean up orphaned recordings (with Phase 3's trash).
+- Fall back to x264 when a VA encoder is present but fails.
+- Camera fallbacks: non-16:9, non-30 fps, `videorate`.
+- The `pulsesrc` fallback for PulseAudio-only systems.
+- A device list that updates live while the popover is open.
+- The PiP checkbox (`pip_for_new_recordings`), with Phase 8 or the Phase 3 inspector.
+- The start flash, the level meter's peak hold and colour gradient (macOS polish).
+- Global rather than per-project device preferences.
