@@ -75,6 +75,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+**Running the app** (needs a display and GStreamer's runtime plugins incl.
+`gstreamer1.0-gl`):
+
+```bash
+cargo run --release -p video-coach-app               # restores the last project
+cargo run --release -p video-coach-app -- <folder>   # opens (or creates) a project there
+cargo run --release -p video-coach-app --example zero_copy_spike -- <video>  # zero-copy diagnostic
+```
+
+The app must run on Slint's **Skia OpenGL** renderer (it selects it and fails
+loudly otherwise): that renderer is EGL on X11 and Wayland, and EGL is what
+lets GStreamer import decoded frames without a CPU copy. It logs the decoder,
+the caps entering `glupload` and the GL platform on every source load; on the
+reference laptop they read `vah265dec` / `memory:DMABuf` / `egl`. Last-project
+state lives in `$XDG_CONFIG_HOME/coach-cuts/state.json`; point
+`XDG_CONFIG_HOME` elsewhere when testing so the real one isn't touched. With
+the monitor off (DPMS), playback slows unless run with `vblank_mode=0`
+(BACKLOG #36).
+
 **Crate layout:**
 
 | Crate | Holds |
