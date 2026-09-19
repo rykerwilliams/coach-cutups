@@ -45,7 +45,7 @@ hdr "1. Hardware decoders (and their RANK vs software)"
 # Rank is the whole game: decodebin picks by rank, and on most distro builds
 # avdec_* is PRIMARY while the hardware decoders are NONE or MARGINAL. The
 # default outcome is therefore SOFTWARE decode of 4K HEVC.
-rank_of() { gst-inspect-1.0 "$1" 2>/dev/null | awk '/Rank/{print $2, $3; exit}'; }
+rank_of() { gst-inspect-1.0 "$1" 2>/dev/null | sed -n 's/^ *Rank *//p' | head -1; }
 FOUND_HW=0
 for e in vah265dec vah264dec vaapih265dec vaapih264dec nvh265dec nvh264dec v4l2slh265dec; do
   if gst-inspect-1.0 --exists "$e" 2>/dev/null; then
@@ -91,62 +91,127 @@ if [ -z "$FILM" ]; then
   exit 0
 fi
 
-hdr "5. Decode path + accurate-seek latency on $FILM"
+hdr "5. Decode path + seek latency on $FILM"
 [ -f "$FILM" ] || { bad "no such file"; exit 1; }
-gst-discoverer-1.0 "$FILM" 2>/dev/null | grep -E 'Duration|width|height|Codec|video codec' | head -6 | sed 's/^/  /'
 
-# Which decoder actually gets chosen, and does the frame stay off the CPU?
-printf '\n  decoder actually selected:\n'
-GST_DEBUG=GST_ELEMENT_FACTORY:4 timeout 25 gst-launch-1.0 -q \
-  filesrc location="$FILM" ! decodebin ! fakesink num-buffers=5 2>&1 \
-  | grep -oE 'chosen.*(vah26[45]dec|nvh26[45]dec|vaapi[a-z0-9]*dec|avdec_h26[45]|v4l2[a-z0-9]*dec)' \
-  | tail -3 | sed 's/^/    /'
-
-printf '\n  negotiated caps feature (zero-copy check):\n'
-CAPS=$(timeout 25 gst-launch-1.0 -v filesrc location="$FILM" ! decodebin ! fakesink num-buffers=3 2>&1 \
-       | grep -oE 'memory:(DMABuf|VAMemory|GLMemory|NVMM)' | sort -u | tr '\n' ' ')
-if [ -n "$CAPS" ]; then
-  ok "frames stay on the GPU: $CAPS"
-else
-  warn "no GPU memory feature negotiated — frames are landing in system memory"
-fi
-
-printf '\n  accurate-seek latency (5 seeks, ACCURATE|FLUSH):\n'
+# Everything below is verified rather than inferred. The first version of this
+# section reported a pass it could not prove: it never checked that a seek was
+# accepted (a rejected seek returns instantly and looks like a fast one), its
+# decoder detection grepped debug output that did not match, and it checked
+# zero-copy against fakesink, which accepts system memory and so proves nothing.
 python3 - "$FILM" <<'PY'
-import sys, time
+import sys, time, statistics
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 Gst.init(None)
-
 path = sys.argv[1]
-p = Gst.parse_launch(f'filesrc location="{path}" ! decodebin ! videoconvert ! fakesink name=s sync=false')
+
+# --- GOP length: the variable that actually decides accurate-seek cost.
+# Accurate seek decodes forward from the previous keyframe, so the worst case
+# is one full GOP of frames regardless of which player or decoder is used.
+kf = []
+def kprobe(pad, info):
+    b = info.get_buffer()
+    if not b.has_flags(Gst.BufferFlags.DELTA_UNIT):
+        kf.append(b.pts / Gst.SECOND)
+    return Gst.PadProbeReturn.OK
+p = Gst.parse_launch(
+    f'filesrc location="{path}" ! parsebin ! video/x-h264;video/x-h265 '
+    '! fakesink name=k sync=false num-buffers=1800')
+p.get_by_name("k").get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, kprobe)
 p.set_state(Gst.State.PLAYING)
-p.get_state(Gst.CLOCK_TIME_NONE)
-
-ok, dur = p.query_duration(Gst.Format.TIME)
-if not ok:
-    print("    could not query duration"); sys.exit(0)
-
-flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
-times = []
-for i in range(1, 6):
-    target = int(dur * i / 7)
-    t0 = time.perf_counter()
-    p.seek_simple(Gst.Format.TIME, flags, target)
-    p.get_state(Gst.CLOCK_TIME_NONE)      # blocks until the seek completes
-    times.append((time.perf_counter() - t0) * 1000)
-
+p.get_bus().timed_pop_filtered(120 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
 p.set_state(Gst.State.NULL)
-worst, avg = max(times), sum(times) / len(times)
-for i, t in enumerate(times, 1):
-    print(f"    seek {i}: {t:7.1f} ms")
-print(f"    avg {avg:.1f} ms   worst {worst:.1f} ms")
+gaps = [b - a for a, b in zip(kf, kf[1:])]
+gop = max(gaps) if gaps else float("nan")
+print(f"  keyframe interval (first ~1800 frames): {gop:.2f}s")
+
+# --- Which decoder gets picked, and whether frames reach GL without a
+# system-memory round trip. glupload accepts DMABuf/VAMemory, so this is the
+# pairing that can actually prove zero-copy.
+#
+# decodebin3, not decodebin: measured on Intel VA-API, decodebin negotiates
+# SYSTEM memory into glupload and runs ~6x slower (117 vs 739 fps at 1440p).
+# The `video/x-raw(ANY)` filter is required -- without it the first pad to
+# appear (often audio) gets linked and the measurement silently times audio.
+p = Gst.parse_launch(
+    f'filesrc location="{path}" ! decodebin3 ! video/x-raw(ANY) ! glupload name=u '
+    '! glcolorconvert ! fakesink num-buffers=3')
+p.set_state(Gst.State.PAUSED)
+p.get_state(30 * Gst.SECOND)
+dec, feature = "NONE FOUND", "?"
+it = p.iterate_recurse()
+while True:
+    r, e = it.next()
+    if r != Gst.IteratorResult.OK:
+        break
+    f = e.get_factory()
+    if f and "Decoder/Video" in (f.get_metadata("klass") or ""):
+        dec = f.get_name()
+caps = p.get_by_name("u").get_static_pad("sink").get_current_caps()
+if caps:
+    feature = caps.get_features(0).to_string()
+p.set_state(Gst.State.NULL)
+hw = not dec.startswith("avdec_")
+print(f"  decoder selected: {dec} ({'HARDWARE' if hw else 'software'})")
+zc = "zero-copy" if "SystemMemory" not in feature else "frames pass through system memory"
+print(f"  caps into GL: {feature} -> {zc}")
+
+# --- Seek latency, measured in PAUSED: scrubbing a paused frame is the real
+# interaction, and a flushing seek in PAUSED must re-preroll, so get_state()
+# genuinely blocks until the target frame is at the sink. Every seek's
+# acceptance is checked and a landed frame is required.
+#
+# Measured THROUGH GL, because that is the app's display path and it changes
+# the answer: into a system-memory sink every frame decoded forward from the
+# keyframe is also copied off the GPU, which made a 2s-GOP 1080p60 file look
+# like 436 ms per accurate seek when the real zero-copy path takes 91 ms.
+p = Gst.parse_launch(
+    f'filesrc location="{path}" ! decodebin3 ! video/x-raw(ANY) ! glupload '
+    '! glcolorconvert ! queue ! fakesink name=s sync=false')
+landed = {"pts": None}
+def sprobe(pad, info):
+    landed["pts"] = info.get_buffer().pts
+    return Gst.PadProbeReturn.OK
+p.get_by_name("s").get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, sprobe)
+p.set_state(Gst.State.PAUSED)
+p.get_state(30 * Gst.SECOND)
+_, dur = p.query_duration(Gst.Format.TIME)
+
+def bench(label, flags, n=10):
+    times = []
+    for i in range(1, n + 1):
+        # Offset so targets rarely coincide with a keyframe.
+        target = int(dur * i / (n + 1)) + 370_000_000
+        landed["pts"] = None
+        t0 = time.perf_counter()
+        if not p.seek_simple(Gst.Format.TIME, flags, target):
+            sys.exit(f"  SEEK REJECTED at {target / Gst.SECOND:.2f}s -- measurement invalid")
+        p.get_state(30 * Gst.SECOND)
+        if landed["pts"] is None:
+            sys.exit("  no frame prerolled after seek -- measurement invalid")
+        times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    print(f"  {label:<10} median {statistics.median(times):7.1f} ms   worst {times[-1]:7.1f} ms")
+    return times[-1]
+
 print()
-if worst <= 250:
-    print("    \033[32mPASS\033[0m — GStreamer stays the scan player.")
+kworst = bench("KEY_UNIT", Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT)
+aworst = bench("ACCURATE", Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE)
+p.set_state(Gst.State.NULL)
+
+print()
+if aworst <= 250:
+    print("  \033[32mPASS\033[0m -- accurate seek within 250 ms on this source.")
+elif not hw:
+    print("  \033[31mSLOW\033[0m -- software decode selected; fix decoder selection first.")
+elif "SystemMemory" in feature:
+    print("  \033[31mSLOW\033[0m -- frames are not zero-copy into GL; every decode-forward frame")
+    print("  is being copied off the GPU. Fix the decode path before judging seek latency.")
 else:
-    print("    \033[31mFAIL\033[0m — exceeds the 250 ms kill criterion.")
-    print("    If a hardware decoder was selected above, this triggers the")
-    print("    libmpv fallback for the scan player (spec risk 1b).")
+    print("  \033[31mSLOW\033[0m -- hardware decode is selected, so this is decode-forward cost:")
+    print(f"  up to one {gop:.1f}s GOP of frames per seek. Switching players (e.g. libmpv) would")
+    print("  NOT help -- it would use the same hardware decoder. Mitigations: KEY_UNIT during")
+    print(f"  drag (worst {kworst:.0f} ms here) and short-GOP proxies at import.")
 PY

@@ -91,6 +91,13 @@ vector overlay layer only. This is measured, not preferred — see
 `docs/superpowers/spikes/2026-09-19-compositing-throughput.md`. Do not move
 full-frame resampling into Rust.
 
+**Decode path stays zero-copy.** Use `decodebin3` with the video stream selected
+by caps (`video/x-raw(ANY)`), or an explicit `demux ! parse ! <hw decoder>`
+chain — never `decodebin`, which negotiates system memory into GL and makes
+accurate seeks ~5× slower (every decode-forward frame gets copied off the GPU).
+Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
+`docs/superpowers/spikes/2026-09-19-seek-latency.md`.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not

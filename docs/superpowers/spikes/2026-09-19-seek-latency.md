@@ -1,46 +1,71 @@
-# Spike — 4K HEVC accurate-seek latency, software decode
+# Spike — seek latency on real hardware (Phase 2 gate)
 
 **Date:** 2026-09-19
-**Question:** The Phase 2 gate says the scan player falls back to libmpv if accurate seek on 4K HEVC exceeds ~250 ms *with a hardware decoder confirmed*. Can that be settled without a GPU?
-**Answer:** Partly. Software decode fails the criterion, which does not settle it — but decomposing the cost does change what the gate should measure.
+**Question:** The spec's Phase 2 gate says the scan player falls back to libmpv if accurate seek exceeds ~250 ms with a hardware decoder confirmed. Does GStreamer pass on real hardware with real footage?
+**Answer:** **Yes, by a wide margin — GStreamer stays the scan player.** But only on a zero-copy decode path, and the measurement nearly came out wrong three times on the way there. Those are recorded below because each one is a trap the implementation can fall into too.
 
-## Method
+## Machine
 
-Generated a synthetic 4K HEVC file (`videotestsrc pattern=smpte` → `x265enc speed-preset=ultrafast bitrate=20000 key-int-max=60` → `matroskamux`): 3840×2160, 30 fps, 30 s, **2-second GOP**, 73 MB.
+Laptop: Intel Core i7-10610U (Comet Lake, 15 W), Intel UHD Graphics (GT2), Ubuntu 24.04, kernel 6.8, GStreamer 1.24.2, X11 session. A low-power 2020 iGPU — deliberately not a favourable test machine.
 
-Measured with `gstreamer-rs`, `filesrc ! decodebin ! videoconvert ! fakesink sync=false`, eight seeks spread across the file, each timed to completion via a blocking state query. Decoder selected: `avdec_h265` (software).
+## Results — measured through the app's real display path
 
-Machine: Intel Xeon @ 2.80 GHz, 4 cores — a shared CI container, so treat absolutes as a **floor**.
+Pipeline: `filesrc ! decodebin3 ! video/x-raw(ANY) ! glupload ! glcolorconvert ! queue ! fakesink`, measured in PAUSED. Each seek's acceptance is checked and a landed frame is required. Ten seeks spread across each file, offset so targets rarely coincide with a keyframe.
 
-## Result
+| Source | Codec | GOP | Decoder | Caps into GL | ACCURATE median / worst | KEY_UNIT median / worst |
+|---|---|---|---|---|---|---|
+| User's camera | HEVC 2560×1440 @ 30 | 0.5 s | `vah265dec` | DMABuf | **10 / 22 ms** | 2.6 / 45 ms |
+| 10-hour recording | H.264 1920×1080 @ 60 | 2.0 s | `vah264dec` | DMABuf | **92 / 149 ms** | 6.4 / 273 ms |
+| Synthetic | HEVC 3840×2160 @ 30 | 2.0 s | `vah265dec` | DMABuf | 191 / 336 ms | 37 / 54 ms |
 
-| Seek mode | median | worst |
+**The user's actual footage passes with ~12× margin.** Both real sources pass. The only case over budget is the worst-case seek on 4K with a 2-second GOP on this 15 W iGPU, and KEY_UNIT during scrubber drag (the spec's hybrid policy) covers it at 37 ms median.
+
+KEY_UNIT worst-case outliers on the 12 GB file (~270–380 ms) are almost certainly cold disk reads when jumping hours into a file much larger than the page cache; the medians are single-digit.
+
+## Findings that change the design
+
+### 1. Zero-copy decides seek latency, not only throughput
+
+The same file, the same hardware decoder, the same seeks:
+
+| Output of the decoder | ACCURATE median / worst, 2 s GOP 1080p60 |
+|---|---|
+| System memory (e.g. into a plain `fakesink`) | 447 / 784 ms — **fails** |
+| VA memory or DMABuf into GL | 92 / 152 ms — **passes** |
+
+An accurate seek decodes forward from the previous keyframe — up to one GOP of frames — and when the decoder's output is system memory, **every one of those frames is copied off the GPU**, even though all but the last are discarded. That copy was 80% of the cost. The spec's rule "decoded video never enters a Rust-owned CPU buffer" was motivated by throughput; it is equally a seek-latency requirement.
+
+### 2. `decodebin3` is required; `decodebin` is not an acceptable fallback
+
+Decode + upload throughput at 1440p, audio consumed identically in each path, startup excluded:
+
+| Path | Throughput | Caps into GL |
 |---|---|---|
-| `FLUSH \| KEY_UNIT` (flush + demux, decodes ~nothing) | **104.6 ms** | 148.9 ms |
-| `FLUSH \| ACCURATE` (+ decode forward to the target frame) | **439.8 ms** | 616.6 ms |
+| `decodebin` | 117 fps | **system memory** |
+| `decodebin3` | 739 fps | DMABuf |
+| explicit `qtdemux ! h265parse ! vah265dec` | 722 fps | DMABuf |
 
-Decomposed:
+`decodebin` auto-plugs the same hardware decoder but negotiates system memory into `glupload` — ~6× slower, and (per finding 1) ~5× slower to seek. The spec named it as the fallback for `decodebin3`; that is removed.
 
-```
-fixed pipeline cost   : 104.6 ms   hardware decode does NOT reduce this
-decode-forward cost   : 335.2 ms   this is what hardware reduces  (76% of total)
-```
+### 3. On this distro, hardware decoders already win by default
 
-## What this settles, and what it doesn't
+`vah265dec` and `vah264dec` are ranked **PRIMARY + 1 (257)**, above software `avdec_*` at PRIMARY (256), so `decodebin3` selects hardware with no intervention. The spec assumed the opposite ("on most distro builds the software decoders outrank the hardware ones"). The decoder probe stays as a safety net for other distros and older GStreamer, but the pessimism was wrong for Ubuntu 24.04 / GStreamer 1.24. (The legacy `vaapih265dec` is present at rank NONE — correctly ignored.)
 
-**It does not settle the gate.** The test is one-sided: hardware decode is strictly faster than software, so a software *pass* would have settled it for every machine. A software *fail* says nothing about hardware — and 76% of the cost is precisely the term hardware eliminates.
+### 4. The libmpv fallback would not have fixed a slow result
 
-**It does produce two facts the gate did not have:**
+When a seek is slow *with* hardware decode and zero-copy, the cost is decoding one GOP of frames. libmpv with `hwdec=vaapi` uses the same VA-API decoder and must decode the same frames. The spec's kill criterion pointed at the player; the variables that actually matter are **GOP length × per-frame decode cost × whether the output stays on the GPU**.
 
-1. **There is a hardware-independent floor of ~105 ms**, spent on the pipeline flush and demux before a single frame is decoded. That is 42% of the entire 250 ms budget. A hardware decoder has to bring 335 ms down to under ~145 ms to pass — plausible, but the criterion is much tighter than "hardware will obviously fix it."
-2. **The hybrid seek policy is independently validated.** KEY_UNIT at ~105 ms median is comfortably usable for live scrubber drag, and it is hardware-independent, so it holds on any machine. The spec already specifies KEY_UNIT during drag and ACCURATE on release; this is evidence for that split rather than an assumption behind it.
+## Traps hit while measuring — each is also an implementation trap
 
-## Caveats
+1. **A rejected seek looks like a fast seek.** The first gate script never checked `seek_simple()`'s return value. It happened to report correct numbers, but could not have told the difference.
+2. **`decodebin3 ! fakesink` links whichever pad appears first — often audio.** One run timed *audio* seeks, printed 775 `gst_buffer_pool_acquire_buffer` CRITICALs from the unlinked video decoder, and produced an impossible 6 ms accurate seek on a 120-frame GOP. It briefly looked like a `decodebin3` bug; it was a missing `video/x-raw(ANY)` caps filter. The app must select the video stream explicitly.
+3. **Measuring into a system-memory sink overstates seek latency ~5×** (finding 1). The first real-hardware numbers for the 2 s GOP file said "fails even on hardware"; that was the download, not the decode.
+4. **Synthetic x265 files carry a 2-frame PTS offset** (B-frame delay with no edit list), so every accurate seek on them lands exactly 67 ms past the target. A property of the fixture, not of seeking; real footage lands within one frame.
 
-- **Synthetic content understates the decode term.** SMPTE bars have far less entropy and motion than real match film, so `avdec_h265` decodes them faster than it would decode the real thing. The 335 ms decode-forward figure is a floor, not an estimate.
-- Shared CI container; both terms would improve on a desktop CPU, but the *ratio* is the durable finding.
-- A 2-second GOP is a reasonable guess at camera output. A longer GOP increases the decode-forward term proportionally and does not move the fixed cost.
+## Correction to the earlier container-only spike
 
-## What still needs real hardware
+An earlier version of this document, measured on a GPU-less CI container with software decode, concluded that KEY_UNIT's ~105 ms was a "hardware-independent floor" leaving hardware only ~145 ms of headroom. **That was wrong.** KEY_UNIT still decodes the keyframe itself, and in software that is most of the cost; on hardware, KEY_UNIT is 2–6 ms. The software numbers themselves reproduced on the laptop almost exactly (container 440 / 617 ms, laptop 450 / 620 ms), which is a useful cross-check that both benches measured the same thing.
 
-`scripts/linux-gate-check.sh <file>` on a machine with a GPU, against **real match film**. Two numbers matter: whether a hardware decoder is selected at all (rank, not just presence), and whether ACCURATE lands under 250 ms given the ~105 ms floor measured here.
+## Reproducing
+
+`scripts/linux-gate-check.sh <file>` — sections 1–4 report decoder ranks, encoders, the GL mixer chain and capture; section 5 reports GOP length, the selected decoder, whether frames reach GL zero-copy, and KEY_UNIT / ACCURATE latency through the GL path.

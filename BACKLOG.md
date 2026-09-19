@@ -234,3 +234,26 @@ Each entry: what, why deferred, when to revisit.
   possibly-zero-height rect). The bus contract already localizes capture to one
   place, so sanitize there. Consider also surfacing a count of `Unknown` events
   from `store::read` so corruption is observable rather than quiet.
+
+### 29. Long-GOP 4K scrubbing on low-power iGPUs
+- **Why deferred:** On the reference laptop (15 W Comet Lake iGPU), accurate
+  seek on synthetic 4K HEVC with a 2 s GOP measured 191 ms median / 336 ms
+  worst — the only measured case over the 250 ms budget. The user's own footage
+  (HEVC 1440p30, 0.5 s GOP) seeks in 10 / 22 ms, and a 2 s-GOP 1080p60 file in
+  92 / 149 ms, so nothing the user actually shoots is affected. KEY_UNIT during
+  drag (37 ms median on the 4K file) already covers live scrubbing; only the
+  accurate settle on release is slow. Options if it matters: detect GOP length
+  at import (the gate script already measures it) and offer short-GOP proxies,
+  as NLEs do. Not worth building for a source type nobody has imported yet.
+- **When to revisit:** When a user imports 4K long-GOP footage (common from
+  some action cameras and broadcast downloads), or if Phase 2 targets a slower
+  GPU than the reference laptop.
+
+### 30. Re-measure SkipCoordinator's burst window against real seeks
+- **Why deferred:** `DEFAULT_BURST_WINDOW` (150 ms) was tuned against mpv and
+  VideoToolbox. On the reference laptop an accurate seek on the user's footage
+  takes 10 ms median / 22 ms worst, so a leading exact seek lands long before
+  150 ms and the coordinator will rarely enter burst mode at all. That is
+  probably fine — the window then mostly just delays the settle after a burst
+  — but it should be tuned by feel with the real transport, not by arithmetic.
+- **When to revisit:** Phase 2, once skip keys drive a real player.

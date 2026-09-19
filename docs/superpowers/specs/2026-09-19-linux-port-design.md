@@ -3,7 +3,7 @@
 **Date:** 2026-09-19
 **Status:** Reviewed — two adversarial review passes and four deliberation passes applied
 **Supersedes:** `rust/docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md` (docs-only; no code was ever committed)
-**Evidence:** `docs/superpowers/spikes/2026-09-19-compositing-throughput.md`
+**Evidence:** `docs/superpowers/spikes/2026-09-19-compositing-throughput.md`, `docs/superpowers/spikes/2026-09-19-seek-latency.md`
 
 ---
 
@@ -79,12 +79,16 @@ Element names below are verified against GStreamer 1.24.2 unless marked otherwis
 
 ```
 filesrc location=<path> ! decodebin3
-  ├─ video pad (pad-added) → queue ! glupload ! glcolorconvert ! <GL sink>
+  ├─ video pad (pad-added) → video/x-raw(ANY) ! queue ! glupload ! glcolorconvert ! <GL sink>
   └─ audio pad (pad-added) → queue ! audioconvert ! audioresample
                                    ! volume name=scan_volume ! autoaudiosink
 ```
 
-`decodebin` exposes video and audio as separate sometimes-pads via `pad-added`; it is not a `tee` (which duplicates one stream and does not demux). The `queue` on each branch is required — without it both branches share a streaming thread and the audio sink's blocking stalls video. `decodebin3` for its stream-selection and seek behavior, with `decodebin` as the fallback.
+`decodebin` exposes video and audio as separate sometimes-pads via `pad-added`; it is not a `tee` (which duplicates one stream and does not demux). The `queue` on each branch is required — without it both branches share a streaming thread and the audio sink's blocking stalls video.
+
+**`decodebin3` is required, and `decodebin` is not an acceptable fallback.** Measured on Intel VA-API (seek-latency spike): `decodebin` auto-plugs the same hardware decoder but negotiates **system memory** into `glupload`, running ~6× slower (117 vs 739 fps at 1440p) and making accurate seeks ~5× slower. If `decodebin3` is ever unusable, the fallback is an explicitly built `demux ! parse ! <hw decoder>` chain, which measured the same as `decodebin3` (722 fps, DMABuf).
+
+**Select the video stream by caps, never by pad order.** `decodebin3 ! <consumer>` links whichever pad appears first, which is frequently audio; during measurement this silently timed audio seeks and left the video decoder unlinked. The `video/x-raw(ANY)` filter (or explicit stream selection) is part of the contract.
 
 **Capture.**
 
@@ -243,7 +247,7 @@ This is a genuine improvement to bank. On macOS the two paths were *forced* apar
 
 ### Decoder selection
 
-Symmetric with encoder selection, and for the same reason: the default is wrong. `decodebin` picks by plugin rank, and on most distro builds the software `avdec_*` decoders outrank the hardware ones, so the default outcome is software HEVC decode — which on 4K is exactly the "unusable scrubbing" the scrub risk describes. macOS treated this as a gated decision worth recording in source (`MPVSourcePlayer.swift:36-37`, `hwdec = "videotoolbox"`, "recorded here as the source of truth"); Linux has no equivalent yet.
+Symmetric with encoder selection. Auto-pluggers pick by plugin rank, and whether hardware wins by default **depends on the distro and GStreamer version**. On the reference laptop (Ubuntu 24.04, GStreamer 1.24.2) the `va` plugin's `vah265dec`/`vah264dec` rank **PRIMARY + 1**, above software `avdec_*` at PRIMARY, so hardware is selected with no intervention — contrary to this spec's original assumption. Older GStreamer, the legacy `vaapi` plugin (present at rank NONE) and other distros can still leave software decode on top, and software decode fails the seek gate by ~2.5× (seek-latency spike). So the probe below stays, as a safety net rather than a correction. macOS treated this as a gated decision worth recording in source (`MPVSourcePlayer.swift:36-37`, `hwdec = "videotoolbox"`, "recorded here as the source of truth"); Linux has no equivalent yet.
 
 At media-subsystem init, probe `vah265dec`/`vah264dec`, then `nvh265dec`/`nvh264dec`, then `v4l2slh265dec`, and raise the rank of the first that instantiates to `GST_RANK_PRIMARY + 1` via `gst_plugin_feature_set_rank`. Software `avdec_*` remains the final fallback. Log the selected factory and its negotiated caps feature, and surface both in diagnostics alongside the encoder — a user on software decode should be told, not left to infer it from the scrubbing.
 
@@ -388,14 +392,15 @@ Twelve phases in four milestones. Each gets its own plan document and follows th
 
 ## Gates and risks
 
-**Phase 2 gate — zero-copy decode-to-display.** Confirm (a) a hardware decoder is selected, and (b) frames reach the display without a system-memory round-trip — verifiable from decoder src-pad caps carrying `memory:DMABuf`, `memory:VAMemory` or `memory:GLMemory`, with no `gldownload`/`videoconvert` between decoder and sink. Measure accurate-seek latency on 4K HEVC here.
+**Phase 2 gate — zero-copy decode-to-display. PASSED on the reference laptop, 2026-09-19** (i7-10610U, Intel UHD GT2, Ubuntu 24.04, GStreamer 1.24.2; `scripts/linux-gate-check.sh`). Hardware decode selected by default; frames reach `glupload` as `memory:DMABuf`; accurate seek through the GL path **10 / 22 ms** (median / worst) on the user's camera footage (HEVC 1440p30, 0.5 s GOP) and **92 / 149 ms** on a 2 s-GOP H.264 1080p60 recording. Re-run the script on any new target machine; it measures the display path, not a system-memory sink.
+
+**Zero-copy is a seek-latency requirement, not only a throughput one.** An accurate seek decodes forward up to one GOP from the previous keyframe; if the decoder's output is system memory, every one of those frames is copied off the GPU even though all but the last are discarded. On the 2 s-GOP file that copy was 80% of the cost (447 → 92 ms median). Any path that lets decoded frames fall back to system memory — `decodebin`, a stray `videoconvert`, a sink without GL — regresses scrubbing, and it is invisible in a playback test.
 
 **Phase 7 gate — first composite.** End-to-end preview at playback resolution sustains output fps with zoom active and a stroke-heavy overlay.
 
 **There is no compositing-throughput gate.** It has been run; it failed; that is *why* the architecture is what it is. Do not re-run it.
 
-1. **1a. Hardware decode availability.** VA-API/NVDEC presence and ranking varies by GPU, driver and distro. Measured at the Phase 2 gate. Without it, everything below measures the wrong thing.
-   **1b. Scrub responsiveness given hardware decode.** *Kill criterion: if accurate seek on 4K HEVC exceeds ~250 ms in Phase 2 **with a hardware decoder confirmed selected**, switch the scan player to libmpv for scan only; GStreamer keeps export and capture, and the project accepts two zoom implementations as the price.* Treat this as a live branch, not a remote one: mpv is the **current, shipped** macOS scan player, and `ContentView.swift:753-773` documents a frame-accuracy problem solved specifically by mpv's synchronous `time-pos` query. The GStreamer scan player is replacing something that works.
+1. **Scrub responsiveness — resolved in GStreamer's favour; the libmpv kill criterion is retired.** Measured on real hardware and real footage (Phase 2 gate above), GStreamer passes with a ~12× margin on the user's footage. The criterion also pointed at the wrong variable: when a seek is slow *with* hardware decode and zero-copy, the cost is decoding one GOP of frames, and libmpv with `hwdec=vaapi` would use the same decoder and decode the same frames. What actually decides accurate-seek cost is **GOP length × per-frame decode cost × whether output stays on the GPU.** Residual edge: 4K with a 2 s GOP on a 15 W iGPU measured 191 / 336 ms, so its worst case exceeds 250 ms; KEY_UNIT during drag (37 ms median there) covers live scrubbing, and only the settle-on-release pays the accurate cost. One property mpv gave macOS still has to be matched: a **synchronous, frame-accurate position query** for the play/pause anchors (`ContentView.swift:753-773`). GStreamer's `query_position` is synchronous; Phase 4 must verify it is frame-accurate after a seek.
 2. **GL interop across drivers.** DMABuf/VA import into GL is solid on Mesa and dicier on the NVIDIA proprietary stack. Mitigation: the software `compositor` fallback, which is already built for CI.
 3. **Font metrics.** cosmic-text will not reproduce CoreText's metrics, and because `fittingFontSize` derives a font *size* from measured width, a different font changes layout, not just pixels. Bundling the font (above) bounds this to a one-time tuning cost.
 4. **Software-encode fallback on low-end hardware.** A machine with no VA-API or NVENC H.264 encoder falls back to `x264enc` and exports substantially slower than the macOS VideoToolbox path. Less likely than the HEVC version of this risk (H.264 encode is near-universal) but not zero. State it in the README.
