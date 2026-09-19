@@ -1,233 +1,314 @@
 # Linux Port — Phase 2 Plan
 
 **Date:** 2026-09-19
-**Spec:** `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md` (decisions are cited as D1–D12)
-**Status:** Draft, pre-review
+**Spec:** `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md` (decisions cited as D1–D12)
+**Status:** Reviewed. Simplification and correctness passes are applied; the correctness pass built the dependency set and tested the GStreamer claims on the reference laptop.
 
-**Goal:** the spec's "Done when" list, on the reference laptop.
+**Goal:** everything on the spec's "Done when" list works on the reference laptop.
 
-**Execution:** `CLAUDE.md` names `superpowers:subagent-driven-development`, which isn't installed. Instead, each task runs in a fresh subagent. The subagent is given this plan, the spec and `CLAUDE.md`, and nothing else from chat history. The orchestrator runs the `verify` skill after each task and commits each task on its own.
+**Execution.** `CLAUDE.md` names `superpowers:subagent-driven-development`, but it isn't installed. Instead, each task runs in a fresh subagent that is given this plan, the spec and `CLAUDE.md`, and no chat history. After each task the orchestrator runs the `verify` skill and commits that task on its own. CI must stay green at every commit, so each task updates CI when it adds a new requirement.
 
-**Environment:** reference laptop (Ubuntu 24.04, GStreamer 1.24.2, Intel UHD, X11). Anything that needs a display runs here. The laptop can capture screenshots (`import -window root`, or `gnome-screenshot -f`) and read them back to check what's on screen.
+**Environment.** The reference laptop runs Ubuntu 24.04, GStreamer 1.24.2 with dev headers installed, an Intel UHD GPU, and X11. Anything that needs a display runs there. Screenshots (`import -window root /path.png`) can be read back to check what's on screen.
+
+**Known facts. Don't re-derive these.**
+- **Build.** A clean build takes about 6 minutes of wall time and 34 CPU-minutes. `skia-bindings` downloads prebuilt binaries, so neither clang nor ninja is needed.
+- **Slint API.**
+  - `PointerScrollEvent` has `modifiers`.
+  - `FocusScope`'s `capture-key-pressed` runs before the focused element.
+  - `DragArea`/`DropArea` are stable in 1.18.
+  - Skia uses EGL on Linux.
+  - With `default-features = false`, the required compat feature is `compat-1-18`.
+- **GStreamer 1.24.2 behavior.**
+  - A flushing seek in PAUSED or PLAYING posts `ASYNC_DONE`.
+  - PAUSED→PLAYING posts none; PLAYING→PAUSED posts one.
+  - A READY→uri→PAUSED load posts its **own** `ASYNC_DONE`, before any seek.
+  - `ASYNC_DONE` carries no seek seqnum.
+  - An appsink whose samples are never pulled **never posts EOS**.
+  - WebM can't carry `image-orientation`.
+  - `glupload`'s uploader can't be queried; its sink-pad caps show which one is used: `memory:DMABuf` means zero-copy, plain `video/x-raw` means copied.
+- **Edition 2021.** The workspace is edition 2021, so code copied from Slint's example must not use let-chains.
 
 ---
 
-## Task 0 — Toolchain and zero-copy spike (gate)
+## Task 0 — Toolchain, CI, and the zero-copy gate
 
-Everything after this task assumes Skia builds, the EGL context can be shared, and a frame shows up through the zero-copy path. So this task proves all three before anything is built on them.
+1. **Workspace `Cargo.toml`.**
+   - Set `resolver = "3"`, which is MSRV-aware. Without it, `gstreamer` 0.25.3 locks `kstring` 2.0.5, which needs Rust 1.96.
+   - Set `rust-version = "1.92"`.
+   - Add these workspace dependencies:
+     - `slint` 1.18 with `default-features = false` and features `std`, `backend-winit`, `renderer-skia-opengl`, `compat-1-18`;
+     - `slint-build` 1.18;
+     - `gstreamer`, `-video`, `-app`, `-gl`, `-gl-egl` and `-pbutils` at 0.25, each with feature `v1_24` and nothing higher;
+     - `glutin_egl_sys` 0.7, for `eglGetCurrentContext`/`eglGetCurrentDisplay`, loaded through Slint's `get_proc_address` as in Slint's example;
+     - `rfd` at the current 0.17.x with its default xdg-portal backend, which needs no GTK packages.
 
-1. **Dev packages.** Check with `dpkg-query`. If any are missing, **stop and ask the user to run**:
-   `sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libegl-dev libgl-dev`
-   Never run `sudo` yourself.
-2. **Workspace.** Set `rust-version = "1.92"`. Add workspace dependencies:
-   - `slint` 1.18 with `default-features = false`, features `std`, `backend-winit`, `renderer-skia-opengl`, `compat-1-2`;
-   - `slint-build` 1.18;
-   - `gstreamer`, `gstreamer-video`, `gstreamer-app`, `gstreamer-gl`, `gstreamer-gl-egl`, `gstreamer-pbutils` 0.25, each with feature `v1_24` and nothing higher.
+   `video-coach-core` gets none of these.
+2. **CI** (`.github/workflows/rust.yml`).
+   - `workspace` job:
+     - apt-installs `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good libfontconfig1-dev libfreetype-dev libxkbcommon-dev libegl-dev libgl-dev`;
+     - adds `Swatinem/rust-cache`;
+     - pins Rust 1.92, since this is the job that compiles Slint and GStreamer, so this is where the pin checks something;
+     - runs fmt, clippy and `cargo test --workspace`. No test may open a window.
+   - `core` job: unchanged, still with no GStreamer.
+3. **Spike** `crates/video-coach-app/examples/zero_copy_spike.rs`. It stays in the repo as a diagnostic.
+   - Select the Skia renderer (D2).
+   - In `RenderingSetup`, assert `eglGetCurrentContext()` is non-null, wrap the context, and answer `NeedContext` from a sync handler. The handler returns `BusSyncReply::Drop` for everything, forwarding non-context messages.
+   - Play a path given as an argument through `playbin3` with the D1 GL sink bin, drawing each frame via `BorrowedOpenGLTextureBuilder`.
+   - Log the decoder factory, the caps on `glupload`'s sink pad, and the GL platform.
+4. **Sub-pixel check.** In the spike, move the `Image` very slowly by setting fractional `x` and `width` values, and confirm with before/after screenshots that it doesn't visibly step. Record the result here.
+5. **Gate.** Run the spike on `~/Downloads/phone_Videos/20260502121738_000004.MP4` with `GST_DEBUG=glupload:6`. The gate passes only if all of these hold:
+   - the decoder is hardware;
+   - the caps into `glupload` are `memory:DMABuf`, and the debug log shows `DirectDmabufExternal`;
+   - the platform is EGL;
+   - a screenshot shows the frame;
+   - playback runs without dropped-frame warnings.
 
-   `video-coach-core` gets **none** of these.
-3. **Skia build.** `cargo build -p video-coach-app` with a minimal Slint window. If `skia-safe` can't fetch prebuilt binaries and needs a source build (clang, ninja, python), stop and report which tools are missing.
-4. **Spike binary** `crates/video-coach-app/examples/zero_copy_spike.rs`. Throwaway, but kept in the repo as a diagnostic. It must:
-   - select the Skia renderer (D2) and assert that `eglGetCurrentContext()` is non-null in `RenderingSetup`;
-   - wrap the context and answer `NeedContext` from a sync handler (D3);
-   - run `playbin3` on a path given as an argument, with the D1 GL sink bin, and draw the latest frame into an `Image` through `BorrowedOpenGLTextureBuilder`;
-   - log the decoder, the `glupload` uploader (from `GST_DEBUG=glupload:6`, or by querying the element) and the GL platform.
-5. **Also probe** the three Slint facts later tasks depend on, and record the answers in this plan's Task 0 notes (append them):
-   - Does `PointerScrollEvent` carry modifiers?
-   - Does `FocusScope`'s `capture-key-pressed` intercept keys before a focused `Slider`?
-   - Does an `Image` with fractional `x`/`width` inside `clip: true` render without visible stepping during a slow pan?
-6. **Gate:**
-   - Run the spike on `~/Downloads/phone_Videos/20260502121738_000004.MP4`.
-   - The log must show a hardware decoder, uploader `DirectDmabufExternal` and platform EGL.
-   - A screenshot must show the frame.
-   - Steady playback must run without dropped-frame warnings.
-   - **If the gate fails, stop.** Report the failure; don't start Task 1.
+   **If the gate fails, stop and report. Don't start Task 1.**
 
-Commit: `chore(app): Phase 2 toolchain and zero-copy spike`.
+Commit: `chore(app): Phase 2 toolchain, CI and zero-copy spike`.
 
 ## Task 1 — Core additions (no GStreamer)
 
-`crates/video-coach-core`, following the `port-swift-module` skill's rules where they apply.
+Work in `crates/video-coach-core`, following the `port-swift-module` skill.
 
-- **`SourceRef.display_aspect: f64`** (D7). Required field, camelCase. Update fixtures and tests. `formatVersion` stays 7.
-- **`Project::locate(abs_seconds) -> (usize, f64)`** (D4), with the four rules from the spec. Tests cover each rule, and round-trip with `abs_seconds` away from boundaries.
-- **Source-list remaps** (D7), as pure functions over `&mut Project` plus the current position:
-  - `remove_source(index, current) -> Result<Option<(usize, f64)>, RemoveError>`: refuses while any clip or match event references the source; decrements higher indices in clips and match events; returns the remapped current position, or `None` if the current source was removed.
-  - `permute_sources(new_order: &[usize], current) -> (usize, f64)`: validates that `new_order` is a permutation, then remaps clips, match events and current.
-- **Aspect gate** (D7):
-  - `aspects_match(a, b)`: both > 0 and `|a−b| / max < 0.005`.
-  - `aspect_reference(project, excluding: Option<usize>) -> Option<f64>`: the first source other than `excluding`.
-  - Test the 0.005 edge in both directions.
-- **`SeekSlot<T>`** (D8), new file `seek_slot.rs`. A single-flight slot where the latest request wins:
-  - `request(t) -> Option<T>` returns what to issue now;
-  - `completed() -> (Option<T>, Option<T>)` returns the seek that finished and the next one to issue;
-  - `clear()`.
+- **`SourceRef.display_aspect: f64`** (D7): required and camelCase. Update fixtures; `formatVersion` stays 7.
+- **`Project::locate(abs) -> (usize, f64)`** (D4), following the spec's four rules. Tests cover each rule, plus a round trip with `abs_seconds` away from boundaries.
+- **`Project::source_is_referenced(i) -> bool`**: true if any clip or match event references the source. `remove_source` uses it, and so does the UI's disabled remove button.
+- **`Project::remove_source(i, current: usize) -> Result<Option<usize>, SourceReferenced>`**:
+  - it refuses while the source is referenced;
+  - it decrements higher `source_index` values in clips and match events;
+  - it returns the remapped current index, or `None` if the current source was removed.
+- **`Project::move_source(from, to, current: usize) -> usize`**: moves one source and remaps clips, match events and the current index. A move is always a valid permutation, so no validation is needed.
+- **`Project::check_aspect(candidate, excluding: Option<usize>) -> Result<(), AspectMismatch>`**:
+  - the reference is the first source other than `excluding`; if there's no such source, there's no gate;
+  - the rule is: both aspects > 0 and `|a−b| / max < 0.005`;
+  - test the 0.005 edge in both directions, and the sole-source relink.
+- **`Zoom::content_fraction(cursor_x, cursor_y, frame_w, frame_h, area_w, area_h) -> (f64, f64)`** in `zoom.rs`, next to `transform`:
+  - maps a cursor in window-area coordinates to fractions of the letterboxed content rect, clamped to `[0, 1]`;
+  - Phase 6 strokes will reuse it;
+  - tests: 16:9 and 4:3 frames in a 16:9 area, including a cursor in the letterbox bars.
+- Tests for `remove_source` (refusal, remap, current removed) and `move_source` (forward, backward, current moved).
 
-  Pure and generic. Tests: idle request issues immediately; requests during flight keep only the latest; completion issues the pending one; completion when idle is a no-op.
-- **`format_hms(seconds) -> String`** (D8 readout), matching macOS `formatDurationHMS`. Tests: 0, a negative value, NaN, 59.9, 3599.9, 3600.
-
-Commit: `feat(core): Phase 2 timeline location, source remaps, seek slot`.
+Commit: `feat(core): Phase 2 locate, source remaps, aspect gate, content fraction`.
 
 ## Task 2 — Media: fixtures and probe
 
-`crates/video-coach-media`.
+Work in `crates/video-coach-media`.
 
-- **`fixtures` module**, behind `#[cfg(any(test, feature = "test-fixtures"))]`. It writes short VP8/Vorbis WebM files into a temp dir with `videotestsrc`/`audiotestsrc ! vp8enc/vorbisenc ! webmmux`, which needs only the base and good plugin sets.
-  - Parameters: duration, width × height, frame rate, and a keyframe interval.
-  - A second helper writes a file tagged with `image-orientation=rotate-90` (via `taginject`), and a third writes one with no video stream.
-- **`probe(path) -> Result<Probe, ProbeError>`** using `Discoverer` (D7). `Probe` holds `duration_seconds` and `display_aspect` (width/height × PAR).
-  - Errors: `NoVideo`, `Rotated(tag)`, `Unreadable(String)`.
-  - Tests: values within one frame of the fixture parameters, and each error case.
+- **`pub mod fixtures`**. Every function writes into a `&Path` directory the caller supplies, so `tempfile` stays a dev-dependency. There's no feature flag.
+  - `webm(dir, name, secs, w, h, fps, keyint)`: `videotestsrc` and `audiotestsrc ! vp8enc`/`vorbisenc ! webmmux`. Set `samplesperbuffer` so the audio matches the video duration exactly; at 44.1 kHz and 30 fps that's `samplesperbuffer=1470`. Uses the base and good plugins only.
+  - `rotated_mp4(dir)`: `videotestsrc ! jpegenc ! taginject scope=global tags="image-orientation=rotate-90" ! qtmux`. Verified: Discoverer reports this tag.
+  - `audio_only(dir)`: a file with no video stream.
+- **`probe(path) -> Result<Probe, ProbeError>`** using `Discoverer`.
+  - `Probe { duration_seconds, display_aspect }`, where the aspect includes PAR.
+  - Errors are `NoVideo`, `Rotated(String)` and `Unreadable(String)`.
+  - Orientation is read from `DiscovererInfo::tags()` (the global tag list) through a pure `check_orientation(tag: Option<&str>)`, which is unit-tested on its own.
+  - Tests: duration within one frame of the fixture; aspect within a **relative** 0.1%, since PAR rounding in WebM gives 1.7771 for 16:9; each error case.
 
 Commit: `feat(media): test fixtures and source probe`.
 
-## Task 3 — Media: the player
+## Task 3 — Media: the player and its seek slot
 
-`crates/video-coach-media/src/player.rs`: the `SourcePlayer` from D1/D4.
+`crates/video-coach-media/src/player.rs`. The load sequence, the seek slot and EOS handling all live here (spec crate table). The bus sees only concat time.
 
-- **Construction.** `SourcePlayer::new(video_sink: gst::Element, audio_sink: gst::Element, gl: Option<GlSlot>, messages: Sender<gst::Message>)`:
-  - creates the one `playbin3` with flags `0x53`;
-  - installs the sync handler, which answers `NeedContext` from `GlSlot` when present (D3) and forwards everything else to `messages`.
-- **`GlSlot`** is shared, write-once-per-setup storage for the wrapped `GLDisplay` and `GLContext`. The type lives here; filling it is Task 7.
-- **`gl_video_sink() -> (gst::Element, FrameMailbox)`** builds the D1 bin, with `new_sample` and `new_preroll` feeding a single-slot latest-wins `FrameMailbox` (D3).
-  - The mailbox holds a `gst::Buffer` and its `VideoInfo`, plus a redraw callback.
-  - Mapping to a texture is the app's job (Task 7).
-- **Load sequence** (D4) as an explicit step-driven API, so the bus thread can drive it from `ASYNC_DONE` messages without blocking:
-  - `begin_load(uri)` goes to READY, sets `uri`, then goes to PAUSED;
-  - `seek(seconds, accurate: bool)` issues a flushing seek, `KEY_UNIT` or `ACCURATE`;
-  - `set_playing(bool)`.
-- **Volume** (D8): `set_volume(linear_0_1)` applies `x³` to `volume`.
-- **`position_handle() -> PositionHandle`**: a clonable `Send` wrapper that allows only `query_position` (D5's single exception).
-- **Diagnostics** (D12): after each load reaches PAUSED, report the decoder factory name, the `glupload` uploader where one exists, and the GL platform from `GlSlot`.
-- **Tests** (injected `appsink` + `fakesink sync=true`, fixtures from Task 2):
-  - load and preroll yields a sample;
-  - an ACCURATE seek lands within one frame (sample PTS);
-  - EOS arrives on the message channel;
-  - a URI change through the load sequence switches files: the preroll sample's source dimensions change between two fixtures of different sizes;
-  - the volume value is `x³`.
+- **Video sink.** `video_sink(kind: SinkKind) -> (gst::Element, FrameMailbox)`.
+  - `SinkKind::Gl` builds the D1 bin, `glupload ! glcolorconvert ! appsink(GLMemory RGBA 2D)`.
+  - `SinkKind::System` builds `appsink(video/x-raw)` for tests.
+  - Both wire `new_sample` and `new_preroll` into the same single-slot, latest-wins `FrameMailbox`: a buffer, its `VideoInfo` (which includes PAR), and a redraw callback. Because samples are always pulled, EOS always arrives.
+- **Constructor.** `SourcePlayer::new(video_sink, audio_sink, on_message: impl Fn(gst::Message) + Send + Sync + 'static)`.
+  - It creates one `playbin3` with flags `0x53` and installs a sync handler.
+  - The sync handler answers `NeedContext` from a private context slot and passes every other message to `on_message`. It returns `BusSyncReply::Drop`, so nothing piles up on the async bus.
+- **`set_gl_context(display, context)`** fills the context slot. A player built with a GL sink refuses to go beyond READY until it has been called (D3).
+- **Seek machinery.** `seek_to(uri: &str, secs: f64, accurate: bool, origin: Origin) -> Result<()>`, where `Origin` is `Skip`, `Scrub` or `System`.
+  - Flight states: `Idle`, `Loading { target }`, `Seeking { target }`, plus a latest-wins `pending` slot.
+  - A different `uri` starts a load: READY, set `uri`, PAUSED. On the load's `ASYNC_DONE` the player issues the seek. In the `Loading` state it accepts `ASYNC_DONE` only when `state(ClockTime::ZERO)` returns `(Success, Paused, VoidPending)`, which guards against a stale one.
+  - On the seek's `ASYNC_DONE`: the seek is complete; issue the pending target if there is one.
+  - A request made while busy **replaces** `pending`. Report the displaced request's origin, so a displaced `Skip` can reset the coordinator.
+  - If a seek call fails, or media isn't loaded, complete that flight immediately with `SeekFailed`.
+  - `set_playing(bool)` records `want_playing`. It's applied once the flight is idle, so there's no flash of frame 0 during a load.
+  - `clear()` drops the flight and the pending target.
+- **`handle(&gst::Message) -> Vec<PlayerEvent>`**. Events:
+  - `SeekDone { origin }` and `SeekDisplaced { origin }`;
+  - `SeekFailed { origin }`;
+  - `Loaded { diagnostics }`;
+  - `Eos`: **ignored while a flight is busy**, because an EOS posted before a flushing seek is stale;
+  - `Error(String)`: also clears the flight.
+- **`Diagnostics`** is a plain struct holding the decoder factory, the caps on `glupload`'s sink pad and the GL platform. The bus logs it.
+- **Volume.** `set_volume(linear)` sets `volume = x³`.
+- **Position.** `position_handle() -> PositionHandle`: a clonable, `Send` wrapper that can only call `query_position` (D5).
+- **Tests.** Use `SinkKind::System` with `fakesink sync=true` for audio, and the Task 2 fixtures. Assertions use the mailbox sample's PTS and dimensions, never the pixel format: the laptop picks `vavp8dec` (NV12) while CI uses `vp8dec` (I420).
+  - Load and preroll.
+  - An ACCURATE seek lands within one frame.
+  - Latest-wins: three quick requests produce two flights, and the middle one is reported as displaced.
+  - Exactly one `SeekDone` per flight.
+  - A cross-source load lands on its target, and the dimensions change between fixtures of different sizes.
+  - A seek in the final second stays in the source.
+  - `Eos` arrives at the end.
+  - A failed seek doesn't wedge the slot.
+  - The volume value is `x³`.
 
-Commit: `feat(media): playbin3 source player with injected sinks`.
+Commit: `feat(media): playbin3 source player with internal seek slot`.
 
-## Task 4 — App: the bus thread
+## Task 4a — Bus: project and sources, with harness tests
 
-`crates/video-coach-app/src/bus/`. It must be constructible **without Slint** (plain Rust), so the harness can drive it.
+`crates/video-coach-app/src/bus/`, which must be constructible **without Slint**: `Bus::spawn(sinks: SinkKind, events: Box<dyn Fn(Event) + Send>) -> BusHandle`.
 
-- **Types.**
-  - `enum Input { Cmd(Command), Gst(gst::Message) }` on one `std::sync::mpsc` channel (D5).
-  - `Command`: `OpenProject`, `RestoreLastProject`, `AddSource`, `RemoveSource`, `ReorderSources`, `RelinkSource`, `RenameProject`, `Play`, `Pause`, `TogglePlay`, `Skip { delta }`, `ScrubMove { abs }`, `ScrubRelease { abs }`, `SetVolume { value, commit: bool }`, `GlReady`, `Teardown { ack: Sender<()> }`, `Shutdown`.
-  - `Event`: `ProjectChanged(Arc<Project>)`, `Position { source_index, target: Option<f64> }`, `Playing(bool)`, `SourceMissing(Option<usize>)`, `Error(UserError)`, `Diagnostics(..)`.
-  - Events go out through a `Box<dyn Fn(Event) + Send>` sink: the app wraps `invoke_from_event_loop`, and tests collect into a `Vec`.
-- **Loop.** `recv_timeout` against the skip-debounce deadline. When it expires, call `burst_ended()` and drive the decision.
-- **Project lifecycle** (D6):
-  - read-first open, then commit;
-  - create on `MissingProjectJson`;
-  - leave everything unchanged on any other error;
-  - restore opens existing projects only;
-  - the state file is `$XDG_CONFIG_HOME/coach-cuts/state.json`, read and written by one small module.
-  - Write `project.json` after each mutating command (D5), and write volume only when `commit`.
-- **Sources** (D7): add, relink, remove and reorder, calling Task 2's probe and Task 1's gate and remaps. Check each path for existence after every change and emit `SourceMissing`.
-- **Transport** (D4, D8):
-  - `current` position, and `SeekSlot<SeekTarget { abs, accurate, origin: Skip | Scrub | System }>`;
-  - a cross-source target runs the load sequence first, advanced by `ASYNC_DONE` messages;
-  - the first `ASYNC_DONE` after an issue completes the in-flight seek;
-  - a completed `Skip` origin calls `seek_completed()` on the coordinator.
-- **Coordinator reset** on scrub release, list mutation and project open. Never on loads that fulfil a skip.
-- **EOS:** advance to the next source at 0 and keep playing; on the last source, set PAUSED.
-- **Clamping:** skip targets and scrub-release targets are clamped to `total − 0.05`.
-- **GL gate** (D3):
-  - no pipeline state change beyond READY until `GlReady`, when the player was built with a GL sink;
-  - on `Teardown`, go to NULL and send the ack.
+- **Input channel.** One `std::sync::mpsc` channel carries `enum Input { Cmd(Command), Gst(gst::Message) }`. The player's `on_message` wraps each message as `Input::Gst`. The loop uses `recv_timeout` with the skip-debounce deadline.
+- **Commands.**
+  - Project: `OpenProject(PathBuf)`, `RestoreLastProject`, `RenameProject`.
+  - Sources: `AddSource(PathBuf)`, `RemoveSource(usize)`, `MoveSource { from, to }`, `RelinkSource(usize, PathBuf)`.
+  - Transport (4b): `TogglePlay`, `Skip { delta }`, `ScrubMove { abs }`, `ScrubRelease { abs }`, `SetVolume { value, commit }`.
+  - Lifecycle: `GlReady { display, context }`, `Shutdown { ack }`. `Shutdown` goes to NULL, acks and exits; it also serves as `RenderingTeardown`.
+- **Events.**
+  - `ProjectOpened(Arc<Project>)`, sent on every successful open; the UI resets zoom on it (D9).
+  - `ProjectChanged(Arc<Project>)`.
+  - `Position { source_index, target_abs: Option<f64> }`, with the target in concat seconds.
+  - `Playing(bool)`.
+  - `Missing(Vec<bool>)`, one entry per source.
+  - `Error(UserError)`, where `UserError` is `AspectMismatch`, `Rotated`, `NoVideo`, `UnreadableProject`, `LegacyProject`, `TooNewProject`, `SourceReferenced` or `Io`.
+- **Project lifecycle (D6).**
+  - Read first, then commit. On `MissingProjectJson`, create a project; on any other error, leave everything unchanged.
+  - After any open: apply `scan_volume` to the player, clear the seek slot and reset the coordinator.
+  - The state file `$XDG_CONFIG_HOME/coach-cuts/state.json` is a tiny module. Restore opens existing projects only.
+  - Write `project.json` after each mutating command.
+- **Sources (D7).** Probe, then gate, then remap, using Task 1 and Task 2.
+  - Check each source's path for existence after every change and emit `Missing`.
+  - If the current source is removed: reload at the same index clamped to the new length, at 0.
+  - If the current source is relinked: reload at the same source time.
+  - Moves and removals of other sources change offsets only, with no reload.
+  - While any source is missing, refuse to play or seek.
+- **Harness tests** (`crates/video-coach-harness/tests/`):
+  - opening a folder with no project creates one;
+  - opening a corrupt project refuses and keeps the previous project and folder;
+  - restoring a folder that no longer exists doesn't create it;
+  - an aspect mismatch is rejected;
+  - a rotated source is rejected;
+  - remove and move remap clips, match events and the current position;
+  - a referenced source can't be removed;
+  - a missing source blocks play.
 
-Commit: `feat(app): bus thread owning project, sources and transport`.
+  Use polling with timeouts, never sleeps.
 
-## Task 5 — Harness tests
+Commit: `feat(app): bus with project lifecycle and source management`.
 
-`crates/video-coach-harness/tests/`. Drive Task 4's bus with the injected non-GL sinks and Task 2 fixtures, and assert on collected events and on-disk state. Cover every harness case in the spec's Testing section, plus:
+## Task 4b — Bus: transport, with harness tests
 
-- the position is preserved when an earlier source is removed;
-- EOS on the last source leaves the player paused;
-- a seek in the final second of a source stays in that source.
+- **Skip.** `SkipCoordinator` over concat time, with `clip_duration = (total − 0.05).max(0.0)`, so its own clamp is the D8 clamp.
+  - Each coordinator seek is `locate`d and issued with `Origin::Skip`.
+  - `SeekDone { Skip }` calls `seek_completed()`.
+  - `SeekDisplaced { Skip }` and `SeekFailed { Skip }` reset the coordinator.
+- **Scrub.** `ScrubMove` issues KEY_UNIT seeks with `Origin::Scrub`. `ScrubRelease` resets the coordinator, then issues one ACCURATE seek clamped to `total − 0.05`.
+- **Resets.** Reset the coordinator and clear the player slot on list mutation, open and `Error`. Never reset on a load that fulfils a skip.
+- **EOS.**
+  - On a non-final source: load the next source at 0 with `Origin::System`, and keep playing.
+  - On the last source: `set_playing(false)` and emit `Playing(false)`.
+- **Position.** Publish a new `source_index` before a load leaves READY. While a flight is busy, `target_abs` is set.
+- **Volume.** `SetVolume` applies immediately and persists only when `commit` is set.
+- **GL gate.** `GlReady` calls `player.set_gl_context`.
+- **Harness tests:**
+  - a skip burst across a source boundary lands on the accumulated target;
+  - a skip burst followed by a scrub release never sticks, and the next skip works;
+  - EOS advances to the next source and keeps playing;
+  - EOS on the last source leaves the player paused;
+  - a seek in the final second of a source stays in that source;
+  - position is preserved when an earlier source is removed.
 
-Use polling helpers with timeouts rather than sleeps.
+Commit: `feat(app): bus transport — skip, scrub, EOS advance`.
 
-Commit: `test(harness): Phase 2 bus end-to-end`.
+## Task 5 — Window with live video
 
-## Task 6 — Slint UI shell
+This moves the spike into the app, so every later task can check its work by eye.
 
-`crates/video-coach-app/ui/*.slint` plus `src/main.rs`. Nothing is rendered in the video area yet.
+- **Startup.**
+  - Select the backend as in D2.
+  - Spawn the bus with `SinkKind::Gl`.
+  - Open the project given as a command-line argument, if there is one (`cargo run -p video-coach-app -- <folder>`); otherwise send `RestoreLastProject`.
+- **Rendering notifier.**
+  - `RenderingSetup`: assert EGL, wrap the context, send `GlReady { display, context }`.
+  - `BeforeRendering`: take the mailbox buffer, wait on its `GLSyncMeta`, map it with `GLVideoFrame::from_buffer_readable`, **keep** it, and set the `Image` source.
+  - `RenderingTeardown`: send `Shutdown` and wait for the ack.
+- **Minimal UI.** A black player area with the video, and keys Space, Left/Right, A/D and Shift wired to the bus. The FocusScope comes in Task 6.
+- **Manual check, with screenshots:**
+  - play and pause;
+  - a paused skip shows the new frame (preroll);
+  - a cross-source skip in a two-source project;
+  - the log shows the decoder, `memory:DMABuf` caps and EGL.
 
-- **Startup:** the backend selector from D2; build the bus with the GL sink; send `RestoreLastProject`.
-- **Layout** (D11): sidebar (project name with `LineEdit`, Sources list with remove and reorder), the player area with empty-state cards, the transport bar (Open…, Add…, play/pause, scrubber, readout, volume), and an error dialog.
-  - File pickers use `rfd` (a native dialog crate) unless Slint 1.18 offers one; confirm in Task 0.
-- **State:**
-  - `ProjectChanged` updates the Slint models;
-  - a 30 Hz `Timer` computes the readout from the `PositionHandle` plus the last `Position` event, preferring `target` when it is set (D8);
-  - `format_hms` from core formats it.
-- **Scrubber:** drag emits `ScrubMove`, release emits `ScrubRelease`. **Volume:** changes emit `SetVolume { commit: false }`, release emits `commit: true`.
-- **Keyboard** (D10): a root `FocusScope` with `capture-key-pressed`; yield while the name `LineEdit` has focus; letters match case-insensitively; Ctrl+O opens.
-- **Non-finite values** from any UI input are dropped before a command is built (BACKLOG #28).
+  Delete the spike example once this works.
 
-Commit: `feat(app): Phase 2 window, sidebar and transport`.
+Commit: `feat(app): window with zero-copy video`.
 
-## Task 7 — Video in the window
+## Task 6 — Sidebar, transport bar, dialogs, keyboard
 
-Move Task 0's spike logic into the app's rendering notifier (D3):
+- **Layout (D11).**
+  - Sidebar:
+    - project-name `LineEdit`, sending `RenameProject` on submit;
+    - Sources list with duration and a missing marker, from `Missing`;
+    - remove button, disabled with a tooltip when `source_is_referenced`;
+    - drag-to-reorder via `DragArea`/`DropArea`, sending `MoveSource`.
+  - Empty-state cards:
+    - no project → Open…;
+    - no sources → Add…;
+    - a missing source → Relink…, for the first missing one.
+  - Transport bar:
+    - Open… and Add… (Add is disabled with no project);
+    - play/pause, following `Playing`;
+    - scrubber;
+    - `current / total` readout;
+    - volume slider.
+  - One error dialog, with a message per `UserError`.
+- **File pickers.** Use `rfd::AsyncFileDialog`, spawned with `slint::spawn_local` and parented to the window. Never use the blocking dialog on the event loop.
+- **Readout and scrubber.**
+  - A 30 Hz `Timer` computes concat time: `PositionHandle` plus the last `source_index`, or `target_abs` when it's set.
+  - The timer drives both the readout and the scrubber, except while the scrubber is being dragged.
+  - Format with an app-crate `format_hms`, matching macOS `formatDurationHMS`. Unit tests: 0, a negative value, NaN, 59.9, 3599.9, 3600.
+- **Controls.**
+  - Scrubber: moving it sends `ScrubMove`, releasing it sends `ScrubRelease`.
+  - Volume: changes send `SetVolume { commit: false }`, release sends `commit: true`. The slider's initial value comes from the snapshot's `scan_volume`.
+- **Keyboard (D10).**
+  - A root `FocusScope` with `capture-key-pressed` handles every shortcut, and yields while the name `LineEdit` has focus.
+  - Letters match case-insensitively. `Ctrl+O` opens.
+- **Input hygiene.** Drop non-finite values before building a command (BACKLOG #28).
 
-- `RenderingSetup`: assert EGL; wrap into `GlSlot`; send `GlReady`.
-- `BeforeRendering`: take the mailbox buffer, wait on its sync meta, map it, keep the mapped frame, and set the `Image` source.
-- `RenderingTeardown`: send `Teardown` and wait for the ack.
-- Show `Diagnostics` in the log.
+Commit: `feat(app): sidebar, transport bar, dialogs and keyboard`.
 
-Manual check with screenshots: play, pause, a paused seek showing the new frame (preroll), and a cross-source seek. Delete the spike example only once this task has proved everything it did. Otherwise keep it as a diagnostic.
+## Task 7 — Zoom
 
-Commit: `feat(app): zero-copy video in the Slint window`.
+D9. Zoom state lives in the UI and isn't persisted.
 
-## Task 8 — Zoom
-
-D9. The zoom state lives in the UI (not persisted); the bus doesn't need it in Phase 2.
-
-- **Content rect** from `Zoom::IDENTITY.transform(frame_w, frame_h, area_w, area_h)`. The video `Image` geometry comes from `zoom.transform(...)` inside `clip: true`.
-- **Input:**
-  - Ctrl+scroll: `scale × 1.1^(dy/60)` about the cursor normalized to the content rect, clamped to its edge;
-  - plain scroll: pan by `delta / (content size × scale)`, a no-op at 1×;
-  - primary-button drag: pan when scale > 1, after a 4 px threshold;
-  - keys `1`, `2`, `3` and `Ctrl+0`;
-  - every result goes through `clamped()`. No snapping and no throttle.
-- **Reset** to identity on `ProjectChanged` when the project folder changes.
-- **Indicator** (D9 constants).
-- **Unit test** (in the app crate, no display): the cursor-to-content-rect normalization for letterboxed 16:9 and 4:3 frames, including a cursor in the bars.
+- **Geometry.**
+  - The frame's display size comes from the mailbox `VideoInfo`, including PAR.
+  - The content rect is `Zoom::IDENTITY.transform(...)`.
+  - The `Image`'s geometry comes from `zoom.transform(...)` inside `clip: true`.
+  - The cursor is mapped through `Zoom::content_fraction` (Task 1).
+- **Input.**
+  - Ctrl+scroll: `scale × 1.1^(dy/60)` about the cursor.
+  - Plain scroll: pan by `delta / (content size × scale)`; a no-op at 1×.
+  - Primary-button drag: pans when scale > 1, after a 4 px threshold.
+  - Keys `1`, `2`, `3` and `Ctrl+0`.
+  - Always `clamped()`. No snapping, no throttle.
+- **Reset.** Return to identity on `ProjectOpened`.
+- **Indicator.** Use the D9 constants.
+- **Manual check.** Ctrl+scroll and two-finger pan on the touchpad, and zoom while paused.
 
 Commit: `feat(app): zoom and pan`.
 
-## Task 9 — CI
+## Task 8 — Closeout
 
-`.github/workflows/rust.yml`:
-
-- The `workspace` job installs the dev packages from Task 0 plus `gstreamer1.0-plugins-base` and `gstreamer1.0-plugins-good`. It runs fmt, clippy and **`cargo test --workspace`**, headless with no display.
-- The app crate's tests must not open a window.
-- The `core` job is unchanged, still with no GStreamer.
-- Pin the toolchain to 1.92 in one job, so `rust-version` is actually checked.
-
-Commit: `ci: run media and harness tests`.
-
-## Task 10 — Closeout
-
-- **Manual checklist** on the reference laptop: every item in the spec's "Done when", recorded in this plan with screenshots saved in the scratchpad (not committed), plus:
-  - arrows after touching each slider;
-  - Ctrl+scroll and two-finger pan on the touchpad;
-  - the boundary hold during multi-source playback (spec Risk 4).
-- **Gate script:** `scripts/linux-gate-check.sh` on the camera footage still passes.
-- **Wayland** (spec Risk 2): if a Wayland session is available, check that EGL is used and frames display. If it isn't available, record that it wasn't checked.
-- **BACKLOG #30:** tune `DEFAULT_BURST_WINDOW` by feel, and record the value and why.
-- **`CLAUDE.md`:** add how to run the app, and note that the app needs the Skia renderer.
-- Adversarial review of the shipped code (`adversarial-review` skill), apply the fixes, `verify`, commit.
+- **Manual checklist** on the reference laptop: every "Done when" item, plus arrows after touching each slider, and the boundary hold during multi-source playback (spec Risk 4). Record the results in this plan. Screenshots stay in the scratchpad, not the repo.
+- **Gate script.** `scripts/linux-gate-check.sh` still passes on the camera footage.
+- **Wayland** (Risk 2). Check it if a Wayland session is available; otherwise record that it wasn't checked.
+- **BACKLOG #30.** Tune `DEFAULT_BURST_WINDOW` by feel, and record the result.
+- **`CLAUDE.md`.** Document how to run the app and that it needs the Skia renderer.
+- **Review.** Adversarial review of the shipped code (`adversarial-review` skill), then apply, `verify` and commit.
 
 ## Deliberately not in this phase
 
 - Clips, tags and undo (Phase 3).
-- Recording and capture (Phase 4).
+- Capture (Phase 4).
 - Export (Phases 5 and 8).
 - Drawing (Phase 6).
 - Preview (Phase 7).
 - Scoreboard (Phase 9).
 - Transcription (Phase 10).
-- Everything in the spec's Deferred list.
+- The spec's Deferred list.

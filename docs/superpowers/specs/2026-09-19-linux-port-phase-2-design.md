@@ -21,7 +21,7 @@ Clips, recording, drawing, scoreboard and export are out of scope; later phases 
 3. Multiple sources behave as one timeline: the readout, scrubber and skips operate on concatenated time, and playback continues into the next source at the end of each.
 4. Space, arrows (±3 s, Shift ±10 s) and A/D work even after the scrubber or volume slider has been touched. Scrubbing previews live while dragging and lands frame-accurate on release.
 5. Ctrl+scroll zooms about the cursor, plain two-finger scroll and dragging pan when zoomed, keys 1/2/3 and Ctrl+0 behave as specified, and the zoom indicator appears above 1×.
-6. On every source load the app logs the decoder, the GL upload method and the GL platform, and on the reference laptop they read hardware / `DirectDmabufExternal` / EGL.
+6. On every source load the app logs the decoder, the caps entering `glupload` and the GL platform, and on the reference laptop they read hardware / `memory:DMABuf` / EGL. (`glupload`'s uploader can't be queried; its sink caps tell zero-copy from copying.)
 
 ---
 
@@ -35,7 +35,7 @@ A single `playbin3` is created per bus-thread lifetime. Switching sources change
 
 - `video-sink`: a bin `glupload ! glcolorconvert ! appsink` with appsink caps `video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D`.
 - `flags` = video | audio | soft-volume | native-video (`0x53`). Soft-volume is required: without it `volume` falls through to the PulseAudio stream volume, which outlives the pipeline and has no effect on a `fakesink`.
-- Both sinks are **injected**. Production passes the GL bin and `autoaudiosink`. Tests pass a system-memory `appsink` for video and `fakesink sync=true` for audio, so media tests run headless with no GL, no display and no sound device.
+- Both sinks are **injected**. Production passes the GL bin and `autoaudiosink`. Tests pass the same mailbox-wired appsink with system-memory caps for video (an appsink whose samples are never pulled never posts EOS) and `fakesink sync=true` for audio, so media tests run headless with no GL, no display and no sound device.
 
 Measured through `playbin3` on the reference laptop: DMABuf reaches `glupload` with flags `0x43`, `0x53` and the default. `playbin3` uses `decodebin3` internally and selects the video stream itself, which avoids the linked-the-audio-pad trap.
 
@@ -114,7 +114,7 @@ macOS set `self.folder` **before** reading (`Workspace.swift:164`). After a fail
 
 ### D7. Source list
 
-- **Probe** with `gst_pbutils::Discoverer` at add and relink time. Reject a file with no video stream. Reject a file whose `image-orientation` tag is anything but `rotate-0`, with a clear message: macOS rotation-corrected its aspect, but the GL path doesn't rotate, and none of the user's footage is rotated (BACKLOG).
+- **Probe** with `gst_pbutils::Discoverer` at add and relink time. Reject a file with no video stream. Reject a file whose `image-orientation` tag — read from `DiscovererInfo::tags()`, the global list, where both real rotated MP4s and `qtmux` fixtures put it — is anything but `rotate-0`, with a clear message: macOS rotation-corrected its aspect, but the GL path doesn't rotate, and none of the user's footage is rotated (BACKLOG).
 - **`SourceRef` gains `display_aspect: f64`** (width/height after pixel aspect ratio), stored at probe time and used **only by the aspect gate**. Rendering uses the live caps. `formatVersion` stays **7**, because no build has written a v7 file outside tests, so this amends an unshipped format rather than extending a shipped one.
 - **Aspect gate** (macOS `aspectsMatch`, `Workspace.swift:290-293`):
   - Rule: both aspects > 0 and `|a − b| / max(a, b) < 0.005`.
@@ -232,7 +232,7 @@ Minimum size 1100 × 700; title "Coach Cuts".
 
 ### D12. Diagnostics and decoder selection
 
-- On every source load, log the selected decoder, the `glupload` uploader and the GL platform, and show them in the log.
+- On every source load, log the selected decoder, the caps on `glupload`'s sink pad (`memory:DMABuf` = zero-copy import, plain `video/x-raw` = CPU copy — the uploader itself isn't queryable) and the GL platform.
 - The parent spec's rank-raising decoder probe is **deferred to Phase 11 packaging**: on the target distro, hardware decoders already outrank software by default (seek-latency spike, finding 3).
 
 ---
