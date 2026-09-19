@@ -1,8 +1,9 @@
 # Linux Port — Design
 
 **Date:** 2026-09-19
-**Status:** Draft, pre-review
+**Status:** Reviewed — two adversarial review passes and four deliberation passes applied
 **Supersedes:** `rust/docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md` (docs-only; no code was ever committed)
+**Evidence:** `docs/superpowers/spikes/2026-09-19-compositing-throughput.md`
 
 ---
 
@@ -10,39 +11,38 @@
 
 Coach Cuts runs natively on Linux, with the same workflow it has on macOS: scan match film, tag moments, record webcam + mic commentary with synchronized freehand telestration, and export one clip per tag with scoreboard, PiP, drawings and zoom burned in.
 
-The macOS app is not being maintained in parallel. This is a replacement, not a second front-end.
+The macOS app is not maintained in parallel. This is a replacement.
 
 ## Locked decisions
 
 | Decision | Choice | Consequence |
 |---|---|---|
-| Primary platform | **Linux, native** | PipeWire capture, VA-API/NVENC encode, AppImage or Flatpak. Windows stays compiling in CI but is not a release target until Phase 10. |
-| Language + stack | **Rust + GStreamer + Slint** | One media dependency covers decode, encode, capture and mux on both platforms. |
-| Transcription | **whisper.cpp, no summarization** | Keeps the offline guarantee. The `summarize` half of the old `ClipIntelligence` seam is dropped, not stubbed. |
-| Project format | **Clean slate (v2 lineage)** | No migration from Swift-era `project.json` v1–v6. Reader hard-errors on legacy files instead of misreading them. |
+| Primary platform | **Linux, native** | PipeWire capture, VA-API/NVENC encode, AppImage or Flatpak. |
+| Language + stack | **Rust + GStreamer + Slint** | One media dependency covers decode, encode, capture and mux. |
+| Transcription | **whisper.cpp, no summarization** | The `summarize` half of the intelligence seam is deleted, not stubbed. |
+| Project format | **Clean slate** | No migration from Swift-era v1–v6. |
+| Pixel work | **GStreamer owns full-frame pixels on the GPU; Rust owns the edit and the vector overlay** | Measured, not assumed. See "The compositor decision". |
+| Output codec | **H.264 High in MP4** | HEVC deferred; YouTube re-encodes on ingest anyway. |
 
 ## Non-goals
 
-- macOS support. The Swift tree stays in the repo as the reference implementation and is not deleted until the port reaches feature parity, but it is not ported back to.
+- macOS support. The Swift tree stays as the reference implementation.
 - Summarization of commentary transcripts.
-- Any WSL target. Webcam and microphone capture through WSL2 is unreliable, and this app is capture-heavy. Native Linux or nothing.
-- **Android.** Not a target, but the stack does not foreclose it: Slint and GStreamer both run on Android, and `video-coach-core` is plain Rust with no platform dependency. What would not port is the workflow — scrub-and-tag with keyboard shortcuts, a webcam PiP recorded over a desktop player, and multi-hour source files on device storage are a different product, not a rebuild of this one. The realistic Android shape is a companion viewer for exported clips. Revisit after Milestone D, if at all.
-- Multi-camera, cloud sync, team sharing, or anything else the macOS app does not already do.
+- Any WSL target. Capture through WSL2 is unreliable and this app is capture-heavy.
+- **Android.** Not a target. The stack doesn't foreclose it — Slint and GStreamer both run there — but the scrub-and-tag-with-keyboard workflow is a different product, so revisit only as a companion viewer for exported clips, if at all.
 
 ---
 
 ## Starting state
 
-The `rust/` directory contains one plan document and no code. It references "Phase 5's `compose.rs`" and "Phase 6's File-menu wiring" as completed work, but nothing was committed — `find rust -type f` returns a single `.md`. **The port starts from zero Rust.** Its architecture sketch is still the best starting point and this spec adopts it, but its phase numbering is abandoned.
-
-What exists to port from:
+The `rust/` directory contains one plan document and no code. It references "Phase 5's `compose.rs`" and "Phase 6's File-menu wiring" as completed, but nothing was committed. **The port starts from zero Rust.** Its architecture sketch is adopted below; its phase numbering is abandoned.
 
 | Area | LOC | Disposition |
 |---|---|---|
-| `VideoCoachCore` pure logic (Foundation-only) | ~1,950 | **Translate.** Semantics preserved exactly; this is the load-bearing IP. |
+| `VideoCoachCore` pure logic | ~1,950 | **Translate**, with invariants recorded below. |
 | `VideoCoachCore` media-bound | ~1,500 | **Rebuild** on GStreamer + tiny-skia. |
 | `apple/App` (SwiftUI + AppKit) | ~8,625 | **Rebuild** in Slint. |
-| `VideoCoachCore` tests | ~6,692 | **Port the ~27 pure-logic files**; rewrite the 15 AVFoundation-bound ones against GStreamer fixtures. |
+| `VideoCoachCore` tests | ~6,692 | 43% translate; 57% is a rewrite. See "Test strategy". |
 
 ---
 
@@ -53,188 +53,383 @@ What exists to port from:
 ```
 crates/
   video-coach-core/     pure logic, zero media deps, no I/O beyond serde
-  video-coach-media/    GStreamer: source player, capture, compositor, export
+  video-coach-media/    GStreamer: source player, capture, export, compositor
   video-coach-app/      Slint UI, command bus, event layer
+  video-coach-harness/  headless integration tests driven over the bus
 ```
 
-`video-coach-core` must stay buildable and testable with no GStreamer on the machine. That boundary is what made the Swift core portable in the first place and it is the single most important structural rule in this port.
+**Core isolation.** `video-coach-core` declares no media dependency — not GStreamer, not an image or font crate, not a feature that pulls one in. CI runs `cargo test -p video-coach-core` on a machine with no GStreamer installed, which fails loudly if one is ever added. That is the enforcement; a `--no-default-features` flag would test nothing, because there are no media features to turn off.
 
 ### Command bus
 
-Adopted from the prior plan: the UI dispatches serde-serializable `Command` values onto an async bus; the bus task owns the media objects and emits `Event` values back. This keeps Slint's single-threaded event loop away from GStreamer's threading, and makes headless harness tests possible — a test drives the bus directly with no window.
+The UI dispatches `Command` values onto an async bus; the bus task owns the media objects and emits `Event` values back.
+
+**Bus contract:**
+
+- **Event-log-bound commands carry caller-captured timestamps.** `Command::RecordPlay { host_time_ns, source_time_seconds }` and its `RecordPause` twin are constructed with both values read on the UI thread *immediately before* the transport call — never timestamped when the bus handles them. `RecordingController.appendPlay(atHostTime:sourceTime:)` (`apple/App/Recording/RecordingController.swift:42-57`) exists precisely because of this, and its call site (`ContentView.swift:774-781`) captures `CACurrentMediaTime()` and a *synchronous* position query before calling `play()`, with a comment (`:753-773`) explaining that the cached observable position lags by up to a frame and puts drawings behind the ball on replay. Queue delay would reintroduce exactly that drift. This requires the UI thread to hold a handle for `query_position` on the running pipeline; that is the **only** direct pipeline access permitted outside the bus task — graph construction, state changes and relinking stay on the bus.
+- **`Command` is not serde-serializable.** The superseded plan required it and wrote round-trip tests per variant. Nothing here serializes a command; `Debug` for tracing is the real requirement.
+
+*Deferred — see Open questions:* who owns `Project`, and how Slint reads state.
 
 ### Media pipelines
+
+Element names below are verified against GStreamer 1.24.2 unless marked otherwise.
 
 **Source playback (scan).**
 
 ```
-filesrc → decodebin → tee ─┬─ videoconvert → RGBA capsfilter → appsink   → UI frame
-                           └─ audioconvert → audioresample → volume → autoaudiosink
+filesrc location=<path> ! decodebin3
+  ├─ video pad (pad-added) → queue ! glupload ! glcolorconvert ! <GL sink>
+  └─ audio pad (pad-added) → queue ! audioconvert ! audioresample
+                                   ! volume name=scan_volume ! autoaudiosink
 ```
 
-Hybrid seek policy, carried over from the prior plan: `ACCURATE` for skip buttons and keyboard shortcuts, `KEY_UNIT` during live scrubber drag, `ACCURATE` on release.
+`decodebin` exposes video and audio as separate sometimes-pads via `pad-added`; it is not a `tee` (which duplicates one stream and does not demux). The `queue` on each branch is required — without it both branches share a streaming thread and the audio sink's blocking stalls video. `decodebin3` for its stream-selection and seek behavior, with `decodebin` as the fallback.
 
-**Capture (commentary recording).**
+**Capture.**
 
 ```
-pipewiresrc (camera) → videoconvert → encoder → ─┐
-                                                 ├→ matroskamux → filesink  (recordings/<uuid>.mkv)
-pipewiresrc (mic)    → audioconvert → opusenc  → ─┘
+pipewiresrc (camera) → videoconvert → x264enc → h264parse ─┐
+                                                           ├→ matroskamux → filesink
+pipewiresrc (mic)    → audioconvert → opusenc            ─┘
 ```
 
-`v4l2src` + `pulsesrc` as the fallback path when PipeWire is absent. Matroska rather than MP4 because a crash mid-record leaves a playable file.
+Both sources share one pipeline clock. macOS used a single `AVCaptureSession` whose synchronization clock timestamped both media types (`CaptureSessionController.swift:205-218`); two independent PipeWire sources will drift without an explicit shared clock and live-source handling. `v4l2src` + `pulsesrc` is the fallback when PipeWire is absent. Matroska rather than MP4 because a crash mid-record leaves a playable file.
+
+Camera format is pinned to the highest-resolution 16:9 format ≤1280 wide supporting 30 fps, with min and max frame duration locked to 1/30 (`CaptureSessionController.swift:180-201`). This bounds PiP quality and file size deliberately; the equivalent is a caps filter plus `videorate`.
 
 **Export.**
 
+Rust owns the **edit** (which source frame appears at each output PTS) and the **vector overlay**. GStreamer owns **all full-frame pixel work** on the GPU. Decoded video never enters a Rust-owned CPU buffer.
+
 ```
-source decode  → appsink ─┐
-                          ├→ [Rust compositor] → appsrc → encoder → mp4mux → filesink
-webcam decode  → appsink ─┘
+per source:  filesrc ! parsebin ! <hw decoder> ! appsink name=src
+per clip:    filesrc ! parsebin ! <hw decoder> ! appsink name=cam
+
+  ┌── Rust frame pump, once per output frame N (PTS = N/30) ─────────────┐
+  │ segment(N) from the flat segment list:                               │
+  │   .play   → pull next decoded source buffer                          │
+  │   .freeze → re-push the held buffer                                  │
+  │ push that GstBuffer UNCHANGED (ref + restamp) → appsrc base          │
+  │ zoom(N) = zoomAt(recordTime) → set base branch transform             │
+  │ rasterize strokes + text bar + scoreboard (tiny-skia) → appsrc ovl   │
+  └──────────────────────────────────────────────────────────────────────┘
+
+appsrc base ! glupload ! glcolorconvert ! gltransformation ! glvideomixer.sink_0
+appsrc cam  ! glupload ! glcolorconvert                    ! glvideomixer.sink_1
+appsrc ovl  ! glupload ! glcolorconvert                    ! glvideomixer.sink_2
+glvideomixer ! <h264 encoder> ! h264parse
+             ! video/x-h264,stream-format=avc,alignment=au ! mp4mux faststart=true ! filesink
 ```
 
-The composite happens in Rust, not in a GStreamer element graph. See below.
+`h264parse` with explicit caps between encoder and `mp4mux` is not optional — without it the muxer either refuses to link or emits a file that plays in VLC and close to nowhere else.
+
+**Zoom is a crop plus a scale on the base branch, before the mixer.** `Zoom.clamped()` (`Zoom.swift:18-25`) guarantees the visible window lies entirely inside the source — at `pan = ±(s−1)/2s` the window edge lands exactly on 0 or 1 — so there is no edge handling.
+
+**Sub-pixel geometry is a requirement.** `zoomAt` lerps between keyframes every frame, so pans are continuous; an integer-pixel crop stair-steps visibly on a slow pan. Verified: `gltransformation`'s `scale-x`/`scale-y` and `translation-x`/`translation-y` are all `Float` (translation in universal [0-1] coordinates). *Acceptance test: a 20-second pan at scale=3 shows no stair-stepping.*
+
+**Overlay alpha.** tiny-skia emits premultiplied RGBA. Verified: `glvideomixer` sink pads expose `blend-function-src-rgb`/`blend-function-dst-rgb` and `blend-equation-rgb`, so premultiplied-over is configured on the pad (`src = one`, `dst = one-minus-src-alpha`) rather than demultiplying every pixel in Rust.
+
+**Rejected: `cairooverlay` and any "draw on the frame" element.** They need the frame in system memory, forcing a GPU download of every full frame — the exact round-trip removed in May (below). `gloverlaycompositor` (present) is a legitimate later optimization; the third mixer pad is uniform across preview and export and easier to test.
+
+**Software fallback, and the CI path.** The same graph runs with `videoconvertscale` + `compositor` when GL interop is unworkable. That is also the CI path, since CI has no GPU. Slower, and its crop is integer-only; both acceptable for CI.
+
+**Export audio.**
+
+```
+source decode → audioconvert ! audioresample ! F32LE/48k/2ch → appsink ─┐
+                                                                        ├→ [Rust mixer] → appsrc → avenc_aac ─┐
+webcam decode → audioconvert ! audioresample ! F32LE/48k/2ch → appsink ─┘                                     ├→ mp4mux
+                                                                                                               │
+(video branch above) ──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Three behaviors carry over from `CompilationExporter.swift:198-205, 357-414`:
+
+1. **Source audio plays only during `.play` segments.** Freezes are silent by design.
+2. **5 ms ramps at segment boundaries.** Without them there is an audible click at every play/freeze transition, and every clip has at least one, because `appendInitialPause` fires at recordTime 0 (`RecordingController.swift:96-98`) so the first segment of every clip is a freeze.
+3. **Per-clip mic audio at a flat `commentaryVolume`.** Both volumes come from `Preferences.previewSourceVolume` / `previewCommentaryVolume` — export reuses the *preview* preferences (`ExportSheet.swift:631-632`). Do not invent a separate export setting.
+
+**Gain is applied in Rust, on the PCM.** Not because control bindings are unsuitable — they handle sparse timed keyframes fine — but for single timeline authority: the mixer already owns the splice, so a gain is one multiply, whereas an element graph is a second timeline that must agree with the video driver's segment list exactly. A 5 ms ramp is ~240 samples; sample-accurate arithmetic is exact. And the ramp curve becomes a pure function in `video-coach-core`, testable with no GStreamer present.
+
+**Ramp rule, stated once:** *every contiguous audio region, on either track, gets a 5 ms linear fade-in at its start and a 5 ms linear fade-out at its end, clamped to the output timeline at t=0.* macOS ramps only at interior boundaries *within* an entry (`:372-402`), leaving clip→clip boundaries and every mic start/stop unramped. The uniform rule reproduces macOS where it ramps and additionally removes the clip-boundary click. Same machinery, fewer special cases, strictly fewer clicks.
+
+AAC-LC 48 kHz stereo at 192 kbps via `avenc_aac`. Source and mic sum with no limiter and both volumes default to 1.0, so a loud passage can clip; macOS behaves identically. Hard-clamp at the F32→encoder boundary and do not add dynamics processing.
+
+### Export frame driver
+
+AVFoundation did the splicing on macOS: `insertTimeRange` for `.play`, a one-tick slice plus `scaleTimeRange` for each `.freeze` (`CompilationExporter.swift:186-226`). The port owns that loop; it is the core of the export phase.
+
+**Flat segment list, absolute output clock.** Flatten the plan into one sorted list before decoding anything:
+
+```rust
+struct OutSegment {
+    out_start: f64, out_end: f64,      // absolute output timeline
+    kind: Play | Freeze,
+    source_index: usize, source_start: f64,
+    entry: usize, entry_out_start: f64,
+}
+```
+
+built by a single cumulative walk over `plan.entries[].segments[].out_duration`. `CompilationPlan.Entry.compositionStart` is a *separate* cumulative sum (of `recordingDuration`) and is **not** used for timing — it is UI metadata. The Swift exporter threaded one `CMTime` cursor end-to-end precisely to stop those two sums from disagreeing and leaving phantom inter-clip gaps (`:144-156`). One walk over the real segment durations removes the class of problem.
+
+**Output is frame-indexed, not cursor-advanced.** Frame `n` has output time `t = n / 30`; binary-search the segment list for the segment containing `t`. No accumulating cursor means no drift, and a segment shorter than one frame interval simply has no frame land in it — which is what replaces the sub-tick skip at `:196`, an artifact of AVFoundation rejecting an empty `insertTimeRange`. Delete it; do not port it.
+
+**Record time is output time minus entry start.** `record_time = t - segment.entry_out_start`. That single value drives `visibleStrokes`, the zoom lookup, the PiP frame index and the scoreboard clock.
+
+**Decoding is seek-driven with forward reuse.** One decode pipeline per distinct `sourceIndex`, alive for the whole export. For each `.play` frame the driver needs the source frame containing `source_start + (t - out_start)`:
+
+- at or ahead of the decoder's position and within ~2 s → pull and drop frames forward;
+- otherwise → `ACCURATE` seek.
+
+A freeze consumes **zero source time**, so after play→freeze→play the decoder already sits on the frame the next `.play` wants; the common case costs no seeks. Seeks occur at clip boundaries and `.skip` events — tens per export. A linear pass is the wrong shape: a 90-minute source would decode 90 minutes to emit ten.
+
+**Freeze holds the last decoded frame**, pulling nothing. The exception is a freeze with no predecessor — the first segment of nearly every clip — where the driver seeks and decodes once. macOS hit this from the other direction: before freeze inserts existed, a clip starting on a freeze exported as **black** until the first `.play` populated the frame cache (`:172-186`).
+
+**The one-tick freeze bias does not port.** `:207-221` biases each freeze slice one tick past its anchor because `insertTimeRange` selects the sample with PTS *strictly* less than the slice start, delivering the frame *before* the one the user saw — drawings then landed one motion step behind the ball. State the intent directly instead: **the frame for anchor `s` is the last frame with `PTS <= s`.** Assert it with a fiducial golden test; the bug is invisible to any test that doesn't check exact frame identity.
+
+**Output frame rate is fixed at 30 fps.** A format decision, not an inherited default. It cannot be "match the source": one compilation can interleave clips from different source files at different frame rates (`CompilationPlan.buildPlan` orders by `sortIndex` across all sources), so there is no single rate to match. Fixing it also makes the frame-index clock and the ETA math exact. A 25 fps source duplicates every fifth frame; 60 fps drops every other. AVFoundation did the same at `frameDuration = 1/30` (`:297`) and it has never been a complaint. Stroke replay and zoom are time-parameterized, so nothing in the overlay stack depends on the value. Put the constant in `video-coach-core` with two consumers — macOS duplicated it in `ExportSheet.swift` with a comment admitting the exporter doesn't expose its own rate.
+
+**Progress** is exact and monotonic: `frames_emitted / ceil(total_duration * 30)`, replacing the 5 Hz poll of `AVAssetExportSession.progress` (`:441-458`).
 
 ### The compositor decision
 
-The macOS compositor runs two stages per output frame: a Core Image pass that composes base video + zoom transform + PiP, then a Core Graphics pass that draws strokes, the text bar and the scoreboard over the result. That two-stage shape is worth keeping — it is already the right decomposition.
+The macOS compositor runs two stages per output frame: a Core Image pass (base + zoom + PiP) and a Core Graphics pass (strokes, text-bar glyphs, scoreboard). **That split is not a decomposition — it is a workaround.** Core Image cannot rasterize glyphs or stroke paths; Core Graphics cannot do a GPU composite. The cost is visible in the code: the text bar's background is drawn in stage 1 and its glyphs in stage 2 (`CompilationCompositor.swift:152-166`, `:316-377`); there are three coordinate flips in one frame (`:233-234`, `:361-363`, `ScoreboardDraw.swift:121-131`) on top of `CIImage`'s bottom-left origin; `Zoom` carries a second transform variant purely to cancel that origin (`Zoom.swift:109-130`); and `PreviewCompositor` pre-decodes every freeze frame (`PreviewCompositor.swift:23-28`) only because AVPlayer calls `startRequest` out of temporal order. The two compositors are kept in sync by a comment (`:116-119`) and **have already drifted** — export honors `showPiP` (`:101`), preview does not (`PreviewCompositor.swift:163`).
 
-**Chosen mapping: `appsink` → compose in Rust with `tiny-skia` + `cosmic-text` → `appsrc`.**
+**The port collapses this to one pull-based compositor, shared by preview and export, in a single top-left coordinate space.** Per output frame it evaluates `recordTime`, derives `sourceTime(atRecordTime:)`, pulls the matching frames, and draws in one pass. Preview differs from export only in output resolution and in where the result goes.
 
-Rejected alternative: wiring GStreamer's own `compositor` + `cairooverlay` elements with `GstControlBinding` animating the zoom properties. That is more idiomatic GStreamer, but per-frame parametric control of a live element graph is the hardest thing to get right in GStreamer, and zoom here is a dense keyframe track (the recorder emits up to ~60 zoom events/second during a pinch). Driving that through control bindings trades a tractable problem for an intractable one.
+This is a genuine improvement to bank. On macOS the two paths were *forced* apart: `ClipPreviewBuilder.swift:266` documents that AVPlayer on macOS 26 strips the custom compositor's instruction subclass, so preview had to be rebuilt on the built-in compositor, which then silently ignores `setTransformRamp` (`:292`), forcing a stepwise-keyframe workaround. One shared graph deletes that entire class of "preview doesn't match export" bug.
 
-Why `tiny-skia` + `cosmic-text` over `cairo` + `pango`:
+**Why the measurement puts the split where it does.** This project already ran this experiment. `docs/superpowers/specs/2026-05-12-compositor-gpu-render-design.md:14-27` records that a 1080p export spent **78 of 87 wall-seconds** in `createCGImage` (GPU→CPU readback, 26%) and `CGContextDrawImage` (CPU rasterization, 55%) — 81% of total — and moved base+PiP to the GPU for a 3–4× win, *deliberately keeping strokes and the text bar on the CPU path* because "they're small and don't dominate the profile." An independent 2026-09-19 benchmark reproduced the same ratio in Rust: base blit with zoom 37.56 ms, PiP 2.58 ms, text-bar fill 0.51 ms, 40-segment stroke 0.83 ms, two text runs 0.22 ms — 41.71 ms total, 0.80× realtime, with full-frame resampling at 90% and the entire vector layer at 1.63 ms. Overlay-only rasterization measured 3.62 ms/frame (9.2× realtime) on a busier frame. Composing everything in Rust would have re-introduced, verbatim, the regression this repo measured and removed in May.
 
-- Pure Rust, no system C libraries beyond GStreamer itself. Windows packaging stays simple.
-- Deterministic rasterization across platforms, which makes golden-frame tests meaningful on both.
-- `tiny-skia` is a Skia path-rendering port; strokes are literally paths, so the mapping from `CGContext` stroke drawing is near-mechanical.
+**Draw order (single pass, back to front):**
 
-Cost, stated plainly: this is **CPU compositing**, where macOS used a GPU Core Image pipeline. At 1080p30 that is a real throughput question, not a theoretical one. Phase 7 measures it before building on it, and `glvideomixer` plus a GL shader zoom is the documented escape hatch if the number is bad.
+1. Opaque black fill of the output rect.
+2. Base source frame, letterbox-fitted and zoom-transformed.
+3. Text-bar background — **before** the PiP, so the PiP is not darkened by the bar tint.
+4. Webcam PiP, bottom-right. **Not affected by zoom.**
+5. Strokes.
+6. Text-bar glyphs — on top of the PiP.
+7. Scoreboard, top-left — on top of everything.
+
+**Layout constants the port must reproduce** (all ratios, so they survive the preview↔export resolution change):
+
+| Element | Constant | Value | Source |
+|---|---|---|---|
+| Text bar | height | `0.08 × outH` | `CompilationCompositor.swift:161`, `:317` |
+| Text bar | fill | black, α `0.6`, full width, flush bottom | `:163` |
+| Text bar | font size | `0.5 × barH`, white | `:339-341` |
+| Text bar | inset | `0.15 × barH` both axes | `:354-355` |
+| Text bar | empty string | draws nothing; background still drawn | `:332` vs `:160` |
+| PiP | width | `0.22 × outW` | `:172` |
+| PiP | height | `pipW × camH / camW` | `:173` |
+| PiP | margin | `0.022 × outH` from bottom and right | `:174`, `:182-185` |
+| PiP | corners | square | (absent) |
+| PiP | visibility | honors `showPiP` in **both** paths | `:101` |
+| Stroke | line width | `stroke.lineWidth × outH` (height) | `:276` |
+| Stroke | caps/joins | round / round | `:310-311` |
+| Scoreboard | bar | `0.36 × outW` × `0.08 × outH`, inset `0.015 × outH` | `ScoreboardDraw.swift:11-15` |
+| Scoreboard | accent strip | `0.08 × barH`, home and away cells only | `:17`, `:41-43` |
+| Scoreboard | columns | home `.30`, score `.20`, away `.30`, clock `.20` | `:20-23` |
+| Scoreboard | team font | `min(fit(home), fit(away))`, desired `0.55 × barH`, 6pt floor | `:48-54`, `:89-94` |
+| Scoreboard | score/clock font | `0.55 × barH`, bold | `:57`, `:60` |
+
+**Base image fit — letterbox, not stretch.** Uniform scale `min(outW/srcW, outH/srcH)`, centered, black bars where aspects differ. macOS disagrees with itself: the mpv record/scan path letterboxes (`MPVSourcePlayer.swift:482-487`, `panscan=0`) while the export compositor stretches non-uniformly (`CompilationCompositor.swift:130-134`). They agree only for 16:9-into-16:9, and a non-16:9 source exported at a fixed 1920×1080 comes out **anamorphically distorted today**. `ContentView.swift:306-313` names the reason letterbox is right: the aspect-locked player exists so "recording and playback render pixel-identical at every zoom." (This is `min(sx, sy)`, not the crop-fill `max(sx, sy)` that `PreviewCompositor.swift:126-128` warns against. Letterbox never crops.)
+
+**Two coordinate spaces:**
+
+- **Content space** — the letterboxed, centered source rect *before* zoom. **Strokes live here.** They are captured normalized to the aspect-locked player view (`DrawingOverlayView.swift:77`, `:101`, inside the aspect-locked ZStack at `ContentView.swift:314-367`) and must denormalize against the content rect, not the output rect, or they drift off the picture on a non-matching aspect. Strokes are **not** zoom-transformed — the user drew on the already-zoomed picture. Stored coordinates are **top-left** normalized (capture Y-flips out of AppKit's unflipped view, `flipY: true`; the compositor does not flip again, `flipY: false`).
+- **Output space** — the full delivered frame. **Text bar, PiP and scoreboard live here** (see Open questions). Stroke *line width* stays `lineWidth × outputHeight`, so stroke weight is constant per delivery resolution.
+
+### Decoder selection
+
+Symmetric with encoder selection, and for the same reason: the default is wrong. `decodebin` picks by plugin rank, and on most distro builds the software `avdec_*` decoders outrank the hardware ones, so the default outcome is software HEVC decode — which on 4K is exactly the "unusable scrubbing" the scrub risk describes. macOS treated this as a gated decision worth recording in source (`MPVSourcePlayer.swift:36-37`, `hwdec = "videotoolbox"`, "recorded here as the source of truth"); Linux has no equivalent yet.
+
+At media-subsystem init, probe `vah265dec`/`vah264dec`, then `nvh265dec`/`nvh264dec`, then `v4l2slh265dec`, and raise the rank of the first that instantiates to `GST_RANK_PRIMARY + 1` via `gst_plugin_feature_set_rank`. Software `avdec_*` remains the final fallback. Log the selected factory and its negotiated caps feature, and surface both in diagnostics alongside the encoder — a user on software decode should be told, not left to infer it from the scrubbing.
 
 ### Encoder selection
 
-HEVC availability on Linux varies by GPU, driver and distro packaging. The export path probes at runtime and picks the first available:
+Output is **H.264 High profile in MP4**, chosen by runtime probe:
 
-1. `vaapih265enc` / `vah265enc` (Intel, AMD)
-2. `nvh265enc` (NVIDIA)
-3. `x265enc` (software, `preset=medium`)
+1. `vah264enc` / `vaapih264enc` (Intel, AMD)
+2. `nvh264enc` (NVIDIA)
+3. `x264enc` (software, `speed-preset=medium`)
 
-If none can be constructed, fall back to the same chain for H.264 and tell the user in the export sheet which encoder was selected. Bitrates carry over unchanged from `ExportSettings.swift`: 6/12/24 Mbps at 1080p for low/medium/high, halved at 720p.
+**HEVC does not ship in the first cut.** The destination is YouTube, which re-encodes on ingest and recommends H.264; HEVC buys a smaller intermediate file and nothing else. Against that: a second probe chain, a second set of parser caps (`mp4mux` requires `stream-format=hvc1` — `hev1` produces a VLC-only file), and a far patchier hardware-encoder story across Linux GPUs. Additive later behind a setting, not before someone asks.
 
-Note that quality-at-bitrate differs meaningfully between these encoders, so the three quality presets will not look identical across machines. That is accepted; the alternative is per-encoder tuning tables, which is not worth it.
+Licensing does not distinguish them: `x264enc` and `x265enc` are both `gst-plugins-ugly` wrappers around GPL-2.0-**or-later** libraries, which combine with this repo's AGPL-3.0 identically. Whichever software fallback ships, it ships as a GPL dependency on the same terms.
+
+**Bitrate targets** come from `ExportSettings.bitrate` — 6/12/24 Mbps at 1080p for low/medium/high, halved at 720p — **but that table has never reached an encoder.** `CompilationExporter` documents `quality` as "currently ignored" (`:45-50`); `presetName(for:quality:)` returns `AVAssetExportPresetHEVC1920x1080` for every pair and never reads `quality` (`:508-518`); and `ExportSettings.bitrate` has *zero* production call sites — its only references are its own unit test. The Quality picker in `ExportSheet` currently changes nothing about the output file. **The Linux port is therefore the first implementation of quality control, not a port of one.** These are plausible targets to validate against real encoder output, not known-good values; the export phase must include an A/B pass and the numbers may move.
+
+The ladder is `base1080 × {r720: 0.5, r1080: 1.0, r2160: 3.0}` — 3/6/12, 6/12/24, 18/36/72 Mbps. The ×3 rather than ×4 reflects sub-linear bitrate scaling at constant perceptual quality; medium at 2160p lands at 36 Mbps, inside YouTube's 35–45 Mbps SDR ingest range. Subject to the same validation caveat.
+
+Report the selected encoder in the export sheet. Quality-at-bitrate differs between VA-API, NVENC and x264, so the presets will not look identical across machines; accepted, and per-encoder tuning tables are not worth it.
 
 ---
 
 ## Logic to port verbatim
 
-These carry semantics that were expensive to get right and must not be re-derived. Each gets its Swift test file ported alongside it.
+Each gets its Swift test file ported alongside it.
 
-**`PlaybackTimeline` — `sourceTime(atRecordTime:)` and `playbackSegments(sourceDuration:)`.** The event-log walk that turns a commentary recording into play/freeze segments. Three subtleties that must survive:
-- `.play`/`.pause` carry a captured `sourceTime` anchor that *overrides* the wall-clock cursor, because player latency makes the computed cursor drift by tens of milliseconds.
-- Playing past EOF splits into a `.play` tail plus a `.freeze`, mirroring what the player shows on screen.
-- `freezeMaxSource = sourceDuration - 0.05` pulls out-of-bounds freeze anchors back inside the source. On macOS an out-of-range slice stalled the compositor; the GStreamer equivalent will differ, but the clamp is correct regardless.
+**`PlaybackTimeline` — `sourceTime(atRecordTime:)` and `playbackSegments(sourceDuration:)`.**
+
+- `.play`/`.pause` carry a captured `sourceTime` anchor that *overrides* the wall-clock cursor, because player latency makes it drift by tens of milliseconds.
+- Playing past EOF splits into a `.play` tail plus a `.freeze`.
+- `freezeMaxSource = max(0, sourceDuration − 0.05)` (`:63`). The `max(0, …)` is not decoration — it keeps a sub-50 ms source from producing a negative anchor, and sub-50 ms sources are exactly what synthetic fixtures are. The macOS rationale was AVFoundation-specific (`:53-62`) and does not transfer, but the constant does: a pull-based compositor asks the decoder for a frame *at* `sourceStart`, and exactly `sourceDuration` is past the last frame.
+- **Source time is clamped to `[0, sourceDuration]` on BOTH paths.** macOS clamps `.skip` in `playbackSegments` (`:130`) but not in `sourceTime(atRecordTime:)` (`:38`, and the unbounded rate integration at `:29`, `:42`). The asymmetry is unpinned by any test and survives only because `sourceTime` has one production caller today. Under the golden rule below it becomes the sole input to the match clock on both paths, so give it the same signature and bounds as the segment builder. Two functions answering "what source time is on screen" must not disagree about what happens past EOF.
 - Only `.play`/`.pause`/`.skip` split segments. Zoom and stroke events must **not**, or a pinch gesture explodes the segment count.
 
-**`ScoreboardState.scoreboardState(absoluteTime:config:events:)`.** Derives period, clock, stoppage, break and fulltime from tagged start/stop events by position, with no sport-specific hard-coding. Includes the P1 back-anchor offset for footage that missed kickoff, and the goal-counting window bounded by first start and final whistle.
+**`ScoreboardState.scoreboardState(absoluteTime:config:events:)`.** Derives period, clock, stoppage, break and fulltime positionally, with no sport-specific hard-coding, including the P1 back-anchor offset.
 
-**`MatchInterpret.interpret(_:format:)`.** Positional assignment of start/stop events to period roles, stable-sorted with input-order tie-break. `setAutoBackAnchorP1` depends on inserting at index 0 to win that tie-break — a detail that looks arbitrary and is not.
+> **Golden rule — the match clock is a function of SOURCE time, never record time.**
+> ```
+> absTime(clip, recordTime) = project.absSeconds(clip.sourceIndex,
+>                                                clip.sourceTime(atRecordTime: recordTime))
+> ```
+> The clock **holds during a freeze and jumps on a skip**, exactly as the footage does. Both preview and export call this one function.
 
-**`Zoom`.** Clamping (hard floor 1.0, cap 10.0, pan limit narrowing as scale → 1), cursor-anchored zoom, snap notches at 3% tolerance, and the transform math. The macOS code carries two transform variants because Core Image uses bottom-left origin; in Rust there is **one** top-left-origin transform and the second variant is deleted. This is a genuine simplification the port should bank.
+macOS gets this wrong and the port must not carry it over: `CompilationCompositor.swift:253` uses `clipStartAbsSeconds + recordTime` — a per-clip constant plus wall-clock — ignoring every pause and skip. Since `appendInitialPause` lands at recordTime 0 on every recording (`CompilationExporter.swift:180-181`), the exported scoreboard runs ahead of the exported footage on essentially every clip. Preview (`ScoreboardReplayOverlay.swift:80-85`) and live scan (`ScoreboardOverlayView.swift:17-19`) already use the source-time rule; export is the outlier. **Port the preview formula and delete the `clipStartAbsSeconds` field** — a per-clip constant is what made the bug expressible. Pin it: a clip with a mid-clip pause of N seconds must show the same clock at recordTime `p` and `p + N`.
 
-**`StrokeReplay.visibleStrokes(in:atRecordTime:)`.** Which strokes are visible at a given record time, honoring `autoClearAfterSeconds` and intervening `clearAll` events, and how many points of each are drawn so far.
+The goal-counting window is **half-open until the match is fully tagged.** Lower bound is period 0's start, inclusive (`ScoreboardState.swift:92`, `:136`). Upper bound is `.infinity` **unless** the interpreted start/stop count exactly equals `expectedStartStopEvents`, in which case it is the final whistle (`:128-130`). A goal tagged after the last tagged stop still counts while the match is partly tagged — the normal case while a coach works through film.
 
-**Also ported:** `CompilationPlan`, `TagAggregation`, `SkipCoordinator`, `UndoController`, `ExportProgress` (including `RunProjection` ETA math), `MatchFormat`, `ClipZoomLookup`, `Tag.normalize`.
+**`MatchInterpret.interpret(_:format:)`.** Stable-sorted by `absSeconds` with input-order tie-break (`:27-33`), then **truncated to `2 × totalPeriods`** (`:35-36`); even positions `.start`, odd `.end`. Each result carries `originalIndex` (`:11-14`) so `startStopRoles(in:)` (`:53-63`) can key roles by record `UUID` without re-interpreting per row — port both. `setAutoBackAnchorP1` inserts at index 0 so the flagged event wins that tie-break, and **deliberately bypasses both the cap and the scoreboard-configured guard** that `appendStartStop` enforces (`MatchEvent.swift:92-97` vs `:106-118`). Pinned by `ScoreboardTests.swift:324-340`, whose comment says outright the tests exist to stop a future reader "fixing" it. Port those tests with the comment intact.
+
+**`Zoom`.** Clamping (floor 1.0, cap 10.0, pan limit `(s−1)/(2s)`, pan forced to 0 at scale 1), cursor-anchored zoom, snap notches `[1, 1.25, 1.5, 2, 3, 5, 7.5, 10]` at 3% tolerance applied on interactive commit only, never on replay.
+
+> **Exactly ONE transform survives, and it is not the one the live macOS compositors call.** There are three: `transform(sourceSize:destSize:)` (`:75-84`, dead outside tests), `deltaTransform(viewportSize:)` (`:94-107`) and `deltaTransformForCIImage(viewportSize:)` (`:121-130`, a sign flip for bottom-left origin). All three map source point `0.5 + pan` to viewport center. They disagree on two things: **base fit** (`transform` letterbox-fits; the delta variants assume the caller pre-stretched) and **what `pan` is a fraction of** (`transform` uses the displayed image; the delta variants use the viewport). Identical only when image == viewport.
+>
+> `sourcePoint(atViewPosition:)` (`:48-55`) and the pan limit define pan in normalized **source** space, and mpv documents `video-pan-x` as a fraction of the scaled source (`MPVSourcePlayer.swift:469-474`). Since the port letterboxes, **`transform`'s formula is the correct one**:
+> ```
+> k  = min(outW / srcW, outH / srcH)
+> s  = k * zoom.scale
+> dx = (outW - srcW * s) / 2  -  zoom.panX * srcW * s
+> dy = (outH - srcH * s) / 2  -  zoom.panY * srcH * s
+> ```
+> Both delta variants are **deleted**. They are correct only under the stretch assumption the port abandons, and a porter who reaches for `deltaTransform` because it is what the live compositors call will get pan wrong on every source whose aspect differs from the output's.
+
+**`ClipZoomLookup.zoomAt(recordTime:)` — zoom replay is a LINEAR INTERPOLATION, not a step function** (`:7-32`). Scale and both pan components lerp with alpha clamped to `[0,1]`; holds first value before the first keyframe, last after the last, identity when empty. The lookup `break`s on the first keyframe past `t` (`:17`), so the event log must stay sorted by `recordTime`.
+
+Three recorder rules exist **only because** of the lerp and port with it (`RecordingController.swift:128-137`):
+
+1. **Anchor keyframe.** If >100 ms since the last distinct capture, emit a keyframe at `(t − 1 ms)` holding the *previous* value before emitting the new one. Without it the lerp ramps smoothly across the whole quiet period instead of holding then snapping.
+2. **Dedupe.** Skip a capture equal to the last captured value (`:130`).
+3. **No throttling, ever.** An earlier version throttled to ~20 Hz and it was a real visual bug (`:101-115`): the user pans while drawing on the ball and sees a smooth 60 Hz picture at record time, but replay is keyframe-stepped, so the drawing ends up offset by the unmatched pan delta. The segment builder already refuses to split on `.zoom`, so a dense track costs disk bytes and nothing else.
+
+**`StrokeReplay.visibleStrokes(in:atRecordTime:)`.**
+
+> **A `.stroke` event's `recordTime` is when the stroke FINISHED, not when it started.** It is appended on mouse-up (`DrawingOverlayView.swift:106-116` → `RecordingController.swift:71-73`), and each point's `t` is seconds since stroke start. Replay back-computes `firstT = ev.recordTime − points.last.t` (`StrokeReplay.swift:24`), and **everything** keys off `firstT`. A port treating event time as stroke start makes every stroke appear late by its own duration — proportional to how long the coach held the pen, so long strokes are visibly wrong while flicks look fine. Nasty to catch by eye.
+
+Exact inequalities, all load-bearing (`:25-30`): visible from `t >= firstT`; auto-clear inclusive at `t >= firstT + auto`; a `clearAll` cancels only when `firstT < clearAllTime <= t` (**strictly** after `firstT`); points drawn = count with `t <= elapsed` (**strictly** greater in the index search). **A single-point stroke renders as a FILLED CIRCLE of diameter `lineWidth`**, not a stroked path (`CompilationCompositor.swift:283-299`) — zero-length paths don't rasterize with round caps in CoreGraphics, and tiny-skia behaves the same.
+
+**Where each module lands.** Phase 1 ports only the modules defining the contract the media layer must satisfy: `PlaybackTimeline`, `CompilationPlan`, `Zoom`, `ClipZoomLookup`, `StrokeReplay`, `SkipCoordinator`. The rest port in the phase that first consumes them — `UndoController` and `TagAggregation` in Phase 3, `ExportProgress` in Phase 8, `ScoreboardState`/`MatchInterpret`/`MatchFormat` in Phase 9. `Project`/`ProjectStore`/`Tag.normalize`/`cumulativeOffset`/`absSeconds` are Phase 0 — they are the format. `ExportProgress` moves for a concrete reason: `Status.done(encodeWallSeconds:averageFps:)` and `.active(fractionCompleted:)` are modelled on `AVAssetExportSession.progress`, and the frame driver reports differently.
 
 ---
 
 ## Project format v2
 
-Clean slate. Folder layout is unchanged — `project.json` plus a `recordings/` subdirectory — because that part was right.
-
-Changes from the Swift v6 schema:
+Folder layout unchanged: `project.json` plus `recordings/` — plus `recordings/.trash`, which holds the one deleted recording undo can restore and is shredded on every project open (`Workspace.swift:182`, `:662-668`).
 
 | Field | v6 | v2 | Why |
 |---|---|---|---|
-| `SourceRef.bookmark` | `Data` (security-scoped bookmark) | `relativePath: String` | Bookmarks are a macOS concept. Path is relative to the project folder, may traverse `..`, breaks if the user moves the file. |
-| `recordingFilename` | `<uuid>.mov` | `<uuid>.mkv` | Matroska for crash resilience. |
-| `Clip.summary` | `String` | *removed* | No summarizer ships. A field nothing writes is cruft; re-add it additively if summarization ever lands. |
-| `preferredCameraID` / `preferredMicID` | `AVCaptureDevice.uniqueID` | PipeWire node name or `/dev/v4l/by-id` path | Same "hint, fall back to default, do not clear" semantics. |
-| `formatVersion` | 6 | 1 | New lineage. |
+| `SourceRef.bookmark` | `Data` | `relativePath: String`, POSIX `/` separators | Bookmarks are macOS-only. May traverse `..`. POSIX separators so paths round-trip if Windows ever ships. |
+| `recordingFilename` | `<uuid>.mov` | `<uuid>.mkv` | Crash resilience. |
+| `Clip.summary` | `String` | *removed* | No summarizer ships. |
+| `preferredCameraID` / `preferredMicID` | `AVCaptureDevice.uniqueID` | PipeWire node name or `/dev/v4l/by-id` path | Same hint/fallback/don't-clear semantics. |
+| `Resolution` | `source` / `r1080` / `r720` | `r720` / `r1080` / `r2160` | `source` was ill-defined and partly broken: its `pixelSize` entry is unreachable dead code (`ExportSettings.swift:20`), its render size came from `sourceAssets[0]` rather than the clips in the plan (`CompilationExporter.swift:528`), its bitrate was the 1080p number at any frame size, and it has no meaning for a compilation mixing sources of different dimensions. `r2160` preserves the 4K capability with a defined size and bitrate. |
+| `formatVersion` | 6 | **7** | Monotonic. See below. |
 
-`Clip.transcript` stays, and stays user-editable.
+**Version stays monotonic.** Resetting to 1 was aesthetic and would have *created* the ambiguity a guard then had to patch: a Swift-era v1 file has no `formatVersion` key at all and decodes as 1 (`Project.swift:144-150`), so v1 and a reset "v2" are indistinguishable. Continuing at 7 makes the guard one numeric comparison — `formatVersion < 7 → refuse` — that cannot have holes. The proposed `bookmark`-key sniff would have missed a Swift file with an empty `sourceVideos` array, decoding it as valid.
 
-**Legacy guard.** A `project.json` containing `sourceVideos[].bookmark` is a Swift-era file. The reader detects that key and fails with an explicit "this project was made by the macOS version and cannot be opened" error rather than decoding it into something subtly wrong. Roughly three lines; worth it.
-
-`CommentaryEvent.Kind` keeps its unknown-variant tolerance — decoding an unrecognized event kind yields `Unknown` and is dropped on save, so a future event type does not brick an older build.
+**`CommentaryEvent.Kind::Unknown` round-trips its payload.** macOS writes nothing into the kind container for `.unknown` (`CommentaryEvent.swift:74-80`), emitting `{"recordTime": x, "kind": {}}` — so the event persists forever as an empty-kind record and only the *payload* is lost. Model it as `Unknown(serde_json::Value)` preserving the original verbatim. That is simpler than the hand-written Swift encoder, actually lossless, and removes the "old build silently destroys a new build's strokes" hazard.
 
 ---
 
 ## Phasing
 
-Four milestones. Each phase gets its own plan document and follows the normal spec → review → plan → review → execute → review loop from `CLAUDE.md`.
+Twelve phases in four milestones. Each gets its own plan document and follows the spec → review → plan → review → execute → review loop in `CLAUDE.md`.
 
-### Milestone A — Foundations
+**Milestone A — Foundations**
 
-**Phase 0. Workspace skeleton.** Three crates, CI running `cargo test` on Linux and `cargo check` on Windows, project format v2 read/write with the legacy guard, and a temp-project test fixture. No media, no UI.
+- **Phase 0. Workspace skeleton and conventions.** Four crates, CI (`cargo test` Linux; `cargo check` Windows, advisory), project format v2 read/write with the `formatVersion < 7` guard, `cumulativeOffset`/`absSeconds`/`Tag.normalize`, temp-project fixture, **and a `CLAUDE.md` Rust section**. No media, no UI.
+- **Phase 1. Contract logic port.** `PlaybackTimeline`, `CompilationPlan`, `Zoom`, `ClipZoomLookup`, `StrokeReplay`, `SkipCoordinator` plus their tests (~594 LOC source, ~1,100 LOC tests). Headless. Establishes the Swift→Rust idioms reused by every later port.
 
-**Phase 1. Pure-logic port.** All of "Logic to port verbatim" above, with the ~27 portable Swift test files translated. Headless. **This is the phase that de-risks everything downstream** — if the clock semantics and segment builder are right and tested, the rest is plumbing. It is also the phase most likely to be under-estimated because the code is small and the invariants are not.
+**Milestone B — Scan and tag**
 
-### Milestone B — Scan and tag
+- **Phase 2. Source playback, transport, and project management.** `SourcePlayer`, Slint window, frame delivery, transport bar, scrubber, skip, keyboard, audio. **Plus:** create/open project (distinguishing "empty folder ⇒ create" from "unreadable `project.json` ⇒ refuse, do not overwrite", `Workspace.swift:163-185`), File menu, recents, add/remove/reorder sources with a `gst_discoverer` duration probe and the **aspect-match gate** (`aspectsMatch`, `:290-293`, 0.5% tolerance), **multi-source virtual-concat playback**, `sourceIndex` remap on delete (`:308-320`) and reorder (`:323-341`), missing-source relink. **Zoom rendering and the zoom gesture** (cursor anchoring, snap, clamping) land here — Phase 6 assumes the rendering exists. The bus contract is realised here.
+- **Phase 3. Clips, tagging and undo.** Clip sidebar and inspector, tag field, tag overview and filter (`TagAggregation`), jump-to-clip, sort order, **`UndoController` + the `recordings/.trash` lifecycle** (move-on-delete, single-trashed-file eviction, restore, shred-on-open). `pushDelete` returns the evicted `DeletedClip` so the caller can shred its file (`UndoController.swift:88-98`, `:127-136`) — both halves of that contract land together. Ships against a fixture project: `Clip.recordingFilename` is non-optional (`Project.swift:58`), so a clip *is* a recording and the first user-created clip arrives in Phase 4.
 
-**Phase 2. Source playback + transport.** GStreamer `SourcePlayer`, Slint window, frame sink, transport bar, scrubber, skip buttons, keyboard shortcuts, audio with volume. Essentially the old Phase 7 scope, rebuilt on Phase 0–1 foundations.
+**Milestone C — Record and review**
 
-**Phase 3. Clips and tagging.** Clip sidebar, clip inspector, tag field with normalization, tag overview and filter, jump-to-clip shortcuts, sort ordering, undo.
+- **Phase 4. Capture.** PipeWire enumeration and selection, recording to `.mkv`, level meter, the `RecordingController` event log with its monotonic-clock guarantee, injected-clock testability, and **caller-captured play/pause timestamps**. `t0Seconds` is the running-time of the first buffer that reaches the muxer, and `recordingDuration` is read back from the finished file (`CaptureSessionController.swift:459-468`), not from wall clock — with a fallback for a `.mkv` reporting unknown duration after a crash.
+- **Phase 5. Passthrough export.** One MP4 per clip from `playbackSegments`: decode the source range, encode, mux. No overlays. Encoder probe and fallback chain. **First output artifact, and the first validation of `PlaybackTimeline` against a real decoder** rather than a unit test. Under the hybrid architecture this graph *is* the full export graph minus the overlay branch — a skeleton, not a throwaway.
+- **Phase 6. Drawing and zoom keyframes during recording.** Stroke capture overlay; zoom *keyframe emission* including the 100 ms anchor keyframe. (Zoom rendering and gesture are Phase 2.)
+- **Phase 7. Clip preview.** Commentary + PiP + strokes + zoom composited live at preview resolution. First use of the shared compositor.
 
-### Milestone C — Record and review
+**Milestone D — Ship**
 
-**Phase 4. Capture.** PipeWire camera + mic enumeration and selection, recording pipeline to `.mkv`, input level meter, the `RecordingController` event log with its monotonic-clock guarantee and injected-clock testability.
-
-**Phase 5. Drawing and zoom during recording.** Stroke capture overlay, zoom gesture with cursor anchoring and snap, zoom keyframe emission including the 100ms-gap anchor keyframe.
-
-**Phase 6. Clip preview.** Play back a recorded clip with its commentary, PiP, strokes and zoom composited live. First use of the Rust compositor, at preview resolution.
-
-### Milestone D — Ship
-
-**Phase 7. Export.** The compositor at full resolution, encoder probe and fallback chain, per-tag MP4 output, progress and ETA reporting, sequential export. **Gate: measure CPU compositing throughput at 1080p30 before building the rest of the phase on it.**
-
-**Phase 8. Scoreboard.** Match inspector panel, team configuration, match format editor, start/stop and goal tagging, back-anchor checkbox, scoreboard overlay in preview and export.
-
-**Phase 9. Transcription.** `whisper-rs` behind the existing `ClipIntelligence`-shaped seam, audio extraction to 16 kHz mono, model acquisition UX, transcript display and editing.
-
-**Phase 10. Packaging and Windows.** AppImage or Flatpak for Linux; Windows capture backend (Media Foundation via `mfvideosrc`), encoder probe for NVENC/QSV, and an installer.
+- **Phase 8. Full export.** Attach the overlay branch to the Phase 5 graph at full resolution; audio mixer and ramps; `ExportProgress` + `RunProjection`; **per-tag and all-clips targets** — the all-clips row is checked by default (`ExportSheet.swift:113`). macOS distinguishes them by a sentinel string `"__all-clips__"` compared in five places; in Rust this is `enum ExportTarget { AllClips, Tag(String) }`. Sequential export (macOS serialized because VideoToolbox saturates; on Linux the binding constraint is the overlay rasterizer and a single hardware encode session — same conclusion).
+- **Phase 9. Scoreboard.** `ScoreboardState`/`MatchInterpret`/`MatchFormat` port, match inspector, team config, format editor, start/stop and goal tagging on the virtual timeline, back-anchor, overlay in preview and export.
+- **Phase 10. Transcription.** `TranscriptionCoordinator` with the summarize half removed — its `Phase` enum collapses to one case and is deleted along with `currentPhase`, and `TranscriptionState` loses `.summarizing`. Its serial-queue semantics (one job in flight, FIFO behind it, idempotent enqueue) are the part worth keeping. `whisper-rs` behind `feature = "whisper"`, 16 kHz mono extraction, model acquisition UX, transcript editing. The `applyAIWrite` "saves but never pushes undo" contract carries over unchanged. **`ClipIntelligence` does not survive** — it exists solely because `Speech`/`FoundationModels` don't link in headless `swift test` (`ClipIntelligence.swift:3-8`); in Rust that is a Cargo feature, and with `summarize` gone it is a one-method trait. `TranscriptionWorkspace` likewise disappears. *Obsoletes BACKLOG #16.*
+- **Phase 11. Packaging and Windows.**
 
 ---
 
 ## Test strategy
 
-- **Pure logic:** direct translation of the Swift XCTest files to `#[test]`. This is the bulk of the existing suite and it ports cleanly.
-- **Media integration:** GStreamer `videotestsrc`-generated fixtures replacing the Swift `SyntheticAsset` / `SplitColorAsset` / `FiducialAsset` helpers. Same idea — synthesize an asset with known pixel values at known times, then assert on output pixels.
-- **Compositor:** golden-frame tests. `tiny-skia` rasterizes deterministically, so a golden PNG is valid on both Linux and Windows. Port `PixelSampling` as the comparison helper.
-- **Harness:** drive the command bus headlessly, assert on emitted events and on-disk state. No window required.
-- **Feature gating:** `video-coach-core` tests must run with `--no-default-features` and no GStreamer present. CI enforces this.
+- **Pure logic:** 26 of 42 Swift test files (~2,845 of 6,692 LOC, **43%** — not "the bulk") translate directly to `#[test]`. One exception: `PlaybackTimelineTests.test_segments_subMillisecondEventGap_roundsToZeroCMTime` asserts that 0.5 ms rounds to zero ticks at timescale 600. GStreamer's nanosecond timebase has no such rounding — port it as "sub-millisecond segments are produced and callers must skip degenerate durations" and drop the `CMTime` assertion. `PlaybackTimelineTests` then needs no media import at all.
+- **Media integration:** the other 16 files (~3,847 LOC) are a **rewrite, not a port** — `ClipPlaybackAccuracyTests` (672), `CompilationExporterE2ETests` (463), `CompilationCompositorZoomTests` (417), `CompilationExporterTests` (350), plus **954 LOC of fixture machinery** (`SyntheticAsset` 434, `FiducialAsset` 371, `SplitColorAsset` 149) that must be rebuilt on `videotestsrc` before any media test can be written. Budget the fixture rebuild as its own task.
+- **Compositor:** property assertions first, golden frames only where geometry is the thing under test. The Swift suite proves this works — `ScoreboardRenderTests` asserts "drew inside the bar rect, left the outside untouched" and never compares an image; **the existing suite has zero golden-image tests.** Where a golden is genuinely clearest, three rules make it sound:
+  1. **The overlay font is bundled in `video-coach-core` and loaded into a private `fontdb` by bytes.** System fonts are never consulted. `ScoreboardDraw.fittingFontSize` picks a per-team-name font *size* from measured width (`:50-52`, `:89`), so a different resolved font changes **layout**, not just antialiasing. This also converts the font-metrics risk from a per-machine variable into a one-time cost.
+  2. **Golden frames composite overlays over a synthetic solid base, never over decoded video.** VA-API vs software decode and YUV→RGB matrix/range differences make decoded pixels machine-dependent.
+  3. **Decoder and encoder ranks are pinned in tests** via `GST_PLUGIN_FEATURE_RANK`.
+- **Harness:** `video-coach-harness` drives the bus headlessly and asserts on emitted events and on-disk state.
 
 ---
 
-## Risks
+## Gates and risks
 
-1. **Scrub responsiveness under GStreamer.** The macOS app migrated its scan player to mpv specifically because the platform framework's seek behavior was unacceptable on this footage. GStreamer is a different stack and should be fine, but this is unproven for this workload. *Kill criterion: if accurate seek on 4K HEVC exceeds ~250 ms in Phase 2, switch the scan player to libmpv and keep GStreamer for export.* libmpv is cross-platform, so this fallback costs a second decoder stack but not the port.
-2. **CPU compositing throughput.** Measured at the Phase 7 gate. Escape hatch is `glvideomixer` plus a shader zoom.
-3. **Font metrics.** `cosmic-text` will not reproduce CoreText's metrics, so every scoreboard and text-bar layout constant needs re-tuning against rendered output. Expect this to be fiddly and budget for it rather than discovering it late.
-4. **HEVC encoder availability.** Highly variable on Linux. Mitigated by the probe chain, but a user on a machine with only software x265 will find exports much slower than the macOS app's VideoToolbox path. This is a real product regression on low-end hardware and should be stated in the README.
-5. **PipeWire device enumeration and permissions.** Portal-mediated camera access on Wayland differs from X11 and across desktop environments. Phase 4 should test on at least one GNOME and one KDE system.
-6. **whisper.cpp model distribution.** A `ggml-base.en` model is ~140 MB. Bundling it bloats the package; downloading it on first run breaks the "no network calls" claim in the README. Needs a decision — see Open questions.
-7. **Slint at this UI complexity.** The macOS `ContentView` is 1,348 lines and `ExportSheet` is 834. Slint is young and its widget set is thinner than SwiftUI's. Phase 3 is the first real test; if the inspector-heavy UI fights the toolkit, that is the moment to reconsider, not Phase 8.
+**Phase 2 gate — zero-copy decode-to-display.** Confirm (a) a hardware decoder is selected, and (b) frames reach the display without a system-memory round-trip — verifiable from decoder src-pad caps carrying `memory:DMABuf`, `memory:VAMemory` or `memory:GLMemory`, with no `gldownload`/`videoconvert` between decoder and sink. Measure accurate-seek latency on 4K HEVC here.
+
+**Phase 7 gate — first composite.** End-to-end preview at playback resolution sustains output fps with zoom active and a stroke-heavy overlay.
+
+**There is no compositing-throughput gate.** It has been run; it failed; that is *why* the architecture is what it is. Do not re-run it.
+
+1. **1a. Hardware decode availability.** VA-API/NVDEC presence and ranking varies by GPU, driver and distro. Measured at the Phase 2 gate. Without it, everything below measures the wrong thing.
+   **1b. Scrub responsiveness given hardware decode.** *Kill criterion: if accurate seek on 4K HEVC exceeds ~250 ms in Phase 2 **with a hardware decoder confirmed selected**, switch the scan player to libmpv for scan only; GStreamer keeps export and capture, and the project accepts two zoom implementations as the price.* Treat this as a live branch, not a remote one: mpv is the **current, shipped** macOS scan player, and `ContentView.swift:753-773` documents a frame-accuracy problem solved specifically by mpv's synchronous `time-pos` query. The GStreamer scan player is replacing something that works.
+2. **GL interop across drivers.** DMABuf/VA import into GL is solid on Mesa and dicier on the NVIDIA proprietary stack. Mitigation: the software `compositor` fallback, which is already built for CI.
+3. **Font metrics.** cosmic-text will not reproduce CoreText's metrics, and because `fittingFontSize` derives a font *size* from measured width, a different font changes layout, not just pixels. Bundling the font (above) bounds this to a one-time tuning cost.
+4. **Software-encode fallback on low-end hardware.** A machine with no VA-API or NVENC H.264 encoder falls back to `x264enc` and exports substantially slower than the macOS VideoToolbox path. Less likely than the HEVC version of this risk (H.264 encode is near-universal) but not zero. State it in the README.
+5. **PipeWire device enumeration and permissions.** Portal-mediated camera access differs across Wayland compositors. Test on GNOME and KDE.
+6. **whisper.cpp model distribution.** See Open questions.
+7. **Slint at this UI complexity.** `ContentView` is 1,348 lines and `ExportSheet` 834. Phase 3 is the first real test; if the inspector-heavy UI fights the toolkit, that is the moment to reconsider — not Phase 9.
+
+**Windows CI is advisory: a red Windows build does not veto a dependency that is right for Linux.** If a Linux-optimal choice breaks Windows, Windows is what gets solved (or dropped), in Phase 11. The tiny-skia + cosmic-text rationale rests on Linux merits: a pure-Rust rasterizer is one static blob, where bundling cairo + pango + harfbuzz + fontconfig into a relocatable package means matching ABI and font-config paths across distros — the most common source of "works on my distro" packaging failures. Strokes are literally Skia paths. Reproducible rasterization makes the overlay tests meaningful.
 
 ---
 
 ## Open questions — deferred to human
 
-1. **whisper model distribution.** Bundle (~140 MB package), download on first run (breaks the offline claim at install time only), or require the user to supply a path? Recommendation: download on first run with an explicit prompt, and reword the README's "no network calls" to "no network calls during normal use; one-time model download on first transcription."
-2. **Linux packaging target.** Flatpak sandboxing complicates camera, microphone and arbitrary-path file access — all three of which this app needs. AppImage avoids that at the cost of a worse update story. Recommendation: AppImage first, Flatpak later if it proves tractable.
-3. **Wayland vs X11 for the drawing overlay.** Freehand telestration wants low input latency. Worth an early spike in Phase 5 rather than an assumption now.
-4. **Fate of the `apple/` tree.** Keep as reference until parity, then delete? Or keep indefinitely as the macOS build? Deleting is the honest choice if nobody runs it, but that decision can wait until Milestone D.
+1. **Chrome coordinate space.** Should the text bar, PiP and scoreboard lay out in **output** space (overlapping the letterbox bars, reading like broadcast furniture) or **content** space (staying inside the picture)? Purely cosmetic, only differs for non-16:9 sources, and there is no existing evidence either way because the macOS stretch collapses the two. *Recommendation: output space.* Only the three chrome layers change; the stroke rule is unaffected either way.
+2. **`Project` ownership.** Does the bus own `Project` (all mutations are commands), or does the UI own it and the bus own media only? *Recommendation: bus owns `Project` and the media objects; every mutation is a `Command`; the bus emits `Event::ProjectChanged(Arc<Project>)` and the UI derives Slint properties from the latest snapshot.* It matches what the superseded plan already assumed, makes undo unambiguously bus-side, and `Arc` snapshots avoid both locking and partial-update bugs. Cost is a full property re-derive per mutation, which is nothing at this project size. Settle it in the Phase 2 plan, after a Slint property-model prototype.
+3. **whisper model distribution.** Bundle (~140 MB), download on first run, or require a user-supplied path? Note this does **not** newly break an offline guarantee — the macOS app already downloads a speech model inside `transcribe()` on first use (BACKLOG #19), so the README's "no network calls" claim is already inaccurate. "No FFmpeg" also becomes false once `gst-libav` ships for software decode of arbitrary match film. Both lines need correcting regardless. *Recommendation: download on first run with an explicit prompt and visible progress — strictly better than the macOS behavior BACKLOG #19 complains about — and reword to "runs entirely on your machine; one-time model download on first transcription."*
+4. **Linux packaging target.** Flatpak sandboxing complicates camera, microphone and arbitrary-path file access, all three of which this app needs. *Recommendation: AppImage first.*
+5. **Wayland vs X11 for the drawing overlay.** Freehand telestration wants low input latency. Worth a spike in Phase 6.
+6. **Fate of the `apple/` tree.** Keep as reference until parity, then delete? Can wait until Milestone D.
 
 ---
 
+## Known macOS bugs this port fixes
+
+Recorded because they are easy to re-introduce by faithfully porting:
+
+- **Scoreboard clock on export** ignores pauses and skips (`CompilationCompositor.swift:253`). Fixed by the source-time golden rule.
+- **Non-16:9 sources are anamorphically distorted** at fixed export resolutions (`:130-134` + `ExportSettings.swift:20-23`). Fixed by letterboxing.
+- **Preview ignores `showPiP`** while export honors it (`PreviewCompositor.swift:163` vs `:101`). Fixed by one shared compositor.
+- **The Quality picker does nothing** (`CompilationExporter.swift:45-50`, `:508-518`). Fixed by implementing it for the first time.
+- **Unknown commentary events persist as empty-kind records** and lose their payload (`CommentaryEvent.swift:74-80`). Fixed by round-tripping the raw value.
+
+None are fixed in the Swift tree — it is the reference implementation and is not maintained in parallel. If that changes, the scoreboard fix is small: pass `clip` instead of `clipStartAbsSeconds` into `CompilationInstruction` and call the preview formula.
+
 ## What this spec does not settle
 
-Effort. The rebuild is roughly 10,000 lines of macOS-bound Swift replaced by Rust and Slint, plus ~1,950 lines translated. Rust UI code tends to run longer than SwiftUI for the same screen, so the Slint side will likely exceed the 8,625 lines it replaces. Any number past that is a guess, and the phase plans are where it becomes real. Phase 1 is a good calibration point: it is well-understood work with a known test suite, so how long it actually takes is the best available predictor for everything after it.
+Effort. Phase 1 is the calibration point: well-understood work with a known test suite, so how long it actually takes is the best available predictor for everything after it. Note that Phase 1 is now roughly half its original size, which halves that calibration sample — a deliberate trade against porting 616 LOC of scoreboard tests that nothing consumes for eight phases.

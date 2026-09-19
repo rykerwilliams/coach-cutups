@@ -109,7 +109,7 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** First manual smoke test. If granting Speech permission
   doesn't propagate to `SpeechAnalyzer`, the guard might need replacement.
 
-### 16. Test coverage: `.transcribing` → `.summarizing` phase transition
+### 16. Test coverage: `.transcribing` → `.summarizing` phase transition — OBSOLETED by the Linux port spec (summarization is dropped; see #22)
 - **Why deferred:** `TranscriptionCoordinator` correctly sets `currentPhase`
   after the transcript write, but no test asserts the in-flight state
   transitions visible to the inspector. The code path is short and correct;
@@ -144,3 +144,74 @@ Each entry: what, why deferred, when to revisit.
   (longer than usual)" with no explicit progress. Spec accepted this; if it's
   painful in practice, add a "Downloading speech model…" caption swap.
 - **When to revisit:** First manual smoke test on a fresh machine.
+
+## Linux port (spec `docs/superpowers/specs/2026-09-19-linux-port-design.md`)
+
+### 20. Chrome coordinate space for non-16:9 sources
+- **Why deferred:** With the port letterboxing the base image, the text bar, PiP
+  and scoreboard can lay out in output space (overlapping the letterbox bars,
+  reading like broadcast furniture) or content space (staying inside the
+  picture). Purely cosmetic, and it only differs for non-16:9 sources. There is
+  no evidence either way in the macOS tree because its non-uniform stretch
+  collapses the two spaces. Spec recommends output space.
+- **When to revisit:** Phase 7 (clip preview), the first time a non-16:9 source
+  is composited. Only the three chrome layers change; the stroke denormalization
+  rule is unaffected either way.
+
+### 21. `Project` ownership in the command bus
+- **Why deferred:** Whether the bus owns `Project` (every mutation is a
+  `Command`) or the UI owns it and the bus owns media only. Spec recommends the
+  bus owning it and emitting `Event::ProjectChanged(Arc<Project>)`, with the UI
+  deriving Slint properties from the snapshot — it makes undo unambiguously
+  bus-side and avoids partial-update bugs. Not locked because it depends on
+  Slint's property model, which nobody has prototyped against.
+- **When to revisit:** Phase 2 plan, after a Slint property-model spike.
+
+### 22. whisper model distribution
+- **Why deferred:** Bundle (~140 MB package), download on first run, or require
+  a user-supplied path. Spec recommends download-on-first-run with explicit
+  prompt and progress. Note this does not newly break an offline guarantee —
+  see #19, the macOS app already downloads a speech model inside `transcribe()`.
+- **When to revisit:** Phase 10. Decide before the packaging phase, since it
+  changes the artifact size.
+
+### 23. README accuracy: "no network calls" and "No FFmpeg"
+- **Why deferred:** Both claims on README line 5 are or will be false. "No
+  network calls" is already inaccurate on macOS (#19). "No FFmpeg" becomes false
+  the moment `gst-libav` ships, which it must for software decode of arbitrary
+  match film. Not fixed now because the README describes the macOS app, which
+  still ships.
+- **When to revisit:** When the Linux build becomes the primary artifact
+  (Phase 11), or sooner if the macOS README is touched for any other reason.
+
+### 24. Linux packaging: AppImage vs Flatpak
+- **Why deferred:** Flatpak sandboxing complicates camera, microphone and
+  arbitrary-path file access — all three of which this app needs. Spec
+  recommends AppImage first.
+- **When to revisit:** Phase 11.
+
+### 25. Wayland vs X11 for the drawing overlay
+- **Why deferred:** Freehand telestration wants low input latency and the two
+  display stacks differ. No measurement exists.
+- **When to revisit:** Phase 6 spike, before stroke capture is built on either.
+
+### 26. Fate of the `apple/` tree
+- **Why deferred:** Keep as reference implementation until the Linux port
+  reaches parity, then delete — or keep indefinitely as a macOS build nobody
+  runs. Deleting is the honest choice if nobody runs it, but the decision costs
+  nothing to postpone.
+- **When to revisit:** Milestone D.
+
+### 27. macOS export bugs the port fixes but the Swift tree keeps
+- **Why deferred:** The review found five live bugs in the macOS app: the export
+  scoreboard clock ignores pauses and skips (`CompilationCompositor.swift:253`);
+  non-16:9 sources are anamorphically distorted at fixed export resolutions;
+  preview ignores `showPiP` while export honors it; the export Quality picker
+  has no effect at all (`ExportSettings.bitrate` has zero production call
+  sites); and unknown commentary events persist as empty-kind records that lose
+  their payload. The port fixes all five by construction. Not fixed in Swift
+  because `apple/` is the reference implementation and is not maintained in
+  parallel.
+- **When to revisit:** Only if the macOS app ships again. The scoreboard fix is
+  small — pass `clip` instead of `clipStartAbsSeconds` into
+  `CompilationInstruction` and call the preview formula.
