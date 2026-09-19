@@ -21,7 +21,7 @@ use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, RecordingStatus, Snapshot,
+    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot, UserError,
 };
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
@@ -161,7 +161,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         }
     });
     window.on_relink_source({
-        let (weak, pickers, send) = (window.as_weak(), pickers, send(bus));
+        let (weak, pickers, send) = (window.as_weak(), pickers.clone(), send(bus));
         move |index| {
             let (Some(w), Ok(index)) = (weak.upgrade(), usize::try_from(index)) else {
                 return;
@@ -246,6 +246,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
     wire_devices(window, bus);
     wire_clips(window, bus);
+    wire_export(window, bus, pickers);
     // Drag-to-reorder carries the list's name and the dragged row's index,
     // so a source dropped on the clip list (or back) is refused.
     window.on_drag_payload(|list, index| {
@@ -310,6 +311,51 @@ fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             });
         }
     });
+}
+
+/// Export (Phase 5 X5): the clip menu's "Export video…" asks where, with the
+/// clip's name suggested in the project folder; the transport's Cancel stops
+/// it.
+fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>, pickers: Pickers) {
+    window.on_export_clip({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move |id| {
+            let (Some(w), Some(id)) = (weak.upgrade(), parse_clip_id(&id)) else {
+                return;
+            };
+            let suggested = UI.with_borrow(|ui| {
+                let s = ui.snapshot.as_ref()?;
+                let clip = s.project.clips.iter().find(|c| c.id == id)?;
+                Some((s.folder.clone(), export_file_name(&clip.name)))
+            });
+            let Some((folder, file_name)) = suggested else {
+                return;
+            };
+            let bus = bus.clone();
+            pickers.open(&w, Pick::Export { folder, file_name }, move |mut path| {
+                // The portal adds no extension to a typed name, and the
+                // file is an MP4 whatever it's called.
+                if !path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+                {
+                    path.as_mut_os_string().push(".mp4");
+                }
+                bus.borrow().send(Command::ExportClip { id, path });
+            });
+        }
+    });
+    window.on_cancel_export({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::CancelExport)
+    });
+}
+
+/// `<clip name>.mp4`, with any `/` (which a file name can't hold) replaced.
+fn export_file_name(clip_name: &str) -> String {
+    let name = clip_name.trim();
+    let name = if name.is_empty() { "Untitled" } else { name };
+    format!("{}.mp4", name.replace('/', "-"))
 }
 
 /// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
@@ -634,6 +680,15 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
+        Event::Export(status) => match status {
+            ExportStatus::Running(percent) => w.set_export_progress(percent.into()),
+            ExportStatus::Done(path) => {
+                w.set_export_progress(-1);
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                show_notice(w, format!("Exported to {}", name.to_string_lossy()));
+            }
+            ExportStatus::Cancelled => w.set_export_progress(-1),
+        },
         // After the operation's `ProjectChanged`, so the clip is in the
         // project; a tag filter that hides it is cleared, so it's listed too.
         // The window re-renders the inspector when the selection changes.
@@ -655,11 +710,15 @@ fn on_event(w: &AppWindow, event: Event) {
         // keys.
         Event::Error(e) if e.is_notice() => {
             eprintln!("ui: notice: {e}");
-            w.set_notice(sentence(&e.to_string()).into());
-            UI.with_borrow_mut(|ui| ui.notice_until = Some(Instant::now() + NOTICE));
+            show_notice(w, sentence(&e.to_string()));
         }
         Event::Error(e) => {
             eprintln!("ui: error: {e}");
+            // An export's end: its bar goes. (A refusal leaves a running
+            // export's bar up.)
+            if let UserError::ExportFailed(_) = e {
+                w.set_export_progress(-1);
+            }
             // The first error stays up: one failure can report several, and
             // the first says what went wrong.
             if w.get_error_message().is_empty() {
@@ -667,6 +726,12 @@ fn on_event(w: &AppWindow, event: Event) {
             }
         }
     }
+}
+
+/// Shows `text` on the notice line for [`NOTICE`].
+fn show_notice(w: &AppWindow, text: String) {
+    w.set_notice(text.into());
+    UI.with_borrow_mut(|ui| ui.notice_until = Some(Instant::now() + NOTICE));
 }
 
 /// The sidebar, the missing-source card, whether playback is possible and

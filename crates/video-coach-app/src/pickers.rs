@@ -13,12 +13,16 @@ use slint::ComponentHandle;
 use crate::AppWindow;
 
 /// What a picker looks for.
-#[derive(Clone, Copy)]
 pub enum Pick {
     ProjectFolder,
     /// A video file; `title` names what it's for.
     Video {
         title: &'static str,
+    },
+    /// Where to save an export: `file_name` in `folder` suggested.
+    Export {
+        folder: PathBuf,
+        file_name: String,
     },
 }
 
@@ -54,6 +58,15 @@ impl Pickers {
                         .add_filter("Video", VIDEO_EXTENSIONS)
                         .add_filter("All files", &["*"])
                         .pick_file()
+                        .await
+                }
+                Pick::Export { folder, file_name } => {
+                    dialog
+                        .set_title("Export Video")
+                        .set_directory(folder)
+                        .set_file_name(file_name)
+                        .add_filter("MP4 video", &["mp4", "MP4"])
+                        .save_file()
                         .await
                 }
             };

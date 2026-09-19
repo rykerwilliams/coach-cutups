@@ -4,7 +4,7 @@
 // Everything here is presentation. `src/main.rs` turns the callbacks into bus
 // commands and feeds bus events back in through the `in` properties.
 
-import { Button, CheckBox, LineEdit, ListView, Palette, Slider, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, Palette, ProgressIndicator, Slider, TextEdit } from "std-widgets.slint";
 
 /// One row of the sidebar's Sources list.
 export struct SourceRow {
@@ -577,8 +577,16 @@ export component AppWindow inherits Window {
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
     in property <[DeviceRow]> mics;
-    /// The latest notice (a device fallback, an unclean stop), shown in the
-    /// transport bar without blocking; empty hides it.
+    // --- Export (Phase 5 X5) ---
+
+    /// The running export's whole percent; negative with none running.
+    in property <int> export-progress: -1;
+    /// Greys out Record and "Export video…": the bus refuses both while an
+    /// export runs.
+    out property <bool> exporting: root.export-progress >= 0;
+
+    /// The latest notice (a device fallback, an unclean stop, an export
+    /// done), shown in the transport bar without blocking; empty hides it.
     in property <string> notice;
 
     /// The error dialog's message; empty hides it.
@@ -613,6 +621,9 @@ export component AppWindow inherits Window {
     callback delete-clip(string);
     callback move-clip(int, int);
     callback sort-clips();
+    /// Ask where, then export the clip with this id.
+    callback export-clip(string);
+    callback cancel-export();
     callback undo();
     callback redo();
     /// An inspector field's commit for clip `id`.
@@ -989,6 +1000,11 @@ export component AppWindow inherits Window {
                                                     activated => { root.jump-to-clip(clip.id); }
                                                 }
                                                 MenuItem {
+                                                    title: "Export video…";
+                                                    enabled: !root.exporting;
+                                                    activated => { root.export-clip(clip.id); }
+                                                }
+                                                MenuItem {
                                                     title: "Delete clip";
                                                     activated => { root.delete-clip(clip.id); }
                                                 }
@@ -1208,7 +1224,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: root.recording ? "Stop" : "Record";
-                            enabled: root.can-play || root.recording;
+                            enabled: (root.can-play && !root.exporting) || root.recording;
                             min-width: 72px;
                             // Off any field first: a click doesn't take focus
                             // from one, and a field disabled while it has
@@ -1221,7 +1237,9 @@ export component AppWindow inherits Window {
                             Tooltip {
                                 text: root.recording
                                     ? @markdown("Stop recording (R or Esc)")
-                                    : @markdown("Record (R)");
+                                    : root.exporting
+                                        ? @markdown("Not while exporting")
+                                        : @markdown("Record (R)");
                             }
                         }
                         if root.recording-phase == RecordingPhase.starting: Text {
@@ -1275,6 +1293,31 @@ export component AppWindow inherits Window {
                                         background: root.level > 0.95 ? #ff3b30 : #34c759;
                                     }
                                 }
+                            }
+                        }
+                        // Its own item, so a notice can't overwrite it.
+                        if root.exporting: HorizontalLayout {
+                            spacing: 6px;
+
+                            // Wide enough for 100%, so the row doesn't
+                            // shift as it counts.
+                            Text {
+                                text: "Exporting " + root.export-progress + "%";
+                                color: Palette.foreground;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                min-width: 84px;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                ProgressIndicator {
+                                    width: 70px;
+                                    progress: root.export-progress / 100;
+                                }
+                            }
+                            Button {
+                                text: "Cancel";
+                                clicked => { root.cancel-export(); }
                             }
                         }
                         // The one stretch item: it takes the row's slack, and

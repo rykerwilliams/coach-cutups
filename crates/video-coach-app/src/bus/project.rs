@@ -136,6 +136,7 @@ impl Bus {
         let open = self.open.as_ref()?;
         Some(Snapshot {
             project: Arc::new(open.project.clone()),
+            folder: open.folder.clone(),
             missing: self.missing.clone(),
         })
     }

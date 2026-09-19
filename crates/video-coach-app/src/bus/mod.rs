@@ -4,12 +4,13 @@
 //! harness drives it with a system-memory sink and no Slint.
 //!
 //! One input channel carries commands, the player's forwarded GStreamer
-//! messages and the recorder's messages, so the thread never has to choose
-//! between queues. The loop waits with `recv_timeout` on the earlier of two
-//! deadlines (the skip debounce and the recording start timeout); with
-//! neither armed it simply blocks.
+//! messages, and the recorder's and the exporter's messages, so the thread
+//! never has to choose between queues. The loop waits with `recv_timeout` on
+//! the earlier of two deadlines (the skip debounce and the recording start
+//! timeout); with neither armed it simply blocks.
 
 mod clips;
+mod export;
 mod project;
 mod recording;
 mod sources;
@@ -30,9 +31,11 @@ use video_coach_core::store::StoreError;
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
-    FrameMailbox, PositionHandle, ProbeError, RecorderMessage, SinkKind, SourcePlayer,
+    ExportMessage, Exporter, FrameMailbox, PositionHandle, ProbeError, RecorderMessage, SinkKind,
+    SourcePlayer,
 };
 
+pub use export::ExportStatus;
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
 
@@ -127,6 +130,17 @@ pub enum Command {
     /// The project's preferred microphone, likewise.
     SetMic(Option<String>),
 
+    // Export (Phase 5 spec X4).
+    /// Export the clip to an MP4 at `path`, in the background. Refused while
+    /// another export runs; dropped while recording.
+    ExportClip {
+        id: Uuid,
+        path: PathBuf,
+    },
+    /// Stop the running export, if any. Its outcome still arrives as the
+    /// export's own: a cancel too late to stop it reports `Done`.
+    CancelExport,
+
     // Lifecycle.
     /// The UI's wrapped GL display and context (spec D3). Until it arrives, a
     /// GL-sink player stays in NULL.
@@ -146,6 +160,8 @@ pub enum Command {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub project: Arc<Project>,
+    /// The project's folder, absolute and canonical.
+    pub folder: PathBuf,
     /// One entry per source: `true` if its file doesn't exist. Re-checked
     /// on open, after every source-list change and after a player error.
     pub missing: Arc<[bool]>,
@@ -173,6 +189,9 @@ pub enum Event {
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
     Level(f64),
+    /// The export's progress, and how it ended unless it failed: a failure
+    /// is a [`UserError::ExportFailed`].
+    Export(ExportStatus),
     /// Select this clip: an undo restored or edited it, or a redo edited it.
     /// Always sent after that change's `ProjectChanged`, which drops a
     /// selection whose clip is gone.
@@ -224,6 +243,12 @@ pub enum UserError {
         "the recording didn't finish cleanly; its clip was kept, but its end may be cut short"
     )]
     StopNotClean,
+    /// Export is refused: there's nothing (or no way) to export yet.
+    #[error("can't export: {0}")]
+    CantExport(&'static str),
+    /// An export that started ended without a file.
+    #[error("export failed: {0}")]
+    ExportFailed(String),
     #[error("{0}")]
     Io(String),
 }
@@ -275,6 +300,8 @@ enum Input {
     Gst(gst::Message),
     /// From the recorder with this generation. Never routed to the player.
     Recorder(u64, RecorderMessage),
+    /// From the running exporter: there is only ever one.
+    Export(ExportMessage),
 }
 
 /// The project the bus has open: folder and document, committed together.
@@ -318,6 +345,8 @@ pub struct Bus {
     generation: u64,
     /// The clip undo history (Phase 3 spec C1). Cleared on every open.
     history: UndoController,
+    /// The export in progress, until its `Finished` arrives.
+    export: Option<Exporter>,
 }
 
 impl Bus {
@@ -376,6 +405,7 @@ impl Bus {
             recording: None,
             generation: 0,
             history: UndoController::default(),
+            export: None,
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -416,12 +446,15 @@ impl Bus {
                     self.player_events(events);
                 }
                 Some(Input::Recorder(generation, msg)) => self.recorder_message(generation, msg),
+                Some(Input::Export(msg)) => self.export_message(msg),
                 Some(Input::Cmd(Command::Shutdown { ack })) => {
                     // A recording keeps its clip (or is aborted while still
                     // starting) before anything is torn down.
                     self.stop_recording();
                     // Dropping the player takes the pipeline to NULL before
-                    // the ack, which the UI's GL teardown waits for.
+                    // the ack, which the UI's GL teardown waits for. An
+                    // export is cancelled and joined, its partial file
+                    // deleted: its GL is its own, not the UI's.
                     drop(self);
                     let _ = ack.send(());
                     return;
@@ -497,6 +530,8 @@ impl Bus {
             Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
+            Command::ExportClip { id, path } => self.export_clip(id, path),
+            Command::CancelExport => self.cancel_export(),
             Command::GlReady { display, context } => {
                 let events = self.player.set_gl_context(display, context);
                 self.player_events(events);

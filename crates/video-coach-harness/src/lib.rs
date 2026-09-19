@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, RecordingStatus, Snapshot, StateFile, UserError,
+    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot,
+    StateFile, UserError,
 };
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
@@ -145,6 +146,14 @@ impl Harness {
     pub fn wait_recording(&mut self) -> RecordingStatus {
         self.wait_map("Recording", |e| match e {
             Event::Recording(s) => Some(*s),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Export`.
+    pub fn wait_export(&mut self) -> ExportStatus {
+        self.wait_map("Export", |e| match e {
+            Event::Export(s) => Some(s.clone()),
             _ => None,
         })
     }
