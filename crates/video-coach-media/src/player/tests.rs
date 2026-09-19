@@ -459,7 +459,7 @@ fn a_pause_while_a_flushing_seek_recovers_playing_sticks() {
         // behind the slot's back, so the pause meets that window with the
         // slot idle: its only chance to stop the return.
         let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
-        let position = gst::ClockTime::from_nseconds((target * 1e9) as u64);
+        let position = super::seconds_to_clock(target);
         rig.player.pipeline.seek_simple(flags, position).unwrap();
         rig.player.set_playing(false);
         rig.drain(Duration::from_millis(300));
@@ -545,4 +545,18 @@ fn a_gl_sink_holds_the_pipeline_in_null_until_the_context_arrives() {
     assert_eq!(player.pipeline.current_state(), gst::State::Null);
     assert_eq!(player.pipeline.pending_state(), gst::State::VoidPending);
     assert!(matches!(player.flight, Flight::Loading(_)));
+}
+
+#[test]
+fn frame_boundaries_round_trip_to_the_exact_nanosecond() {
+    // Truncation put 1.7-1.9% of k/30 boundaries 1 ns early.
+    for k in 0..3000u64 {
+        let secs = k as f64 / 30.0;
+        let exact = k * 1_000_000_000 / 30;
+        let got = super::seconds_to_clock(secs).nseconds();
+        assert!(
+            got.abs_diff(exact) <= 1 && got >= exact,
+            "frame {k}: {got} vs {exact}"
+        );
+    }
 }

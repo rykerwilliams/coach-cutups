@@ -437,9 +437,7 @@ impl SourcePlayer {
             } else {
                 gst::SeekFlags::KEY_UNIT
             };
-        // `f64::max` maps NaN to 0; an infinite target saturates and lands at
-        // the end.
-        let position = gst::ClockTime::from_nseconds((request.secs.max(0.0) * 1e9) as u64);
+        let position = seconds_to_clock(request.secs);
         let origin = request.origin;
         match self.pipeline.seek_simple(flags, position) {
             Ok(()) => self.flight = Flight::Seeking(request),
@@ -556,4 +554,12 @@ fn answer_need_context(msg: &gst::Message, need: &gst::message::NeedContext, gl_
 
 fn seconds(t: gst::ClockTime) -> f64 {
     t.nseconds() as f64 / 1e9
+}
+
+/// Seconds to a `ClockTime`, **rounded** to the nanosecond. Truncating lands
+/// 1 ns short of a frame boundary for ~2% of frame times (e.g. `k / 30.0`), and
+/// an accurate seek there shows the previous frame (export-graph spike).
+/// `f64::max` maps NaN to 0; an infinite target saturates and lands at the end.
+pub(crate) fn seconds_to_clock(secs: f64) -> gst::ClockTime {
+    gst::ClockTime::from_nseconds((secs.max(0.0) * 1e9).round() as u64)
 }
