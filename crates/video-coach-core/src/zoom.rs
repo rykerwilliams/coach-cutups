@@ -87,3 +87,159 @@ impl Zoom {
         }
     }
 }
+
+impl Zoom {
+    /// Hard floor 1.0x (never zoom out past the full frame), soft cap 10x.
+    ///
+    /// The pan limit narrows as scale approaches 1 and is forced to 0 at
+    /// exactly 1. At `pan = ±(s−1)/(2s)` the visible window's edge lands
+    /// exactly on the source edge, which is what lets the compositor treat
+    /// zoom as a plain crop with no edge handling.
+    pub fn clamped(self) -> Zoom {
+        let s = self.scale.clamp(1.0, 10.0);
+        if s <= 1.0 {
+            return Zoom::IDENTITY;
+        }
+        let limit = (s - 1.0) / (2.0 * s);
+        Zoom {
+            scale: s,
+            pan_x: self.pan_x.clamp(-limit, limit),
+            pan_y: self.pan_y.clamp(-limit, limit),
+        }
+    }
+
+    /// Snap `scale` to a notch within 3% relative tolerance; pan is preserved.
+    ///
+    /// Returns the **first** matching notch in table order. The table's spacing
+    /// (≥20% between neighbours) makes the tolerance windows disjoint, so first
+    /// and nearest coincide — but only by property of this table. Inserting a
+    /// closely-spaced notch would silently change the semantics.
+    ///
+    /// Interactive commits only. Replay never snaps, or authored zoom values
+    /// would not survive a round-trip.
+    pub fn snapped(self) -> Zoom {
+        for n in SNAP_NOTCHES {
+            if (self.scale - n).abs() <= n * 0.03 {
+                return Zoom { scale: n, ..self };
+            }
+        }
+        self
+    }
+
+    /// Linear interpolation, with `alpha` clamped to `0..=1`.
+    pub fn lerp(a: Zoom, b: Zoom, alpha: f64) -> Zoom {
+        let t = alpha.clamp(0.0, 1.0);
+        Zoom {
+            scale: a.scale + (b.scale - a.scale) * t,
+            pan_x: a.pan_x + (b.pan_x - a.pan_x) * t,
+            pan_y: a.pan_y + (b.pan_y - a.pan_y) * t,
+        }
+    }
+
+    /// The normalized source point currently visible at a position within the
+    /// **displayed (letterboxed) source rect**.
+    ///
+    /// `content_x` / `content_y` are fractions of that rect, **not** of the
+    /// viewport. A caller holding a window-space cursor must convert first —
+    /// on a source whose aspect differs from the output's, the two differ.
+    ///
+    /// Inverse of the rendering transform: the visible window is `1/scale`
+    /// wide, centred on `0.5 + pan`.
+    pub fn source_point(self, content_x: f64, content_y: f64) -> (f64, f64) {
+        (
+            (0.5 + self.pan_x) + (content_x - 0.5) / self.scale,
+            (0.5 + self.pan_y) + (content_y - 0.5) / self.scale,
+        )
+    }
+
+    /// Change scale while keeping the source point under the cursor fixed.
+    ///
+    /// `content_x` / `content_y` carry the same meaning as in
+    /// [`Zoom::source_point`].
+    pub fn zoomed_to_cursor(self, new_scale: f64, content_x: f64, content_y: f64) -> Zoom {
+        let s2 = new_scale.clamp(1.0, 10.0);
+        if s2 <= 1.0 {
+            return Zoom::IDENTITY;
+        }
+        let (sx, sy) = self.source_point(content_x, content_y);
+        Zoom {
+            scale: s2,
+            pan_x: (sx - (content_x - 0.5) / s2) - 0.5,
+            pan_y: (sy - (content_y - 0.5) / s2) - 0.5,
+        }
+        .clamped()
+    }
+
+    /// Map source-frame pixels onto output pixels, **letterbox-fitted**, in a
+    /// top-left coordinate space.
+    ///
+    /// This is the one surviving transform (see the module comment). `pan` is a
+    /// fraction of the *displayed source rect*, hence the `* src_w * s` term —
+    /// dropping the `* s` gives a pan that drifts toward centre as scale rises.
+    ///
+    /// At [`Zoom::IDENTITY`] this is also the **content rect** that strokes
+    /// denormalize against, so one function covers both needs.
+    pub fn transform(self, src_w: f64, src_h: f64, out_w: f64, out_h: f64) -> Affine {
+        let base = (out_w / src_w).min(out_h / src_h);
+        let s = self.scale * base;
+        Affine {
+            a: s,
+            b: 0.0,
+            c: 0.0,
+            d: s,
+            tx: (out_w - src_w * s) / 2.0 - self.pan_x * src_w * s,
+            ty: (out_h - src_h * s) / 2.0 - self.pan_y * src_h * s,
+        }
+    }
+}
+
+/// The zoom in effect at `record_time`, **linearly interpolated** between
+/// adjacent keyframes.
+///
+/// Before the first keyframe it holds the first value; after the last it holds
+/// the last; an empty track is identity.
+///
+/// The interpolation is why three recorder-side rules exist, and porting the
+/// lookup without them produces visibly wrong replay:
+///
+/// 1. **Anchor keyframe.** When more than 100 ms has passed since the last
+///    distinct capture, the recorder emits an extra keyframe at `t − 1 ms`
+///    holding the *previous* value. Without it the lerp ramps smoothly across
+///    a quiet gap instead of holding and then snapping.
+/// 2. **Dedupe.** Captures equal to the last captured value are skipped.
+/// 3. **No throttling.** Capturing at a reduced rate makes replay keyframe-
+///    stepped while the coach saw a smooth picture, so a drawing made while
+///    panning lands offset from what it was drawn on.
+///
+/// The scan stops at the first keyframe past `record_time`, so the event log
+/// must be sorted.
+pub fn zoom_at(events: &[crate::event::CommentaryEvent], record_time: f64) -> Zoom {
+    use crate::event::EventKind;
+
+    let mut prev: Option<(f64, Zoom)> = None;
+    let mut next: Option<(f64, Zoom)> = None;
+
+    for e in events {
+        let EventKind::Zoom(z) = e.kind else { continue };
+        if e.record_time <= record_time {
+            prev = Some((e.record_time, z));
+        } else {
+            next = Some((e.record_time, z));
+            break;
+        }
+    }
+
+    match (prev, next) {
+        (None, None) => Zoom::IDENTITY,
+        (Some((_, p)), None) => p,
+        (None, Some((_, n))) => n,
+        (Some((pt, p)), Some((nt, n))) => {
+            let span = nt - pt;
+            if span <= 0.0 {
+                n
+            } else {
+                Zoom::lerp(p, n, (record_time - pt) / span)
+            }
+        }
+    }
+}
