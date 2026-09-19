@@ -129,6 +129,31 @@ pub fn counter_video(
     frames: u32,
     kind: CounterKind,
 ) -> PathBuf {
+    counter_video_with(path, w, h, fps, frames, kind, CounterQuirks::default())
+}
+
+/// Irregular timing for a [`counter_video_with`], for export's edge cases.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CounterQuirks {
+    /// `(after, slots)`: frames after frame `after` are pushed `slots` frame
+    /// intervals late, so frame `after`'s duration doesn't reach the next
+    /// frame's PTS.
+    pub gap: Option<(u32, u32)>,
+    /// Frame intervals of audio past the video's end
+    /// ([`CounterKind::Vp8WebmWithAudio`] only).
+    pub audio_tail: u32,
+}
+
+/// [`counter_video`] with `quirks`. Frame `i` still shows `i`.
+pub fn counter_video_with(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fps: u32,
+    frames: u32,
+    kind: CounterKind,
+    quirks: CounterQuirks,
+) -> PathBuf {
     let (block_w, block_h) = block_size(w, h);
     assert!(
         block_w >= 32 && block_h >= 32 && w.is_multiple_of(8) && h.is_multiple_of(2),
@@ -139,6 +164,12 @@ pub fn counter_video(
         "{frames} frames overflow the counter"
     );
     let caps = format!("video/x-raw,format=I420,width={w},height={h},framerate={fps}/1");
+    let gap_slots = quirks.gap.map_or(0, |(_, slots)| slots);
+    // The frame interval frame `i` is pushed at.
+    let slot = move |i: u32| match quirks.gap {
+        Some((after, slots)) if i > after => i + slots,
+        _ => i,
+    };
     let description = match kind {
         CounterKind::Vp8WebmWithAudio => {
             assert!(
@@ -146,19 +177,23 @@ pub fn counter_video(
                 "fps {fps} must divide {AUDIO_RATE} so the audio matches the video duration"
             );
             let samples_per_buffer = AUDIO_RATE / fps;
+            let audio_buffers = frames + gap_slots + quirks.audio_tail;
             format!(
                 "appsrc name=src format=time caps={caps} \
                    ! vp8enc deadline=1 keyframe-max-dist={fps} ! queue ! mux. \
-                 audiotestsrc num-buffers={frames} samplesperbuffer={samples_per_buffer} \
+                 audiotestsrc num-buffers={audio_buffers} samplesperbuffer={samples_per_buffer} \
                    ! audio/x-raw,rate={AUDIO_RATE},channels=1 \
                    ! audioconvert ! vorbisenc ! queue ! mux. \
                  webmmux name=mux ! filesink name=out"
             )
         }
-        CounterKind::H264Mp4BFrames => format!(
-            "appsrc name=src format=time caps={caps} \
+        CounterKind::H264Mp4BFrames => {
+            assert_eq!(quirks.audio_tail, 0, "the H.264 counter has no audio");
+            format!(
+                "appsrc name=src format=time caps={caps} \
                ! x264enc bframes=2 key-int-max={fps} ! mp4mux ! filesink name=out"
-        ),
+            )
+        }
     };
     run_with(&description, path, |pipeline| {
         let src = pipeline
@@ -178,8 +213,9 @@ pub fn counter_video(
                         |i: u32| gst::ClockTime::SECOND.mul_div_floor(u64::from(i), u64::from(fps));
                     {
                         let buffer = buffer.get_mut().expect("a new buffer is writable");
-                        buffer.set_pts(at(next));
-                        buffer.set_duration(at(next + 1).zip(at(next)).map(|(b, a)| b - a));
+                        let slot = slot(next);
+                        buffer.set_pts(at(slot));
+                        buffer.set_duration(at(slot + 1).zip(at(slot)).map(|(b, a)| b - a));
                     }
                     let _ = src.push_buffer(buffer);
                     next += 1;

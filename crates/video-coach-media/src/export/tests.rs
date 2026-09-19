@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use video_coach_core::zoom::Zoom;
 
-use super::encode::{choose_encoder, fit_rect, zoom_params};
+use super::encode::{fit_rect, zoom_params};
 use super::*;
 use crate::fixtures::{self, CounterKind};
 
@@ -35,14 +35,6 @@ fn zoom_params_follow_the_measured_mapping() {
     assert_eq!(zoom_params(Zoom::IDENTITY), (1.0, 0.0, 0.0));
     // Scale s; translation −pan·s on both axes.
     assert_eq!(zoom_params(Zoom::new(2.0, 0.25, -0.125)), (2.0, -0.5, 0.25));
-}
-
-#[test]
-fn encoders_prefer_va_then_x264() {
-    let choice = |has: fn(&str) -> bool| choose_encoder(has).map(|(name, _)| name);
-    assert_eq!(choice(|_| true), Some("vah264lpenc"));
-    assert_eq!(choice(|f| f == "x264enc"), Some("x264enc"));
-    assert_eq!(choice(|_| false), None);
 }
 
 #[test]
@@ -87,8 +79,7 @@ fn a_mid_stream_error_fails_the_export_without_hanging() {
             let _ = tx.send(msg);
         },
         Some("identity error-after=10"),
-    )
-    .unwrap();
+    );
 
     let deadline = Duration::from_secs(60);
     let result = loop {

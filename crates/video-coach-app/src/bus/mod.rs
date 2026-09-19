@@ -189,8 +189,7 @@ pub enum Event {
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
     Level(f64),
-    /// The export's progress, and how it ended unless it failed: a failure
-    /// is a [`UserError::ExportFailed`].
+    /// The export's progress, and how it ended.
     Export(ExportStatus),
     /// Select this clip: an undo restored or edited it, or a redo edited it.
     /// Always sent after that change's `ProjectChanged`, which drops a
@@ -245,10 +244,7 @@ pub enum UserError {
     StopNotClean,
     /// Export is refused: there's nothing (or no way) to export yet.
     #[error("can't export: {0}")]
-    CantExport(&'static str),
-    /// An export that started ended without a file.
-    #[error("export failed: {0}")]
-    ExportFailed(String),
+    CantExport(String),
     #[error("{0}")]
     Io(String),
 }

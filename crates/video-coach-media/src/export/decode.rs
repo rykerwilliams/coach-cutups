@@ -7,17 +7,19 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use super::{start_failure, ExportError, SharedGl, Stopper, Watch, POLL};
+use super::{ExportError, SharedGl, Stopper, Watch, POLL};
 use crate::player::{diagnostics, gl_bin, gl_caps, Diagnostics};
 
 /// A target at most this far ahead of the current frame is reached by
-/// pulling forward (~1.3 ms a frame) rather than an accurate seek (12 ms on
-/// camera footage, up to ~100 ms on a 2 s GOP). Measured.
+/// pulling forward (~1.3 ms a frame) rather than a seek, which decodes from
+/// the keyframe before it (12 ms on camera footage, up to ~100 ms on a 2 s
+/// GOP). Measured.
 const PULL_AHEAD: gst::ClockTime = gst::ClockTime::from_mseconds(500);
 
 /// One decoded frame and its source time.
 struct Decoded {
-    buffer: gst::Buffer,
+    /// Holds a buffer with a PTS.
+    sample: gst::Sample,
     /// **Stream** time, not PTS: an MP4 edit list (B-frame delay) starts the
     /// segment after 0, and raw PTS then runs two frames ahead of the time the
     /// player shows, which is what the schedule's times are.
@@ -28,8 +30,6 @@ pub(super) struct Decoder {
     pipeline: Stopper,
     appsink: gst_app::AppSink,
     glupload: gst::Element,
-    /// The latest sample's caps.
-    caps: Option<gst::Caps>,
     /// The frame `frame_at` last answered with.
     current: Option<Decoded>,
     /// The frame after `current`, pulled to learn that `current` is still the
@@ -40,12 +40,12 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// Builds the pipeline, prerolls it, and sets it PLAYING. Its bus joins
-    /// `watch`.
+    /// Builds the pipeline, prerolls it, and sets it PLAYING. Its errors
+    /// reach `watch`.
     pub(super) fn start(
         source: &Path,
         gl: &SharedGl,
-        watch: &mut Watch,
+        watch: &Watch,
     ) -> Result<Decoder, ExportError> {
         let pipeline = gst::Pipeline::new();
         let make = |factory: &str| {
@@ -77,19 +77,17 @@ impl Decoder {
                 let _ = pad.link(&sink);
             }
         });
-        gl.install(&pipeline, &[gst::MessageType::Error]);
-        watch
-            .buses
-            .push(pipeline.bus().expect("a pipeline has a bus"));
+        // The appsink reports the end of the stream.
+        gl.install(&pipeline, watch);
         let pipeline = Stopper(pipeline);
 
         // Preroll first: a seek before the stream is up is dropped.
-        if pipeline.0.set_state(gst::State::Paused).is_err() {
-            return Err(start_failure(&pipeline.0, "could not open the source"));
+        if pipeline.set_state(gst::State::Paused).is_err() {
+            return Err(watch.failure("could not open the source"));
         }
         loop {
             watch.check()?;
-            match pipeline.0.state(POLL) {
+            match pipeline.state(POLL) {
                 (Ok(_), gst::State::Paused, gst::State::VoidPending) => break,
                 (Err(_), ..) => {
                     watch.check()?;
@@ -98,14 +96,13 @@ impl Decoder {
                 _ => {}
             }
         }
-        if pipeline.0.set_state(gst::State::Playing).is_err() {
-            return Err(start_failure(&pipeline.0, "could not play the source"));
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            return Err(watch.failure("could not play the source"));
         }
         Ok(Decoder {
             pipeline,
             appsink,
             glupload,
-            caps: None,
             current: None,
             next: None,
             eos: false,
@@ -113,7 +110,7 @@ impl Decoder {
     }
 
     /// The last frame with stream time at or before `target` (or the first
-    /// frame, for a target before it).
+    /// frame, for a target before it; the last, for one past the end).
     ///
     /// Reuses the current frame while it still answers, pulls forward to a
     /// target up to [`PULL_AHEAD`] ahead, and seeks otherwise. It never seeks
@@ -123,59 +120,53 @@ impl Decoder {
         &mut self,
         target: gst::ClockTime,
         watch: &Watch,
-    ) -> Result<gst::Buffer, ExportError> {
-        let behind = self.current.as_ref().is_none_or(|c| target < c.time);
-        let answered = !behind && (self.eos || self.next.as_ref().is_some_and(|n| n.time > target));
-        if !answered {
-            let near = self
-                .current
-                .as_ref()
-                .is_some_and(|c| target >= c.time && target - c.time <= PULL_AHEAD);
-            if !near {
-                self.seek(target)?;
-            }
-            loop {
+    ) -> Result<&gst::Sample, ExportError> {
+        // Past the end, the last frame answers every later target.
+        let far = self
+            .current
+            .as_ref()
+            .is_none_or(|c| target < c.time || (!self.eos && target - c.time > PULL_AHEAD));
+        if far {
+            self.seek(target)?;
+        }
+        while !self.eos {
+            if self.next.is_none() {
+                self.next = self.pull(watch)?;
                 if self.next.is_none() {
-                    self.next = self.pull(watch)?;
-                    if self.next.is_none() {
-                        self.eos = true;
-                        break;
-                    }
-                }
-                let next_time = self.next.as_ref().map(|n| n.time);
-                if self.current.is_none() || next_time.is_some_and(|t| t <= target) {
-                    self.current = self.next.take();
-                } else {
+                    self.eos = true;
                     break;
                 }
             }
+            let next = self.next.as_ref().expect("pulled above");
+            if self.current.is_some() && next.time > target {
+                break;
+            }
+            self.current = self.next.take();
         }
         self.current
             .as_ref()
-            .map(|c| c.buffer.clone())
+            .map(|c| &c.sample)
             .ok_or_else(|| ExportError::Failed(format!("the source has no frame at {target}")))
     }
 
-    /// The latest decoded frame's caps: once `frame_at` has answered, those
-    /// of the frames it returns.
-    pub(super) fn caps(&self) -> &gst::Caps {
-        self.caps
-            .as_ref()
-            .expect("caps are known once frame_at has returned a frame")
-    }
-
     pub(super) fn diagnostics(&self) -> Diagnostics {
-        diagnostics(&self.pipeline.0, Some(&self.glupload))
+        diagnostics(&self.pipeline, Some(&self.glupload))
     }
 
-    /// An accurate, flushing seek. The frames held are from before it.
+    /// A flushing seek to the keyframe at or before `target`, from which
+    /// `frame_at` pulls forward. Not an accurate seek: it drops a frame
+    /// whose duration ends before `target` although it is the last one
+    /// before it (a gap, or VFR), and past the video's end it finds nothing.
+    /// The frames held are from before it.
     fn seek(&mut self, target: gst::ClockTime) -> Result<(), ExportError> {
         self.current = None;
         self.next = None;
         self.eos = false;
         self.pipeline
-            .0
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target)
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE,
+                target,
+            )
             .map_err(|_| ExportError::Failed(format!("the source refused a seek to {target}")))
     }
 
@@ -184,10 +175,7 @@ impl Decoder {
     fn pull(&mut self, watch: &Watch) -> Result<Option<Decoded>, ExportError> {
         loop {
             if let Some(sample) = self.appsink.try_pull_sample(POLL) {
-                let buffer = sample
-                    .buffer_owned()
-                    .ok_or_else(|| ExportError::Failed("a decoded sample has no buffer".into()))?;
-                let pts = buffer.pts().ok_or_else(|| {
+                let pts = sample.buffer().and_then(|b| b.pts()).ok_or_else(|| {
                     ExportError::Failed("a decoded frame has no timestamp".into())
                 })?;
                 let segment = sample
@@ -202,8 +190,7 @@ impl Decoder {
                     Some(gst::Signed::Positive(t)) => t,
                     _ => gst::ClockTime::ZERO,
                 };
-                self.caps = sample.caps_owned();
-                return Ok(Some(Decoded { buffer, time }));
+                return Ok(Some(Decoded { sample, time }));
             }
             if self.appsink.is_eos() {
                 return Ok(None);

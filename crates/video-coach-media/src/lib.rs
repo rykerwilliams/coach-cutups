@@ -6,6 +6,7 @@
 
 pub mod capture;
 pub mod export;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod player;
 pub mod probe;

@@ -16,6 +16,12 @@ gstreamer-pbutils.workspace = true
 gstreamer-video.workspace = true
 thiserror.workspace = true
 
+[features]
+# The synthetic media in `fixtures`, for tests here and in the harness.
+fixtures = []
+
 [dev-dependencies]
+# Itself with `fixtures`, for the integration tests in `tests/`.
+video-coach-media = { path = ".", features = ["fixtures"] }
 tempfile.workspace = true
 uuid.workspace = true

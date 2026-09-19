@@ -52,7 +52,8 @@ From the spike and the review, on the reference laptop:
 - **Frame identity:** 1800/1800 frames exact against a burned-in counter.
   - Source time is **stream time** (`segment.to_stream_time(pts)`). An edit list in an MP4 with B-frames puts raw PTS 2 frames ahead.
   - Seconds → ns **rounds** (`seconds_to_clock`).
-- **Seek vs pull:** pulling a frame forward costs about 1.3 ms; an accurate seek costs 12 ms (camera footage) to 60–105 ms (a 2 s GOP). The forward-reuse threshold is **0.5 s**.
+- **Seek vs pull:** pulling a frame forward costs about 1.3 ms; a seek, which decodes from the keyframe before its target, costs 12 ms (camera footage) to 60–105 ms (a 2 s GOP). The forward-reuse threshold is **0.5 s**.
+- *Corrected in the code review:* **an accurate seek can miss the frame.** The decoder drops every frame whose duration ends before the target, so a target in a gap between frames (VFR MKV/WebM, a dropped frame) got the frame after it. And past the video's end, where the audio runs on, it found no frame at all. The pump seeks to the keyframe at or before the target (`KEY_UNIT | SNAP_BEFORE`) and pulls forward to the last frame ≤ target; past the end, that is the video's last frame. Both cases are media tests.
 - **Encoders.**
   - `vah264lpenc` is the only hardware H.264 encoder here, and it is **CQP-only**. Its properties are `rate-control`, `qpi`, `qpp` and `key-int-max`, and it emits no B-frames.
   - QP 22/26/30 gives 15.4/8.4/4.9 Mbps.
@@ -112,11 +113,11 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 - **The pump,** on the exporter's thread, for each `FrameSpec`:
   - **Reuse:** if the cached current frame is still "last PTS ≤ `source_time`" (the next frame's PTS is > `source_time`, or the source is at EOS), re-push it.
   - **Pull:** if the target is ahead and within 0.5 s, pull forward.
-  - **Seek:** otherwise, an accurate seek.
+  - **Seek:** otherwise, a flushing seek to the keyframe at or before the target (`KEY_UNIT | SNAP_BEFORE`), then pull forward. Not an accurate seek, which drops the wanted frame in a gap and finds nothing past the video's end (see Measured facts).
   - **Never seek backwards** to a target that is ≥ the current frame's PTS.
   - **PTS** is stream time, and seconds → ns go through `seconds_to_clock`.
   - **Push** `buffer.copy()` (a reference) with PTS `n/30` and duration `1/30`.
-  - **Watch the encode bus** for errors between pushes, since a failed encoder leaves a blocking `appsrc` hanging.
+  - **Watch for errors** between pushes, since a failed encoder leaves a blocking `appsrc` hanging. Each pipeline's bus sync handler records the first `ERROR` as it is posted (and the encode side's `EOS`), and drops every message.
 - **Output file:**
   - It is written to `<path>.part` and renamed to `<path>` only on success, so a cancel or error never destroys a previous file there.
   - `reserved-max-duration` puts `moov` first with no temp file.
@@ -150,13 +151,13 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 
 **On the bus:**
 - **`Command::ExportClip { id, path }`:**
-  - refused, with an `Event::Error`, if the clip or its source is missing, or an export is running;
+  - refused, with an `Event::Error(CantExport)`, if the clip or its source is missing, the clip has no frames, the path is the source video, or an export is running;
   - dropped silently by the recording guard while recording, since the UI greys it out.
   - Otherwise the bus computes the schedule and starts the exporter.
 - **`Command::CancelExport`** sets the flag, and nothing else.
 - **The outcome.** The bus keeps the exporter until `Finished` arrives, then:
   - joins it (instantly);
-  - emits `Event::Export(ExportStatus::{Done(PathBuf), Cancelled})`, or `Event::Error(UserError::ExportFailed(msg))`;
+  - emits `Event::Export(ExportStatus::{Done(PathBuf), Cancelled, Failed(msg)})`;
   - logs the diagnostics line.
 
   Because the thread's own result decides the outcome, a cancel that races a finished export reports `Done`, which is true. There is one sender and a FIFO channel, so there is no job id and no stale message.
@@ -173,7 +174,7 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 
 ### X5. UI
 
-- **Clip context menu:** "Export video…". It opens an `rfd` save dialog (default name, `*.mp4` filter), then sends `ExportClip`. It is disabled while an export runs or while recording, and Record is disabled while an export runs.
+- **Clip context menu:** "Export video…". It opens an `rfd` save dialog (default name, `*.mp4` filter), then sends `ExportClip`. A name typed with no extension gets `.mp4`; if that file exists, the export is refused (the dialog confirmed an overwrite of the name as typed). It is disabled while an export runs or while recording, and Record is disabled while an export runs.
 - **Progress.** An `export-progress` property, hidden when negative, drives a small progress bar with **Cancel** in the transport. It is separate from the timed notice line, so notices can't overwrite it.
 - **Completion:** "Exported to …" goes through the ordinary notice; an error goes through the usual dialog. The bar hides on any terminal outcome.
 
@@ -185,7 +186,7 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 |---|---|
 | `video-coach-core` | `export.rs`: `OUTPUT_FPS`, `FrameSpec`, `frame_schedule`. |
 | `video-coach-media` | `export/`: `Exporter` (the decode pipeline via the shared `gl_bin`, the pump, the encode pipeline, the encoder probe, the surfaceless EGL display and context sharing, the zoom mapping, `.part` handling, cancel, and a non-blocking pump). `gstreamer-gl-egl` (with `v1_24`) moves into media's dependencies. |
-| `video-coach-app` | Bus: `ExportClip`, `CancelExport`, `Input::Export`, `Event::Export`, `UserError::ExportFailed`, refusing to record during an export, and dropping the exporter on shutdown. UI: the menu item, save dialog, progress bar and Cancel. |
+| `video-coach-app` | Bus: `ExportClip`, `CancelExport`, `Input::Export`, `Event::Export`, `UserError::CantExport`, refusing to record during an export, and dropping the exporter on shutdown. UI: the menu item, save dialog, progress bar and Cancel. |
 | `video-coach-harness` | Export end to end, running on llvmpipe in CI. |
 | CI | No change expected. `gstreamer1.0-gl` and `libgl1` already pull in `libegl-mesa0`, `mesa-libgallium` (llvmpipe) and `libgl1-mesa-dri` as hard dependencies on noble. With no `/dev/dri`, `new_surfaceless` falls back to llvmpipe by itself. `openh264dec` comes from plugins-bad. |
 

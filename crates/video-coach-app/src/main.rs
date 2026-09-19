@@ -331,15 +331,21 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>, pickers: Picker
             let Some((folder, file_name)) = suggested else {
                 return;
             };
-            let bus = bus.clone();
+            let (weak, bus) = (weak.clone(), bus.clone());
             pickers.open(&w, Pick::Export { folder, file_name }, move |mut path| {
-                // The portal adds no extension to a typed name, and the
-                // file is an MP4 whatever it's called.
-                if !path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
-                {
-                    path.as_mut_os_string().push(".mp4");
+                // The portal adds no extension to a typed name. The picker
+                // confirmed an overwrite of the name as typed, not of this
+                // one, so an existing file is refused.
+                if path.extension().is_none() {
+                    path.set_extension("mp4");
+                    if path.exists() {
+                        if let Some(w) = weak.upgrade() {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy();
+                            let why = format!("{name} already exists");
+                            show_error(&w, &UserError::CantExport(why).to_string());
+                        }
+                        return;
+                    }
                 }
                 bus.borrow().send(Command::ExportClip { id, path });
             });
@@ -688,6 +694,10 @@ fn on_event(w: &AppWindow, event: Event) {
                 show_notice(w, format!("Exported to {}", name.to_string_lossy()));
             }
             ExportStatus::Cancelled => w.set_export_progress(-1),
+            ExportStatus::Failed(e) => {
+                w.set_export_progress(-1);
+                show_error(w, &format!("export failed: {e}"));
+            }
         },
         // After the operation's `ProjectChanged`, so the clip is in the
         // project; a tag filter that hides it is cleared, so it's listed too.
@@ -712,19 +722,16 @@ fn on_event(w: &AppWindow, event: Event) {
             eprintln!("ui: notice: {e}");
             show_notice(w, sentence(&e.to_string()));
         }
-        Event::Error(e) => {
-            eprintln!("ui: error: {e}");
-            // An export's end: its bar goes. (A refusal leaves a running
-            // export's bar up.)
-            if let UserError::ExportFailed(_) = e {
-                w.set_export_progress(-1);
-            }
-            // The first error stays up: one failure can report several, and
-            // the first says what went wrong.
-            if w.get_error_message().is_empty() {
-                w.set_error_message(sentence(&e.to_string()).into());
-            }
-        }
+        Event::Error(e) => show_error(w, &e.to_string()),
+    }
+}
+
+/// Shows `text` in the error dialog, unless one is already up: one failure
+/// can report several, and the first says what went wrong.
+fn show_error(w: &AppWindow, text: &str) {
+    eprintln!("ui: error: {text}");
+    if w.get_error_message().is_empty() {
+        w.set_error_message(sentence(text).into());
     }
 }
 

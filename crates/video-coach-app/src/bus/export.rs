@@ -26,6 +26,9 @@ pub enum ExportStatus {
     Done(PathBuf),
     /// Cancelled: no file, and any file already at the path untouched.
     Cancelled,
+    /// Failed, with no file and any file already at the path untouched.
+    /// A refusal to start is a [`UserError::CantExport`] instead.
+    Failed(String),
 }
 
 impl Bus {
@@ -37,7 +40,7 @@ impl Bus {
     }
 
     fn start_export(&mut self, id: Uuid, path: PathBuf) -> Result<(), UserError> {
-        let refused = |why| Err(UserError::CantExport(why));
+        let refused = |why: &str| Err(UserError::CantExport(why.into()));
         if self.export.is_some() {
             return refused("an export is running");
         }
@@ -47,25 +50,35 @@ impl Bus {
         let Some(clip) = open.project.clips.iter().find(|c| c.id == id) else {
             return refused("the clip is gone");
         };
-        let Some(source) = open.project.source_videos.get(clip.source_index) else {
+        let Some(video) = open.project.source_videos.get(clip.source_index) else {
             return refused("the clip's game video is gone");
         };
         if self.missing.get(clip.source_index).copied().unwrap_or(true) {
             return refused("the clip's game video is missing; relink it first");
         }
+        let source = open.folder.join(&video.relative_path);
+        // The finished file would replace the game video.
+        if path
+            .canonicalize()
+            .is_ok_and(|p| Some(p) == source.canonicalize().ok())
+        {
+            return refused("that file is the clip's game video");
+        }
+        let frames = frame_schedule(clip, video.duration_seconds);
+        if frames.is_empty() {
+            return refused("the clip has nothing to export");
+        }
         // A snapshot: later edits to the project don't reach this export.
         let job = ExportJob {
-            source: open.folder.join(&source.relative_path),
-            frames: frame_schedule(clip, source.duration_seconds),
+            source,
+            frames,
             path,
         };
         let tx = self.tx.clone();
-        let exporter = Exporter::start(job, move |msg| {
+        self.export = Some(Exporter::start(job, move |msg| {
             // Fails only once the bus thread has exited.
             let _ = tx.send(Input::Export(msg));
-        })
-        .map_err(UserError::ExportFailed)?;
-        self.export = Some(exporter);
+        }));
         self.emit(Event::Export(ExportStatus::Running(0)));
         Ok(())
     }
@@ -103,7 +116,7 @@ impl Bus {
                     }
                     Err(ExportError::Failed(e)) => {
                         eprintln!("bus: export failed: {e}");
-                        self.emit(Event::Error(UserError::ExportFailed(e)));
+                        self.emit(Event::Export(ExportStatus::Failed(e)));
                     }
                 }
             }

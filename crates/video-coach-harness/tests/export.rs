@@ -24,7 +24,7 @@ struct Rig {
     h: Harness,
     clip: Uuid,
     out: PathBuf,
-    _tmp: TempDir,
+    tmp: TempDir,
 }
 
 impl Rig {
@@ -53,14 +53,10 @@ impl Rig {
         let mut h = Harness::new(&tmp.path().join("config"));
         h.send(Command::OpenProject(folder));
         h.wait_opened();
-        Rig {
-            h,
-            clip,
-            out,
-            _tmp: tmp,
-        }
+        Rig { h, clip, out, tmp }
     }
 
+    /// Exports the clip to `name` in `out`.
     fn export(&self, name: &str) -> PathBuf {
         let path = self.out.join(name);
         self.h.send(Command::ExportClip {
@@ -77,6 +73,15 @@ fn outputs(out: &Path) -> Vec<String> {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect()
+}
+
+/// How the running export ends, past its progress.
+fn outcome(h: &mut Harness) -> ExportStatus {
+    h.wait_map("the export's outcome", |e| match e {
+        Event::Export(ExportStatus::Running(_)) => None,
+        Event::Export(s) => Some(s.clone()),
+        _ => None,
+    })
 }
 
 fn no_export_events(rest: &[Event]) {
@@ -109,30 +114,26 @@ fn an_export_reports_progress_then_its_file() {
     rig.h.shutdown();
 }
 
+/// A failed export reports it, and doesn't block the next.
 #[test]
-fn cancel_stops_an_export_and_leaves_nothing() {
-    // 300 frames: far from done when the cancel lands.
-    let mut rig = Rig::open(10.0);
-    rig.export("clip.mp4");
+fn a_failed_export_is_reported_and_the_next_one_runs() {
+    let mut rig = Rig::open(1.0);
+    rig.export("missing/clip.mp4");
     assert_eq!(rig.h.wait_export(), ExportStatus::Running(0));
-    // Mid-export, not before the first frame.
-    assert!(matches!(rig.h.wait_export(), ExportStatus::Running(1..)));
+    let status = outcome(&mut rig.h);
+    assert!(matches!(status, ExportStatus::Failed(_)), "{status:?}");
 
-    rig.h.send(Command::CancelExport);
-    let status = rig.h.wait_map("the export's outcome", |e| match e {
-        Event::Export(ExportStatus::Running(_)) => None,
-        Event::Export(s) => Some(s.clone()),
-        _ => None,
-    });
-    assert_eq!(status, ExportStatus::Cancelled);
-    assert!(outputs(&rig.out).is_empty(), "{:?}", outputs(&rig.out));
+    let path = rig.export("clip.mp4");
+    assert_eq!(outcome(&mut rig.h), ExportStatus::Done(path));
+    assert_eq!(outputs(&rig.out), ["clip.mp4"]);
     rig.h.shutdown();
 }
 
-/// One export at a time, and never alongside a recording. Shutdown cancels
-/// the export that's running.
+/// One export at a time, and never alongside a recording. Cancel stops the
+/// one running, leaving nothing.
 #[test]
 fn while_exporting_a_second_export_and_recording_are_refused() {
+    // 300 frames: far from done when the cancel lands.
     let mut rig = Rig::open(10.0);
     rig.export("first.mp4");
     rig.export("second.mp4");
@@ -143,21 +144,19 @@ fn while_exporting_a_second_export_and_recording_are_refused() {
     assert_eq!(rig.h.wait_export(), ExportStatus::Running(0));
     assert_eq!(
         rig.h.wait_for_error(),
-        UserError::CantExport("an export is running")
+        UserError::CantExport("an export is running".into())
     );
     assert_eq!(
         rig.h.wait_for_error(),
         UserError::CantRecord("an export is running")
     );
+    rig.h.send(Command::CancelExport);
+    assert_eq!(outcome(&mut rig.h), ExportStatus::Cancelled);
     let rest = rig.h.shutdown();
     assert!(
-        !rest.iter().any(|e| matches!(
-            e,
-            Event::Recording(_) | Event::Export(ExportStatus::Done(_))
-        )),
+        !rest.iter().any(|e| matches!(e, Event::Recording(_))),
         "{rest:#?}"
     );
-    // Shutdown cancelled the first, which deleted its partial file.
     assert!(outputs(&rig.out).is_empty(), "{:?}", outputs(&rig.out));
 }
 
@@ -169,7 +168,7 @@ fn an_export_needs_its_clip_and_game_video() {
     rig.export("clip.mp4");
     assert_eq!(
         rig.h.wait_for_error(),
-        UserError::CantExport("the clip's game video is missing; relink it first")
+        UserError::CantExport("the clip's game video is missing; relink it first".into())
     );
     rig.h.send(Command::ExportClip {
         id: Uuid::new_v4(),
@@ -177,7 +176,37 @@ fn an_export_needs_its_clip_and_game_video() {
     });
     assert_eq!(
         rig.h.wait_for_error(),
-        UserError::CantExport("the clip is gone")
+        UserError::CantExport("the clip is gone".into())
+    );
+    let rest = rig.h.shutdown();
+    no_export_events(&rest);
+    assert!(outputs(&rig.out).is_empty(), "{:?}", outputs(&rig.out));
+}
+
+#[test]
+fn an_export_never_writes_over_its_game_video() {
+    let mut rig = Rig::open(1.0);
+    let source = rig.tmp.path().join("media/a.webm");
+    rig.h.send(Command::ExportClip {
+        id: rig.clip,
+        path: source.clone(),
+    });
+    assert_eq!(
+        rig.h.wait_for_error(),
+        UserError::CantExport("that file is the clip's game video".into())
+    );
+    let rest = rig.h.shutdown();
+    no_export_events(&rest);
+    assert!(source.exists());
+}
+
+#[test]
+fn an_export_needs_frames() {
+    let mut rig = Rig::open(0.0);
+    rig.export("clip.mp4");
+    assert_eq!(
+        rig.h.wait_for_error(),
+        UserError::CantExport("the clip has nothing to export".into())
     );
     let rest = rig.h.shutdown();
     no_export_events(&rest);

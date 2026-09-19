@@ -11,7 +11,10 @@ use gstreamer_video as gst_video;
 use video_coach_core::export::OUTPUT_FPS;
 use video_coach_core::zoom::Zoom;
 
-use super::{start_failure, ExportError, SharedGl, Stopper, Watch, POLL};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use super::{ExportError, SharedGl, Stopper, Watch, POLL};
 
 /// The output frame size.
 pub(super) const OUTPUT_WIDTH: i32 = 1920;
@@ -39,31 +42,34 @@ fn encoders() -> [(&'static str, String); 2] {
     ]
 }
 
-/// The first of [`encoders`] that `has`. A presence check only: one that
-/// fails at start fails the export (BACKLOG #39).
-pub(super) fn choose_encoder(has: impl Fn(&str) -> bool) -> Option<(&'static str, String)> {
-    encoders().into_iter().find(|(name, _)| has(name))
-}
-
 pub(super) struct Encoder {
-    pipeline: Stopper,
+    /// Held to go to NULL with the encoder.
+    _pipeline: Stopper,
     appsrc: gst_app::AppSrc,
     name: &'static str,
+    /// Set when the file is complete.
+    eos: Arc<AtomicBool>,
 }
 
 impl Encoder {
-    /// Builds the graph for frames with the decoder's `caps`, writing to
-    /// `part`, and sets it PLAYING. Output frame `n` gets `zooms[n]`. Its bus
-    /// joins `watch`. `inject` is spliced in before the encoder (tests).
+    /// Builds the graph for frames shaped like `first` (the decoder's),
+    /// writing to `part`, and sets it PLAYING. Output frame `n` gets
+    /// `zooms[n]`. Its errors reach `watch`. `inject` is spliced in before the
+    /// encoder (tests).
+    ///
+    /// The encoder is the first of [`encoders`] installed. A presence check
+    /// only: one that fails at start fails the export (BACKLOG #39).
     pub(super) fn start(
-        caps: &gst::Caps,
+        first: &gst::Sample,
         part: &Path,
         zooms: Vec<Zoom>,
         gl: &SharedGl,
         inject: Option<&str>,
-        watch: &mut Watch,
+        watch: &Watch,
     ) -> Result<Encoder, ExportError> {
-        let (name, settings) = choose_encoder(|f| gst::ElementFactory::find(f).is_some())
+        let (name, settings) = encoders()
+            .into_iter()
+            .find(|(name, _)| gst::ElementFactory::find(name).is_some())
             .ok_or_else(|| {
                 ExportError::Failed(
                     "no H.264 encoder: install gst-plugins-ugly (x264enc) or VA drivers".into(),
@@ -92,9 +98,12 @@ impl Encoder {
             .expect("a multi-element launch string yields a pipeline");
         let by_name = |n: &str| pipeline.by_name(n).expect("named in the launch string");
 
+        let caps = first
+            .caps()
+            .ok_or_else(|| ExportError::Failed("a decoded frame has no caps".into()))?;
         let info = gst_video::VideoInfo::from_caps(caps)
             .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
-        let mut caps = caps.clone();
+        let mut caps = caps.to_owned();
         caps.make_mut()
             .set("framerate", gst::Fraction::new(OUTPUT_FPS as i32, 1));
         let appsrc = by_name("src")
@@ -110,30 +119,27 @@ impl Encoder {
         mix_pad.set_property("ypos", y);
         mix_pad.set_property("width", w);
         mix_pad.set_property("height", h);
-        install_zoom(&by_name("zoom"), zooms.clone());
-
         // `moov` goes first, in space reserved up front, with no temp file
         // (`faststart` writes the whole `mdat` to `$TMPDIR`, which a crash
         // leaks). The reserve must cover the whole file, so it gets a margin.
         let duration = frame_time(zooms.len() as u64);
+        install_zoom(&by_name("zoom"), zooms);
         by_name("mux").set_property(
             "reserved-max-duration",
             (duration + duration / 10 + gst::ClockTime::SECOND).nseconds(),
         );
         by_name("out").set_property("location", part);
 
-        gl.install(&pipeline, &[gst::MessageType::Error, gst::MessageType::Eos]);
-        watch
-            .buses
-            .push(pipeline.bus().expect("a pipeline has a bus"));
+        let eos = gl.install(&pipeline, watch);
         let pipeline = Stopper(pipeline);
-        if pipeline.0.set_state(gst::State::Playing).is_err() {
-            return Err(start_failure(&pipeline.0, "could not start the encoder"));
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            return Err(watch.failure("could not start the encoder"));
         }
         Ok(Encoder {
-            pipeline,
+            _pipeline: pipeline,
             appsrc,
             name,
+            eos,
         })
     }
 
@@ -142,15 +148,18 @@ impl Encoder {
         self.name
     }
 
-    /// Pushes `buffer` as output frame `n`. A reference, not a pixel copy:
-    /// the same GL texture may go out many times.
+    /// Pushes `sample`'s buffer as output frame `n`. A reference, not a pixel
+    /// copy: the same GL texture may go out many times.
     pub(super) fn push(
         &self,
         n: u64,
-        buffer: &gst::Buffer,
+        sample: &gst::Sample,
         watch: &Watch,
     ) -> Result<(), ExportError> {
-        let mut out = buffer.copy();
+        let mut out = sample
+            .buffer()
+            .expect("the decoder keeps only samples with a buffer")
+            .copy();
         {
             let out = out.get_mut().expect("a fresh copy is writable");
             out.set_pts(frame_time(n));
@@ -162,27 +171,23 @@ impl Encoder {
             watch.check()?;
             std::thread::sleep(Duration::from(POLL) / 5);
         }
-        self.appsrc.push_buffer(out).map_err(|e| {
-            watch
-                .check()
-                .err()
-                .unwrap_or_else(|| ExportError::Failed(format!("pushing frame {n}: {e:?}")))
-        })?;
+        self.appsrc
+            .push_buffer(out)
+            .map_err(|e| watch.failure(format!("pushing frame {n}: {e:?}")))?;
         Ok(())
     }
 
     /// Ends the stream and waits for the muxer to finish the file.
     pub(super) fn finish(&self, watch: &Watch) -> Result<(), ExportError> {
         let _ = self.appsrc.end_of_stream();
-        let bus = self.pipeline.0.bus().expect("a pipeline has a bus");
         loop {
-            // Only the cancel flag: `watch.check()` would pop the EOS away.
-            watch.check_cancel()?;
-            match bus.timed_pop_filtered(POLL, &[gst::MessageType::Eos, gst::MessageType::Error]) {
-                Some(msg) if msg.type_() == gst::MessageType::Eos => return Ok(()),
-                Some(msg) => return Err(super::failure(&msg)),
-                None => {}
+            // Read before the check: an error is recorded before any EOS.
+            let done = self.eos.load(Ordering::SeqCst);
+            watch.check()?;
+            if done {
+                return Ok(());
             }
+            std::thread::sleep(POLL.into());
         }
     }
 }

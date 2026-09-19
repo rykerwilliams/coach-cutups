@@ -56,11 +56,6 @@ const DUR: f64 = 1000.0;
 const FPS: f64 = OUTPUT_FPS as f64;
 
 #[test]
-fn output_is_thirty_fps() {
-    assert_eq!(OUTPUT_FPS, 30);
-}
-
-#[test]
 fn frame_count_covers_the_total() {
     assert_eq!(frame_schedule(&clip(0.0, 2.0, vec![]), DUR).len(), 60);
     // A partial trailing interval still gets its frame at 2.0 s.

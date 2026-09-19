@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 video-coach-app = { path = "../video-coach-app" }
 video-coach-core = { path = "../video-coach-core" }
-video-coach-media = { path = "../video-coach-media" }
+video-coach-media = { path = "../video-coach-media", features = ["fixtures"] }
 gstreamer.workspace = true
 uuid.workspace = true
 

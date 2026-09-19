@@ -19,7 +19,8 @@ use video_coach_core::export::{frame_schedule, FrameSpec};
 use video_coach_core::project::Clip;
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
-    self, block_centre, counter_video, decode_counters, read_counter, CounterKind, COUNTER_BITS,
+    self, block_centre, counter_video, counter_video_with, decode_counters, read_counter,
+    CounterKind, CounterQuirks, COUNTER_BITS,
 };
 use video_coach_media::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
 
@@ -60,8 +61,7 @@ fn export_with(
         ExportMessage::Finished(result) => {
             let _ = tx.send(result);
         }
-    })
-    .unwrap();
+    });
     with_exporter(&exporter);
     let result = rx.recv_timeout(TIMEOUT).expect("the export finished");
     eprintln!(
@@ -259,6 +259,71 @@ fn a_vp8_export_shows_the_scheduled_frame_every_frame() {
 #[test]
 fn an_h264_export_shows_the_scheduled_frame_every_frame() {
     fiducial(CounterKind::H264Mp4BFrames);
+}
+
+/// An export of `times` from `source` shows `expected`.
+fn exports_as(source: PathBuf, times: &[f64], expected: &[u32]) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.mp4");
+    let frames = times
+        .iter()
+        .map(|&source_time| FrameSpec {
+            source_time,
+            zoom: Zoom::IDENTITY,
+        })
+        .collect();
+    export(ExportJob {
+        source,
+        frames,
+        path: path.clone(),
+    })
+    .unwrap();
+    assert_eq!(decode_counters(&path), expected);
+}
+
+/// A seek landing in a gap between frames (VFR, a dropped frame) answers
+/// with the frame before it, although that frame's duration ends before the
+/// target: an accurate seek drops it.
+#[test]
+fn a_seek_into_a_gap_shows_the_frame_before_it() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Frame 10 at 0.40 s lasts to 0.44 s; frame 11 is at 0.64 s, 12 at 0.68 s.
+    let source = counter_video_with(
+        &dir.path().join("src.webm"),
+        640,
+        360,
+        25,
+        50,
+        CounterKind::Vp8WebmWithAudio,
+        CounterQuirks {
+            gap: Some((10, 5)),
+            audio_tail: 0,
+        },
+    );
+    exports_as(source, &[0.5, 0.5, 0.7], &[10, 10, 12]);
+}
+
+/// Past the video's end, where the audio runs on, the export shows the last
+/// frame: an accurate seek there finds no video at all.
+#[test]
+fn a_seek_past_the_video_shows_its_last_frame() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // 2 s of video, 3 s of audio.
+    let source = counter_video_with(
+        &dir.path().join("src.webm"),
+        640,
+        360,
+        25,
+        50,
+        CounterKind::Vp8WebmWithAudio,
+        CounterQuirks {
+            gap: None,
+            audio_tail: 25,
+        },
+    );
+    exports_as(source, &[2.5, 2.6], &[49, 49]);
 }
 
 /// A 4:3 source is pillarboxed into black bars, and a zoom moves the counter
