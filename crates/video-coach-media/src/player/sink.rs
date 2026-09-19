@@ -92,11 +92,7 @@ pub(super) fn video_sink(kind: SinkKind) -> VideoSink {
     let mailbox = FrameMailbox::default();
     let appsink = gst_app::AppSink::builder()
         .caps(&match kind {
-            SinkKind::Gl => gst_video::VideoCapsBuilder::new()
-                .features([gst_gl::CAPS_FEATURE_MEMORY_GL_MEMORY])
-                .format(gst_video::VideoFormat::Rgba)
-                .field("texture-target", "2D")
-                .build(),
+            SinkKind::Gl => gl_caps(),
             // Any system-memory layout: the decoder picks (NV12 from
             // `vavp8dec`, I420 from `vp8dec`), so tests never assert on it.
             SinkKind::System => gst::Caps::builder("video/x-raw").build(),
@@ -134,9 +130,19 @@ pub(super) fn audio_sink(kind: SinkKind) -> gst::Element {
         .expect("audio sink is missing (gst-plugins-base/good)")
 }
 
+/// What a GL sink's appsink accepts: RGBA 2D textures in GL memory.
+pub(crate) fn gl_caps() -> gst::Caps {
+    gst_video::VideoCapsBuilder::new()
+        .features([gst_gl::CAPS_FEATURE_MEMORY_GL_MEMORY])
+        .format(gst_video::VideoFormat::Rgba)
+        .field("texture-target", "2D")
+        .build()
+}
+
 /// `glupload ! glcolorconvert ! appsink` as one bin, ghosting `glupload`'s
-/// sink pad (spec D1). Returns the bin and its `glupload`.
-fn gl_bin(appsink: &gst_app::AppSink) -> (gst::Element, gst::Element) {
+/// sink pad (spec D1). Returns the bin and its `glupload`. `appsink` should
+/// accept [`gl_caps`]. Export's decode pipeline uses it too.
+pub(crate) fn gl_bin(appsink: &gst_app::AppSink) -> (gst::Element, gst::Element) {
     let make = |name: &str| {
         gst::ElementFactory::make(name)
             .build()

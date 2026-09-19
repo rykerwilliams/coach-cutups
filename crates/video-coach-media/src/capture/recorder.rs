@@ -15,6 +15,7 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 
 use super::devices::{choose_encoder, Camera, Input};
+use crate::error_text;
 
 /// Test sources' frame size: small, so x264 stays cheap on CI, where tests run
 /// in parallel.
@@ -383,15 +384,4 @@ fn level_peak(s: &gst::StructureRef) -> Option<f64> {
         .iter()
         .filter_map(|v| v.get::<f64>().ok())
         .reduce(f64::max)
-}
-
-fn error_text(err: &gst::message::Error) -> String {
-    let from = err
-        .src()
-        .map(|s| format!("{}: ", s.name()))
-        .unwrap_or_default();
-    match err.debug() {
-        Some(debug) => format!("{from}{} ({debug})", err.error()),
-        None => format!("{from}{}", err.error()),
-    }
 }

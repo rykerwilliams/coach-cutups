@@ -45,9 +45,9 @@ From the spike and the review, on the reference laptop:
   - Its output size is the bounding box of its pads, and its frame rate comes from the input caps. Both must be **pinned** after the mixer: `width=1920,height=1080,framerate=30/1`.
   - A 60 fps source otherwise produced a 60/1 file with every frame doubled.
 - **The zoom mapping,** with `gltransformation` before the mixer, where its output is the source resolution:
-  - `scale-x = scale-y = s`, `translation-x = −pan_x·s`, `translation-y = +pan_y·s`. Positive `translation-y` moves the image **up**.
-  - Verified with a 4:3 source letterboxed into 1920×1080: identity, s=2 with pan (0.2, −0.2), and s=3 with pan (0.25, −0.25), each within a pixel.
-  - The zoomed content is clipped to the fit rect, and the bars stay black.
+  - `scale-x = scale-y = s`, `translation-x = −pan_x·s`, `translation-y = −pan_y·s`. Translation is in units of the picture's width and height, applied after the scale; positive `translation-y` moves the image **down**.
+  - *Corrected in Task 2.* Offered the choice, `gltransformation` doesn't render: it passes the frame through with an affine-transformation meta, and `glvideomixer` draws the transformed quad **unclipped**, so a zoomed 4:3 source spilled into its bars. The review measured that path, where `translation-y` has the opposite sign. The exporter strips that meta from `gltransformation`'s allocation answer, so it renders into its own source-sized texture and the zoom is clipped to the fit rect.
+  - Verified on the render path: s = 0.25 and 0.5 with translations on 4:3 and 16:9, and s=2 with pan (0.2, −0.2) on a 4:3 source letterboxed into 1920×1080 (the media test), with the bars black.
 - **Sub-pixel pans:** `gltransformation` is smooth (step std 0.005 px).
 - **Frame identity:** 1800/1800 frames exact against a burned-in counter.
   - Source time is **stream time** (`segment.to_stream_time(pts)`). An edit list in an MP4 with B-frames puts raw PTS 2 frames ahead.
@@ -105,7 +105,7 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 
 - **There is one graph, and no software variant.** The exporter owns its GL display, so it doesn't depend on the UI. On a machine without a GPU, Mesa's llvmpipe runs the same graph, CI included. That way CI tests the shipping graph: its sub-pixel zoom, its mapping, its letterbox.
   - Without EGL at all, export fails with a clear error. It never silently falls back to a stair-stepping crop.
-- **One GL display and context** (`GLDisplayEGL::new_surfaceless()`, plus a `GLContext` created from it) is shared by both pipelines. Each pipeline's bus sync handler answers `NeedContext` for `gst.gl.GLDisplay` and `gst.gl.app_context`, so the GL memory crossing appsink → appsrc belongs to one context.
+- **One GL display and context** (`GLDisplayEGL::new_surfaceless()`, plus a `GLContext` created from it) is shared by both pipelines. *Corrected in Task 2:* it is one per process, created on first use and never dropped. Every surfaceless display wraps the same `EGLDisplay`, and finalizing one calls `eglTerminate` for all, so exports running side by side failed as soon as one finished. Each pipeline's bus sync handler answers `NeedContext` for `gst.gl.GLDisplay` and `gst.gl.app_context`, so the GL memory crossing appsink → appsrc belongs to one context.
 - **The decode builder reuses the player's `gl_bin`,** made `pub(crate)`, rather than duplicating it.
 - **The letterbox** is the mixer pad's `xpos`/`ypos`/`width`/`height`: the source's fit rect inside 1920×1080, computed from the **decoded caps** (width, height and PAR). `SourceRef.display_aspect` is gate-only.
 - **Zoom** uses the verified mapping above: a pure function in media, tested there. A buffer probe on `gltransformation`'s sink pad sets it, keyed on PTS, so the value matches the frame.
@@ -136,7 +136,7 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
 `Exporter::start(job, on_msg) -> Result<Exporter, _>` in media owns its thread, the way `Recorder` does.
 
 **Pump rules:**
-- **All GStreamer objects** (the display, the context, both pipelines) are created, used and torn down **on that thread**.
+- **Both pipelines** are created, used and torn down **on that thread**. (The GL display and context are the process's; see X2.)
 - **The pump never blocks without a bound.**
   - `appsrc block=false`. While the queue is full, it waits in a short loop.
   - It pulls with short timeouts.

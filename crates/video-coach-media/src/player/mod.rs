@@ -29,6 +29,7 @@ use gstreamer::prelude::*;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
 
+pub(crate) use sink::{gl_bin, gl_caps};
 pub use sink::{Frame, FrameMailbox, SinkKind};
 
 /// Who asked for a seek. Reported back on completion, displacement and
@@ -67,9 +68,9 @@ pub enum PlayerEvent {
     Error(String),
 }
 
-/// What the display path is actually doing (spec D12). Logged on every load.
-/// A field is `None` where it doesn't apply, e.g. the GL fields with a
-/// [`SinkKind::System`] sink.
+/// What the display path is actually doing (spec D12). Logged on every load,
+/// and on every export. A field is `None` where it doesn't apply, e.g. the GL
+/// fields with a [`SinkKind::System`] sink.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diagnostics {
     /// Factory name of the selected video decoder, e.g. `vah265dec`.
@@ -166,7 +167,11 @@ impl SourcePlayer {
             let gl_slot = gl_slot.clone();
             move |_, msg| {
                 match msg.view() {
-                    gst::MessageView::NeedContext(need) => answer_need_context(msg, need, &gl_slot),
+                    gst::MessageView::NeedContext(need) => {
+                        if let Some((display, context)) = gl_slot.lock().unwrap().as_ref() {
+                            answer_need_context(msg, need, display, context);
+                        }
+                    }
                     _ => on_message(msg.to_owned()),
                 }
                 gst::BusSyncReply::Drop
@@ -350,7 +355,7 @@ impl SourcePlayer {
                             )
                         {
                             events.push(PlayerEvent::Loaded {
-                                diagnostics: self.diagnostics(),
+                                diagnostics: diagnostics(&self.pipeline, self.glupload.as_ref()),
                             });
                             self.seek(request, &mut events);
                         } else {
@@ -487,36 +492,6 @@ impl SourcePlayer {
             self.flight = Flight::Settling;
         }
     }
-
-    fn diagnostics(&self) -> Diagnostics {
-        let decoder = self
-            .pipeline
-            .iterate_recurse()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.factory())
-            .find(|f| {
-                let klass = f.klass();
-                klass.contains("Decoder") && klass.contains("Video")
-            })
-            .map(|f| f.name().to_string());
-        let glupload_caps = self
-            .glupload
-            .as_ref()
-            .and_then(|u| u.static_pad("sink"))
-            .and_then(|p| p.current_caps())
-            .map(|c| c.to_string());
-        let gl_platform = self
-            .glupload
-            .as_ref()
-            .and_then(|u| u.property::<Option<gst_gl::GLContext>>("context"))
-            .map(|c| c.gl_platform().to_string());
-        Diagnostics {
-            decoder,
-            glupload_caps,
-            gl_platform,
-        }
-    }
 }
 
 /// Dropping the player takes the pipeline to NULL, which is how the bus shuts
@@ -527,14 +502,46 @@ impl Drop for SourcePlayer {
     }
 }
 
-/// Answers a GL element's context request from the slot `set_gl_context`
-/// fills. Other context types (e.g. a VA display) are left to the element.
-fn answer_need_context(msg: &gst::Message, need: &gst::message::NeedContext, gl_slot: &GlSlot) {
+/// What `pipeline`'s video path is doing: its video decoder, and with a
+/// `glupload` inside, the caps it was fed and its GL platform.
+pub(crate) fn diagnostics(
+    pipeline: &gst::Pipeline,
+    glupload: Option<&gst::Element>,
+) -> Diagnostics {
+    let decoder = pipeline
+        .iterate_recurse()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.factory())
+        .find(|f| {
+            let klass = f.klass();
+            klass.contains("Decoder") && klass.contains("Video")
+        })
+        .map(|f| f.name().to_string());
+    let glupload_caps = glupload
+        .and_then(|u| u.static_pad("sink"))
+        .and_then(|p| p.current_caps())
+        .map(|c| c.to_string());
+    let gl_platform = glupload
+        .and_then(|u| u.property::<Option<gst_gl::GLContext>>("context"))
+        .map(|c| c.gl_platform().to_string());
+    Diagnostics {
+        decoder,
+        glupload_caps,
+        gl_platform,
+    }
+}
+
+/// Answers a GL element's context request with `display` and `context`, so
+/// every GL element shares them. Other context types (e.g. a VA display) are
+/// left to the element.
+pub(crate) fn answer_need_context(
+    msg: &gst::Message,
+    need: &gst::message::NeedContext,
+    display: &gst_gl::GLDisplay,
+    context: &gst_gl::GLContext,
+) {
     let Some(element) = msg.src().and_then(|s| s.downcast_ref::<gst::Element>()) else {
-        return;
-    };
-    let slot = gl_slot.lock().unwrap();
-    let Some((display, context)) = slot.as_ref() else {
         return;
     };
     let ctx_type = need.context_type();

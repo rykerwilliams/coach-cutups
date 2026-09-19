@@ -33,7 +33,7 @@
   - The separate registry keeps the user's cache untouched.
   - `LIBGL_ALWAYS_SOFTWARE` alone doesn't hide VA.
 - **CI packages:** `libegl-mesa0`, `mesa-libgallium` and `libgl1-mesa-dri` are already pulled in as hard dependencies, so expect no CI change. CI runs only on PRs and `main`, so it hasn't run on this branch.
-- **Parallel exporters:** 3 at once, each with its own surfaceless display, all fine.
+- **Parallel exporters:** 3 at once, each with its own surfaceless display, all fine. *Wrong, see Task 2 notes: the displays share one `EGLDisplay`.*
 - **Long pauses:** a pump stalled for 40 s with both pipelines PLAYING is fine.
 - **Audio in the source:** `decodebin3` with its audio pad left unlinked decodes the video correctly across seeks.
 - **Player code:**
@@ -105,6 +105,40 @@ Commit: `feat(core): export frame schedule`.
    - Delete the output.
 
 Commit: `feat(media): passthrough export`.
+
+### Task 2 notes
+
+**Hardware** (reference laptop, 60 s of `20260502121738_000004.MP4` from 300 s, 20 × (2 s play, 1 s freeze), release build, two runs):
+- 1800 frames in 16.5 s: **109 fps overall, 112–114 fps after the first 1%, 3.6× realtime**. The output is 57 MB (7.7 Mbps at QP 24), H.264 High, 1920×1080, 30/1, 60.000 s. It was deleted.
+- `encoder vah264lpenc, decoder vah265dec, glupload caps video/x-raw(memory:DMABuf), format=DMA_DRM, 2560x1440, drm-format=NV12:0x0100000000000002, gl platform egl`.
+- `GST_DEBUG=glupload:6`: 1209 `DirectDmabufExternal` imports (the ~1200 source frames decoded; freezes reuse), and no `Raw Data`.
+
+**Tests.**
+- **Hardware** (VA decode and encode): 7 integration tests in ~15 s wall, in parallel. Each 87-frame fiducial export takes ~1.0–1.3 s. All export tests (integration and unit) passed 3×.
+- **CI path** (`GST_REGISTRY=<scratch>/t2-reg.bin bwrap --dev-bind / / --tmpfs /dev/dri`, `GL_RENDERER: llvmpipe (LLVM 20.1.2, 256 bits)`, `x264enc`, 8 threads):
+  - With the tests running in parallel, the 87-frame fiducials take **11.5 s (vp8dec) and 12.5 s (avdec_h264)**; the 60-frame cancel 4.5 s; the 3-frame letterbox export 3.2 s. The whole binary takes 26 s wall and 116 s CPU.
+  - With `GST_PLUGIN_FEATURE_RANK=avdec_h264:0` (CI has no libav), `openh264dec` decodes the H.264 fixture and output, and all pass.
+  - The unit tests, including the mid-stream error, pass too.
+  - No CI package change was needed. The test `TIMEOUT` is 120 s: a 4-core runner should take ~2–3× these times.
+
+**Surprises. Both are corrected in the spec.**
+1. **The zoom wasn't clipped.** Offered the choice by `glvideomixer`, `gltransformation` doesn't render. It passes the frame through with an affine-transformation meta, and the mixer draws the transformed quad unclipped, so a zoomed 4:3 source spilled into the bars (measured: white at x = 1724 with the bar starting at 1680).
+   - The fix: a post-query probe on `gltransformation`'s src pad strips that meta from the allocation answer. It then renders into its own source-sized texture, which clips the zoom.
+   - On that render path, **`translation-y` has the opposite sign**: `zoom_params` is `(s, −pan_x·s, −pan_y·s)`, in units of the picture's width and height. The spec's `+pan_y·s` was measured on the meta path. The letterbox test now checks the bars on the zoomed frames too.
+2. **One surfaceless display per export breaks exports running side by side.** Every surfaceless `GLDisplayEGL` wraps the same `EGLDisplay` (the same handle, verified), and `GstGLDisplayEGL` calls `eglTerminate` when finalized.
+   - With a display per export, the parallel tests failed as soon as one finished: `glupload` "Failed to upload buffer", "could not create an EGL context … EGL_SUCCESS", and one SIGSEGV.
+   - The display and context are now **one per process**, in a `OnceLock` (a failure is cached too), and never dropped. Both pipelines stay on the export thread. With that change, the parallel runs passed 3/3. The plan-review "3 parallel exporters fine" result was luck.
+
+**Smaller findings and deviations.**
+- **`filesrc` linked before `location` is set posts an ERROR.** Linking sends a scheduling query, which starts the source. `fixtures::for_each_gray` and the decoder therefore set the location first.
+- `gldownload` is followed by a pinned `video/x-raw,format=NV12`: the system-memory readback that was measured.
+- The mixer's output caps also pin `pixel-aspect-ratio=1/1`.
+- **The injection hook** is a private `Exporter::spawn(job, on_msg, inject)` rather than `#[cfg(test)]` state. `start` passes `None`.
+- **`Exporter::start` returns `Result<Exporter, String>`.** It errs only for an empty schedule or a failed thread spawn; everything else arrives as `Finished`.
+- There is no `Progress(0)`: the first message is `Progress(1)` or higher.
+- **`error_text`** moved from `recorder.rs` to `lib.rs` for reuse. The player's `answer_need_context` now takes `(display, context)`, and `gl_caps()` is shared.
+- **Media now depends on `video-coach-core`** (for `FrameSpec`/`Zoom`), with `uuid` as a dev-dependency.
+- **Counter layout:** a 6 × 4 grid over the picture, bits in rows 1–2, and blocks at 60% of a cell. They are ≥32 px at 480×360 and scale with the picture, so `read_counter` needs no source size.
 
 ## Task 3 — Bus, harness, UI
 

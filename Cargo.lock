@@ -4788,10 +4788,13 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-gl",
+ "gstreamer-gl-egl",
  "gstreamer-pbutils",
  "gstreamer-video",
  "tempfile",
  "thiserror 2.0.20",
+ "uuid",
+ "video-coach-core",
 ]
 
 [[package]]
