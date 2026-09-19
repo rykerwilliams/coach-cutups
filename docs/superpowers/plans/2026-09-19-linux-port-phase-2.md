@@ -354,6 +354,7 @@ Commit: `feat(app): zoom and pan`.
 - **BACKLOG #30.** Tune `DEFAULT_BURST_WINDOW` by feel, and record the result.
 - **`CLAUDE.md`.** Document how to run the app and that it needs the Skia renderer.
 - **Review.** Adversarial review of the shipped code (`adversarial-review` skill), then apply, `verify` and commit.
+- **Spike removed (review, 2026-09-19).** `examples/zero_copy_spike.rs` was deleted after all, reversing Task 0's "stays as a diagnostic": the app logs the same decoder / `glupload` caps / GL platform on every load, and `scripts/linux-gate-check.sh` covers measurement, so the spike was a second copy of the GL path to keep compiling for nothing.
 
 ## Deliberately not in this phase
 
@@ -367,3 +368,10 @@ Commit: `feat(app): zoom and pan`.
 - The spec's Deferred list.
 
 **Orchestrator follow-up to Task 7:** the zoomed picture is now clipped to the letterboxed content rect instead of the whole player area. Before, it spilled into the letterbox bars and showed black only at the pan limit. What's on screen now matches exactly the crop export produces, and it's the same rect Phase 6 strokes normalize to. Confirmed by screenshot at 1.75×: the bars stay black and the picture stops at the content edges.
+
+**Task 8 closeout status (orchestrator):**
+- Gate script re-run on the camera footage: PASS. Zero-copy under EGL; KEY_UNIT 2.6 / 55.1 ms, ACCURATE 8.6 / 21.1 ms (median / worst).
+- `CLAUDE.md` now documents how to run the app.
+- Adversarial code review is done (simplification + correctness). Both fix passes are applied: the pause-then-seek early-completion race (reproduced 10/10, now fixed and pinned by a test), saves no longer recreating folders, error recovery, derived seek state, and the other fixes.
+- Wayland was **not checked**: the reference laptop runs an X11 session only.
+- **Waiting on the user** (needs a real pointer or modifier keys, which synthetic input can't provide): drag-to-reorder, Shift±10 s, Ctrl+O, Ctrl+0, live scrubber drag, touchpad two-finger pan and Ctrl+scroll zoom, click-drag pan, picking files in the dialogs, the burst-window feel (BACKLOG #30), and the boundary hold (Risk 4).

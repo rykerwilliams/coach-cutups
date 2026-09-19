@@ -10,8 +10,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use video_coach_app::bus::{Bus, BusHandle, Command, Event, StateFile};
-use video_coach_media::SinkKind;
+use video_coach_app::bus::{Bus, BusHandle, Command, Event, Snapshot, StateFile, UserError};
+use video_coach_core::project::{Project, SourceRef};
+use video_coach_core::store;
+use video_coach_media::{fixtures, probe, SinkKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -20,7 +22,7 @@ pub struct Harness {
     bus: BusHandle,
     rx: mpsc::Receiver<Event>,
     log: Vec<Event>,
-    /// Events before this index have been consumed by `wait_for`.
+    /// Events before this index have been consumed by `wait_map`.
     cursor: usize,
 }
 
@@ -47,15 +49,19 @@ impl Harness {
         self.bus.send(cmd);
     }
 
-    /// Waits until an unconsumed event matches `pred`, and consumes every
-    /// event up to and including it. Panics after [`TIMEOUT`].
-    pub fn wait_for(&mut self, what: &str, pred: impl Fn(&Event) -> bool) -> Event {
+    /// Waits until `f` maps an unconsumed event to `Some`, consumes every
+    /// event up to and including it, and returns the mapped value. Panics
+    /// after [`TIMEOUT`].
+    pub fn wait_map<T>(&mut self, what: &str, f: impl Fn(&Event) -> Option<T>) -> T {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            if let Some(i) = self.log[self.cursor..].iter().position(&pred) {
-                let event = self.log[self.cursor + i].clone();
+            let found = self.log[self.cursor..]
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| f(e).map(|t| (i, t)));
+            if let Some((i, t)) = found {
                 self.cursor += i + 1;
-                return event;
+                return t;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
@@ -66,6 +72,61 @@ impl Harness {
                 ),
             }
         }
+    }
+
+    /// Waits for the next `ProjectOpened`.
+    pub fn wait_opened(&mut self) -> Snapshot {
+        self.wait_map("ProjectOpened", |e| match e {
+            Event::ProjectOpened(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `ProjectChanged`.
+    pub fn wait_changed(&mut self) -> Snapshot {
+        self.wait_map("ProjectChanged", |e| match e {
+            Event::ProjectChanged(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Position`: source index and target.
+    pub fn wait_position(&mut self) -> (usize, Option<f64>) {
+        self.wait_map("Position", |e| match e {
+            Event::Position {
+                source_index,
+                target_abs,
+            } => Some((*source_index, *target_abs)),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Playing`.
+    pub fn wait_playing(&mut self) -> bool {
+        self.wait_map("Playing", |e| match e {
+            Event::Playing(p) => Some(*p),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Error` event and returns its payload.
+    pub fn wait_for_error(&mut self) -> UserError {
+        self.wait_map("an error", |e| match e {
+            Event::Error(e) => Some(e.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits until no seek is outstanding: a `Position` with no target.
+    /// Returns its source index.
+    pub fn wait_settled(&mut self) -> usize {
+        self.wait_map("a settled position", |e| match e {
+            Event::Position {
+                source_index,
+                target_abs: None,
+            } => Some(*source_index),
+            _ => None,
+        })
     }
 
     /// Waits until `cond` holds, receiving events meanwhile, and polling it
@@ -96,30 +157,6 @@ impl Harness {
         self.bus.position_handle().query_position()
     }
 
-    /// Waits for the next `Error` event and returns its payload.
-    pub fn wait_for_error(&mut self) -> video_coach_app::bus::UserError {
-        match self.wait_for("an error", |e| matches!(e, Event::Error(_))) {
-            Event::Error(e) => e,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Waits until no seek is outstanding: a `Position` with no target.
-    pub fn wait_settled(&mut self) -> usize {
-        match self.wait_for("a settled position", |e| {
-            matches!(
-                e,
-                Event::Position {
-                    target_abs: None,
-                    ..
-                }
-            )
-        }) {
-            Event::Position { source_index, .. } => source_index,
-            _ => unreachable!(),
-        }
-    }
-
     /// Shuts the bus down, which handles every command sent before it, and
     /// returns the events not yet consumed. Use it as a barrier to assert that
     /// something did not happen.
@@ -128,4 +165,28 @@ impl Harness {
         self.log.extend(self.rx.try_iter());
         self.log.split_off(self.cursor)
     }
+}
+
+/// Writes a project to `folder` whose sources are 16:9 30 fps WebM fixtures
+/// of the given names and lengths in seconds, created in `media`, which must
+/// be a sibling of `folder` (the stored paths are `../<media>/<name>`).
+/// Returns what was written.
+pub fn write_project(folder: &Path, media: &Path, videos: &[(&str, u32)]) -> Project {
+    let media_name = media
+        .file_name()
+        .expect("media is a named folder")
+        .to_string_lossy();
+    let mut project = Project::new("Game");
+    for &(name, secs) in videos {
+        let path = fixtures::webm(media, name, secs, 320, 180, 30, 15);
+        let p = probe(&path).expect("probe a fixture");
+        project.source_videos.push(SourceRef {
+            relative_path: format!("../{media_name}/{name}"),
+            display_name: name.into(),
+            duration_seconds: p.duration_seconds,
+            display_aspect: p.display_aspect,
+        });
+    }
+    store::write(folder, &mut project).expect("write the fixture project");
+    project
 }

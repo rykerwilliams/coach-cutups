@@ -4743,10 +4743,8 @@ version = "0.1.0"
 dependencies = [
  "glutin_egl_sys",
  "gstreamer",
- "gstreamer-app",
  "gstreamer-gl",
  "gstreamer-gl-egl",
- "gstreamer-video",
  "rfd",
  "serde",
  "serde_json",

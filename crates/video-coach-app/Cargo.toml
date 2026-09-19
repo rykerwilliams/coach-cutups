@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 # The library (the bus) uses none of the UI dependencies, so it builds and
-# tests without a display. Slint, the EGL wrapping, `gstreamer-video` and
-# `rfd` are for the binary (`src/main.rs`, `src/video.rs`, `src/pickers.rs`),
-# which Cargo can't give dependencies of its own.
+# tests without a display. Slint, the EGL wrapping and `rfd` are for the
+# binary (`src/main.rs`, `src/video.rs`, `src/pickers.rs`), which Cargo can't
+# give dependencies of its own.
 [dependencies]
 video-coach-core = { path = "../video-coach-core" }
 video-coach-media = { path = "../video-coach-media" }
@@ -20,7 +20,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06"] }
 rfd.workspace = true
-gstreamer-video.workspace = true
 gstreamer-gl-egl.workspace = true
 glutin_egl_sys.workspace = true
 
@@ -29,5 +28,3 @@ slint-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# Used only by examples/zero_copy_spike.rs.
-gstreamer-app.workspace = true

@@ -7,10 +7,8 @@
 
 use tempfile::TempDir;
 use video_coach_app::bus::{Command, Event};
-use video_coach_core::project::{Project, SourceRef};
-use video_coach_core::store;
-use video_coach_harness::Harness;
-use video_coach_media::{fixtures, probe};
+use video_coach_core::project::Project;
+use video_coach_harness::{write_project, Harness};
 
 const FRAME: f64 = 1.0 / 30.0;
 
@@ -31,18 +29,7 @@ impl Rig {
         let media = tmp.path().join("media");
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&media).unwrap();
-        let mut project = Project::new("Game");
-        for &(name, secs) in videos {
-            let path = fixtures::webm(&media, name, secs, 320, 180, 30, 15);
-            let p = probe(&path).unwrap();
-            project.source_videos.push(SourceRef {
-                relative_path: format!("../media/{name}"),
-                display_name: name.into(),
-                duration_seconds: p.duration_seconds,
-                display_aspect: p.display_aspect,
-            });
-        }
-        store::write(&folder, &mut project).unwrap();
+        let project = write_project(&folder, &media, videos);
 
         let h = Harness::new(&tmp.path().join("config"));
         h.send(Command::OpenProject(folder));
@@ -93,13 +80,11 @@ fn latest_position(h: &Harness) -> Option<(usize, Option<f64>)> {
     })
 }
 
-/// Waits for `Playing(playing)`, skipping earlier ones such as the
-/// `Playing(false)` every open sends.
+/// Waits for `Playing(playing)`, skipping any earlier `Playing` events.
 fn wait_playing(h: &mut Harness, playing: bool) {
-    h.wait_for(
-        &format!("Playing({playing})"),
-        |e| matches!(e, Event::Playing(p) if *p == playing),
-    );
+    h.wait_map(&format!("Playing({playing})"), |e| {
+        matches!(e, Event::Playing(p) if *p == playing).then_some(())
+    });
 }
 
 #[test]
@@ -205,8 +190,7 @@ fn the_position_survives_removing_an_earlier_source() {
     rig.settle_at(2, 0.7);
 
     rig.h.send(Command::RemoveSource(0));
-    rig.h
-        .wait_for("ProjectChanged", |e| matches!(e, Event::ProjectChanged(_)));
+    rig.h.wait_changed();
     // c is now source 1, still at 0.7: nothing reloaded.
     rig.settle_at(1, 0.7);
 

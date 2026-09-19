@@ -15,15 +15,13 @@ mod video;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 
-use video_coach_app::bus::{Bus, BusHandle, Command, Event};
+use video_coach_app::bus::{Bus, BusHandle, Command, Event, Snapshot};
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
-use video_coach_core::project::Project;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{PositionHandle, SinkKind};
 
@@ -37,9 +35,8 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// What the UI thread knows of the bus's state, from its events, and the
 /// zoom, which is the UI's own.
 struct UiState {
-    project: Option<Arc<Project>>,
-    /// One entry per source, from the last `Missing` event.
-    missing: Vec<bool>,
+    /// The open project, from the latest `ProjectOpened` or `ProjectChanged`.
+    snapshot: Option<Snapshot>,
     /// The source the player holds (or is loading).
     source_index: usize,
     /// While a seek is outstanding, where it's headed, concat seconds.
@@ -56,8 +53,7 @@ struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
-            project: None,
-            missing: Vec::new(),
+            snapshot: None,
             source_index: 0,
             target_abs: None,
             last_secs: 0.0,
@@ -118,8 +114,8 @@ fn main() {
     bus.borrow_mut().shutdown();
 }
 
-/// Turns the window's callbacks into bus commands. Values that aren't finite
-/// are dropped here, before they become commands (BACKLOG #28).
+/// Turns the window's callbacks into bus commands. Values are passed on as
+/// they are: the bus is the one place that sanitizes them (BACKLOG #28).
 fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let send = |bus: &Rc<RefCell<BusHandle>>| {
         let bus = bus.clone();
@@ -180,59 +176,34 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         }
     });
     window.on_rename_project({
-        let send = send(bus);
-        move |name| send(Command::RenameProject(name.into()))
-    });
-    window.on_toggle_play({
-        let send = send(bus);
-        move || send(Command::TogglePlay)
-    });
-    window.on_skip({
-        let send = send(bus);
-        move |delta| {
-            if let Some(delta) = finite(delta) {
-                send(Command::Skip { delta });
+        let (weak, send) = (window.as_weak(), send(bus));
+        move |name| {
+            let Some(w) = weak.upgrade() else { return };
+            let name = name.trim();
+            let unchanged =
+                UI.with_borrow(|ui| ui.snapshot.as_ref().is_none_or(|s| s.project.name == name));
+            if name.is_empty() || unchanged {
+                return;
             }
+            send(Command::RenameProject(name.into()));
+            // What the field shows once it loses focus, which accepting
+            // moves; the bus confirms it with `ProjectChanged`.
+            w.set_saved_project_name(name.into());
         }
     });
-    window.on_scrub_move({
-        let send = send(bus);
-        move |abs| {
-            if let Some(abs) = finite(abs) {
-                send(Command::ScrubMove { abs });
-            }
-        }
-    });
-    window.on_scrub_release({
-        let send = send(bus);
-        move |abs| {
-            if let Some(abs) = finite(abs) {
-                send(Command::ScrubRelease { abs });
-            }
-        }
-    });
-    window.on_volume_changed({
-        let send = send(bus);
-        move |value| {
-            if let Some(value) = finite(value) {
-                send(Command::SetVolume {
-                    value,
-                    commit: false,
-                });
-            }
-        }
-    });
-    window.on_volume_released({
-        let send = send(bus);
-        move |value| {
-            if let Some(value) = finite(value) {
-                send(Command::SetVolume {
-                    value,
-                    commit: true,
-                });
-            }
-        }
-    });
+    let toggle = send(bus);
+    window.on_toggle_play(move || toggle(Command::TogglePlay));
+    window.on_skip(cmd(bus, |delta| Command::Skip { delta }));
+    window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
+    window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
+    window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
+        value,
+        commit: false,
+    }));
+    window.on_volume_released(cmd(bus, |value| Command::SetVolume {
+        value,
+        commit: true,
+    }));
     // Drag-to-reorder carries the dragged row's index.
     window.on_source_payload(|index| DataTransfer::from(SharedString::from(index.to_string())));
     window.on_payload_source(|data| {
@@ -241,6 +212,12 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             .and_then(|text| text.parse().ok())
             .unwrap_or(-1)
     });
+}
+
+/// A callback taking one Slint `float` that sends `command(value)`.
+fn cmd(bus: &Rc<RefCell<BusHandle>>, command: impl Fn(f64) -> Command + 'static) -> impl Fn(f32) {
+    let bus = bus.clone();
+    move |value| bus.borrow().send(command(value.into()))
 }
 
 /// Zoom and pan (spec D9). The state lives in [`UiState`]; the window gets
@@ -348,23 +325,23 @@ fn finite(value: f32) -> Option<f64> {
 /// Applies a bus event on the UI thread.
 fn on_event(w: &AppWindow, event: Event) {
     match event {
-        Event::ProjectOpened(project) => {
+        Event::ProjectOpened(snapshot) => {
             UI.with_borrow_mut(|ui| {
                 ui.source_index = 0;
                 ui.target_abs = None;
                 ui.last_secs = 0.0;
             });
             set_zoom(w, Zoom::IDENTITY);
-            w.set_volume(project.preferences.scan_volume as f32);
-            w.set_project_name(project.name.as_str().into());
-            show_project(w, project);
+            w.set_volume(snapshot.project.preferences.scan_volume as f32);
+            w.set_project_name(snapshot.project.name.as_str().into());
+            show_project(w, snapshot);
         }
-        Event::ProjectChanged(project) => {
+        Event::ProjectChanged(snapshot) => {
             // Never overwrite a name that's being typed.
             if !w.get_name_editing() {
-                w.set_project_name(project.name.as_str().into());
+                w.set_project_name(snapshot.project.name.as_str().into());
             }
-            show_project(w, project);
+            show_project(w, snapshot);
         }
         Event::Position {
             source_index,
@@ -374,52 +351,47 @@ fn on_event(w: &AppWindow, event: Event) {
             ui.target_abs = target_abs;
         }),
         Event::Playing(playing) => w.set_playing(playing),
-        Event::Missing(missing) => {
-            UI.with_borrow_mut(|ui| ui.missing = missing);
-            show_sources(w);
-        }
         Event::Error(e) => {
             eprintln!("ui: error: {e}");
-            w.set_error_message(sentence(&e.to_string()).into());
+            // The first error stays up: one failure can report several, and
+            // the first says what went wrong.
+            if w.get_error_message().is_empty() {
+                w.set_error_message(sentence(&e.to_string()).into());
+            }
         }
     }
 }
 
-fn show_project(w: &AppWindow, project: Arc<Project>) {
+/// The sidebar, the missing-source card and whether playback is possible,
+/// from `snapshot`.
+fn show_project(w: &AppWindow, snapshot: Snapshot) {
+    let project = &snapshot.project;
+    let missing = |i: usize| snapshot.missing.get(i).copied().unwrap_or(false);
+    let rows: Vec<SourceRow> = project
+        .source_videos
+        .iter()
+        .enumerate()
+        .map(|(i, source)| SourceRow {
+            name: source.display_name.as_str().into(),
+            duration: format_hms(source.duration_seconds).into(),
+            missing: missing(i),
+            referenced: project.source_is_referenced(i),
+        })
+        .collect();
+    let first_missing = (0..rows.len()).find(|&i| missing(i));
     w.set_has_project(true);
+    w.set_saved_project_name(project.name.as_str().into());
     w.set_total_seconds(project.total_source_duration() as f32);
-    UI.with_borrow_mut(|ui| ui.project = Some(project));
-    show_sources(w);
-}
-
-/// The Sources list, the missing-source card and whether playback is
-/// possible, from the latest snapshot and `Missing` event.
-fn show_sources(w: &AppWindow) {
-    UI.with_borrow(|ui| {
-        let Some(project) = &ui.project else { return };
-        let missing = |i: usize| ui.missing.get(i).copied().unwrap_or(false);
-        let rows: Vec<SourceRow> = project
-            .source_videos
-            .iter()
-            .enumerate()
-            .map(|(i, source)| SourceRow {
-                name: source.display_name.as_str().into(),
-                duration: format_hms(source.duration_seconds).into(),
-                missing: missing(i),
-                referenced: project.source_is_referenced(i),
-            })
-            .collect();
-        let first_missing = (0..rows.len()).find(|&i| missing(i));
-        w.set_missing_index(first_missing.map_or(-1, |i| i as i32));
-        w.set_missing_name(
-            first_missing
-                .map(|i| project.source_videos[i].display_name.as_str())
-                .unwrap_or_default()
-                .into(),
-        );
-        w.set_can_play(!rows.is_empty() && first_missing.is_none());
-        w.set_sources(ModelRc::new(VecModel::from(rows)));
-    });
+    w.set_missing_index(first_missing.map_or(-1, |i| i as i32));
+    w.set_missing_name(
+        first_missing
+            .map(|i| project.source_videos[i].display_name.as_str())
+            .unwrap_or_default()
+            .into(),
+    );
+    w.set_can_play(!rows.is_empty() && first_missing.is_none());
+    w.set_sources(ModelRc::new(VecModel::from(rows)));
+    UI.with_borrow_mut(|ui| ui.snapshot = Some(snapshot));
 }
 
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value
@@ -427,7 +399,9 @@ fn show_sources(w: &AppWindow) {
 /// position on the current source.
 fn tick(w: &AppWindow, position: &PositionHandle) {
     UI.with_borrow_mut(|ui| {
-        let Some(project) = &ui.project else { return };
+        let Some(project) = ui.snapshot.as_ref().map(|s| s.project.clone()) else {
+            return;
+        };
         let total = project.total_source_duration();
         let current = if w.get_scrubbing() {
             f64::from(w.get_position_seconds())

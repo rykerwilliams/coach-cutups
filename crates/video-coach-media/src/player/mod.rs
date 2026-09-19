@@ -302,10 +302,16 @@ impl SourcePlayer {
         }
     }
 
-    /// Whether the pipeline holds `uri` (loaded, or loading), so a request for
-    /// it seeks rather than reloads.
+    /// Whether `uri` is the source the player holds or is heading to: the
+    /// pending request's, else the loaded (or loading) one. False once the
+    /// source was dropped — by an error, `unload`, or a load `clear` cut
+    /// short.
     pub fn holds(&self, uri: &str) -> bool {
-        self.loaded_uri.as_deref() == Some(uri)
+        let heading = match &self.pending {
+            Some(request) => Some(request.uri.as_str()),
+            None => self.loaded_uri.as_deref(),
+        };
+        heading == Some(uri)
     }
 
     /// The `uri` the pipeline holds, for logging.
@@ -471,7 +477,14 @@ impl SourcePlayer {
         } else {
             gst::State::Paused
         };
-        if self.pipeline.current_state() == target {
+        // Against where the pipeline is heading, not where it is: while a
+        // PLAYING change is still pending the current state is PAUSED, and a
+        // pause then would be taken as already done.
+        let heading = match self.pipeline.pending_state() {
+            gst::State::VoidPending => self.pipeline.current_state(),
+            pending => pending,
+        };
+        if heading == target {
             return;
         }
         let change = self.pipeline.set_state(target);

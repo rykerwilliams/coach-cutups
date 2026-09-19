@@ -38,7 +38,7 @@ component ZoomIndicator inherits Rectangle {
     in property <float> scale;
     in property <[float]> notches;
 
-    /// 1× is the left end, 10× the right: log2(scale) / log2(10).
+    /// 1× is the left end, 10× the right: log10(scale).
     function track-x(scale: float) -> length {
         max(0, min(1, log(max(scale, 1), 10))) * track.width
     }
@@ -179,7 +179,11 @@ export component AppWindow inherits Window {
     // --- Project state (from bus events) ---
 
     in property <bool> has-project;
+    /// The project-name field's text.
     in-out property <string> project-name;
+    /// The name the field returns to when it loses focus: the project's, or
+    /// a rename just sent.
+    in property <string> saved-project-name;
     in property <[SourceRow]> sources;
     /// The first missing source, or -1.
     in property <int> missing-index: -1;
@@ -195,7 +199,14 @@ export component AppWindow inherits Window {
     /// The scrubber's value, concat seconds. Set by the 30 Hz timer except
     /// while `scrubbing`.
     in-out property <float> position-seconds;
+    /// A scrub drag is under way. Cleared if the scrubber is disabled
+    /// mid-drag, which never delivers its `released`.
     out property <bool> scrubbing;
+    changed can-play => {
+        if (!self.can-play) {
+            self.scrubbing = false;
+        }
+    }
     /// `current / total`.
     in property <string> readout: "0:00 / 0:00";
     /// Linear 0..1.
@@ -245,6 +256,10 @@ export component AppWindow inherits Window {
         }
         if (name-edit.has-focus) {
             return reject;
+        }
+        // No shortcut, but a touched slider would take them.
+        if (event.text == Key.Home || event.text == Key.End) {
+            return accept;
         }
         if (event.modifiers.control) {
             if (event.text == "o" || event.text == "O") {
@@ -326,6 +341,14 @@ export component AppWindow inherits Window {
                             accepted(name) => {
                                 root.rename-project(name);
                                 keys.focus();
+                            }
+                            // Accepting or leaving the field shows the saved
+                            // name, so an empty, unchanged or abandoned edit
+                            // doesn't linger.
+                            changed has-focus => {
+                                if (!self.has-focus) {
+                                    root.project-name = root.saved-project-name;
+                                }
                             }
                         }
 

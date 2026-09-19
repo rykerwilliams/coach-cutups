@@ -8,16 +8,24 @@ use std::sync::Arc;
 use video_coach_core::project::Project;
 use video_coach_core::store::{self, StoreError};
 
-use super::{Bus, Event, Open, UserError};
+use super::{Bus, Event, Open, Snapshot, UserError};
 
 impl Bus {
-    /// Opens `folder`, creating a project if it has no `project.json`. Any
-    /// other failure changes nothing — not the file, not the open project.
+    /// Opens `folder`, creating a project if it exists but has no
+    /// `project.json`. Any other failure changes nothing — not the file, not
+    /// the open project. A folder that doesn't exist is an error: saving
+    /// never creates one.
     pub(super) fn open_project(&mut self, folder: PathBuf) {
         let folder = match std::path::absolute(&folder) {
             Ok(folder) => folder,
             Err(e) => return self.emit(Event::Error(UserError::Io(e.to_string()))),
         };
+        if !folder.is_dir() {
+            return self.emit(Event::Error(UserError::Io(format!(
+                "folder not found: {}",
+                folder.display()
+            ))));
+        }
         match store::read(&folder) {
             Ok(project) => self.commit(folder, project),
             Err(StoreError::MissingProjectJson(_)) => {
@@ -73,16 +81,16 @@ impl Bus {
         let folder = folder.canonicalize().unwrap_or(folder);
         self.state.set_last_project(Some(&folder));
 
-        self.reset_skip();
-        self.reset_slot();
-        self.set_playing(false);
+        // Nothing of the previous project survives: not its requests, its
+        // skip burst, nor its frame.
+        self.unload();
         self.player.set_volume(project.preferences.scan_volume);
         self.current = 0;
-        self.loaded = false;
-        let snapshot = Arc::new(project.clone());
         self.open = Some(Open { folder, project });
-        self.emit(Event::ProjectOpened(snapshot));
-        self.check_missing();
+        self.refresh_missing();
+        if let Some(snapshot) = self.snapshot() {
+            self.emit(Event::ProjectOpened(snapshot));
+        }
         self.ensure_loaded(0.0);
     }
 
@@ -93,11 +101,24 @@ impl Bus {
         let Some(open) = &mut self.open else {
             return;
         };
-        let saved = store::write(&open.folder, &mut open.project);
-        let snapshot = Arc::new(open.project.clone());
-        if let Err(e) = saved {
+        if let Err(e) = store::write(&open.folder, &mut open.project) {
             self.emit(Event::Error(e.into()));
         }
-        self.emit(Event::ProjectChanged(snapshot));
+        self.publish_project();
+    }
+
+    /// Publishes the open project, with the cached missing flags.
+    pub(super) fn publish_project(&self) {
+        if let Some(snapshot) = self.snapshot() {
+            self.emit(Event::ProjectChanged(snapshot));
+        }
+    }
+
+    fn snapshot(&self) -> Option<Snapshot> {
+        let open = self.open.as_ref()?;
+        Some(Snapshot {
+            project: Arc::new(open.project.clone()),
+            missing: self.missing.clone(),
+        })
     }
 }

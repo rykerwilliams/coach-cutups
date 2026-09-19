@@ -5,9 +5,6 @@
 //! pipeline leave NULL (the startup gate). Before each redraw it takes the
 //! newest frame from the mailbox and gives Slint the frame's texture to draw,
 //! with no copy. On teardown it waits for the bus to release the context.
-//!
-//! `examples/zero_copy_spike.rs` is the same path with no bus, as a
-//! diagnostic.
 
 use std::cell::RefCell;
 use std::rc::Rc;

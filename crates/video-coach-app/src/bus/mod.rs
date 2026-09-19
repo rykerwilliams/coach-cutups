@@ -83,23 +83,33 @@ pub enum Command {
     },
 }
 
+/// The open project as the UI sees it.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub project: Arc<Project>,
+    /// One entry per source: `true` if its file doesn't exist. Re-checked
+    /// on open, after every source-list change and after a player error.
+    pub missing: Arc<[bool]>,
+}
+
 /// What the bus tells the UI.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A project was opened (or created). The UI resets zoom on it (D9).
-    ProjectOpened(Arc<Project>),
-    /// The open project changed and has been saved.
-    ProjectChanged(Arc<Project>),
-    /// The source the player holds, and while a seek is outstanding its
-    /// target in concat seconds. Published **before** a load starts, so the
-    /// readout never combines a new source's position with the old index.
+    ProjectOpened(Snapshot),
+    /// The open project changed (and a save was attempted), or which of its
+    /// sources are missing did.
+    ProjectChanged(Snapshot),
+    /// The source the player holds or is heading to, and while a seek is
+    /// outstanding its target in concat seconds. A target is published
+    /// **before** its request is issued, so the readout never combines a new
+    /// source's position with the old index; the settled position (no
+    /// target) once the player is idle. Never repeated unchanged.
     Position {
         source_index: usize,
         target_abs: Option<f64>,
     },
     Playing(bool),
-    /// One entry per source: `true` if its file doesn't exist.
-    Missing(Vec<bool>),
     Error(UserError),
 }
 
@@ -111,13 +121,13 @@ pub enum UserError {
          ({existing:.3}:1)"
     )]
     AspectMismatch { existing: f64, attempted: f64 },
-    #[error("the video is rotated ({0}); rotated video is not supported")]
-    Rotated(String),
-    #[error("the file has no video stream")]
-    NoVideo,
-    /// The source file exists (or was chosen) but can't be read as video.
-    #[error("the file could not be read as video: {0}")]
-    UnreadableSource(String),
+    /// A chosen source file was refused by the probe.
+    #[error(transparent)]
+    Source(#[from] ProbeError),
+    /// The player failed on a source it had accepted, e.g. one changed on
+    /// disk since. Play reloads it.
+    #[error("playback failed: {0}")]
+    Playback(String),
     #[error("the project file is unreadable: {0}")]
     UnreadableProject(String),
     #[error(
@@ -144,16 +154,6 @@ impl From<StoreError> for UserError {
             e @ StoreError::MissingProjectJson(_) => UserError::UnreadableProject(e.to_string()),
             StoreError::NotSerializable(msg) => UserError::Io(msg),
             StoreError::Io(e) => UserError::Io(e.to_string()),
-        }
-    }
-}
-
-impl From<ProbeError> for UserError {
-    fn from(e: ProbeError) -> Self {
-        match e {
-            ProbeError::NoVideo => UserError::NoVideo,
-            ProbeError::Rotated(tag) => UserError::Rotated(tag),
-            ProbeError::Unreadable(msg) => UserError::UnreadableSource(msg),
         }
     }
 }
@@ -194,23 +194,15 @@ pub struct Bus {
     position: PositionHandle,
     state: StateFile,
     open: Option<Open>,
-    /// Index of the source the player holds, or of the latest request's
-    /// source while one is outstanding.
+    /// Index of the latest request's source: the one the player holds, or is
+    /// heading to. Whether it actually holds it, and where it's heading, are
+    /// the player's to say (`SourcePlayer::holds`, `target_secs`).
     current: usize,
-    /// Whether the player holds (or is loading) `current`. False after an
-    /// open, after the current source was removed or relinked, after a player
-    /// error, and while `current` is missing.
-    loaded: bool,
-    /// Source seconds (on `current`) of the latest seek request, while any
-    /// request is outstanding.
-    target_secs: Option<f64>,
-    /// Seek requests that haven't yet completed, been displaced or failed.
-    /// Each request ends in exactly one of those, or is dropped wholesale by
-    /// `clear` or an error.
-    outstanding: usize,
+    /// The last `Position` published: source index and target.
+    last_position: (usize, Option<f64>),
     playing: bool,
     /// One entry per source, from the last existence check.
-    missing: Vec<bool>,
+    missing: Arc<[bool]>,
     /// Coalesces skip presses over concat time (spec D8).
     skip: SkipCoordinator,
     /// When the skip debounce fires, if armed.
@@ -254,11 +246,9 @@ impl Bus {
             state,
             open: None,
             current: 0,
-            loaded: false,
-            target_secs: None,
-            outstanding: 0,
+            last_position: (0, None),
             playing: false,
-            missing: Vec::new(),
+            missing: Arc::new([]),
             skip: SkipCoordinator::default(),
             deadline: None,
         };
@@ -307,6 +297,7 @@ impl Bus {
                 }
                 Some(Input::Cmd(cmd)) => self.command(cmd),
             }
+            self.publish_position();
         }
     }
 

@@ -13,13 +13,18 @@ use video_coach_core::skip::SkipDecision;
 use video_coach_media::{Origin, PlayerEvent};
 
 use super::sources::END_MARGIN;
-use super::{Bus, Event};
+use super::{Bus, Event, UserError};
 
 impl Bus {
-    /// Play is refused (answered with `Playing(false)`) while any source is
-    /// missing or nothing is loaded. Pausing is always allowed.
+    /// Play is refused (answered with `Playing(false)`) with no sources or
+    /// while any is missing. If the player dropped the current source (after
+    /// an error), play reloads it where it was first. Pausing is always
+    /// allowed.
     pub(super) fn toggle_play(&mut self) {
-        let play = !self.playing && self.loaded && !self.any_missing();
+        let play = !self.playing
+            && self.seekable()
+            && (self.loaded()
+                || self.load(self.current, self.current_secs(), true, Origin::System));
         self.set_playing(play);
     }
 
@@ -122,25 +127,27 @@ impl Bus {
     pub(super) fn player_events(&mut self, events: Vec<PlayerEvent>) {
         for event in events {
             match event {
-                PlayerEvent::SeekDone { origin } => {
-                    // Before `request_ended`: the burst's next seek keeps a
-                    // request outstanding, so no settled position is
-                    // published between a burst's flights.
-                    if origin == Origin::Skip {
-                        let decision = self.skip.seek_completed();
-                        self.apply_skip(decision);
-                    }
-                    self.request_ended();
+                // The burst's next seek is issued in this same batch, so the
+                // player is never idle between a burst's flights and no
+                // settled position is published there.
+                PlayerEvent::SeekDone {
+                    origin: Origin::Skip,
+                } => {
+                    let decision = self.skip.seek_completed();
+                    self.apply_skip(decision);
                 }
-                PlayerEvent::SeekDisplaced { origin } | PlayerEvent::SeekFailed { origin } => {
-                    if origin == Origin::Skip {
-                        self.reset_skip();
-                    }
-                    self.request_ended();
+                PlayerEvent::SeekDisplaced {
+                    origin: Origin::Skip,
                 }
+                | PlayerEvent::SeekFailed {
+                    origin: Origin::Skip,
+                } => self.reset_skip(),
+                PlayerEvent::SeekDone { .. }
+                | PlayerEvent::SeekDisplaced { .. }
+                | PlayerEvent::SeekFailed { .. } => {}
                 PlayerEvent::Loaded { diagnostics } => eprintln!(
-                    "bus: loaded source {}: decoder {:?}, glupload caps {:?}, GL platform {:?}",
-                    self.current,
+                    "bus: loaded {}: decoder {:?}, glupload caps {:?}, GL platform {:?}",
+                    self.player.loaded_uri().unwrap_or("?"),
                     diagnostics.decoder,
                     diagnostics.glupload_caps,
                     diagnostics.gl_platform
@@ -148,13 +155,18 @@ impl Bus {
                 PlayerEvent::Eos => self.end_of_stream(),
                 PlayerEvent::Error(msg) => {
                     eprintln!("bus: player error: {msg}");
-                    // The player dropped its flight and its source; the next
-                    // seek reloads.
+                    // The player dropped its flight and its source; play or
+                    // the next seek reloads it. One failure often posts
+                    // several errors.
                     self.reset_skip();
-                    self.reset_slot();
-                    self.loaded = false;
-                    self.publish_position();
-                    self.set_playing(false);
+                    if self.playing {
+                        self.set_playing(false);
+                    }
+                    self.emit(Event::Error(UserError::Playback(msg)));
+                    // A file deleted mid-session gets its Relink card.
+                    if self.refresh_missing() {
+                        self.publish_project();
+                    }
                 }
             }
         }
@@ -177,48 +189,38 @@ impl Bus {
         }
     }
 
-    /// Issues a seek request and publishes its target first — so a load's
-    /// new source index is out before the pipeline leaves READY.
-    pub(super) fn request(&mut self, uri: &str, secs: f64, accurate: bool, origin: Origin) {
-        self.target_secs = Some(secs);
-        self.outstanding += 1;
-        self.publish_position();
-        let events = self.player.seek_to(uri, secs, accurate, origin);
-        self.player_events(events);
-    }
-
-    fn request_ended(&mut self) {
-        self.outstanding = self.outstanding.saturating_sub(1);
-        if self.outstanding == 0 {
-            self.target_secs = None;
-            self.publish_position();
-        }
-    }
-
-    /// Drops the player's flight and pending request.
-    pub(super) fn reset_slot(&mut self) {
-        self.player.clear();
-        self.outstanding = 0;
-        self.target_secs = None;
-    }
-
     /// Drops the loaded source entirely, so no stale frame stays up: for no
     /// sources, or a current source that is missing.
     pub(super) fn unload(&mut self) {
         self.reset_skip();
-        self.reset_slot();
         self.player.unload();
-        self.loaded = false;
         if self.playing {
             self.set_playing(false);
         }
     }
 
-    pub(super) fn publish_position(&self) {
-        let target_abs = self.open.as_ref().and_then(|open| {
-            self.target_secs
-                .map(|secs| open.project.abs_seconds(self.current, secs))
+    /// Publishes where the player is heading, recomputed from the player
+    /// after every input (so a list change that moves the concat offsets
+    /// moves the target too), or the settled position once it's idle. A
+    /// pause settling with nothing requested publishes nothing.
+    pub(super) fn publish_position(&mut self) {
+        let target = self.player.target_secs();
+        if target.is_some() || self.player.is_idle() {
+            self.publish_position_at(target);
+        }
+    }
+
+    /// Publishes `current` with `target` (source seconds), unless unchanged.
+    pub(super) fn publish_position_at(&mut self, target: Option<f64>) {
+        let target_abs = target.and_then(|secs| {
+            let open = self.open.as_ref()?;
+            Some(open.project.abs_seconds(self.current, secs))
         });
+        let position = (self.current, target_abs);
+        if position == self.last_position {
+            return;
+        }
+        self.last_position = position;
         self.emit(Event::Position {
             source_index: self.current,
             target_abs,

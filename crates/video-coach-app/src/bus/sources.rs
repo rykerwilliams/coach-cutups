@@ -10,6 +10,7 @@
 //! *is* a concat time, is reset on every change.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use gstreamer as gst;
 use video_coach_core::project::{Project, SourceRef};
@@ -32,8 +33,8 @@ impl Bus {
                     open.project.source_videos.push(source);
                 }
                 self.reset_skip();
+                self.refresh_missing();
                 self.project_changed();
-                self.check_missing();
                 // Loads only if nothing was loaded, i.e. the first source.
                 self.ensure_loaded(0.0);
             }
@@ -54,17 +55,15 @@ impl Bus {
             Err(e) => return self.emit(Event::Error(e.into())),
             Ok(Some(current)) => self.current = current,
             Ok(None) => {
-                // The current source is gone: reload the one that took its
-                // place (or the new last one) from its start. With none
-                // left, `ensure_loaded` unloads.
+                // The current source is gone: `ensure_loaded` loads the one
+                // that took its place (or the new last one) from its start,
+                // or unloads with none left.
                 self.current = index.min(remaining.saturating_sub(1));
-                self.loaded = false;
-                self.reset_slot();
             }
         }
         self.reset_skip();
+        self.refresh_missing();
         self.project_changed();
-        self.check_missing();
         self.ensure_loaded(0.0);
     }
 
@@ -81,8 +80,8 @@ impl Bus {
         }
         self.current = open.project.move_source(from, to, self.current);
         self.reset_skip();
+        self.refresh_missing();
         self.project_changed();
-        self.check_missing();
         self.ensure_loaded(0.0);
     }
 
@@ -97,34 +96,32 @@ impl Bus {
             Ok(source) => source,
             Err(e) => return self.emit(Event::Error(e)),
         };
-        // Taken before the swap: the time the player is at (or heading to)
-        // in the old file.
-        let resume = self.current_secs();
         if let Some(open) = &mut self.open {
             open.project.source_videos[index] = source;
         }
-        if index == self.current {
-            self.loaded = false;
-            self.reset_slot();
-        }
         self.reset_skip();
+        self.refresh_missing();
         self.project_changed();
-        self.check_missing();
-        self.ensure_loaded(resume);
+        // A relinked current source has a new path, so the player no longer
+        // holds it: it loads from its start. (Relink is for a missing
+        // source, which was unloaded, so there's no position to keep.)
+        self.ensure_loaded(0.0);
     }
 
-    /// Re-checks every source path and publishes the result.
-    pub(super) fn check_missing(&mut self) {
+    /// Re-checks every source path. Returns whether the result changed.
+    pub(super) fn refresh_missing(&mut self) -> bool {
         let Some(open) = &self.open else {
-            return;
+            return false;
         };
-        self.missing = open
+        let missing: Arc<[bool]> = open
             .project
             .source_videos
             .iter()
             .map(|s| !open.folder.join(&s.relative_path).exists())
             .collect();
-        self.emit(Event::Missing(self.missing.clone()));
+        let changed = missing != self.missing;
+        self.missing = missing;
+        changed
     }
 
     pub(super) fn any_missing(&self) -> bool {
@@ -133,8 +130,7 @@ impl Bus {
 
     /// Loads `current` at `secs` unless the player already holds it, and
     /// unloads the player when there is nothing to hold — no sources, or a
-    /// missing current source — so no stale frame stays up. Publishes the
-    /// position in every case.
+    /// missing current source — so no stale frame stays up.
     pub(super) fn ensure_loaded(&mut self, secs: f64) {
         let loadable = self.open.as_ref().is_some_and(|open| {
             self.current < open.project.source_videos.len()
@@ -142,40 +138,61 @@ impl Bus {
         });
         if !loadable {
             self.unload();
-        } else if !self.loaded && self.load(self.current, secs, true, Origin::System) {
-            return;
+        } else if !self.loaded() {
+            self.load(self.current, secs, true, Origin::System);
         }
-        self.publish_position();
     }
 
     /// Requests `secs` of source `index` (clamped inside it), loading it if
-    /// the player holds another file. Returns whether the request was issued.
+    /// the player holds another file. This is the one path every request
+    /// takes: it makes `index` current and publishes the target before
+    /// issuing, so a load's new index is out before the pipeline leaves
+    /// READY. Returns whether the request was issued.
     pub(super) fn load(&mut self, index: usize, secs: f64, accurate: bool, origin: Origin) -> bool {
-        let Some(open) = &self.open else {
+        let Some(source) = self
+            .open
+            .as_ref()
+            .and_then(|open| open.project.source_videos.get(index))
+        else {
             return false;
         };
-        let source = &open.project.source_videos[index];
-        let path = open.folder.join(&source.relative_path);
-        let uri = match gst::glib::filename_to_uri(&path, None) {
-            Ok(uri) => uri,
-            Err(e) => {
-                eprintln!("bus: no URI for {}: {e}", path.display());
-                return false;
-            }
+        let Some(uri) = self.uri(index) else {
+            return false;
         };
         let secs = clamp_in_source(secs, source.duration_seconds);
         self.current = index;
-        self.loaded = true;
-        self.request(&uri, secs, accurate, origin);
+        self.publish_position_at(Some(secs));
+        let events = self.player.seek_to(&uri, secs, accurate, origin);
+        self.player_events(events);
         true
     }
 
-    /// Where the player is, or is heading, in `current`, in source seconds.
-    pub(super) fn current_secs(&self) -> f64 {
-        if !self.loaded {
-            return 0.0;
+    /// Whether the player holds `current`, or is heading to it.
+    pub(super) fn loaded(&self) -> bool {
+        self.uri(self.current)
+            .is_some_and(|uri| self.player.holds(&uri))
+    }
+
+    /// The URI of source `index`'s file.
+    fn uri(&self, index: usize) -> Option<String> {
+        let open = self.open.as_ref()?;
+        let path = open
+            .folder
+            .join(&open.project.source_videos.get(index)?.relative_path);
+        match gst::glib::filename_to_uri(&path, None) {
+            Ok(uri) => Some(uri.into()),
+            Err(e) => {
+                eprintln!("bus: no URI for {}: {e}", path.display());
+                None
+            }
         }
-        self.target_secs
+    }
+
+    /// Where the player is, or is heading, in its source, in source seconds;
+    /// 0 when it can't say (nothing loaded).
+    pub(super) fn current_secs(&self) -> f64 {
+        self.player
+            .target_secs()
             .or_else(|| self.position.query_position())
             .unwrap_or(0.0)
     }
@@ -285,6 +302,25 @@ mod tests {
                     });
             assert_eq!(joined, Path::new(p), "{rel}");
         }
+    }
+
+    #[test]
+    fn relative_path_from_a_symlinked_folder_resolves_through_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("deep/real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let video = tmp.path().join("a.mp4");
+        std::fs::write(&video, b"").unwrap();
+
+        // What the bus stores: computed from canonical paths (`commit`
+        // canonicalizes the folder, `probed_source` the file).
+        let video = video.canonicalize().unwrap();
+        let rel = relative_path(&video, &link.canonicalize().unwrap()).unwrap();
+        assert_eq!(rel, "../../a.mp4");
+        // Joined to the link, the kernel resolves `..` from its target.
+        assert_eq!(link.join(&rel).canonicalize().unwrap(), video);
     }
 
     #[test]
