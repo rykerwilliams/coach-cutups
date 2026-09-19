@@ -121,6 +121,8 @@ pub struct SourcePlayer {
     /// presence also closes the GL gate until `set_gl_context`.
     glupload: Option<gst::Element>,
     gl_slot: GlSlot,
+    /// The video sink's mailbox, emptied by [`SourcePlayer::unload`].
+    mailbox: FrameMailbox,
     flight: Flight,
     pending: Option<Request>,
     /// The `uri` the pipeline holds, set when its load starts and cleared when
@@ -130,12 +132,14 @@ pub struct SourcePlayer {
 }
 
 impl SourcePlayer {
-    /// Creates the `playbin3` with the injected sinks, in NULL.
+    /// Creates the `playbin3` with the injected sinks, in NULL. `mailbox` is
+    /// the one [`video_sink`] returned with `video_sink`.
     ///
     /// `on_message` receives every bus message except GL context requests,
     /// which are answered here. It is called on GStreamer's threads.
     pub fn new(
         video_sink: gst::Element,
+        mailbox: FrameMailbox,
         audio_sink: gst::Element,
         on_message: impl Fn(gst::Message) + Send + Sync + 'static,
     ) -> Self {
@@ -173,6 +177,7 @@ impl SourcePlayer {
             pipeline,
             glupload,
             gl_slot,
+            mailbox,
             flight: Flight::Idle,
             pending: None,
             loaded_uri: None,
@@ -244,6 +249,23 @@ impl SourcePlayer {
         }
         self.flight = Flight::Idle;
         self.pending = None;
+    }
+
+    /// Drops the loaded source: the pipeline goes to READY and the flight,
+    /// the pending request and the mailbox's frame are dropped, so nothing of
+    /// the old source remains to be drawn. Nothing plays until the next
+    /// request loads a source. Idempotent.
+    pub fn unload(&mut self) {
+        // A gated GL pipeline never left NULL, and must not leave it now.
+        if !self.gl_gated() {
+            // Downward, so synchronous: the streaming threads have stopped
+            // and can't refill the mailbox once this returns.
+            let _ = self.pipeline.set_state(gst::State::Ready);
+        }
+        self.flight = Flight::Idle;
+        self.pending = None;
+        self.loaded_uri = None;
+        self.mailbox.take();
     }
 
     /// Sets the volume from a linear slider value in `0..=1`, mapped as `x³`
@@ -391,6 +413,8 @@ impl SourcePlayer {
         }
     }
 
+    /// Nothing is played (or paused) with no source loaded: the pipeline
+    /// stays where `unload` or a failed load left it.
     fn apply_playing(&self) {
         if self.loaded_uri.is_none() || self.gl_gated() {
             return;

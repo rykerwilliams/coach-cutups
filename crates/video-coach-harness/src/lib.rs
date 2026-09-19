@@ -68,6 +68,34 @@ impl Harness {
         }
     }
 
+    /// Waits until `cond` holds, receiving events meanwhile, and polling it
+    /// at least every 10 ms. For state the bus doesn't announce, such as the
+    /// playback position. Panics after [`TIMEOUT`].
+    pub fn poll_until(&mut self, what: &str, mut cond: impl FnMut(&mut Self) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !cond(self) {
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {what}; unconsumed events: {:#?}",
+                    &self.log[self.cursor..]
+                );
+            }
+            if let Ok(event) = self.rx.recv_timeout(Duration::from_millis(10)) {
+                self.log.push(event);
+            }
+        }
+    }
+
+    /// Every event received so far, consumed or not.
+    pub fn log(&self) -> &[Event] {
+        &self.log
+    }
+
+    /// The pipeline's position in its current source, in seconds.
+    pub fn position_secs(&self) -> Option<f64> {
+        self.bus.position_handle().query_position()
+    }
+
     /// Waits for the next `Error` event and returns its payload.
     pub fn wait_for_error(&mut self) -> video_coach_app::bus::UserError {
         match self.wait_for("an error", |e| matches!(e, Event::Error(_))) {

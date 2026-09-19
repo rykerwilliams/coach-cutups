@@ -73,6 +73,7 @@ impl Bus {
         let folder = folder.canonicalize().unwrap_or(folder);
         self.state.set_last_project(Some(&folder));
 
+        self.reset_skip();
         self.reset_slot();
         self.set_playing(false);
         self.player.set_volume(project.preferences.scan_volume);

@@ -4,7 +4,10 @@
 //!
 //! Position survives list changes: `current` goes through the same remap as
 //! clips and match events, and the player reloads only when the current
-//! source itself was removed or relinked. Otherwise only concat offsets move.
+//! source itself was removed or relinked. Otherwise only concat offsets move,
+//! and a request in flight or pending still lands where it was headed: it
+//! names a file, not a concat time. Only the skip coordinator, whose target
+//! *is* a concat time, is reset on every change.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -16,7 +19,7 @@ use super::{Bus, Event, UserError};
 
 /// How far before a source's end a load may land (spec D8's clamp), so a
 /// reload never starts at end of stream.
-const END_MARGIN: f64 = 0.05;
+pub(super) const END_MARGIN: f64 = 0.05;
 
 impl Bus {
     pub(super) fn add_source(&mut self, path: PathBuf) {
@@ -28,6 +31,7 @@ impl Bus {
                 if let Some(open) = &mut self.open {
                     open.project.source_videos.push(source);
                 }
+                self.reset_skip();
                 self.project_changed();
                 self.check_missing();
                 // Loads only if nothing was loaded, i.e. the first source.
@@ -51,15 +55,14 @@ impl Bus {
             Ok(Some(current)) => self.current = current,
             Ok(None) => {
                 // The current source is gone: reload the one that took its
-                // place (or the new last one) from its start.
+                // place (or the new last one) from its start. With none
+                // left, `ensure_loaded` unloads.
                 self.current = index.min(remaining.saturating_sub(1));
                 self.loaded = false;
                 self.reset_slot();
-                if remaining == 0 {
-                    self.set_playing(false);
-                }
             }
         }
+        self.reset_skip();
         self.project_changed();
         self.check_missing();
         self.ensure_loaded(0.0);
@@ -77,6 +80,7 @@ impl Bus {
             return;
         }
         self.current = open.project.move_source(from, to, self.current);
+        self.reset_skip();
         self.project_changed();
         self.check_missing();
         self.ensure_loaded(0.0);
@@ -103,6 +107,7 @@ impl Bus {
             self.loaded = false;
             self.reset_slot();
         }
+        self.reset_skip();
         self.project_changed();
         self.check_missing();
         self.ensure_loaded(resume);
@@ -126,35 +131,43 @@ impl Bus {
         self.missing.iter().any(|&m| m)
     }
 
-    /// Loads `current` at `secs` unless the player already holds it or its
-    /// file is missing; publishes the position either way.
+    /// Loads `current` at `secs` unless the player already holds it, and
+    /// unloads the player when there is nothing to hold — no sources, or a
+    /// missing current source — so no stale frame stays up. Publishes the
+    /// position in every case.
     pub(super) fn ensure_loaded(&mut self, secs: f64) {
         let loadable = self.open.as_ref().is_some_and(|open| {
             self.current < open.project.source_videos.len()
                 && !self.missing.get(self.current).copied().unwrap_or(true)
         });
-        if self.loaded || !loadable {
-            return self.publish_position();
+        if !loadable {
+            self.unload();
+        } else if !self.loaded && self.load(self.current, secs, true, Origin::System) {
+            return;
         }
-        self.load(self.current, secs, true, Origin::System);
+        self.publish_position();
     }
 
     /// Requests `secs` of source `index` (clamped inside it), loading it if
-    /// the player holds another file.
-    pub(super) fn load(&mut self, index: usize, secs: f64, accurate: bool, origin: Origin) {
+    /// the player holds another file. Returns whether the request was issued.
+    pub(super) fn load(&mut self, index: usize, secs: f64, accurate: bool, origin: Origin) -> bool {
         let Some(open) = &self.open else {
-            return;
+            return false;
         };
         let source = &open.project.source_videos[index];
         let path = open.folder.join(&source.relative_path);
         let uri = match gst::glib::filename_to_uri(&path, None) {
             Ok(uri) => uri,
-            Err(e) => return eprintln!("bus: no URI for {}: {e}", path.display()),
+            Err(e) => {
+                eprintln!("bus: no URI for {}: {e}", path.display());
+                return false;
+            }
         };
         let secs = clamp_in_source(secs, source.duration_seconds);
         self.current = index;
         self.loaded = true;
         self.request(&uri, secs, accurate, origin);
+        true
     }
 
     /// Where the player is, or is heading, in `current`, in source seconds.

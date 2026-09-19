@@ -6,7 +6,7 @@
 //! One input channel carries both commands and the player's forwarded
 //! GStreamer messages, so the thread never has to choose between two queues.
 //! The loop waits with `recv_timeout` on an optional deadline (the skip
-//! debounce, Task 4b); with no deadline it simply blocks.
+//! debounce); with no deadline it simply blocks.
 
 mod project;
 mod sources;
@@ -21,6 +21,7 @@ use std::time::Instant;
 use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
+use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
 use video_coach_media::{
     video_sink, FrameMailbox, PositionHandle, ProbeError, SinkKind, SourcePlayer,
@@ -50,7 +51,7 @@ pub enum Command {
 
     // Transport. Positions are concat-timeline seconds.
     TogglePlay,
-    /// Skip by `delta` seconds (Task 4b).
+    /// Skip by `delta` seconds; presses in quick succession accumulate.
     Skip {
         delta: f64,
     },
@@ -195,10 +196,12 @@ pub struct Bus {
     position: PositionHandle,
     state: StateFile,
     open: Option<Open>,
-    /// Index of the source the player holds (or is loading).
+    /// Index of the source the player holds, or of the latest request's
+    /// source while one is outstanding.
     current: usize,
-    /// Whether the player holds `current`. False after an open, after the
-    /// current source was removed, and while `current` is missing.
+    /// Whether the player holds (or is loading) `current`. False after an
+    /// open, after the current source was removed or relinked, after a player
+    /// error, and while `current` is missing.
     loaded: bool,
     /// Source seconds (on `current`) of the latest seek request, while any
     /// request is outstanding.
@@ -210,7 +213,9 @@ pub struct Bus {
     playing: bool,
     /// One entry per source, from the last existence check.
     missing: Vec<bool>,
-    /// When the loop next wakes with no input (the skip debounce, Task 4b).
+    /// Coalesces skip presses over concat time (spec D8).
+    skip: SkipCoordinator,
+    /// When the skip debounce fires, if armed.
     deadline: Option<Instant>,
 }
 
@@ -236,7 +241,7 @@ impl Bus {
         gst::init().expect("GStreamer failed to initialize");
         let (tx, rx) = mpsc::channel();
         let (video, mailbox) = video_sink(sinks);
-        let player = SourcePlayer::new(video, audio_sink(sinks), {
+        let player = SourcePlayer::new(video, mailbox.clone(), audio_sink(sinks), {
             let tx = tx.clone();
             move |msg| {
                 // Fails only once the bus thread has exited.
@@ -256,6 +261,7 @@ impl Bus {
             outstanding: 0,
             playing: false,
             missing: Vec::new(),
+            skip: SkipCoordinator::default(),
             deadline: None,
         };
         let thread = std::thread::Builder::new()

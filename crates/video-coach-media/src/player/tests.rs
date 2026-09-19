@@ -36,7 +36,7 @@ impl Rig {
             .build()
             .unwrap();
         let (tx, rx) = mpsc::channel();
-        let player = SourcePlayer::new(video, audio, move |m| {
+        let player = SourcePlayer::new(video, mailbox.clone(), audio, move |m| {
             let _ = tx.send(m);
         });
         Rig {
@@ -330,6 +330,42 @@ fn a_rejected_seek_fails_without_wedging_the_slot() {
 }
 
 #[test]
+fn unload_drops_the_source_and_its_frame_and_nothing_plays() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 2, 320, 180);
+    rig.load(&a, 1.0);
+    // Leave the frame in the mailbox, and a request pending behind a flight.
+    rig.seek(&a, 0.5, true, Origin::Skip);
+    rig.seek(&a, 1.5, true, Origin::Scrub);
+
+    rig.player.unload();
+    assert!(rig.mailbox.take().is_none(), "a stale frame remains");
+    assert_eq!(rig.player.pipeline.current_state(), gst::State::Ready);
+    assert!(matches!(rig.player.flight, Flight::Idle));
+    assert!(rig.player.pending.is_none());
+
+    // Play is refused with nothing loaded, and the dropped requests never
+    // complete.
+    rig.player.set_playing(true);
+    let late = rig.drain(Duration::from_millis(300));
+    assert!(
+        !late
+            .iter()
+            .any(|e| matches!(e, PlayerEvent::SeekDone { .. })),
+        "{late:?}"
+    );
+    assert_eq!(rig.player.pipeline.current_state(), gst::State::Ready);
+    assert!(rig.mailbox.take().is_none());
+
+    // The same source loads again (it isn't taken as still loaded), and the
+    // recorded play is applied once it has.
+    rig.seek(&a, 1.0, true, Origin::System);
+    rig.wait_for("Loaded", |e| matches!(e, PlayerEvent::Loaded { .. }));
+    rig.wait_done(Origin::System);
+    rig.wait_for("Eos", |e| *e == PlayerEvent::Eos);
+}
+
+#[test]
 fn volume_is_the_cube_of_the_slider() {
     let rig = Rig::new();
     let volume = || rig.player.pipeline.property::<f64>("volume");
@@ -350,9 +386,9 @@ fn a_gl_sink_holds_the_pipeline_in_null_until_the_context_arrives() {
         eprintln!("skipped: glupload is not installed (gstreamer1.0-gl)");
         return;
     }
-    let (video, _mailbox) = video_sink(SinkKind::Gl);
+    let (video, mailbox) = video_sink(SinkKind::Gl);
     let audio = gst::ElementFactory::make("fakesink").build().unwrap();
-    let mut player = SourcePlayer::new(video, audio, |_| {});
+    let mut player = SourcePlayer::new(video, mailbox, audio, |_| {});
     let dir = tempfile::tempdir().unwrap();
     let a = uri(&fixtures::webm(dir.path(), "a.webm", 1, 320, 180, 30, 15));
 

@@ -1,11 +1,18 @@
-//! Transport: play/pause, seeks and volume, and the player's events.
+//! Transport (spec D8): play/pause, skips, scrubs and volume, and the
+//! player's events.
 //!
-//! Task 4a handles these minimally: a skip is a single accurate seek and EOS
-//! just pauses. Task 4b adds the skip coordinator, the debounce deadline and
-//! EOS advance.
+//! Every seek goes through the player's single-flight slot. Skips go through
+//! the [`SkipCoordinator`](video_coach_core::skip::SkipCoordinator) first, over
+//! concat time, and every outcome of a skip's flight reaches it: a completion
+//! drives the burst on, while a displacement or failure resets it, so it can
+//! never be left waiting for a landing that won't come.
 
+use std::time::Instant;
+
+use video_coach_core::skip::SkipDecision;
 use video_coach_media::{Origin, PlayerEvent};
 
+use super::sources::END_MARGIN;
 use super::{Bus, Event};
 
 impl Bus {
@@ -38,44 +45,99 @@ impl Bus {
         }
     }
 
-    /// Task 4a: one accurate seek per press. Task 4b routes this through the
-    /// skip coordinator.
+    /// Skips by `delta` concat seconds from the burst's accumulated target,
+    /// or from where the player is (or is heading) if no burst is running.
+    /// The coordinator clamps to `total − END_MARGIN` (spec D8).
     pub(super) fn skip(&mut self, delta: f64) {
         let Some(open) = &self.open else {
             return;
         };
-        let abs = open.project.abs_seconds(self.current, self.current_secs());
-        self.seek_abs(abs + delta, true, Origin::Skip);
+        if !delta.is_finite() || !self.seekable() {
+            return;
+        }
+        let clip_duration = (open.project.total_source_duration() - END_MARGIN).max(0.0);
+        let now = open.project.abs_seconds(self.current, self.current_secs());
+        let decision = self.skip.request_skip(delta, now, clip_duration);
+        self.apply_skip(decision);
     }
 
+    /// Scrub moves are keyframe seeks, latest wins. A release is a new user
+    /// context: it abandons any skip burst, then lands frame-accurate.
     pub(super) fn scrub(&mut self, abs: f64, release: bool) {
+        if release {
+            self.reset_skip();
+        }
         self.seek_abs(abs, release, Origin::Scrub);
     }
 
-    /// Seeks to concat time `abs`, clamped to the timeline. Refused while any
-    /// source is missing.
-    fn seek_abs(&mut self, abs: f64, accurate: bool, origin: Origin) {
-        let Some(open) = &self.open else {
-            return;
-        };
-        if !abs.is_finite() || open.project.source_videos.is_empty() || self.any_missing() {
-            return;
-        }
-        let (index, secs) = open.project.locate(abs);
-        // `load` clamps short of the source's end, which for the last source
-        // is the end of the timeline.
-        self.load(index, secs, accurate, origin);
+    /// The skip debounce fired: the burst is over.
+    pub(super) fn deadline_passed(&mut self) {
+        let decision = self.skip.burst_ended();
+        self.apply_skip(decision);
     }
 
-    /// The skip debounce fired (Task 4b).
-    pub(super) fn deadline_passed(&mut self) {}
+    /// Forgets any skip burst and its debounce. For user context switches
+    /// (scrub release, list mutation, open) and a skip flight that won't
+    /// land — never for a load that fulfils a skip.
+    pub(super) fn reset_skip(&mut self) {
+        self.skip.reset();
+        self.deadline = None;
+    }
+
+    fn apply_skip(&mut self, decision: SkipDecision) {
+        if let Some(debounce) = decision.arm_debounce {
+            self.deadline = Some(Instant::now() + debounce);
+        }
+        if let Some(seek) = decision.seek {
+            // A seek that can't be issued would leave the coordinator waiting
+            // for its landing.
+            if !self.seek_abs(seek.target_seconds, seek.exact, Origin::Skip) {
+                self.reset_skip();
+            }
+        }
+    }
+
+    /// Whether seeks are allowed: some sources, none missing.
+    fn seekable(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| !open.project.source_videos.is_empty())
+            && !self.any_missing()
+    }
+
+    /// Seeks to concat time `abs`. `locate` clamps it to the timeline and
+    /// `load` short of its source's end, which for the last source is the
+    /// spec's `total − END_MARGIN`. Returns whether a request was issued.
+    fn seek_abs(&mut self, abs: f64, accurate: bool, origin: Origin) -> bool {
+        let Some(open) = &self.open else {
+            return false;
+        };
+        if !abs.is_finite() || !self.seekable() {
+            return false;
+        }
+        let (index, secs) = open.project.locate(abs);
+        self.load(index, secs, accurate, origin)
+    }
 
     pub(super) fn player_events(&mut self, events: Vec<PlayerEvent>) {
         for event in events {
             match event {
-                PlayerEvent::SeekDone { .. }
-                | PlayerEvent::SeekDisplaced { .. }
-                | PlayerEvent::SeekFailed { .. } => self.request_ended(),
+                PlayerEvent::SeekDone { origin } => {
+                    // Before `request_ended`: the burst's next seek keeps a
+                    // request outstanding, so no settled position is
+                    // published between a burst's flights.
+                    if origin == Origin::Skip {
+                        let decision = self.skip.seek_completed();
+                        self.apply_skip(decision);
+                    }
+                    self.request_ended();
+                }
+                PlayerEvent::SeekDisplaced { origin } | PlayerEvent::SeekFailed { origin } => {
+                    if origin == Origin::Skip {
+                        self.reset_skip();
+                    }
+                    self.request_ended();
+                }
                 PlayerEvent::Loaded { diagnostics } => eprintln!(
                     "bus: loaded source {}: decoder {:?}, glupload caps {:?}, GL platform {:?}",
                     self.current,
@@ -83,11 +145,14 @@ impl Bus {
                     diagnostics.glupload_caps,
                     diagnostics.gl_platform
                 ),
-                // Task 4b advances to the next source.
-                PlayerEvent::Eos => self.set_playing(false),
+                PlayerEvent::Eos => self.end_of_stream(),
                 PlayerEvent::Error(msg) => {
                     eprintln!("bus: player error: {msg}");
+                    // The player dropped its flight and its source; the next
+                    // seek reloads.
+                    self.reset_skip();
                     self.reset_slot();
+                    self.loaded = false;
                     self.publish_position();
                     self.set_playing(false);
                 }
@@ -95,7 +160,25 @@ impl Bus {
         }
     }
 
-    /// Issues a seek request and publishes its target first.
+    /// Playback reached the end of `current` (spec D4): continue into the
+    /// next source from its start, or stop at the end of the last one, where
+    /// its final frame stays up.
+    fn end_of_stream(&mut self) {
+        if !self.playing {
+            return;
+        }
+        let sources = self
+            .open
+            .as_ref()
+            .map_or(0, |open| open.project.source_videos.len());
+        let next = self.current + 1;
+        if next >= sources || !self.load(next, 0.0, true, Origin::System) {
+            self.set_playing(false);
+        }
+    }
+
+    /// Issues a seek request and publishes its target first — so a load's
+    /// new source index is out before the pipeline leaves READY.
     pub(super) fn request(&mut self, uri: &str, secs: f64, accurate: bool, origin: Origin) {
         self.target_secs = Some(secs);
         self.outstanding += 1;
@@ -117,6 +200,18 @@ impl Bus {
         self.player.clear();
         self.outstanding = 0;
         self.target_secs = None;
+    }
+
+    /// Drops the loaded source entirely, so no stale frame stays up: for no
+    /// sources, or a current source that is missing.
+    pub(super) fn unload(&mut self) {
+        self.reset_skip();
+        self.reset_slot();
+        self.player.unload();
+        self.loaded = false;
+        if self.playing {
+            self.set_playing(false);
+        }
     }
 
     pub(super) fn publish_position(&self) {
