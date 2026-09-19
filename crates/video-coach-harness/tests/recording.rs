@@ -12,6 +12,7 @@ use video_coach_app::bus::{CaptureKind, Command, Event, RecordingStatus, UserErr
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
+use video_coach_core::timeline;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{write_project, Harness};
 use video_coach_media::{fixtures, now_ns};
@@ -329,6 +330,36 @@ fn a_pause_right_after_a_skip_is_anchored_at_the_skip_target() {
     assert!(
         (target - FRAME..target + 0.1).contains(&source_time),
         "{source_time}, from {before}"
+    );
+    rig.h.shutdown();
+}
+
+#[test]
+fn a_skip_burst_while_playing_lands_where_replay_puts_it() {
+    let mut rig = Rig::open(&[("a.webm", 10)]);
+    let duration = rig.project.source_videos[0].duration_seconds;
+    rig.record();
+    rig.h.toggle_play();
+    assert!(rig.h.wait_playing());
+    // Replay applies each delta at its press and keeps playing; live has to
+    // land there too, not at the burst's base plus the deltas.
+    rig.h.skip(3.0);
+    rig.h.skip(3.0);
+    std::thread::sleep(Duration::from_millis(1500));
+    rig.h.toggle_play();
+    assert!(!rig.h.wait_playing());
+    let clip = rig.stop();
+
+    let Some(pause) = clip.events.last() else {
+        panic!("no events");
+    };
+    let EventKind::Pause { source_time } = pause.kind else {
+        panic!("ends with the pause: {:?}", clip.events);
+    };
+    let replayed = timeline::source_time(&clip, pause.record_time - 1e-6, duration);
+    assert!(
+        (replayed - source_time).abs() < 0.05,
+        "replay reaches {replayed} before the pause anchored at {source_time}"
     );
     rig.h.shutdown();
 }

@@ -278,6 +278,9 @@ pub struct Bus {
     skip: SkipCoordinator,
     /// When the skip debounce fires, if armed.
     skip_deadline: Option<Instant>,
+    /// When the skip burst's target was last where playback would be: its
+    /// leading press, or play starting. See `Bus::apply_skip`.
+    skip_since: Instant,
     /// Where recordings come from.
     capture: CaptureKind,
     /// The recording in progress.
@@ -337,6 +340,7 @@ impl Bus {
             missing: Arc::new([]),
             skip: SkipCoordinator::default(),
             skip_deadline: None,
+            skip_since: Instant::now(),
             capture,
             recording: None,
             generation: 0,

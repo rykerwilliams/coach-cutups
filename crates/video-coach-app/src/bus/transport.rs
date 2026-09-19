@@ -8,6 +8,7 @@
 //! drives the burst on, while a displacement or failure resets it, so it can
 //! never be left waiting for a landing that won't come.
 
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
 use video_coach_core::skip::SkipDecision;
@@ -31,6 +32,10 @@ impl Bus {
             && (self.loaded()
                 || self.load(self.current, self.current_secs(), true, Origin::System));
         self.set_playing(play);
+        if play && !was_playing {
+            // A burst's target stood still while paused.
+            self.skip_since = Instant::now();
+        }
         if self.playing != was_playing {
             self.log_playing(host_ns, ui_secs);
         }
@@ -64,13 +69,31 @@ impl Bus {
     /// recording to the clip's source, short of its end by the same margin
     /// (R10), and the requested delta is logged at `host_ns`.
     pub(super) fn skip(&mut self, delta: f64, host_ns: u64) {
-        let Some(open) = &self.open else {
-            return;
-        };
         if !delta.is_finite() || !self.seekable() {
             return;
         }
-        let range = match &self.recording {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.skip.target().is_none() {
+            // A leading press: the burst's base is sampled now.
+            self.skip_since = Instant::now();
+        }
+        let now = open.project.abs_seconds(self.current, self.current_secs());
+        let decision = self.skip.request_skip(delta, now, self.skip_range());
+        self.apply_skip(decision);
+        if let Some(active) = &mut self.recording {
+            active.log.skip(host_ns, delta);
+        }
+    }
+
+    /// Where a skip may land (spec D8, R10): the clip's source while
+    /// recording, short of its end by `END_MARGIN`, else the whole timeline.
+    fn skip_range(&self) -> RangeInclusive<f64> {
+        let Some(open) = &self.open else {
+            return 0.0..=0.0;
+        };
+        match &self.recording {
             Some(active) => {
                 let src = active.pending.source_index;
                 let start = open.project.cumulative_offset(src);
@@ -82,12 +105,6 @@ impl Bus {
                 start..=start + (duration - END_MARGIN).max(0.0)
             }
             None => 0.0..=(open.project.total_source_duration() - END_MARGIN).max(0.0),
-        };
-        let now = open.project.abs_seconds(self.current, self.current_secs());
-        let decision = self.skip.request_skip(delta, now, range);
-        self.apply_skip(decision);
-        if let Some(active) = &mut self.recording {
-            active.log.skip(host_ns, delta);
         }
     }
 
@@ -119,16 +136,33 @@ impl Bus {
             self.skip_deadline = Some(Instant::now() + debounce);
         }
         if let Some(seek) = decision.seek {
+            // The coordinator's target is where playback was when the burst
+            // began, plus the presses. Replay applies each press's delta at
+            // its own time and keeps playing, so while playing the live
+            // target advances by the play time since then; unadvanced, the
+            // settle landed ~150 ms behind replay and visibly jumped back.
+            // The clamp keeps a recording's clip in one source. The
+            // coordinator keeps its own targets unadvanced: it matches a
+            // landing against them, and would otherwise refire forever.
+            let mut target = seek.target_seconds;
+            if self.playing {
+                let (lo, hi) = self.skip_range().into_inner();
+                target = (target + self.skip_since.elapsed().as_secs_f64())
+                    .min(hi.max(lo))
+                    .max(lo);
+            }
             // A seek that can't be issued would leave the coordinator waiting
             // for its landing.
-            if !self.seek_abs(seek.target_seconds, seek.exact, Origin::Skip) {
+            if !self.seek_abs(target, seek.exact, Origin::Skip) {
                 self.reset_skip();
             }
         }
     }
 
     /// Where the player is heading, as source index and source seconds (R6,
-    /// R10): a skip burst's target, else the seek in flight, else `ui_secs`
+    /// R10): a skip burst's target (which live playback reaches advanced by
+    /// the play time since the burst began, while playing, so live matches
+    /// replay's model: base + deltas + elapsed), else the seek in flight, else `ui_secs`
     /// (the position the UI read at the keypress), else the pipeline's
     /// position. Both a recording's start and its play and pause anchors.
     pub(super) fn heading(&self, ui_secs: Option<f64>) -> (usize, f64) {

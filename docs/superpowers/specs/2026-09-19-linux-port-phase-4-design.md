@@ -239,7 +239,7 @@ The parent spec's "fallback for unknown duration after a crash" is dropped. R6 a
 **Allowed while recording:** Space, skips (±3/±10) and zoom (keys, Ctrl+scroll, scroll pan, drag pan). Each is logged through R8 with the UI-captured `host_ns`.
 
 **The pause and play anchor** is chosen by the bus:
-- If a skip burst is outstanding, the anchor is the SkipCoordinator's burst target. Otherwise, if a seek is in flight, it is `player.target_secs()`. The pipeline hasn't got there yet, but live playback will: the skip ends in an accurate seek to that target.
+- If a skip burst is outstanding, the anchor is the SkipCoordinator's burst target. Otherwise, if a seek is in flight, it is `player.target_secs()`. The pipeline hasn't got there yet, but live playback will: the skip ends in an accurate seek to that target, advanced by the play time since the burst began, while playing, so live matches replay's model (base + deltas + elapsed).
 - Otherwise it is the `query_position` the UI read synchronously at the keypress. The UI already holds a `PositionHandle`.
 
 **Clamped to the clip's source.** A clip points into one source.
