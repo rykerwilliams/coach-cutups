@@ -4,10 +4,15 @@
 //! Every entry point here assumes `gstreamer::init()` has already run.
 //! See `docs/superpowers/specs/2026-09-19-linux-port-design.md`.
 
+pub mod capture;
 pub mod fixtures;
 pub mod player;
 pub mod probe;
 
+pub use capture::{
+    choose_camera_mode, choose_encoder, list_devices, now_ns, resolve_camera, resolve_mic, Camera,
+    CameraMode, Devices, EncoderChain, Input, Mic,
+};
 pub use player::{
     Diagnostics, Frame, FrameMailbox, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
 };
