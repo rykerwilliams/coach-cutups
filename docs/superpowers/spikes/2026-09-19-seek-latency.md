@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-19
 **Question:** The spec's Phase 2 gate says the scan player falls back to libmpv if accurate seek exceeds ~250 ms with a hardware decoder confirmed. Does GStreamer pass on real hardware with real footage?
-**Answer:** **Yes, by a wide margin — GStreamer stays the scan player.** But only on a zero-copy decode path, and the measurement nearly came out wrong three times on the way there. Those are recorded below because each one is a trap the implementation can fall into too.
+**Answer:** **Yes, by a wide margin — GStreamer stays the scan player.** But only on a zero-copy decode path, which on X11 requires **both `decodebin3` and an EGL GL context** (see "Correction 2"). The measurement came out wrong four times on the way there. Those are recorded below because each one is a trap the implementation can fall into too.
 
 ## Machine
 
@@ -59,10 +59,29 @@ When a seek is slow *with* hardware decode and zero-copy, the cost is decoding o
 
 1. **A rejected seek looks like a fast seek.** The first gate script never checked `seek_simple()`'s return value. It happened to report correct numbers, but could not have told the difference.
 2. **`decodebin3 ! fakesink` links whichever pad appears first — often audio.** One run timed *audio* seeks, printed 775 `gst_buffer_pool_acquire_buffer` CRITICALs from the unlinked video decoder, and produced an impossible 6 ms accurate seek on a 120-frame GOP. It briefly looked like a `decodebin3` bug; it was a missing `video/x-raw(ANY)` caps filter. The app must select the video stream explicitly.
-3. **Measuring into a system-memory sink overstates seek latency ~5×** (finding 1). The first real-hardware numbers for the 2 s GOP file said "fails even on hardware"; that was the download, not the decode.
+3. **Measuring into a system-memory sink overstates seek latency ~5×** (finding 1). The opposite trap: **a `fakesink` after `glupload` lets it pass DMABuf through without importing**, so "DMABuf into GL" can look fine while the real GL import would copy. Force `GLMemory` caps downstream and check the uploader name (Correction 2). The first real-hardware numbers for the 2 s GOP file said "fails even on hardware"; that was the download, not the decode.
 4. **Synthetic x265 files carry a 2-frame PTS offset** (B-frame delay with no edit list), so every accurate seek on them lands exactly 67 ms past the target. A property of the fixture, not of seeking; real footage lands within one frame.
 
-## Correction to the earlier container-only spike
+## Correction 2 — the first laptop "zero-copy" results measured passthrough, not GL import
+
+The first laptop pass ended its pipelines in a plain `fakesink` after `glupload ! glcolorconvert`. Nothing downstream required GL memory, so `glupload` chose **`Dmabuf Passthrough`**: it forwarded the DMABuf without importing it into GL at all (`GST_DEBUG=glupload:6`). "Caps into GL: `memory:DMABuf`" was true only for a pipeline that never touched GL. The Phase 2 review caught it.
+
+Re-measured with the app's real sink requirement, `video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D`, which forces a real import:
+
+| Decode path | GL platform | Caps into `glupload` | Uploader | Steady-state throughput (1440p HEVC) |
+|---|---|---|---|---|
+| `decodebin3` | **EGL** | `memory:DMABuf` | `DirectDmabufExternal` (zero-copy import) | **651 fps** |
+| `decodebin3` | GLX (**the default on X11**) | `NV12` system memory | `Raw Data` (CPU copy) | 58 fps |
+| `decodebin` | EGL | system memory | `Raw Data` | 61 fps |
+| `decodebin` | GLX | system memory | `Raw Data` | 62 fps |
+
+**Missing either requirement costs ~11×.** On this X11 laptop GStreamer defaults to GLX, and GStreamer 1.24's DMABuf importer needs EGL — so without an explicit EGL context the "hardware" path silently copies every frame through the CPU. In the app, the EGL context is Slint's (Skia renderer), shared with GStreamer; see the Phase 2 spec.
+
+Seek latency through the real import path under EGL is unchanged from the table above — camera footage **8.8 / 20.5 ms**, 2 s-GOP 1080p60 **88.5 / 152 ms** — because an accurate seek's cost is decoding forward from the keyframe, and importing the one landed frame is cheap. Under GLX the camera footage seeks in 41 / 54 ms: still within budget, but ~5× slower.
+
+The earlier throughput table (`decodebin` 117 vs `decodebin3` 739 fps) measured **decode alone** (passthrough) and is superseded by this one for any claim about the display path.
+
+## Correction 1 — the earlier container-only spike
 
 An earlier version of this document, measured on a GPU-less CI container with software decode, concluded that KEY_UNIT's ~105 ms was a "hardware-independent floor" leaving hardware only ~145 ms of headroom. **That was wrong.** KEY_UNIT still decodes the keyframe itself, and in software that is most of the cost; on hardware, KEY_UNIT is 2–6 ms. The software numbers themselves reproduced on the laptop almost exactly (container 440 / 617 ms, laptop 450 / 620 ms), which is a useful cross-check that both benches measured the same thing.
 

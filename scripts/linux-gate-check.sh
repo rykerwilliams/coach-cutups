@@ -94,6 +94,18 @@ fi
 hdr "5. Decode path + seek latency on $FILM"
 [ -f "$FILM" ] || { bad "no such file"; exit 1; }
 
+# The app's GL context is EGL (Slint's Skia renderer). On X11 GStreamer defaults
+# to GLX, where 1.24's DMABuf importer does not exist and every frame is copied
+# through the CPU. Report what the default would do, then measure as the app.
+GLOUT='glupload name=u ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D'
+up_default=$(GST_DEBUG=glupload:6 timeout 30 gst-launch-1.0 filesrc location="$FILM" ! decodebin3 ! 'video/x-raw(ANY)' ! glupload ! glcolorconvert ! 'video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D' ! fakesink num-buffers=5 2>&1 | grep -oE 'uploader [A-Za-z ]+ returned 1' | head -1 | sed -E 's/uploader (.*) returned 1/\1/')
+if [ "$up_default" = "DirectDmabufExternal" ] || [ "$up_default" = "Dmabuf" ]; then
+  ok "default GL platform imports DMABuf zero-copy ($up_default)"
+else
+  warn "default GL platform uploads via '${up_default:-?}' (a CPU copy) -- the app must use an EGL context"
+fi
+export GST_GL_PLATFORM=egl
+
 # Everything below is verified rather than inferred. The first version of this
 # section reported a pass it could not prove: it never checked that a seek was
 # accepted (a rejected seek returns instantly and looks like a fast one), its
@@ -127,9 +139,10 @@ gaps = [b - a for a, b in zip(kf, kf[1:])]
 gop = max(gaps) if gaps else float("nan")
 print(f"  keyframe interval (first ~1800 frames): {gop:.2f}s")
 
-# --- Which decoder gets picked, and whether frames reach GL without a
-# system-memory round trip. glupload accepts DMABuf/VAMemory, so this is the
-# pairing that can actually prove zero-copy.
+# --- Which decoder gets picked, and whether frames are imported into GL
+# without a system-memory round trip. The downstream GLMemory/RGBA caps are
+# essential: with a plain fakesink after glupload, glupload passes DMABuf
+# THROUGH without importing, which looks zero-copy and proves nothing.
 #
 # decodebin3, not decodebin: measured on Intel VA-API, decodebin negotiates
 # SYSTEM memory into glupload and runs ~6x slower (117 vs 739 fps at 1440p).
@@ -137,7 +150,8 @@ print(f"  keyframe interval (first ~1800 frames): {gop:.2f}s")
 # appear (often audio) gets linked and the measurement silently times audio.
 p = Gst.parse_launch(
     f'filesrc location="{path}" ! decodebin3 ! video/x-raw(ANY) ! glupload name=u '
-    '! glcolorconvert ! fakesink num-buffers=3')
+    '! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D '
+    '! fakesink num-buffers=3')
 p.set_state(Gst.State.PAUSED)
 p.get_state(30 * Gst.SECOND)
 dec, feature = "NONE FOUND", "?"
@@ -156,7 +170,7 @@ p.set_state(Gst.State.NULL)
 hw = not dec.startswith("avdec_")
 print(f"  decoder selected: {dec} ({'HARDWARE' if hw else 'software'})")
 zc = "zero-copy" if "SystemMemory" not in feature else "frames pass through system memory"
-print(f"  caps into GL: {feature} -> {zc}")
+print(f"  caps into GL (EGL, as the app): {feature} -> {zc}")
 
 # --- Seek latency, measured in PAUSED: scrubbing a paused frame is the real
 # interaction, and a flushing seek in PAUSED must re-preroll, so get_state()
@@ -169,7 +183,8 @@ print(f"  caps into GL: {feature} -> {zc}")
 # like 436 ms per accurate seek when the real zero-copy path takes 91 ms.
 p = Gst.parse_launch(
     f'filesrc location="{path}" ! decodebin3 ! video/x-raw(ANY) ! glupload '
-    '! glcolorconvert ! queue ! fakesink name=s sync=false')
+    '! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D '
+    '! queue ! fakesink name=s sync=false')
 landed = {"pts": None}
 def sprobe(pad, info):
     landed["pts"] = info.get_buffer().pts

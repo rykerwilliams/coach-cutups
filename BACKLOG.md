@@ -158,7 +158,7 @@ Each entry: what, why deferred, when to revisit.
   is composited. Only the three chrome layers change; the stroke denormalization
   rule is unaffected either way.
 
-### 21. `Project` ownership in the command bus
+### 21. `Project` ownership in the command bus — RESOLVED (Phase 2 spec D5: the bus thread owns it and publishes `Arc<Project>` snapshots)
 - **Why deferred:** Whether the bus owns `Project` (every mutation is a
   `Command`) or the UI owns it and the bus owns media only. Spec recommends the
   bus owning it and emitting `Event::ProjectChanged(Arc<Project>)`, with the UI
@@ -257,3 +257,43 @@ Each entry: what, why deferred, when to revisit.
   probably fine — the window then mostly just delays the settle after a burst
   — but it should be tuned by feel with the real transport, not by arithmetic.
 - **When to revisit:** Phase 2, once skip keys drive a real player.
+
+## Phase 2 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md`)
+
+### 31. GL re-setup after a window hide
+- **Why deferred:** On Wayland, hiding a Slint window destroys it, and
+  `RenderingSetup` later arrives with a new GL context. GStreamer's GL elements
+  hold the old display/context from NULL→READY, so recovery means cycling the
+  pipeline to NULL, re-wrapping, reloading and re-seeking. Phase 2's main
+  window is never hidden, so teardown is handled (synchronous NULL with an
+  acknowledgement) and re-setup is not.
+- **When to revisit:** The first phase that hides a window (e.g. a preview or
+  export window), or if a Wayland user reports a black player after
+  minimize/restore.
+
+### 32. Recents list and a menu bar
+- **Why deferred:** macOS had neither; restore-last-project covers the common
+  case, and a third entry point for Open/Add adds UI surface without adding
+  capability.
+- **When to revisit:** When the user works across several projects regularly,
+  or if Linux users expect a File menu.
+
+### 33. Pinch-to-zoom
+- **Why deferred:** winit 0.30 delivers pinch gestures only on macOS/iOS, so
+  Slint's `ScaleRotateGestureHandler` receives nothing on Linux. Scroll-zoom
+  and drag-pan cover the interaction.
+- **When to revisit:** When winit gains Linux touchpad gestures.
+
+### 34. Rotated source videos
+- **Why deferred:** Phase 2 rejects sources whose `image-orientation` tag isn't
+  `rotate-0`, because the GL path doesn't rotate and none of the user's ~74
+  files is rotated. Supporting it means swapping the stored aspect and adding
+  `glvideoflip video-direction=auto` to the sink bin, and the Phase 6 stroke
+  coordinates would need to follow.
+- **When to revisit:** The first time a user needs portrait phone footage.
+
+### 35. Physical-key bindings for A/D and digits
+- **Why deferred:** Slint key events carry text, not scancodes, so A/D and the
+  zoom digits follow the keyboard layout (on AZERTY the digits need Shift).
+  Arrows are unaffected.
+- **When to revisit:** Only if a non-QWERTY user reports it.

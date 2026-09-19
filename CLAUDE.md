@@ -102,10 +102,13 @@ vector overlay layer only. This is measured, not preferred — see
 `docs/superpowers/spikes/2026-09-19-compositing-throughput.md`. Do not move
 full-frame resampling into Rust.
 
-**Decode path stays zero-copy.** Use `decodebin3` with the video stream selected
-by caps (`video/x-raw(ANY)`), or an explicit `demux ! parse ! <hw decoder>`
-chain — never `decodebin`, which negotiates system memory into GL and makes
-accurate seeks ~5× slower (every decode-forward frame gets copied off the GPU).
+**Decode path stays zero-copy, which needs `decodebin3` AND an EGL context.**
+Use `decodebin3` (or `playbin3`) with the video stream selected by caps
+(`video/x-raw(ANY)`), or an explicit `demux ! parse ! <hw decoder>` chain —
+never `decodebin`. And the GL context must be **EGL**: on X11 GStreamer defaults
+to GLX, where 1.24's DMABuf importer is unavailable and every frame is copied
+through the CPU (~11× slower; seeks ~5× slower). In the app the EGL context is
+Slint's Skia renderer's, shared with GStreamer.
 Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 `docs/superpowers/spikes/2026-09-19-seek-latency.md`.
 
