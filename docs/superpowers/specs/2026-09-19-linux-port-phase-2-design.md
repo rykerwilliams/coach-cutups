@@ -20,7 +20,7 @@ Clips, recording, drawing, scoreboard and export are out of scope; later phases 
 2. **Add Source Video…** probes the file, rejects an aspect mismatch, a rotated video or a file without video, and appends it. Sources can be removed and reordered from the sidebar.
 3. Multiple sources behave as one timeline: the readout, scrubber and skips operate on concatenated time, and playback continues into the next source at the end of each.
 4. Space, arrows (±3 s, Shift ±10 s) and A/D work even after the scrubber or volume slider has been touched. Scrubbing previews live while dragging and lands frame-accurate on release.
-5. Scrolling zooms about the cursor, dragging pans when zoomed, keys 1/2/3 and Ctrl+0 behave as specified, and the zoom indicator appears above 1×.
+5. Ctrl+scroll zooms about the cursor, plain two-finger scroll and dragging pan when zoomed, keys 1/2/3 and Ctrl+0 behave as specified, and the zoom indicator appears above 1×.
 6. On every source load the app logs the decoder, the GL upload method and the GL platform, and on the reference laptop they read hardware / `DirectDmabufExternal` / EGL.
 
 ---
@@ -175,7 +175,10 @@ The math is already in core (`Zoom`, Phase 1). Phase 2 adds rendering and input.
 - drag-pan deltas are divided by content-rect size × scale.
 
 **Inputs**
-- **Scroll:** `scale × 1.1^(−dy/60)`, anchored on the cursor. On X11, winit can't distinguish a wheel from a touchpad (both arrive as line deltas), so a proportional factor keeps touchpads from running away. An unmodified touchpad scroll zooms rather than pans.
+- **Scroll pans; Ctrl+scroll zooms** (user decision, 2026-09-19). The app can't tell a touchpad from a mouse wheel: on X11 winit reports both as line deltas (a wheel click is ±1.0, two-finger scrolling is fractional; `event_processor.rs:1086-1089`, `:1164`), and Slint converts both to pixel deltas and exposes no device type. So one rule serves both devices, and it's chosen for the touchpad on the user's laptop:
+  - **Plain scroll**, when scale > 1: pan by `delta / (content size × scale)` in both axes, moving the picture the way the system scrolls a document (which honours the user's natural-scrolling setting). At scale 1 it does nothing (macOS parity).
+  - **Ctrl+scroll**: `scale × 1.1^(dy/60)`, anchored on the cursor. The factor is proportional to the delta, so fine touchpad deltas zoom smoothly instead of running away. This matches the common Linux convention (browsers, image viewers) and macOS's Cmd+scroll on a trackpad.
+  - Mouse-wheel users hold Ctrl to zoom, or use keys 2/3.
 - **Drag** with the primary button when scale > 1: pan, after a 4 px threshold.
 - **Keys:** `1` goes to identity; `2` and `3` change scale by −0.25 and +0.25 about the cursor; `Ctrl+0` goes to identity.
 - **Pinch:** none on Linux, because winit 0.30 delivers pinch only on macOS/iOS (BACKLOG).
