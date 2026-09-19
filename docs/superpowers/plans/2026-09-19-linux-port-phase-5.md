@@ -183,6 +183,27 @@ Commit: `feat(app): export a clip`.
    - the `bwrap` recipe for testing the CI path locally.
 3. The user's hands-on checklist items, in the Task 4 notes.
 
+### Task 4 notes (closeout, 2026-09-19)
+
+**Status: Phase 5 complete** apart from the hands-on checks below.
+
+**Code review** (`327da18`), both passes applied.
+- **Seek fix:** accurate seeks dropped the wanted frame in VFR or gapped files, and failed past the video's end. They are now keyframe seeks followed by a forward pull, with fixture tests for both cases.
+- **Safety:**
+  - `.mp4` is appended only to a name with no extension, and refused if that file exists;
+  - exporting over the game video is refused;
+  - an empty clip is a refusal;
+  - GL creation is retried after a failure.
+- **Simplifications:** one outcome channel (`ExportStatus::Failed`), an error slot filled by the sync handler, and fixtures behind a feature.
+- **Real footage:** the reviewer exported 25 s of the user's HEVC clip (a freeze, skips, a zoomed pan): 750/750 frames matched the scheduled source frame (about 51 dB vs 18–35 dB for its neighbours) at 104 fps, zero-copy.
+
+**Hands-on checklist for the user** (batched with Phases 2–4):
+1. **Right-click a clip → "Export video…".** The dialog opens in the project folder with `<name>.mp4` suggested.
+2. **Watch the exported file.** Pauses freeze on the frame you paused on, skips jump, and a slow zoom pan is smooth. There's no drawing, webcam or audio yet (Phase 8).
+3. **During an export:** the progress bar and Cancel fit the window, and Record is greyed out. **Cancel** leaves no file behind.
+4. **Type a name without `.mp4`** that matches an existing file: the app refuses rather than overwriting.
+5. **Speed:** an export of a 1-minute clip takes about 17 s. Check the log line `bus: exported … vah265dec … DMABuf … vah264lpenc`.
+
 ## Deliberately not in this phase
 
 - Overlays, PiP, audio, compilations, the quality and resolution picker: Phase 8.

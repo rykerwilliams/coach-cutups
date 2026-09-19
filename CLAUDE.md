@@ -139,6 +139,14 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Event times:** `host_ns` comes from `video_coach_media::now_ns()`.
 - **Tests:** they use injected test sources (`CaptureKind::Test`) and never the real camera or mic. See `docs/superpowers/specs/2026-09-19-linux-port-phase-4-design.md`.
 
+**Export runs one GL graph everywhere, on its own GL display.**
+- **The graph:** decode (`decodebin3` → the player's `gl_bin` → pull `appsink`) → a Rust pump → `appsrc` → `gltransformation` (zoom) → `glvideomixer` (letterbox, pinned to 1920×1080@30) → NV12 `gldownload` → encoder → `mp4mux`.
+- **The GL display:** process-wide and surfaceless (`GLDisplayEGL::new_surfaceless()`), never the UI's. CI has no GPU, so Mesa's llvmpipe runs the same graph; there is no software variant.
+- **Picking source frames:** use **stream time** (`segment.to_stream_time`), not raw PTS: MP4 edit lists offset raw PTS. Round seconds to ns (`seconds_to_clock`). Seek `KEY_UNIT|SNAP_BEFORE`, then pull forward: ACCURATE seeks drop frames in VFR or gapped files.
+- **Quality is a constant QP:** `vah264lpenc` is CQP-only.
+- **Never block a push or pull without a bound.** A blocking `appsrc` push hangs forever after a downstream error.
+- **To test CI's path locally,** hide the GPU with `GST_REGISTRY=<scratch>/reg.bin bwrap --dev-bind / / --tmpfs /dev/dri cargo test …`. See `docs/superpowers/specs/2026-09-19-linux-port-phase-5-design.md`.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not
