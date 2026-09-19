@@ -18,6 +18,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
+use uuid::Uuid;
 
 use video_coach_app::bus::{
     Bus, BusHandle, CaptureKind, Command, Event, RecordingStatus, Snapshot,
@@ -241,13 +242,57 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         move || send(Command::StopRecording)
     });
     wire_devices(window, bus);
-    // Drag-to-reorder carries the dragged row's index.
-    window.on_source_payload(|index| DataTransfer::from(SharedString::from(index.to_string())));
-    window.on_payload_source(|data| {
+    wire_clips(window, bus);
+    // Drag-to-reorder carries the list's name and the dragged row's index,
+    // so a source dropped on the clip list (or back) is refused.
+    window.on_drag_payload(|list, index| {
+        DataTransfer::from(SharedString::from(format!("{list}:{index}")))
+    });
+    window.on_dropped_index(|list, data| {
         data.plain_text()
             .ok()
-            .and_then(|text| text.parse().ok())
+            .and_then(|text| {
+                let (from, index) = text.split_once(':')?;
+                if from != list.as_str() {
+                    return None;
+                }
+                index.parse().ok()
+            })
             .unwrap_or(-1)
+    });
+}
+
+/// The Clips list and the undo keys (Phase 3 C5). Rows name their clip by
+/// its UUID; the selection is the window's `selected-clip`.
+fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    let by_id = |bus: &Rc<RefCell<BusHandle>>, command: fn(Uuid) -> Command| {
+        let bus = bus.clone();
+        move |id: SharedString| match Uuid::parse_str(&id) {
+            Ok(id) => bus.borrow().send(command(id)),
+            Err(_) => eprintln!("ui: not a clip id: {id:?}"),
+        }
+    };
+    window.on_jump_to_clip(by_id(bus, Command::JumpToClip));
+    window.on_delete_clip(by_id(bus, Command::DeleteClip));
+    window.on_move_clip({
+        let bus = bus.clone();
+        move |from, to| {
+            if let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) {
+                bus.borrow().send(Command::MoveClip { from, to });
+            }
+        }
+    });
+    window.on_sort_clips({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::SortClipsBySource)
+    });
+    window.on_undo({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::Undo)
+    });
+    window.on_redo({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::Redo)
     });
 }
 
@@ -458,6 +503,7 @@ fn on_event(w: &AppWindow, event: Event) {
                 ui.last_secs = 0.0;
             });
             set_zoom(w, Zoom::IDENTITY);
+            w.set_selected_clip(SharedString::new());
             w.set_volume(snapshot.project.preferences.scan_volume as f32);
             w.set_project_name(snapshot.project.name.as_str().into());
             show_project(w, snapshot);
@@ -504,8 +550,8 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
-        // Selection arrives with the Clips list (Phase 3, Task 3).
-        Event::Select(_) => {}
+        // After the operation's `ProjectChanged`, so the clip is listed.
+        Event::Select(id) => w.set_selected_clip(id.to_string().into()),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {
@@ -553,15 +599,26 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     );
     w.set_can_play(!rows.is_empty() && first_missing.is_none());
     w.set_sources(ModelRc::new(VecModel::from(rows)));
-    let mut clips: Vec<_> = project.clips.iter().collect();
-    clips.sort_by_key(|c| c.sort_index);
-    let clips: Vec<ClipRow> = clips
-        .into_iter()
+    // Stored order is the order (C3).
+    let clips: Vec<ClipRow> = project
+        .clips
+        .iter()
         .map(|c| ClipRow {
-            name: c.name.as_str().into(),
+            id: c.id.to_string().into(),
+            name: if c.name.is_empty() {
+                "Untitled"
+            } else {
+                &c.name
+            }
+            .into(),
             duration: format_hms(c.recording_duration).into(),
         })
         .collect();
+    // A selection whose clip is gone (deleted, or undone away) is dropped.
+    let selected = w.get_selected_clip();
+    if !selected.is_empty() && !clips.iter().any(|c| c.id == selected) {
+        w.set_selected_clip(SharedString::new());
+    }
     w.set_clips(ModelRc::new(VecModel::from(clips)));
     UI.with_borrow_mut(|ui| ui.snapshot = Some(snapshot));
 }

@@ -16,8 +16,11 @@ export struct SourceRow {
     referenced: bool,
 }
 
-/// One row of the sidebar's Clips list. Read-only until Phase 3.
+/// One row of the sidebar's Clips list, in the project's order.
 export struct ClipRow {
+    /// The clip's UUID.
+    id: string,
+    /// "Untitled" for an empty name.
     name: string,
     /// The recording's length, already formatted.
     duration: string,
@@ -305,8 +308,8 @@ export component AppWindow inherits Window {
 
     in property <RecordingPhase> recording-phase;
     /// Not idle. Greys out everything the bus refuses while recording (R6's
-    /// guard): the source list, Open Project, rename, the scrubber and the
-    /// Devices button.
+    /// guard): the source and clip lists, Open Project, rename, the scrubber
+    /// and the Devices button.
     out property <bool> recording: root.recording-phase != RecordingPhase.idle;
     /// Time since the recording's t0, already formatted.
     in property <string> recording-elapsed: "0:00";
@@ -315,6 +318,10 @@ export component AppWindow inherits Window {
     /// A level has arrived during this recording.
     in property <bool> level-seen;
     in property <[ClipRow]> clips;
+    /// The selected clip's id, empty for none (Phase 3 C7). UI state only:
+    /// `src/main.rs` sets it on the bus's `Select`, and clears it on project
+    /// open and when its clip leaves the project.
+    in-out property <string> selected-clip;
     /// The Devices popover's lists, "System default" first. Empty while
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
@@ -350,15 +357,23 @@ export component AppWindow inherits Window {
     /// `node-name`, empty for the system default.
     callback choose-camera(string);
     callback choose-mic(string);
+    /// Clips (Phase 3 C5), by id; `move-clip` takes list indices.
+    callback jump-to-clip(string);
+    callback delete-clip(string);
+    callback move-clip(int, int);
+    callback sort-clips();
+    callback undo();
+    callback redo();
     callback volume-changed(float);
     callback volume-released(float);
     /// Zoom keys (spec D9): `1`/`Ctrl+0` reset; `2`/`3` step the scale about
     /// the pointer at (x, y) when it's over the player (the bool).
     callback zoom-reset();
     callback zoom-step(float, bool, length, length);
-    /// Drag-to-reorder payload: a source index to and from `data-transfer`.
-    pure callback source-payload(int) -> data-transfer;
-    pure callback payload-source(data-transfer) -> int;
+    /// Drag-to-reorder payload: a row index of the named list ("sources" or
+    /// "clips") to and from `data-transfer`; -1 when it's another list's.
+    pure callback drag-payload(string, int) -> data-transfer;
+    pure callback dropped-index(string, data-transfer) -> int;
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -396,6 +411,18 @@ export component AppWindow inherits Window {
                 }
                 return accept;
             }
+            // Ctrl+Z undoes; Ctrl+Shift+Z (Z shifted) or Ctrl+Y redoes. Not
+            // while recording, which the bus refuses.
+            if (event.text == "z" || event.text == "Z" || event.text == "y" || event.text == "Y") {
+                if (pressed && !root.recording) {
+                    if (event.text == "y" || event.text == "Y" || event.modifiers.shift) {
+                        root.redo();
+                    } else {
+                        root.undo();
+                    }
+                }
+                return accept;
+            }
             return reject;
         }
         // R and Space toggle, so an auto-repeat would toggle straight back.
@@ -405,9 +432,21 @@ export component AppWindow inherits Window {
             }
             return accept;
         }
-        if (event.text == Key.Escape && root.recording) {
+        // Esc cascade (C6): the dialog above, then the recording, then the
+        // selection.
+        if (event.text == Key.Escape) {
             if (pressed) {
-                root.stop-recording();
+                if (root.recording) {
+                    root.stop-recording();
+                } else {
+                    root.selected-clip = "";
+                }
+            }
+            return accept;
+        }
+        if (event.text == Key.Delete) {
+            if (pressed && !root.recording && root.selected-clip != "") {
+                root.delete-clip(root.selected-clip);
             }
             return accept;
         }
@@ -502,17 +541,17 @@ export component AppWindow inherits Window {
                                 drop := DropArea {
                                     enabled: !root.recording;
                                     can-drop(event) => {
-                                        root.payload-source(event.data) >= 0 ? DragAction.move : DragAction.none
+                                        root.dropped-index("sources", event.data) >= 0 ? DragAction.move : DragAction.none
                                     }
                                     dropped(event) => {
-                                        root.move-source(root.payload-source(event.data), index);
+                                        root.move-source(root.dropped-index("sources", event.data), index);
                                         DragAction.move
                                     }
 
                                     DragArea {
                                         enabled: !root.recording;
                                         allow-move: true;
-                                        data: root.source-payload(index);
+                                        data: root.drag-payload("sources", index);
 
                                         HorizontalLayout {
                                             padding-left: 6px;
@@ -567,31 +606,101 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        Text {
-                            text: "Clips";
-                            color: Palette.alternate-foreground;
-                            font-size: 11px;
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: "Clips";
+                                color: Palette.alternate-foreground;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Sort by position";
+                                enabled: root.clips.length >= 2 && !root.recording;
+                                clicked => { root.sort-clips(); }
+
+                                Tooltip {
+                                    text: @markdown("Order the clips by where they start in the match");
+                                }
+                            }
                         }
 
+                        // Phase 3 C9. A click selects (never toggles: a
+                        // double-click is two clicks first), a double-click
+                        // jumps, a right-click opens the row's own menu without
+                        // selecting, and a drag reorders. All off while
+                        // recording, which the bus refuses.
                         ListView {
-                            for clip in root.clips: HorizontalLayout {
+                            for clip[index] in root.clips: Rectangle {
                                 height: 28px;
-                                padding-left: 6px;
-                                padding-right: 6px;
-                                spacing: 8px;
+                                border-radius: 4px;
+                                background: clip-drop.has-drag || clip.id == root.selected-clip
+                                    ? Palette.selection-background
+                                    : transparent;
 
-                                Text {
-                                    text: clip.name;
-                                    color: Palette.foreground;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                }
-                                Text {
-                                    text: clip.duration;
-                                    color: Palette.alternate-foreground;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
+                                clip-drop := DropArea {
+                                    enabled: !root.recording;
+                                    can-drop(event) => {
+                                        root.dropped-index("clips", event.data) >= 0 ? DragAction.move : DragAction.none
+                                    }
+                                    dropped(event) => {
+                                        root.move-clip(root.dropped-index("clips", event.data), index);
+                                        DragAction.move
+                                    }
+
+                                    DragArea {
+                                        enabled: !root.recording;
+                                        allow-move: true;
+                                        data: root.drag-payload("clips", index);
+
+                                        TouchArea {
+                                            enabled: !root.recording;
+                                            clicked => {
+                                                root.selected-clip = clip.id;
+                                                // Off any field, so the keys work.
+                                                keys.focus();
+                                            }
+                                            double-clicked => {
+                                                root.jump-to-clip(clip.id);
+                                            }
+                                        }
+
+                                        ContextMenuArea {
+                                            enabled: !root.recording;
+                                            Menu {
+                                                MenuItem {
+                                                    title: "Jump to clip start";
+                                                    activated => { root.jump-to-clip(clip.id); }
+                                                }
+                                                MenuItem {
+                                                    title: "Delete clip";
+                                                    activated => { root.delete-clip(clip.id); }
+                                                }
+                                            }
+                                        }
+
+                                        HorizontalLayout {
+                                            padding-left: 6px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+
+                                            Text {
+                                                text: clip.name;
+                                                color: root.recording ? Palette.alternate-foreground : Palette.foreground;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text {
+                                                text: clip.duration;
+                                                color: Palette.alternate-foreground;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
