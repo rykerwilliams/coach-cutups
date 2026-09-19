@@ -297,3 +297,16 @@ Each entry: what, why deferred, when to revisit.
   zoom digits follow the keyboard layout (on AZERTY the digits need Shift).
   Arrows are unaffected.
 - **When to revisit:** Only if a non-QWERTY user reports it.
+
+### 36. Decoding slows to ~0.1× when the display is off (vsync-blocked swap)
+- **Why deferred:** In Phase 2 Task 5, with the laptop's monitor DPMS-off,
+  playback ran at about 0.1× in both the app and the Task 0 spike (26 GL
+  uploads in 8 s instead of ~240). With `vblank_mode=0` it ran at full speed.
+  The likely cause is that Slint's vsync-blocked buffer swap on the shared EGL
+  context also throttles GStreamer's GL upload work; the mechanism isn't
+  confirmed. It doesn't affect normal use with the screen on, but it means a
+  stalled UI thread can slow decoding, which will matter for export (Phase 8)
+  if export ever shares the UI's GL context.
+- **When to revisit:** Phase 8, when export runs its own GL pipeline — make
+  sure it uses its own context, not the UI's. Or sooner if playback stutters
+  when the window is occluded or on another workspace.

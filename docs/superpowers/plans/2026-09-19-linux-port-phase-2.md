@@ -258,6 +258,15 @@ This moves the spike into the app, so every later task can check its work by eye
 
 Commit: `feat(app): window with zero-copy video`.
 
+### Task 5 notes (2026-09-19, reference laptop)
+
+- **Shape.** `src/main.rs` selects the backend (D2), spawns the bus with `SinkKind::Gl`, and sends `OpenProject(<arg>)` or `RestoreLastProject`. Bus events reach the UI thread through `slint::Weak::upgrade_in_event_loop`. `src/video.rs` is the renderer bridge: `RenderingSetup` wraps the EGL context and sends `GlReady`, `BeforeRendering` takes the mailbox frame, waits on its `GLSyncMeta`, maps it and keeps it mapped until the next one, and `RenderingTeardown` calls `BusHandle::shutdown`. `ui/app.slint` holds the player area and a plain `FocusScope` `key-pressed` handler, which Task 6 replaces with the `capture-key-pressed` root scope. Slint and the EGL crates are now normal dependencies of `video-coach-app`, because Cargo can't give a binary its own dependencies. The library doesn't use them, and `cargo test --workspace` passes with `DISPLAY` unset.
+- **Manual check.** The test project had two sources, `20260314131843_000042.MP4` (HEVC 1920x1080 at 60 fps, 11.58 s) followed by `20260711105130_000010.MP4` (HEVC 2560x1440, 1242.17 s). Keys were sent to the window by id with python-xlib `XSendEvent`, since xdotool isn't installed.
+  - Log for each load: `decoder Some("vah265dec")`, `glupload caps Some("video/x-raw(memory:DMABuf), format=(string)DMA_DRM, … drm-format=(string)NV12:0x0100000000000002")`, `GL platform Some("egl")`. Slint's context was `EGL`/`GLES2`.
+  - Screenshots: a frame appears at startup; paused skips of +3 s show new preroll frames; play advances the picture; playback crosses from source 0 to source 1 by EOS advance (`loaded source 1`, position restarting at 0 and running at 1.0×); a paused state stays still (screenshot difference 0.0); a paused skip back (`Left`, then `a`) across the boundary shows source 0 again. Closing the window while playing exits with status 0. Launching with no argument restored the last project.
+  - **Not exercised: Shift.** Synthetic key events don't carry modifier state into winit, which tracks modifiers through XKB, so the ±10 s path went untested.
+- **Monitor off throttles playback.** With the laptop's monitor DPMS-off, playback crawled at about 0.1× in both the app and the Task 0 spike (26 `DirectDmabufExternal` uploads in 8 s). With `vblank_mode=0` it ran at 1.0× (221 uploads in 8 s). The likely cause is that the vsync-blocked swap on Slint's context also throttles GStreamer's GL work on the shared context. The mechanism wasn't confirmed. That's harmless with the screen on, but a UI thread that stalls in swap slows decoding.
+
 ## Task 6 — Sidebar, transport bar, dialogs, keyboard
 
 - **Layout (D11).**

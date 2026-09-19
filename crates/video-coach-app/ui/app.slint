@@ -1,0 +1,52 @@
+// The Coach Cuts window. Task 5: the player area and the transport keys.
+
+export component AppWindow inherits Window {
+    title: "Coach Cuts";
+    preferred-width: 1100px;
+    preferred-height: 700px;
+    background: black;
+    forward-focus: keys;
+
+    /// The newest video frame (a borrowed GL texture), set by the renderer
+    /// bridge in `src/video.rs`.
+    in property <image> frame;
+    /// Display width / height of `frame`, from the negotiated caps (pixel
+    /// aspect ratio included), so the picture is never stretched.
+    in property <float> frame-aspect: 16 / 9;
+
+    callback toggle-play();
+    /// Skip by this many seconds (negative is backwards).
+    callback skip(float);
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.toggle-play();
+                return accept;
+            }
+            if (event.text == Key.LeftArrow || event.text == "a" || event.text == "A") {
+                root.skip(event.modifiers.shift ? -10 : -3);
+                return accept;
+            }
+            if (event.text == Key.RightArrow || event.text == "d" || event.text == "D") {
+                root.skip(event.modifiers.shift ? 10 : 3);
+                return accept;
+            }
+            reject
+        }
+
+        // The player area: black, the picture fitted and centred in it.
+        player := Rectangle {
+            background: black;
+
+            Image {
+                source: root.frame;
+                width: min(player.width, player.height * root.frame-aspect);
+                height: self.width / root.frame-aspect;
+                x: (player.width - self.width) / 2;
+                y: (player.height - self.height) / 2;
+                image-fit: fill;
+            }
+        }
+    }
+}
