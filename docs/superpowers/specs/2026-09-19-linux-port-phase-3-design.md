@@ -25,7 +25,7 @@ Selecting a clip does **not** open a preview: preview is Phase 7. Until then, se
 1. **Selection.** Clicking a clip selects it, and the right-hand inspector shows its name, tags, notes and PiP flag. With nothing selected, the inspector shows the tag overview.
 2. **Editing.** Edits save to `project.json`. Each committed field is one undo step: Ctrl+Z undoes it, and Ctrl+Shift+Z or Ctrl+Y redoes it.
 3. **Typing is safe.** While a text field has focus, no app shortcut fires. Typing "r" in a name doesn't start a recording.
-4. **Delete.** The Delete key (with no text field focused), or the context menu, removes the clip. Its recording moves to `recordings/.trash/`, and Ctrl+Z brings both back to the same place in the list.
+4. **Delete.** The Delete key (with no text field focused), or the context menu, removes the clip. Its recording moves to `recordings/.trash/`, and Ctrl+Z brings both back to the same place in the list, for any number of deletes.
 5. **Order.**
    - Dragging clips reorders them.
    - "Sort by position" orders them by source, then start time.
@@ -42,40 +42,52 @@ Selecting a clip does **not** open a preview: preview is Phase 7. Until then, se
 
 ## Decisions
 
-### C1. `UndoController` is ported to core
+### C1. `UndoController` is ported to core — with multi-level delete undo
 
-`video-coach-core/src/undo.rs` ports `UndoController.swift`. It stays pure: no I/O.
+`video-coach-core/src/undo.rs` ports `UndoController.swift`. It is pure: no I/O.
 
 ```rust
 pub enum ClipEdit { Name(String), Tags(Vec<String>), Notes(String), ShowPip(bool) }
 pub enum UndoAction {
-    EditClip { id: Uuid, before: ClipEdit, after: ClipEdit },  // one field; before/after same variant
+    EditClip { id: Uuid, before: ClipEdit, after: ClipEdit },  // one field; same variant
     DeleteClip(Clip),              // its file is recordings/.trash/<recording_filename>
     ReorderClips { before: Vec<Uuid>, after: Vec<Uuid> },
 }
 impl UndoController {
-    pub fn push(&mut self, action: UndoAction) -> Option<Clip>;  // returns a delete whose trashed file to shred
-    pub fn pop_undo(&mut self) -> Option<UndoAction>;
-    pub fn pop_redo(&mut self) -> Option<UndoAction>;
-    pub fn evict_delete(&mut self) -> Option<Clip>;               // for source changes (C4)
+    pub fn push(&mut self, a: UndoAction) -> Vec<Clip>;       // clears redo; returns evicted deletes
+    pub fn take_undo(&mut self) -> Option<UndoAction>;        // removes; caller applies, then…
+    pub fn undone(&mut self, a: UndoAction);                  // …files it on redo
+    pub fn take_redo(&mut self) -> Option<UndoAction>;
+    pub fn redone(&mut self, a: UndoAction);                  // files it on undo (no redo clear)
+    pub fn evict_deletes(&mut self) -> Vec<Clip>;             // for source changes (C4)
     pub fn clear(&mut self);
 }
 ```
 
-**`push`:**
-1. **Clear redo**, as every push does.
-2. **If pushing a `DeleteClip`,** evict the prior `DeleteClip` from the **undo** stack.
-   - After step 1, a delete can only be there. A delete that was on the redo stack had been undone, so its clip was live and it had no trashed file. Clearing redo drops it safely.
-   - This keeps the invariant: **at most one delete in history**, so `.trash` holds at most one file (macOS parity).
-3. **Drop every `EditClip` for the evicted clip's id** from the undo stack. The clip can never return, so those entries could only no-op. macOS kept them, and Ctrl+Z silently consumed them.
-4. **Append, then enforce the cap of 100** by dropping from the front.
-   - If the cap drops a `DeleteClip`, that clip is returned for shredding, and its edits are purged the same way.
-   - At most one delete can come back from one push.
+**Any number of deletes can be undone.** This is a **deliberate change from macOS**, which kept at most one delete in its history and shredded the previous file on every delete. Multi-level undo is what Ctrl+Z means everywhere else, and it removes macOS's eviction-on-delete machinery.
 
-**Tests:** port `UndoControllerTests`, plus:
-- the redo-stack case (the purge must not touch a live clip's edits);
-- the purge;
-- the cap-dropped delete.
+The cost: `.trash` holds one recording per undoable delete until the project is next opened, when it's emptied (C4). *User may overrule; it's a product call.*
+
+**`push`:**
+1. Clear redo.
+2. Append.
+3. Enforce the cap of 100 by dropping from the front.
+
+It returns any `DeleteClip` the cap drops. The caller shreds its file.
+
+**Eviction** is one routine, used by the cap and by `evict_deletes`: remove the delete, and **purge every `EditClip` for that clip id** from both stacks. The clip can never return, so those entries could only no-op. macOS kept them, and Ctrl+Z silently consumed them.
+
+**Take and file.**
+- `take_undo`/`take_redo` hand the action to the bus, which applies it and then files it with `undone`/`redone`.
+- The bus may file an **updated** action. A redo of a delete files the clip exactly as it was when trashed, with source indices remapped since and any edits that saved without pushing. Re-filing the old snapshot would restore stale data.
+- An action whose target is gone (can't happen once eviction purges, but defensively) is dropped: not filed.
+
+**Tests:**
+- port `UndoControllerTests`, except the Swift one-delete eviction tests (`test_pushDelete_evicts_*`), which are deliberate divergences;
+- multi-delete undo;
+- the cap-dropped delete and its purge;
+- `evict_deletes` and its purge;
+- take and file with an updated action.
 
 ### C2. Edits snapshot one field
 
@@ -128,22 +140,25 @@ There are no ties, gaps or collisions for export (Phase 8) to meet.
 
 | Action | Steps |
 |---|---|
-| `DeleteClip` command | `trash_clip`, then `push(DeleteClip)`, then shred any returned clip's `.trash/<file>` |
-| Undo of a delete | `restore_clip` |
-| Redo of a delete | `trash_clip`, with no push: `pop_redo` already moved the action |
+| `DeleteClip` command | `trash_clip`, then `push(DeleteClip)`, then shred any returned clips' `.trash/<file>` |
+| Undo of a delete | `restore_clip`, then `undone` |
+| Redo of a delete | `trash_clip` (no push), then `redone` with the clip `trash_clip` removed |
 
 **Why save first on delete.** macOS moved the file first, so a crash in between left `project.json` listing a clip whose recording the next open's shred-on-open deleted. With save first, a crash leaves at worst an **unreferenced** recording in `recordings/`: an orphan, which is harmless (BACKLOG #38). The restore order (move back, then save) is safe the same way: the reverse order would let the open-time shred delete a referenced file.
 
-**Save failures** follow the existing `project_changed` convention: the in-memory change stands, and the error is reported.
-- **One exception: the first delete.** If its save fails, the clip is put back, the file isn't moved, and nothing is pushed, so the user sees that the delete didn't happen.
-- **A redo-delete whose save fails** doesn't move the file.
-- **Edits, reorders, undo and redo** push and apply regardless.
+**Save failures** follow the existing `project_changed` convention everywhere: the in-memory change stands, the error is reported, and the action is pushed.
+- The one delete-specific rule: **if the save failed, `trash_clip` doesn't move the file.**
+- So `project.json` can never list a clip whose file is in `.trash`, where the next open would wipe it.
+- The worst case is an orphan in `recordings/`.
 
-**Shredding** only ever touches `recordings/.trash/<file>`, never `recordings/`.
+**Shredding** only ever touches `recordings/.trash/<file>`, never `recordings/`. Moves and shreds ignore `NotFound`.
 
-**Source changes invalidate a trashed clip.** `MoveSource` and `RemoveSource` renumber live clips' `source_index`, but a trashed clip isn't live. Restored later, it would point at the wrong video or past the end of the list; macOS had this bug. So both commands call `evict_delete()` and shred its file. They are rare, and edits and reorders hold no source indices.
+**Source changes invalidate trashed clips.** `MoveSource` and `RemoveSource` renumber live clips' `source_index`, but trashed clips aren't live. Restored later, one would point at the wrong video or past the end of the list; macOS had this bug.
+- So after a **successful** source change (not a refused remove, not `from == to`), the bus calls `evict_deletes()` and shreds their files.
+- Source changes are rare, and edits and reorders hold no source indices.
+- A delete on the redo stack is a live clip, and is refreshed when redone.
 
-**At project open:** remove `recordings/.trash/` entirely and clear the history. Undo is in-memory only (macOS parity). Orphans in `recordings/` are not touched, which stays BACKLOG #38; update its "When to revisit".
+**At project open**, on every path including the startup restore (`Bus::commit`): remove `recordings/.trash/` entirely and clear the history. Undo is in-memory only (macOS parity). Orphans in `recordings/` are not touched, which stays BACKLOG #38; update its "When to revisit".
 
 `write` doesn't fsync, so after a power loss the two renames could land out of order. That is noted, not handled.
 
