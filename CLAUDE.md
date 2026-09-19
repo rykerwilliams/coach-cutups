@@ -53,6 +53,51 @@ After both reviews return:
 
 ## Build + test conventions
 
+### Rust port (primary)
+
+The Linux port is the active codebase. Spec: `docs/superpowers/specs/2026-09-19-linux-port-design.md`.
+
+```bash
+cargo test -p video-coach-core     # pure logic -- needs NO GStreamer
+cargo test --workspace             # everything -- needs GStreamer dev libraries
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+**Crate layout:**
+
+| Crate | Holds |
+|---|---|
+| `video-coach-core` | Pure logic: project format, playback timeline, zoom, stroke replay. |
+| `video-coach-media` | GStreamer: source player, capture, export frame driver, overlay rasterizer. |
+| `video-coach-app` | Slint UI, command bus, event layer. |
+| `video-coach-harness` | Headless integration tests driven over the bus. |
+
+**`video-coach-core` declares no media dependency** — not GStreamer, not an image
+or font crate, not a feature that pulls one in. CI runs its tests on a runner
+with no GStreamer installed, so adding one fails the build rather than passing
+silently. If you need a media type in core, you need a different design.
+
+**Bus contract — caller-captured timestamps.** Any command that lands in the
+commentary event log carries its timestamp (and source-position anchor) as a
+field, captured at the input event on the UI thread, never assigned by the bus
+handler. Queue delay would reintroduce the drift that puts drawings behind the
+ball on replay. Querying position on a running pipeline is the only direct
+pipeline access permitted outside the bus task.
+
+**Pixel work split.** GStreamer owns every full-frame pixel operation, on the
+GPU. Rust owns the edit (which decoded frame lands at each output PTS) and the
+vector overlay layer only. This is measured, not preferred — see
+`docs/superpowers/spikes/2026-09-19-compositing-throughput.md`. Do not move
+full-frame resampling into Rust.
+
+### Reference implementation (`apple/`, not maintained)
+
+The macOS app is kept as the reference for behavior and invariants. It is **not
+maintained in parallel** and is not built by CI. Read it to answer "what did the
+original do?", not to change it. Several known bugs are deliberately left in it
+(see `BACKLOG.md` #27); the port fixes them by construction.
+
 - **Core package tests:** `swift test --package-path apple/VideoCoachCore`
 - **App build:** the `.xcodeproj` is gitignored, regenerated from `apple/project.yml`. After creating any new file under `apple/App/**`:
   ```
@@ -61,13 +106,15 @@ After both reviews return:
   ```
 - Core package files under `apple/VideoCoachCore/**` are auto-discovered by SwiftPM — no xcodegen needed.
 
-## Architecture notes
+## Architecture notes (reference implementation)
+
+These describe `apple/`. The Rust port's architecture is in the spec above.
 
 - **`VideoCoachCore`** (Swift Package) holds all pure logic: data model, clock semantics, custom AVFoundation compositor, export pipeline. Tested headlessly via `swift test`.
 - **App target** (`apple/App/`) is SwiftUI + AppKit interop. Workspace is `@Observable @MainActor`; ContentView owns ephemeral UI state (`@State` + `@Binding` to children).
 - **`Workspace` is project-data only** — never put pure UI mode flags on it. Inspector mode, modal-flow flags, etc. live on `ContentView` as `@State`.
 - **Custom compositor lives on the export path only.** Preview playback uses AVFoundation's built-in compositor because macOS 26 strips custom-compositor instruction subclasses (`ClipPreviewBuilder.swift` documents this). Overlays in preview live as AppKit overlay views above `AVPlayerView`.
-- **Project file is `project.json` under the project folder**, plus a `recordings/` subdir of `.mov` clips. `formatVersion` discipline: bump on every additive schema change; migration happens at decode time, never at save.
+- **Project file is `project.json` under the project folder**, plus a `recordings/` subdir of `.mov` clips. `formatVersion` discipline: bump on every additive schema change; migration happens at decode time, never at save. (The Rust port starts at v7 and refuses anything lower.)
 
 ## Backlog
 
