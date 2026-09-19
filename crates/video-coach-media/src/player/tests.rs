@@ -446,6 +446,44 @@ fn a_seek_while_playing_completes_and_playback_continues() {
 }
 
 #[test]
+fn a_pause_while_a_flushing_seek_recovers_playing_sticks() {
+    let mut rig = Rig::new();
+    let a = rig.fixture("a.webm", 4, 320, 180);
+    rig.load(&a, 0.0);
+    for target in [2.5, 1.0, 3.0] {
+        rig.player.set_playing(true);
+        rig.drain(Duration::from_millis(150));
+
+        // A flushing seek in PLAYING drops the pipeline to PAUSED, pending
+        // PAUSED, and it returns to PLAYING by itself once prerolled. Issued
+        // behind the slot's back, so the pause meets that window with the
+        // slot idle: its only chance to stop the return.
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
+        let position = gst::ClockTime::from_nseconds((target * 1e9) as u64);
+        rig.player.pipeline.seek_simple(flags, position).unwrap();
+        rig.player.set_playing(false);
+        rig.drain(Duration::from_millis(300));
+        assert!(rig.player.is_idle());
+
+        assert_eq!(
+            rig.player.pipeline.state(gst::ClockTime::ZERO),
+            (
+                Ok(gst::StateChangeSuccess::Success),
+                gst::State::Paused,
+                gst::State::VoidPending
+            )
+        );
+        let before = rig.player.position_handle().query_position().unwrap();
+        rig.drain(Duration::from_millis(300));
+        let after = rig.player.position_handle().query_position().unwrap();
+        assert!(
+            (after - target).abs() < FRAME && (after - before).abs() < FRAME,
+            "played on from {target}: {before} then {after}"
+        );
+    }
+}
+
+#[test]
 fn clear_during_a_seek_settles_before_the_next_request() {
     let mut rig = Rig::new();
     let a = rig.fixture("a.webm", 2, 320, 180);

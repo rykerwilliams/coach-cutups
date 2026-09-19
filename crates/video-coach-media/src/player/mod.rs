@@ -464,6 +464,13 @@ impl SourcePlayer {
     /// source loaded: the pipeline stays where `unload` or a failed load left
     /// it.
     ///
+    /// The target is always set, never skipped as already reached: the
+    /// pipeline's current and pending states don't say where it is going. A
+    /// flushing seek in PLAYING leaves it PAUSED, pending PAUSED, until it
+    /// prerolls and returns to PLAYING by itself; a pause skipped then would
+    /// be lost. A redundant change is harmless: PAUSED on a settled PAUSED
+    /// pipeline returns success.
+    ///
     /// A pause that goes async posts an `ASYNC_DONE`, so the slot settles on
     /// it (see the module docs). Only a pause: going to PLAYING can return
     /// async too, but posts no `ASYNC_DONE`, and waiting for one would wedge
@@ -477,16 +484,6 @@ impl SourcePlayer {
         } else {
             gst::State::Paused
         };
-        // Against where the pipeline is heading, not where it is: while a
-        // PLAYING change is still pending the current state is PAUSED, and a
-        // pause then would be taken as already done.
-        let heading = match self.pipeline.pending_state() {
-            gst::State::VoidPending => self.pipeline.current_state(),
-            pending => pending,
-        };
-        if heading == target {
-            return;
-        }
         let change = self.pipeline.set_state(target);
         if target == gst::State::Paused && change == Ok(gst::StateChangeSuccess::Async) {
             self.flight = Flight::Settling;

@@ -300,6 +300,17 @@ fn a_pause_right_after_a_skip_is_anchored_at_the_skip_target() {
     rig.h.skip(1.0);
     rig.h.toggle_play();
     assert!(!rig.h.wait_playing());
+    // And the player paused: once the skip lands, the position holds.
+    rig.h.poll_until("the skip landed", |h| {
+        latest_position(h).is_some_and(|(_, target)| target.is_none())
+    });
+    let landed = rig.h.position_secs().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let later = rig.h.position_secs().unwrap();
+    assert!(
+        (later - landed).abs() < FRAME,
+        "played from {landed} to {later}"
+    );
     let clip = rig.stop();
 
     let Some(EventKind::Pause { source_time }) = clip.events.last().map(|e| e.kind.clone()) else {
