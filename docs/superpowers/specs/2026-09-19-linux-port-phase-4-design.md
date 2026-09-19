@@ -26,6 +26,7 @@ Clip editing, tags, delete and undo belong to Phase 3. Stroke drawing belongs to
 4. The camera and microphone can be chosen. The choice persists, and a missing device falls back to the default without forgetting the preference.
 5. Killing the app mid-recording leaves a playable `.mkv` behind. Nothing else is recovered (R7).
 6. Pausing leaves the frame that was on screen, and that is the frame the logged anchor points at (R10).
+   - The one exception: the anchor is read on the UI thread at the keypress, and the pause lands a few milliseconds later on the bus. When that gap crosses a frame boundary, the anchor is one frame behind the held frame. This is accepted, to keep the caller-captured contract.
 
 ---
 
@@ -99,7 +100,11 @@ matroskamux name=mux offset-to-zero=false ! filesink buffer-mode=unbuffered loca
 ### R2. Devices: enumerate via PipeWire, key on `node.name`
 
 - **Enumeration:** `gst::DeviceMonitor` for `Video/Source` and `Audio/Source`, run when the Devices popover opens and again at record time. There is no long-lived monitor and no hot-plug watching.
-- **IR filter:** cameras whose caps offer only GRAY8 are dropped, so the IR camera never appears.
+- **Usable cameras only:** a camera is listed only if R3 finds a mode for it. GRAY8 is never a usable format, so the IR camera never appears, and a camera the app can't record from can't be picked.
+- **System default:**
+  - For the mic, "default" means no `target-object` is set, so PipeWire's session manager picks.
+  - For the camera, it means the listed camera with the highest `priority.session` (1000 for the webcam, 980 for the IR camera here).
+  - DeviceMonitor exposes no default flag.
 - **Stored key:** `node.name`, the only key, goes in the existing `Preferences.preferred_camera_id` / `preferred_mic_id`.
   - The field doc comment in `project.rs`, which recommends `/dev/v4l/by-id`, is corrected.
 - **Missing device:** if the stored device is absent at record time, record with the default device and show a notice. The preference is **not** cleared.
@@ -108,9 +113,9 @@ matroskamux name=mux offset-to-zero=false ! filesink buffer-mode=unbuffered loca
 
 ### R3. Camera format: one rule, else refuse
 
-Use the largest **16:9** mode that is **≤1280 wide at 30/1**, raw or MJPEG. The choice only decides whether a JPEG decode goes in the chain.
-
-- If there is no such mode, the recording is refused with "This camera has no 16:9 mode at 30 fps up to 1280 wide". This is the parent spec's rule and macOS's `noSuitableFormat`.
+Use the largest **exactly 16:9** (`w·9 = h·16`) mode that is **≤1280 wide at 30/1**, MJPEG or raw (not GRAY8).
+- The choice decides the head of the chain: MJPEG gets a JPEG decode, raw gets a `videoconvert`, because `vah264lpenc` accepts only NV12 (measured: YUY2 won't link).
+- A camera with no such mode isn't listed (R2). With no usable camera at all, the recording is refused: "No camera with a 16:9, 30 fps mode up to 1280 wide". This is the parent spec's rule and macOS's `noSuitableFormat`.
 - The choice is a pure function over the device's caps, tested with recorded caps structures.
 
 ### R4. Encoder: a presence check, CQP
@@ -140,54 +145,57 @@ Use the largest **16:9** mode that is **≤1280 wide at 30/1**, raw or MJPEG. Th
 ### R6. Recording lifecycle
 
 ```
-Idle ──StartRecording──▶ Starting ──first video buffer at mux──▶ Recording ──StopRecording──▶ (stop, blocking) ──▶ Idle
+Idle ──StartRecording──▶ Active(starting) ──first video buffer at mux──▶ Active ──StopRecording──▶ (stop, blocking) ──▶ Idle
                            │ StopRecording, ERROR, or 5 s with no video
                            ▼
-                          Idle (file deleted, error shown if any)
+                          Idle (file deleted, no clip, error shown if any)
 ```
 
-**Commands.** `StartRecording { zoom }`, `StopRecording` and `Zoom { host_ns, zoom }` are separate commands. The UI's R key toggles between them from its own state, so a queued second R press is a no-op instead of a new recording.
+**Commands.** `StartRecording { zoom }`, `StopRecording` and `Zoom { host_ns, zoom }` are separate commands. The UI's R key toggles between them from its own state. A queued second Start is dropped by the guard below, so it is a no-op instead of a new recording.
 
 **Preconditions for Start:**
 - a project is open;
 - it has sources and none is missing;
-- the current source is loaded;
-- the recorder is Idle.
+- the current source is loaded or loading.
 
-Otherwise the command is refused with a message. A skip or scrub in flight is **not** a reason to refuse: the start position is where the player is heading (below).
+Otherwise the command is refused with a message. A skip or scrub in flight is **not** a reason to refuse: the start position is where the player is heading.
 
 **Start sequence:**
 1. The bus pauses the player (as on macOS, every clip starts on a still frame).
-2. It records `pending = { clip_id, source_index, start_source_seconds }`. The position follows the same order as the R10 anchor: the burst target, else the in-flight target, else the pipeline's position.
-3. It starts the recorder and reads `t0_ns = base_time`.
+2. It records `pending = { clip_id, source_index, start_source_seconds }`. Both the source and the position follow the same order as the R10 anchor: the burst target (located, since it can lie in the next source), else the in-flight target, else the pipeline's position.
+3. It starts the recorder and reads `t0_ns = base_time` as soon as `set_state(PLAYING)` returns.
+   - Don't wait for PLAYING. `matroskamux` waits for data on every pad, so the pipeline doesn't reach PLAYING until the camera's first frame arrives. `base_time` is fixed when `set_state` returns (measured).
+4. It creates the `RecordingLog` (R8) with t0, the UI's zoom and `start_source_seconds`.
 
-**Starting:**
-- lasts until the first video buffer reaches the muxer, which proves the camera is alive;
-- TogglePlay, Skip and scrub are ignored, so the logged `pause(start) @0` stays true;
-- `Zoom` commands update the latest zoom, so the initial keyframe is current;
-- StopRecording, a recorder ERROR, or 5 s with no video abort it: the pipeline goes to NULL and the file is deleted.
+There is one **Active** state from here on. Until the first video buffer reaches the muxer, it is flagged *starting*. That flag changes only two things:
+- the UI label ("Preparing…");
+- what stopping does: StopRecording, a recorder ERROR, or 5 s with no video **abort**. The pipeline goes to NULL, the file is deleted and no clip is made.
 
-**Entering Recording:** the bus creates the `RecordingController` (R8) with t0, the latest zoom and `start_source_seconds`.
+Transport and zoom during the camera warm-up are logged like any other. File time 0 is `base_time`, so the warm-up is recorded audio, and a key pressed there really happened at that record time. (macOS ignored keys while starting because its time 0 was the first frame; that reason doesn't apply here.)
+
+A failed `Recorder::start` also deletes the file, which filesink has already created at 0 bytes.
 
 **Stopping is synchronous on the bus thread.** `Recorder::stop()` and the bus's closing steps:
 1. **Stop logging:** the controller's `finish()` is called first, so no event can outlast the file.
 2. **Finalize:** `stop()` sends EOS, waits on the recorder's own GStreamer bus for EOS or ERROR (at most 5 s), sets NULL, and returns the duration.
 3. **Duration:** the latest buffer end, in running time, that reached the muxer. A pad probe tracks it. After a clean EOS this is the file's duration, so Discoverer isn't needed. After a timeout or error it is still a good estimate of what was written.
-4. **Save:** the bus builds the clip (R9) and saves. **The clip is always built once Recording was reached.** Losing a coach's commentary over a finalization hiccup is the worst outcome, and the file is playable either way.
+4. **Save:** the bus builds the clip (R9) and saves. **The clip is always built once the first video frame arrived.** Losing a coach's commentary over a finalization hiccup is the worst outcome, and the file is playable either way.
 5. **Notify:** if the stop timed out or errored, the user also gets a notice.
 
 A typical stop takes <100 ms, so no Stopping state or "ignore R while stopping" rule is needed.
 
-**Closing the window while recording** runs the same stop, builds the clip and saves before the bus exits.
+**Closing the window while recording** runs the same stop, builds the clip and saves before the bus exits. While still starting, it aborts instead.
 
-**One guard while recording.** While the recorder is not Idle, the bus refuses every command except:
+**One guard while recording.** While Active, the bus refuses every command except:
 - TogglePlay, Skip, SetVolume;
 - Zoom, StopRecording;
 - GlReady, Shutdown.
 
+`Zoom` while Idle is ignored. The UI sends every zoom change, so a change made before its status catches up isn't lost.
+
 This replaces a per-command list, so commands added later (Phase 3's delete and undo) are refused by default. The UI greys out the sidebar, the menus and the scrubber from one `recording` property.
 
-**Timer:** the bus's single `deadline` slot (the skip debounce) becomes a small set of named deadlines, adding the Starting timeout.
+**Timer:** the bus's single `deadline` slot (the skip debounce) becomes two named deadlines, adding the starting timeout. Deadlines that have passed are dispatched after every input, not only on a receive timeout, so a busy channel (level messages at 10 Hz) can't starve them.
 
 ### R7. Crash recovery: none, by design
 
@@ -195,9 +203,9 @@ A crash loses the in-memory event log and the pending start position, so an orph
 
 The parent spec's "fallback for unknown duration after a crash" is dropped. R6 already covers the non-crash case (timeout or error at stop). Listing and cleaning up unreferenced recordings belongs with Phase 3's trash handling (backlog).
 
-### R8. `RecordingController` is ported to core, as a pure event log
+### R8. `RecordingLog`: `RecordingController` ported to core, as a pure event log
 
-`video-coach-core` gains `recording.rs`, which ports `RecordingController.swift`. The Swift version's injected clock is replaced by caller-supplied times. The controller lives on the bus.
+`video-coach-core` gains `recording.rs`, which ports `RecordingController.swift` as `RecordingLog` (it controls nothing). The Swift version's injected clock is replaced by caller-supplied times. The log lives on the bus.
 
 - `new(t0_ns, zoom, start_source_seconds)` writes `zoom @0` then `pause(start) @0`. The order is an invariant of construction, not something the caller must remember.
 - `play(host_ns, source_seconds)` and `pause(host_ns, source_seconds)` take a caller-captured time and the anchor chosen by the bus (R10).
@@ -207,7 +215,7 @@ The parent spec's "fallback for unknown duration after a crash" is dropped. R6 a
   - if more than 100 ms have passed since the last capture, first emits an anchor keyframe holding the previous value at `max(t − 1 ms, last event time)`, so the log stays sorted. macOS could break the order here, which makes `debug_assert_sorted` panic;
   - never throttles.
 - `finish() -> Vec<CommentaryEvent>`.
-- `record_time` is clamped at ≥ 0. A `host_ns` captured just before t0 can still arrive while Recording.
+- `record_time` is clamped to ≥ the last event's time. The log starts with events at 0, so this also covers a `host_ns` captured just before t0.
 - **Tests:** port `apple/Tests/AppTests/RecordingZoomCaptureTests.swift`, plus the construction order, the sorted anchor and dedupe.
 
 ### R9. Clip construction lives on `Project`
@@ -259,7 +267,7 @@ This fix applies whenever the user pauses, recording or not, so the plan lands i
 
 ### R11. Recording UI
 
-- **Starting:** "Preparing recording…". There is no Cancel button: R, Esc or Stop aborts.
+- **Starting** (Active, before the first video frame): "Preparing recording…". There is no Cancel button: R, Esc or Stop aborts.
 - **Recording:**
   - a red dot, "Recording", and elapsed time since t0 at 1 Hz, via the existing `format_hms`;
   - a mic level bar;
@@ -271,7 +279,7 @@ This fix applies whenever the user pauses, recording or not, so the plan lands i
 - **Clips list:** the sidebar gains a **Clips** section below Sources, with each clip's name and duration (`format_hms`), ordered by `sort_index`. There is no selection or editing yet (Phase 3).
 - **Errors:** new `UserError` variants, shown through the existing error display. They cover:
   - device missing (a notice; the recording still goes ahead);
-  - no suitable camera format;
+  - no usable camera or microphone;
   - recording failed (pipeline error, or no video within 5 s);
   - the stop didn't finalize cleanly (a notice; the clip is kept).
 
@@ -282,7 +290,7 @@ This fix applies whenever the user pauses, recording or not, so the plan lands i
 | Crate | Phase 4 contents |
 |---|---|
 | `video-coach-core` | `recording.rs` (the controller); `Project::add_recorded_clip`; `SkipCoordinator` range parameter. |
-| `video-coach-media` | `Recorder`: the pipeline from R1 with injected sources, the forced clock, t0 = base_time, a first-video-buffer signal, a last-buffer-end probe, a synchronous `stop()`, level and error messages, and a generation tag. `devices`: enumeration, IR filter, the caps choice (R3), the encoder choice (R4). |
+| `video-coach-media` | `Recorder`: the pipeline from R1 with injected sources, the forced clock, t0 = base_time, a first-video-buffer signal, a last-buffer-end probe, a synchronous `stop()`, level and error messages, and a generation tag. `devices`: enumeration of usable devices, the caps choice (R3), the encoder choice (R4). |
 | `video-coach-app` | Bus: the recording state machine (R6), Start/Stop/Zoom commands, the one guard, anchor choice, clamping, named deadlines, stop on shutdown. UI: R/Esc, the recording transport, the level bar, the Devices popover, the Clips list. |
 | `video-coach-harness` | End-to-end recording with test sources. |
 
@@ -310,8 +318,8 @@ This fix applies whenever the user pauses, recording or not, so the plan lands i
 - **Harness** (bus end to end, test sources):
   - Start → Recording → Stop → a clip appears with the right `source_index`, `start_source_seconds`, duration, and a log starting `[zoom, pause]`. The file exists.
   - `sort_index` is `max + 1` after a manual gap.
-  - Stop during Starting leaves no clip and no file.
-  - TogglePlay during Starting is ignored.
+  - Stop while starting (camera delayed) leaves no clip and no file.
+  - TogglePlay during the warm-up is logged.
   - Start with a missing source is refused.
   - A command outside the guard (e.g. AddSource) is refused while recording.
   - A skip is clamped to the source.
