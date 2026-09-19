@@ -36,7 +36,7 @@ Select a clip and play it back inside the app: the game video edited by the coac
 | Control (no pipeline) | — | 0.76 / 1.34 / 6.1 ms |
 
 - **Sharing Slint's GL context is the *better* topology.** A private surfaceless display measured 0.97 / **28.3** / 45.2 ms, about 4× worse at p95, before adding a system-memory copy. The bottleneck is the 15 W iGPU, not the context. **There is no private-context fallback.**
-- **Rasterize the overlay at the output size.** A 1080p overlay into a 720p preview costs 2.5× the p95 and 3.5× the max.
+- **Rasterize the overlay small.** A 1080p overlay into a 720p preview costs 2.5× the p95 and 3.5× the max, so it is rasterized at the **picture rect** (P4), which is at most the output size.
 - **`glupload` takes a system-memory RGBA buffer per frame at 30 fps** without trouble. `glvideomixer`'s `blend-function-dst-rgb` already defaults to `one-minus-src-alpha`, so only `blend-function-src-rgb=one` needs setting.
 - **An audio appsink on a pumped decode branch deadlocks.** With `decodebin3` feeding a GL video appsink (max-buffers 2) plus an audio appsink, pulling only video stalled after 15 frames (0.2 s). Draining audio first, then pulling video, ran clean (3651 video + 5711 audio buffers in 5 s). **This is why the source branch stays video-only in Phase 7** (Phase 8's mixer must adopt the drain-first rule).
 - **A pipeline seek fires `seek-data` on *every* seekable appsrc, on the seeking thread,** not the pump's, and pushes after `FLUSH_STOP` with stale PTS are silently accepted (zero `FLUSHING` returns).
@@ -58,7 +58,7 @@ Select a clip and play it back inside the app: the game video edited by the coac
 | Tail | NV12 → `gldownload` → encoder → `mp4mux` → `filesink` | `glcolorconvert` → `gl_caps()` appsink → the shared `FrameMailbox` |
 | Output | 1920×1080 | **1280×720** (measured: the best UI frame time) |
 | Errors | `CompositeError` (`export/` is renamed `composite/`, with a tail each) | the same |
-| GL | a private surfaceless display | **Slint's context**, from `Command::GlReady` |
+| GL | a private surfaceless display | **Slint's context** in the app; `SharedGl::get()` in tests |
 | Pacing | as fast as possible | the sink syncs to the clock |
 
 - **Output size and GL context become parameters** of the builder. `SharedGl` becomes injectable.
