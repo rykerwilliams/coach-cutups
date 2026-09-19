@@ -51,6 +51,17 @@ After both reviews return:
 - Every change must earn its place; if the fix is worse than the original issue, skip it
 - Leave the code in a better place than we found it
 
+## Project skills (`.claude/skills/`)
+
+| Skill | Use it to |
+|---|---|
+| `port-swift-module` | Translate a module from `apple/` into `video-coach-core` without repeating past mistakes |
+| `verify` | Run fmt, clippy, tests and the core dependency audit before committing |
+| `measure-media` | Benchmark GStreamer decode/seek on real hardware without fooling yourself |
+| `adversarial-review` | Run the review pattern below on a spec, plan, or diff |
+
+`.claude/` is committed; personal overrides go in `.claude/settings.local.json` (gitignored).
+
 ## Build + test conventions
 
 ### Rust port (primary)

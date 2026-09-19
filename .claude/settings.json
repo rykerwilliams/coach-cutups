@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo tree *)",
+      "Bash(gst-inspect-1.0 *)",
+      "Bash(gst-discoverer-1.0 *)",
+      "Bash(gst-launch-1.0 *)",
+      "Bash(scripts/linux-gate-check.sh *)",
+      "Bash(./scripts/linux-gate-check.sh *)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git show *)",
+      "Bash(git branch)",
+      "Bash(git branch -a)",
+      "Bash(git branch --show-current)"
+    ]
+  }
+}

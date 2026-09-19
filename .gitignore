@@ -17,8 +17,8 @@ Package.resolved
 *.xcodeproj
 apple/App/Info.plist
 
-# Claude Code workspace
-.claude/
+# Claude Code: .claude/ is committed (shared settings, skills). Personal overrides stay local.
+.claude/settings.local.json
 
 # Superpowers brainstorm sessions (visual companion mockups)
 .superpowers/
