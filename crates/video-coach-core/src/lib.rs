@@ -11,6 +11,7 @@ pub mod project;
 pub mod scoreboard_config;
 pub mod store;
 pub mod stroke;
+pub mod stroke_replay;
 pub mod tag;
 pub mod timeline;
 pub mod zoom;
