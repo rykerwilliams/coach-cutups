@@ -28,6 +28,7 @@ use uuid::Uuid;
 use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
+use video_coach_core::stroke::Stroke;
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
@@ -123,6 +124,17 @@ pub enum Command {
     Zoom {
         host_ns: u64,
         zoom: Zoom,
+    },
+    /// A drawing finished (Phase 6 spec D4). `host_ns` is the moment of its
+    /// **last** point, the pen-up. Logged while recording, ignored otherwise.
+    Stroke {
+        host_ns: u64,
+        stroke: Stroke,
+    },
+    /// The coach wiped every drawing. Logged while recording, ignored
+    /// otherwise.
+    ClearAll {
+        host_ns: u64,
     },
     /// The project's preferred camera, by PipeWire `node.name`; `None` is
     /// the system default.
@@ -487,6 +499,8 @@ impl Bus {
                     | Command::Skip { .. }
                     | Command::SetVolume { .. }
                     | Command::Zoom { .. }
+                    | Command::Stroke { .. }
+                    | Command::ClearAll { .. }
                     | Command::ToggleRecording { .. }
                     | Command::StopRecording
                     | Command::GlReady { .. }
@@ -524,6 +538,8 @@ impl Bus {
             Command::ToggleRecording { zoom } => self.toggle_recording(zoom),
             Command::StopRecording => self.stop_recording(),
             Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
+            Command::Stroke { host_ns, stroke } => self.log_stroke(host_ns, stroke),
+            Command::ClearAll { host_ns } => self.log_clear_all(host_ns),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
             Command::ExportClip { id, path } => self.export_clip(id, path),

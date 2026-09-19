@@ -16,6 +16,7 @@ use gstreamer::glib;
 use uuid::Uuid;
 use video_coach_core::project::Preferences;
 use video_coach_core::recording::{PendingClip, RecordingLog};
+use video_coach_core::stroke::Stroke;
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
     list_devices, resolve_camera, resolve_mic, CaptureSources, Recorder, RecorderMessage,
@@ -203,6 +204,22 @@ impl Bus {
     pub(super) fn log_zoom(&mut self, host_ns: u64, zoom: Zoom) {
         if let Some(active) = &mut self.recording {
             active.log.zoom(host_ns, zoom);
+        }
+    }
+
+    /// Logs a finished drawing while recording, ignored while idle (Phase 6
+    /// spec D4). `host_ns` is its pen-up, the moment of its last point. The UI
+    /// is what confines drawing to the Recording phase.
+    pub(super) fn log_stroke(&mut self, host_ns: u64, stroke: Stroke) {
+        if let Some(active) = &mut self.recording {
+            active.log.stroke(host_ns, stroke);
+        }
+    }
+
+    /// Logs a Clear while recording, ignored while idle.
+    pub(super) fn log_clear_all(&mut self, host_ns: u64) {
+        if let Some(active) = &mut self.recording {
+            active.log.clear_all(host_ns);
         }
     }
 

@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tempfile::TempDir;
+use uuid::Uuid;
 use video_coach_app::bus::{CaptureKind, Command, Event, RecordingStatus, UserError};
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
+use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::timeline;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{write_project, Harness};
@@ -126,6 +128,87 @@ fn files(dir: &Path) -> Vec<PathBuf> {
 
 fn kinds(events: &[CommentaryEvent]) -> Vec<EventKind> {
     events.iter().map(|e| e.kind.clone()).collect()
+}
+
+/// A finished stroke as the UI sends one at pen-up: two points, red, auto-clear
+/// on.
+fn a_stroke() -> Stroke {
+    Stroke {
+        id: Uuid::new_v4(),
+        color: Rgba::RED,
+        line_width: 0.005,
+        points: vec![
+            StrokePoint {
+                x: 0.25,
+                y: 0.5,
+                t: 0.0,
+            },
+            StrokePoint {
+                x: 0.75,
+                y: 0.5,
+                t: 0.1,
+            },
+        ],
+        auto_clear_after_seconds: Some(5.0),
+    }
+}
+
+/// Phase 6 spec D4: both land at the record time the caller's `host_ns` names,
+/// so a queued command can't drift the drawing.
+#[test]
+fn a_stroke_and_a_clear_while_recording_are_logged() {
+    let mut rig = Rig::open(&[("a.webm", 2)]);
+    let t0 = rig.record();
+    let drawn = a_stroke();
+    // As the UI captures them: `now_ns()` at the input event, here pinned to
+    // t0 so the record times are exact.
+    rig.h.send(Command::Stroke {
+        host_ns: t0 + 250_000_000,
+        stroke: drawn.clone(),
+    });
+    rig.h.send(Command::ClearAll {
+        host_ns: t0 + 500_000_000,
+    });
+    let clip = rig.stop();
+
+    assert_eq!(
+        kinds(&clip.events),
+        [
+            EventKind::Zoom(Zoom::IDENTITY),
+            EventKind::Pause {
+                source_time: clip.start_source_seconds
+            },
+            EventKind::Stroke(drawn),
+            EventKind::ClearAll,
+        ]
+    );
+    assert_eq!(clip.events[2].record_time, 0.25);
+    assert_eq!(clip.events[3].record_time, 0.5);
+    rig.h.shutdown();
+}
+
+#[test]
+fn a_stroke_and_a_clear_outside_a_recording_are_dropped() {
+    let mut rig = Rig::open(&[("a.webm", 2)]);
+    rig.h.send(Command::Stroke {
+        host_ns: now_ns(),
+        stroke: a_stroke(),
+    });
+    rig.h.send(Command::ClearAll { host_ns: now_ns() });
+    // Nothing was held over: the next recording's log opens clean.
+    rig.record();
+    let clip = rig.stop();
+
+    assert_eq!(
+        kinds(&clip.events),
+        [
+            EventKind::Zoom(Zoom::IDENTITY),
+            EventKind::Pause {
+                source_time: clip.start_source_seconds
+            },
+        ]
+    );
+    rig.h.shutdown();
 }
 
 #[test]
