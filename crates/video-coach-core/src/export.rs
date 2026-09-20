@@ -56,9 +56,7 @@ const RATE_MIN_SPAN: f64 = 2.0;
 /// second**.
 ///
 /// The caller divides its remaining frames by this; frames are what the pump
-/// counts, so nothing has to convert through a duration that per-entry
-/// quantization has already made approximate (see
-/// `CompilationPlan::total_duration_seconds`).
+/// counts, so nothing has to convert through a duration at all.
 ///
 /// macOS's monotonic clamp is deliberately **not** ported: it existed to
 /// absorb `AVFoundation`'s `fractionCompleted` overshooting 1.0. A pushed-frame

@@ -31,7 +31,7 @@ jobs:
       # `gstreamer1.0-libav` is there for `avenc_aac`, which is rank none and
       # has no alternative; it also brings `avdec_h264` (rank 256), which
       # outranks `openh264dec` and so moves this runner closer to the dev
-      # machine. `tests/openh264.rs` keeps openh264 covered by rank.
+      # machine.
       - name: Install GStreamer and UI build dependencies
         run: |
           sudo apt-get update

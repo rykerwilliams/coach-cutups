@@ -20,8 +20,8 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
-use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
-use video_coach_core::plan::{CompilationPlan, ExportTarget, PlanEntry};
+use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec};
+use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, SourceRef};
 
 /// How long a fixture pipeline may run before it is declared hung.
@@ -35,33 +35,26 @@ const AUDIO_RATE: u32 = 44_100;
 /// read back to the sample.
 const TONE_RATE: u32 = 48_000;
 
-/// A one-entry compilation of `frames` for `clip`, with `text` on the bar: the
-/// plan `compilation_schedule` builds for a single-clip target.
+/// A one-entry compilation of `frames` for `clip`, with `text` on the bar.
 ///
-/// The media tests drive the export from frame lists no project can express —
-/// a seek into a gap, a zoom held over three frames, a deliberate mid-stream
-/// error — so they assemble the entry rather than going through a project.
-/// `segments` is left empty: it is the audio edit's input (Phase 8 Task 4),
-/// not the picture's.
+/// The plan is the real one [`one_clip`] builds — segments and all, since the
+/// segments are the game track's audio edit — with only the frame list and the
+/// bar's line replaced. The media tests drive the export from frame lists no
+/// project can express (a seek into a gap, a zoom held over three frames, a
+/// deliberate mid-stream error), and that is the one thing they fabricate.
 pub fn one_entry(clip: &Clip, frames: Vec<FrameSpec>, text: &str) -> Compilation {
-    let count = frames.len();
-    Compilation {
-        plan: CompilationPlan {
-            total_duration_seconds: count as f64 / f64::from(OUTPUT_FPS),
-            entries: vec![PlanEntry {
-                clip_id: clip.id,
-                source_index: clip.source_index,
-                recording_filename: clip.recording_filename.clone(),
-                show_pip: clip.show_pip,
-                segments: Vec::new(),
-                recording_duration: clip.recording_duration,
-                start_frame: 0,
-                frames: count,
-                text: text.to_owned(),
-            }],
-        },
-        frames,
-    }
+    // Covering by construction, so the clip's own segments survive planning;
+    // the caller's frame list is what the pump follows regardless.
+    let mut compilation = one_clip(clip, clip.start_source_seconds + clip.recording_duration);
+    let entry = compilation
+        .plan
+        .entries
+        .first_mut()
+        .expect("a one-clip project plans one entry");
+    entry.frames = frames.len();
+    entry.text = text.to_owned();
+    compilation.frames = frames;
+    compilation
 }
 
 /// A VP8 + Vorbis WebM of `secs` seconds at `w`×`h`, `fps` frames per second,

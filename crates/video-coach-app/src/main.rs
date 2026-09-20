@@ -21,8 +21,8 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    export_targets, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, ExportTargetRow,
-    ExportTargetRun, RecordingStatus, Snapshot, TargetState,
+    export_targets, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, ExportTargetRun,
+    RecordingStatus, Snapshot, TargetState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
@@ -89,7 +89,7 @@ struct UiState {
     /// What the export sheet's rows stand for, in its order (Phase 8 E8).
     /// The window holds the labels and the ticks; the targets are here, since
     /// it has no type for one.
-    export_targets: Vec<ExportTargetRow>,
+    export_targets: Vec<ExportTarget>,
 }
 
 impl Default for UiState {
@@ -399,7 +399,7 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                     .iter()
                     .zip(ticked.iter())
                     .filter(|(_, row)| row.ticked)
-                    .map(|(target, _)| target.target.clone())
+                    .map(|(target, _)| target.clone())
                     .collect()
             });
             bus.borrow().send(Command::Export {
@@ -428,9 +428,8 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
 fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
     let Some((resolution, quality, rows)) = UI.with_borrow_mut(|ui| {
         let project = &ui.snapshot.as_ref()?.project;
-        ui.export_targets = export_targets(project, clip);
-        let rows: Vec<TargetRow> = ui
-            .export_targets
+        let targets = export_targets(project, clip);
+        let rows: Vec<TargetRow> = targets
             .iter()
             .map(|row| {
                 let clips = if row.clips == 1 { "clip" } else { "clips" };
@@ -444,11 +443,15 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
             })
             .collect();
         let prefs = &project.preferences;
-        Some((
+        let picked = (
             prefs.last_export_resolution,
             prefs.last_export_quality,
             rows,
-        ))
+        );
+        // The rows the sheet shows and the targets a tick means, in the same
+        // order: the sheet reads back only the ticks.
+        ui.export_targets = targets.into_iter().map(|row| row.target).collect();
+        Some(picked)
     }) else {
         return;
     };
@@ -1047,12 +1050,14 @@ fn show_export(w: &AppWindow, run: &ExportRun) {
 /// carries the reason.
 fn run_row(target: &ExportTargetRun) -> RunRow {
     let frames = target.frames.max(1);
+    let done = match target.state {
+        TargetState::Running(done) => Some(done),
+        _ => None,
+    };
     RunRow {
         label: target.label.as_str().into(),
-        progress: match target.state {
-            TargetState::Running(done) => done as f32 / frames as f32,
-            _ => -1.0,
-        },
+        rendering: done.is_some(),
+        progress: done.unwrap_or(0) as f32 / frames as f32,
         status: match target.state {
             TargetState::Pending => "Pending".into(),
             TargetState::Running(done) => format!("{}%", done * 100 / frames).into(),

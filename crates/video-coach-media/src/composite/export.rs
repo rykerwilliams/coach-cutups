@@ -15,7 +15,8 @@
 //! **Every pad gets a buffer for every frame.** A requested pad that never
 //! receives one produced no output at all and backed the base `appsrc` up,
 //! with no error (measured), so an entry with the PiP off, or with a recording
-//! that can't be read, pushes a 1×1 transparent pixel instead.
+//! that can't be read, pushes a 1×1 transparent pixel instead — in GL memory,
+//! like the recording's own frames (see [`Filler`]).
 //!
 //! **Caps may change from the pushing thread; geometry may not.** Every
 //! `appsrc` takes a mid-stream caps change and it lands on exactly the right
@@ -37,17 +38,17 @@ use gstreamer_video as gst_video;
 use video_coach_core::audio::Region;
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
-use video_coach_core::plan::PlanEntry;
 use video_coach_core::project::{Clip, Quality, Resolution};
 
 use super::audio::Mixer;
 use super::decode::Decoder;
 use super::{
-    audio, fit_rect, frame_time, head, install_geometry, install_zoom, place, push_buffer, stamp,
-    stamp_buffer, CompositeError, Gl, Layout, Schedule, Stopper, Watch, POLL, QUEUED,
+    audio, fit_rect, frame_time, head, install_geometry, install_overlay_pad, install_zoom,
+    overlay_branch, push_buffer, stamp, stamp_buffer, CompositeError, Gl, Layout, Schedule,
+    Stopper, Watch, POLL, QUEUED,
 };
 use crate::overlay::{OverlayFrame, OverlayRenderer};
-use crate::player::{seconds_to_clock, Diagnostics};
+use crate::player::{gl_caps, seconds_to_clock, Diagnostics};
 
 /// Where the PiP's filler lands: one transparent pixel, so the rect is only
 /// something for `glvideomixer` to scale nothing into.
@@ -256,7 +257,10 @@ fn export(
     let mut sources: HashMap<usize, Decoder> = HashMap::new();
     let mut mixer = Mixer::new(job);
     let mut overlays = OverlayRenderer::new();
-    let mut encoder: Option<Encoder> = None;
+    // Before any decoding: the encode side depends on nothing the pump
+    // produces, so a missing encoder is reported in the moment the run starts
+    // rather than after the first source has been opened and seeked.
+    let encoder = Encoder::start(part, &schedule, job, &gl, inject, &watch)?;
     // The entry the layout and the caps are currently for, and its PiP, which
     // is opened and closed with it.
     let mut laid_out: Option<usize> = None;
@@ -280,18 +284,12 @@ fn export(
             .get_mut(&entry.source_index)
             .expect("inserted just above");
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), &watch)?;
-        // The first frame's caps shape the encode side: its size, PAR and
-        // memory.
-        if encoder.is_none() {
-            encoder = Some(Encoder::start(part, &schedule, job, &gl, inject, &watch)?);
-        }
-        let encoder = encoder.as_ref().expect("started above");
         if laid_out != Some(frame.entry) {
             let caps = source_caps(sample)?;
             let info = gst_video::VideoInfo::from_caps(&caps)
                 .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
             picture = fit_rect(&info, out_w, out_h);
-            pip = Pip::open(entry, &media.recording, &gl, cancel, (out_w, out_h));
+            pip = Pip::open(&media.clip, &media.recording, &gl, cancel, (out_w, out_h));
             // Before the push, so the pad probes find it (see `Schedule`).
             schedule.set_layout(
                 frame.entry,
@@ -333,7 +331,6 @@ fn export(
             on_message(ExportMessage::Progress(n + 1));
         }
     }
-    let encoder = encoder.ok_or_else(|| ExportError::Failed("the target has no frames".into()))?;
     encoder.finish(&watch)?;
     Ok(ExportDone {
         path: job.path.clone(),
@@ -397,17 +394,17 @@ impl Pip {
         }
     }
 
-    /// Opens `recording` for `entry`, or falls back to the filler, saying on
+    /// Opens `recording` for `clip`, or falls back to the filler, saying on
     /// stderr why. A missing PiP is a smaller loss than a failed export of an
     /// hour of video.
     fn open(
-        entry: &PlanEntry,
+        clip: &Clip,
         recording: &Path,
         gl: &Gl,
         cancel: &AtomicBool,
         (out_w, out_h): (i32, i32),
     ) -> Pip {
-        if !entry.show_pip {
+        if !clip.show_pip {
             return Pip::filler();
         }
         let refuse = |why: String| {
@@ -455,16 +452,23 @@ impl Pip {
     /// the entry's own timeline. Past the recording's end `Decoder::frame_at`
     /// holds its last frame, which is what `repeat-after-eos` would have done
     /// on a pad that could EOS — a pumped one never does.
-    fn frame(&mut self, n: u64, record_time: f64, cancel: &AtomicBool) -> (gst::Buffer, gst::Caps) {
+    fn frame(
+        &mut self,
+        n: u64,
+        record_time: f64,
+        cancel: &AtomicBool,
+        filler: &Filler,
+    ) -> (gst::Buffer, gst::Caps) {
         if let Some(decoded) = self.decode(n, record_time, cancel) {
             return decoded;
         }
         // Whatever went wrong won't get better: the rest of the entry takes
         // the filler rather than retrying the recording once a frame.
         self.decoder = None;
-        let mut buffer = gst::Buffer::from_slice([0u8; 4]);
+        // A reference to the one texture, not a copy of it.
+        let mut buffer = filler.buffer.copy();
         stamp_buffer(&mut buffer, n);
-        (buffer, filler_caps())
+        (buffer, filler.caps.clone())
     }
 
     /// The recording's frame at `record_time`, or `None` once there is no
@@ -496,15 +500,73 @@ impl Pip {
     }
 }
 
-/// One transparent RGBA pixel's caps. The pad scales it to whatever rect it
-/// has, and a transparent pixel is invisible however big (measured).
-fn filler_caps() -> gst::Caps {
-    gst_video::VideoCapsBuilder::new()
-        .format(gst_video::VideoFormat::Rgba)
-        .width(1)
-        .height(1)
-        .framerate(gst::Fraction::new(OUTPUT_FPS as i32, 1))
-        .build()
+/// The PiP pad's stand-in: one 1×1 transparent RGBA frame **in GL memory**,
+/// uploaded once and re-stamped for every frame with no inset. The pad scales
+/// it to whatever rect it has, and a transparent pixel is invisible however
+/// big (measured).
+///
+/// **It has to be GL memory, because the pad's caps feature may not change.**
+/// The recording decodes to GL, so a system-memory filler made the branch's
+/// `glupload` take GL frames and then a system-memory one, which it refuses
+/// ("Failed to upload buffer"): any target whose first entry has no inset and
+/// whose second has one died there (reproduced). Uploaded here, the pad
+/// carries GL memory from the first frame to the last, and only the size
+/// changes — which GL to GL takes.
+struct Filler {
+    buffer: gst::Buffer,
+    caps: gst::Caps,
+}
+
+impl Filler {
+    /// Uploads the pixel on `gl`, through a pipeline of its own that is gone
+    /// by the time this returns. The texture outlives it: the buffer holds it,
+    /// and `gl`'s context is the process's ([`Gl::shared`]).
+    fn new(gl: &Gl, watch: &Watch) -> Result<Filler, ExportError> {
+        let pipeline = gst::parse::launch(&format!(
+            "appsrc name=src format=time is-live=false block=false \
+               caps=video/x-raw,format=RGBA,width=1,height=1,framerate={OUTPUT_FPS}/1 \
+             ! glupload ! glcolorconvert ! appsink name=out sync=false"
+        ))
+        .map_err(|e| ExportError::Failed(format!("could not build the filler graph: {e}")))?
+        .downcast::<gst::Pipeline>()
+        .expect("a multi-element launch string yields a pipeline");
+        let by_name = |n: &str| pipeline.by_name(n).expect("named in the launch string");
+        let src = by_name("src")
+            .downcast::<gst_app::AppSrc>()
+            .expect("named as an appsrc in the launch string");
+        let sink = by_name("out")
+            .downcast::<gst_app::AppSink>()
+            .expect("named as an appsink in the launch string");
+        sink.set_caps(Some(&gl_caps()));
+        gl.install(&pipeline, watch, |_| {});
+        let pipeline = Stopper(pipeline);
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            return Err(watch.failure("could not start the filler graph"));
+        }
+
+        let mut buffer = gst::Buffer::from_slice([0u8; 4]);
+        stamp_buffer(&mut buffer, 0);
+        src.push_buffer(buffer)
+            .map_err(|e| watch.failure(format!("pushing the filler pixel: {e:?}")))?;
+        let _ = src.end_of_stream();
+        loop {
+            watch.check()?;
+            if let Some(sample) = sink.try_pull_sample(POLL) {
+                let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) else {
+                    return Err(ExportError::Failed(
+                        "the filler pixel came back bare".into(),
+                    ));
+                };
+                return Ok(Filler {
+                    buffer: buffer.copy(),
+                    caps: caps.to_owned(),
+                });
+            }
+            if sink.is_eos() {
+                return Err(watch.failure("the filler pixel did not upload"));
+            }
+        }
+    }
 }
 
 /// The H.264 encoders export can use, in preference order, with their
@@ -550,6 +612,8 @@ struct Encoder {
     overlay: gst_app::AppSrc,
     /// The mixed sound, straight into the muxer's AAC branch.
     audio: gst_app::AppSrc,
+    /// What the PiP pad takes whenever there is no inset to show.
+    filler: Filler,
     name: &'static str,
     /// Set when the file is complete.
     eos: Arc<AtomicBool>,
@@ -587,12 +651,12 @@ impl Encoder {
                 "no AAC encoder: install gstreamer1.0-libav (avenc_aac)".into(),
             ));
         }
+        let filler = Filler::new(gl, watch)?;
         let inject = inject.map(|i| format!("{i} ! ")).unwrap_or_default();
         // The readback before the encoder is required, and so is the queue.
-        // The overlay branch is RGBA end to end; `OverlayRenderer` hands over
-        // premultiplied pixels and GStreamer's `RGBA` means straight alpha, so
-        // the pad's `blend-function-src-rgb=one` (set below) does the
-        // premultiplied-over on the GPU rather than anything demultiplying.
+        //
+        // **The PiP branch has no `glupload`**: everything that reaches it is
+        // already GL memory, the recording's frames and the [`Filler`] alike.
         //
         // **The audio appsrc alone is unbounded** (`max-buffers=0`) and the
         // pump never waits for room on it. Bounding it at 0.27 s deadlocked
@@ -611,14 +675,10 @@ impl Encoder {
              ! audioconvert ! avenc_aac bitrate=192000 ! aacparse ! mux. \
              appsrc name=pip format=time is-live=false block=false \
                max-buffers={QUEUED} max-bytes=0 max-time=0 \
-             ! glupload ! glcolorconvert ! mix.sink_1 \
-             appsrc name=ov format=time is-live=false block=false \
-               max-buffers={QUEUED} max-bytes=0 max-time=0 \
-               caps=video/x-raw,format=RGBA,width={out_w},height={out_h},\
-                 framerate={OUTPUT_FPS}/1 \
-             ! glupload ! glcolorconvert \
-             ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2",
+             ! glcolorconvert ! mix.sink_1 \
+             {overlay}",
             head = head(out_w, out_h),
+            overlay = overlay_branch(out_w, out_h),
             audio_caps = audio::caps_description()
         );
         let pipeline = gst::parse::launch(&description)
@@ -642,10 +702,8 @@ impl Encoder {
         // output frame for the whole run.
         install_geometry(&mix_pad("sink_0"), schedule, 0, |l| l.picture);
         install_geometry(&mix_pad("sink_1"), schedule, 1, |l| l.pip);
-        let overlay_pad = mix_pad("sink_2");
-        place(&overlay_pad, (0, 0, out_w, out_h), 2);
-        overlay_pad.set_property_from_str("blend-function-src-rgb", "one");
-        install_zoom(&by_name("zoom"), schedule);
+        install_overlay_pad(&mix, out_w, out_h);
+        install_zoom(&by_name("zoom"), &schedule.frames);
 
         // `moov` goes first, in space reserved up front, with no temp file
         // (`faststart` writes the whole `mdat` to `$TMPDIR`, which a crash
@@ -670,6 +728,7 @@ impl Encoder {
             pip,
             overlay,
             audio,
+            filler,
             name,
             eos,
         })
@@ -707,7 +766,7 @@ impl Encoder {
         self.audio
             .push_buffer(mixer.block(n, watch.cancel))
             .map_err(|e| watch.failure(format!("pushing the sound of frame {n}: {e:?}")))?;
-        let (inset, caps) = pip.frame(n, record_time, watch.cancel);
+        let (inset, caps) = pip.frame(n, record_time, watch.cancel, &self.filler);
         set_caps(&self.pip, &caps);
         stamp_buffer(&mut overlay, n);
 

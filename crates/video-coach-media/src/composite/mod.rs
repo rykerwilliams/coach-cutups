@@ -213,6 +213,36 @@ fn head(out_w: i32, out_h: i32) -> String {
     )
 }
 
+/// The overlay pad's branch, which both tails share: an `out_w`×`out_h` RGBA
+/// `appsrc` uploaded into GL memory and linked to the mixer's third pad.
+///
+/// RGBA end to end. GStreamer's `RGBA` means *straight* alpha and
+/// `OverlayRenderer` hands over premultiplied pixels; nothing here
+/// demultiplies them, because the pad's `blend-function-src-rgb=one` (see
+/// [`install_overlay_pad`]) is premultiplied-over for free on the GPU.
+fn overlay_branch(out_w: i32, out_h: i32) -> String {
+    format!(
+        "appsrc name=ov format=time is-live=false block=false \
+           max-buffers={QUEUED} max-bytes=0 max-time=0 \
+           caps=video/x-raw,format=RGBA,width={out_w},height={out_h},\
+             framerate={OUTPUT_FPS}/1 \
+         ! glupload ! glcolorconvert \
+         ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2"
+    )
+}
+
+/// Places [`overlay_branch`]'s mixer pad: the whole `out_w`×`out_h` frame, on
+/// top, blended as the premultiplied pixels it carries. Returns the pad, which
+/// preview also makes repeat after EOS.
+fn install_overlay_pad(mix: &gst::Element, out_w: i32, out_h: i32) -> gst::Pad {
+    let pad = mix
+        .static_pad("sink_2")
+        .expect("requested in the launch string");
+    place(&pad, (0, 0, out_w, out_h), 2);
+    pad.set_property_from_str("blend-function-src-rgb", "one");
+    pad
+}
+
 /// Waits until `appsrc` has room for another buffer, in [`POLL`]/5 steps.
 ///
 /// `block=false` never waits, so the wait is here, where the pipeline's errors
@@ -303,7 +333,8 @@ struct Layout {
 /// recording's — so the pump fills them in before it pushes that entry's first
 /// frame, which is strictly before any probe can ask for them.
 struct Schedule {
-    frames: Vec<FrameSpec>,
+    /// Shared with [`install_zoom`], which needs the frames and nothing else.
+    frames: Arc<[FrameSpec]>,
     /// One per plan entry, written by the pump and read on GStreamer's
     /// threads.
     layouts: Mutex<Vec<Layout>>,
@@ -313,7 +344,7 @@ impl Schedule {
     /// A schedule of `frames` over `entries` entries, with no geometry yet.
     fn new(frames: Vec<FrameSpec>, entries: usize) -> Arc<Schedule> {
         Arc::new(Schedule {
-            frames,
+            frames: frames.into(),
             layouts: Mutex::new(vec![Layout::default(); entries]),
         })
     }
@@ -371,7 +402,7 @@ fn install_geometry(
 /// transformation meta, and the mixer draws the transformed quad unclipped:
 /// a zoomed 4:3 source spills into its pillarbox bars (measured). Rendered
 /// into its own source-sized texture, the zoom is clipped to the picture.
-fn install_zoom(transform: &gst::Element, schedule: &Arc<Schedule>) {
+fn install_zoom(transform: &gst::Element, frames: &Arc<[FrameSpec]>) {
     transform
         .static_pad("src")
         .expect("gltransformation has a src pad")
@@ -391,7 +422,7 @@ fn install_zoom(transform: &gst::Element, schedule: &Arc<Schedule>) {
             },
         );
     let weak = transform.downgrade();
-    let schedule = schedule.clone();
+    let frames = frames.clone();
     transform
         .static_pad("sink")
         .expect("gltransformation has a sink pad")
@@ -401,7 +432,7 @@ fn install_zoom(transform: &gst::Element, schedule: &Arc<Schedule>) {
             else {
                 return gst::PadProbeReturn::Ok;
             };
-            if let Some(spec) = schedule.spec(pts) {
+            if let Some(spec) = frames.get(frame_index(pts) as usize) {
                 let (s, tx, ty) = zoom_params(spec.zoom);
                 transform.set_property("scale-x", s);
                 transform.set_property("scale-y", s);

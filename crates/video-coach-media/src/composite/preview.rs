@@ -58,8 +58,9 @@ use video_coach_core::project::Clip;
 
 use super::decode::Decoder;
 use super::{
-    display_aspect, fit_rect, frame_index, frame_time, head, install_zoom, place, stamp,
-    stamp_buffer, wait_for_room, CompositeError, Gl, Schedule, Stopper, Watch, POLL, QUEUED,
+    display_aspect, fit_rect, frame_index, frame_time, head, install_overlay_pad, install_zoom,
+    overlay_branch, place, stamp, stamp_buffer, wait_for_room, CompositeError, Gl, Stopper, Watch,
+    POLL,
 };
 use crate::mailbox::FrameMailbox;
 use crate::overlay::{OverlayFrame, OverlayRenderer};
@@ -123,7 +124,7 @@ pub struct PreviewStats {
 /// each preview it starts.
 ///
 /// It is the frame the pump last pushed (or the one a seek asked for), which
-/// leads the picture by whatever is queued (at most [`QUEUED`] frames,
+/// leads the picture by whatever is queued (at most [`super::QUEUED`] frames,
 /// 0.13 s), and reaches the schedule's length when it ends.
 #[derive(Debug, Clone, Default)]
 pub struct PreviewPosition(Arc<AtomicU64>);
@@ -500,24 +501,15 @@ impl Composite {
         } else {
             ""
         };
-        // The overlay branch is RGBA end to end. GStreamer's `RGBA` means
-        // *straight* alpha and `OverlayRenderer` hands over premultiplied
-        // pixels; nothing here demultiplies them, because the mixer pad's
-        // `blend-function-src-rgb=one` (set below) is premultiplied-over for
-        // free on the GPU.
         let description = format!(
             "{head} ! glcolorconvert \
              ! appsink name=out sync=true qos=true max-buffers=1 enable-last-sample=false \
-             appsrc name=ov format=time is-live=false block=false \
-               max-buffers={QUEUED} max-bytes=0 max-time=0 \
-               caps=video/x-raw,format=RGBA,width={OUTPUT_WIDTH},height={OUTPUT_HEIGHT},\
-                 framerate={OUTPUT_FPS}/1 \
-             ! glupload ! glcolorconvert \
-             ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2 \
+             {overlay} \
              {pip}\
              queue name=audioq ! audioconvert ! audioresample \
              ! volume name=vol ! autoaudiosink",
             head = head(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            overlay = overlay_branch(OUTPUT_WIDTH, OUTPUT_HEIGHT),
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| CompositeError::Failed(format!("could not build the preview graph: {e}")))?
@@ -569,9 +561,7 @@ impl Composite {
         // chrome in output space and waits for the camera's shape.
         let base_pad = mix_pad("sink_0");
         place(&base_pad, picture, 0);
-        let overlay_pad = mix_pad("sink_2");
-        place(&overlay_pad, (0, 0, OUTPUT_WIDTH, OUTPUT_HEIGHT), 2);
-        overlay_pad.set_property_from_str("blend-function-src-rgb", "one");
+        let overlay_pad = install_overlay_pad(&mix, OUTPUT_WIDTH, OUTPUT_HEIGHT);
         // The two pumped pads are sent EOS at the end of the schedule (see
         // `Composite::end`), and an EOS pad is otherwise not drawn at all:
         // with the recording still running on pad 1, the freeze would be on
@@ -582,12 +572,9 @@ impl Composite {
         if job.clip.show_pip {
             place_pip(&mix_pad("sink_1"));
         }
-        // One entry, laid out once above rather than per entry, so the
-        // schedule here carries only the zoom.
-        install_zoom(
-            &by_name("zoom"),
-            &Schedule::new(job.compilation.frames.clone(), 1),
-        );
+        // One entry, laid out once above rather than per entry, so the zoom is
+        // all the preview's pads read out of the schedule.
+        install_zoom(&by_name("zoom"), &job.compilation.frames.clone().into());
 
         let out = by_name("out")
             .downcast::<gst_app::AppSink>()

@@ -37,15 +37,8 @@ pub struct PlanEntry {
     /// Index into `Project::source_videos`. Every frame of this entry pulls
     /// from it, so [`crate::export::FrameSpec`] does not repeat it.
     pub source_index: usize,
-    /// `<uuid>.mkv`, relative to the project's `recordings/` directory: the
-    /// picture-in-picture's video.
-    pub recording_filename: String,
-    pub show_pip: bool,
     /// Walked play/freeze segments for this clip.
     pub segments: Vec<PlaybackSegment>,
-    /// The clip's recording duration, for display. **Not** a timing source —
-    /// see `CompilationPlan::total_duration_seconds`.
-    pub recording_duration: f64,
     /// This entry's first output frame.
     ///
     /// Entries are quantized to whole output frames: `frames` is the `ceil` of
@@ -79,28 +72,15 @@ impl PlanEntry {
 /// A description of one output video.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompilationPlan {
-    /// Sum of every segment's `out_duration` across every entry.
-    ///
-    /// Deliberately **not** the sum of `recording_duration`. Those two agree
-    /// only when every event's `record_time` lies inside
-    /// `[0, recording_duration]`: an out-of-range event advances the record
-    /// cursor past the end, the closing emit then produces nothing, and the
-    /// segment sum exceeds the recording duration.
-    ///
-    /// **Nothing measures the output with it.** Every denominator, every
-    /// displayed length and every remaining-time estimate comes from
-    /// [`CompilationPlan::total_frames`] instead: per-entry quantization rounds
-    /// each entry up to a whole frame, so the rendered video can be up to one
-    /// frame per entry longer than this. Progress against this value would
-    /// climb past 100%, which is the same failure defining it from segments
-    /// already removed once.
-    pub total_duration_seconds: f64,
     pub entries: Vec<PlanEntry>,
 }
 
 impl CompilationPlan {
-    /// Output frames in total — **the** denominator, and the only honest
-    /// output length (see `total_duration_seconds`).
+    /// Output frames in total — **the** denominator, and the only measure of
+    /// the output's length. Per-entry quantization rounds each entry up to a
+    /// whole frame, so a duration summed from the segments would be short of
+    /// the rendered video by up to one frame per entry, and progress against
+    /// it would climb past 100%.
     pub fn total_frames(&self) -> usize {
         self.entries.last().map_or(0, |e| e.start_frame + e.frames)
     }
@@ -155,7 +135,6 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
     let count = clips.len();
 
     let mut entries = Vec::with_capacity(count);
-    let mut total = 0.0;
     let mut start_frame = 0;
 
     for (i, clip) in clips.into_iter().enumerate() {
@@ -166,19 +145,13 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
             .unwrap_or(clip.start_source_seconds + clip.recording_duration);
 
         let segments = playback_segments(clip, source_duration);
-        let entry_seconds: f64 = segments.iter().map(|s| s.out_duration).sum();
-        total += entry_seconds;
-
         // Quantized per entry, so the next one starts on a frame boundary.
-        let frames = frame_count(entry_seconds);
+        let frames = frame_count(segments.iter().map(|s| s.out_duration).sum());
 
         entries.push(PlanEntry {
             clip_id: clip.id,
             source_index: clip.source_index,
-            recording_filename: clip.recording_filename.clone(),
-            show_pip: clip.show_pip,
             segments,
-            recording_duration: clip.recording_duration,
             start_frame,
             frames,
             text: entry_text(clip, i + 1, count),
@@ -186,8 +159,5 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
         start_frame += frames;
     }
 
-    CompilationPlan {
-        total_duration_seconds: total,
-        entries,
-    }
+    CompilationPlan { entries }
 }

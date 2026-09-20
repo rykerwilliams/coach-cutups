@@ -153,6 +153,29 @@ fn a_run_renders_every_target_and_its_frames_only_fall() {
     rig.h.shutdown();
 }
 
+/// Two targets that would be called the same thing — a clip named after a tag
+/// — get one file each: the label names the file (spec E6), so without the
+/// suffix the second target would overwrite the first's output part-way
+/// through the run.
+#[test]
+fn two_targets_with_the_same_name_write_two_files() {
+    let mut rig = Rig::open_with(&[1.0, 1.0], |folder, _| {
+        let mut project = store::read(folder).unwrap();
+        project.clips[1].name = "t0".into();
+        store::write(folder, &mut project).unwrap();
+    });
+    rig.export(vec![rig.tag(0), ExportTarget::Clip(rig.clips[1])]);
+
+    let done = outcome(&mut rig.h);
+    let labels: Vec<&str> = done.targets.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(labels, ["t0", "t0 (2)"]);
+    assert_eq!(
+        outputs(&rig.exports),
+        ["t0 (2) - Game.mp4", "t0 - Game.mp4"]
+    );
+    rig.h.shutdown();
+}
+
 /// A target that can't be written reports it and the run carries on: one
 /// broken output must not cost the rest of an evening's exports.
 #[test]

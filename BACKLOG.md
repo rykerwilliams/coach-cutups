@@ -467,3 +467,20 @@ Each entry: what, why deferred, when to revisit.
   Export is what gets shared, so it took the audio work first.
 - **When to revisit:** when judging levels by ear matters, i.e. alongside the
   volume UI (#52).
+
+### 55. An export run leaks about 19 dmabuf fds and never plateaus
+- **Why deferred:** measured over eight consecutive export runs in one
+  process: open file descriptors climbed 120 → 253 (~19 a run, `/proc/self/fd`
+  dominated by `anon_inode:dmabuf`), with no plateau. Thread count stayed flat
+  and RSS plateaued, so it is descriptors alone. The cause is
+  `composite::Gl::shared`: the surfaceless `GLDisplayEGL` is process-wide and
+  deliberately never finalized, so the display's buffer pools and the dmabufs
+  imported through them outlive every run. Dropping the shared display is what
+  the comment on `Gl::shared` says breaks concurrent exports — every
+  surfaceless `GLDisplayEGL` wraps the same `EGLDisplay`, and finalizing one
+  calls `eglTerminate` for all of them, which made side-by-side exports fail to
+  import frames. So the obvious fix is the one thing that is known not to work,
+  and 19 fds a run is ~50 runs inside a 1024 soft limit.
+- **When to revisit:** if a long session ever hits `EMFILE`, or when GStreamer
+  offers a way to release a display's imported buffers without terminating the
+  `EGLDisplay`. Raising `RLIMIT_NOFILE` is the cheap stopgap.

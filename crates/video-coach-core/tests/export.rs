@@ -196,7 +196,7 @@ fn a_one_entry_compilation_tags_every_frame_with_entry_zero() {
 /// Each entry is rounded **up** to a whole frame and the next starts on the
 /// boundary, so record time stays output time inside every entry. The price is
 /// that the rendered video is longer than the plan's segment sum — which is
-/// why nothing measures the output with `total_duration_seconds`.
+/// why `total_frames` is the only measure of the output's length.
 #[test]
 fn entries_are_quantized_to_whole_frames() {
     // 2.01 s is 60.3 frames: 61 each, so the second entry starts at 61 rather
@@ -216,8 +216,15 @@ fn entries_are_quantized_to_whole_frames() {
 
     // The frame count exceeds the segment sum by the rounding, one frame per
     // entry: 122/30 = 4.0667 s against 4.02 s.
-    assert!(approx(c.plan.total_duration_seconds, 4.02));
-    assert!(c.plan.total_frames() as f64 / FPS > c.plan.total_duration_seconds);
+    let segments: f64 = c
+        .plan
+        .entries
+        .iter()
+        .flat_map(|e| &e.segments)
+        .map(|s| s.out_duration)
+        .sum();
+    assert!(approx(segments, 4.02));
+    assert!(c.plan.total_frames() as f64 / FPS > segments);
 
     // The last frame of the first entry, then the first of the second.
     assert_eq!(c.frames[60].entry, 0);
@@ -239,82 +246,6 @@ fn record_time_is_derived_from_the_entry_and_the_frame_index() {
         second.record_time(second.start_frame + second.frames - 1),
         29.0 / FPS
     ));
-}
-
-/// The entry carries what its frames don't: which source to pull from, which
-/// recording is the PiP, and whether to show it.
-#[test]
-fn an_entry_carries_its_source_recording_and_pip_flag() {
-    let mut a = clip(0.0, 1.0, vec![]);
-    a.source_index = 0;
-    a.recording_filename = "a.mkv".into();
-    a.show_pip = false;
-
-    let c = compile(vec![a], DUR);
-    let entry = &c.plan.entries[0];
-    assert_eq!(entry.source_index, 0);
-    assert_eq!(entry.recording_filename, "a.mkv");
-    assert!(!entry.show_pip);
-}
-
-#[test]
-fn the_text_line_numbers_the_clip_within_its_target() {
-    let mut a = clip(0.0, 1.0, vec![]);
-    a.name = "Back post header".into();
-    a.tags = vec!["shot".into(), "set piece".into()];
-    let mut b = clip(0.0, 1.0, vec![]);
-    b.name = "Turnover".into();
-    b.tags = vec![];
-
-    let c = compile(vec![a, b], DUR);
-    assert_eq!(
-        c.plan.entries[0].text,
-        "1 / 2 | Back post header | shot, set piece"
-    );
-    // No tags: the part and its separator both go.
-    assert_eq!(c.plan.entries[1].text, "2 / 2 | Turnover");
-}
-
-#[test]
-fn the_text_line_collapses_an_empty_name_and_empty_tags() {
-    let mut a = clip(0.0, 1.0, vec![]);
-    a.name = "   ".into();
-    a.tags = vec!["shot".into()];
-    let mut b = clip(0.0, 1.0, vec![]);
-    b.name = String::new();
-    b.tags = vec![];
-
-    let c = compile(vec![a, b], DUR);
-    assert_eq!(c.plan.entries[0].text, "1 / 2 | shot");
-    assert_eq!(c.plan.entries[1].text, "2 / 2");
-}
-
-/// `<total>` is the **target's** clip count, not the project's.
-#[test]
-fn the_text_line_counts_only_the_targets_clips() {
-    let mut a = clip(0.0, 1.0, vec![]);
-    a.name = "a".into();
-    a.tags = vec!["shot".into()];
-    let mut b = clip(0.0, 1.0, vec![]);
-    b.name = "b".into();
-    let id = b.id;
-
-    let mut p = Project::new("p");
-    p.source_videos.push(SourceRef {
-        relative_path: "film.mp4".into(),
-        display_name: "film".into(),
-        duration_seconds: DUR,
-        display_aspect: 16.0 / 9.0,
-    });
-    p.clips = vec![a, b];
-
-    let tag = compilation_schedule(&p, &ExportTarget::Tag("shot".into()));
-    assert_eq!(tag.plan.entries[0].text, "1 / 1 | a | shot");
-
-    let one = compilation_schedule(&p, &ExportTarget::Clip(id));
-    assert_eq!(one.plan.entries.len(), 1);
-    assert_eq!(one.plan.entries[0].text, "1 / 1 | b");
-    assert_eq!(one.frames.len(), 30);
 }
 
 // ── The rate window ────────────────────────────────────────────────────────

@@ -47,8 +47,9 @@ export struct TargetRow {
 /// One row of the export sheet's run list: a target of the run in progress.
 export struct RunRow {
     label: string,
-    /// How far it has got, 0..1; negative when it isn't rendering, and
-    /// `status` stands in for the bar.
+    /// Whether this target is the one rendering: only then is there a bar.
+    rendering: bool,
+    /// How far it has got, 0..1. Meaningless unless `rendering`.
     progress: float,
     /// "Pending", "45%", "Done", "Cancelled" or "Failed".
     status: string,
@@ -667,7 +668,7 @@ component ExportSheet inherits Rectangle {
                     horizontal-stretch: 1;
                 }
                 // Only while it renders; the status word stands in otherwise.
-                if row.progress >= 0: VerticalLayout {
+                if row.rendering: VerticalLayout {
                     alignment: center;
                     ProgressIndicator {
                         width: 120px;

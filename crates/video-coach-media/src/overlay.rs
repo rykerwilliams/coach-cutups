@@ -69,7 +69,8 @@ pub(crate) struct OverlayFrame<'a> {
     /// the base pad's rect, which is the space the strokes were drawn in.
     pub picture: (i32, i32, i32, i32),
     /// The bar's line. **Empty draws no bar at all** — neither its background
-    /// nor its glyphs — which is what preview passes until Phase 8's Task 5.
+    /// nor its glyphs: that is how a caller suppresses the bar. Neither
+    /// shipping caller does; both draw the entry's own line (spec E7).
     pub text: &'a str,
 }
 
@@ -579,8 +580,8 @@ mod tests {
         assert_eq!(at(&px, 1280, 20, bar_top - 2), [0, 0, 0, 0]);
     }
 
-    /// An empty line draws nothing at all — not even the bar's background.
-    /// Preview relies on it until it gains the bar of its own.
+    /// An empty line draws nothing at all — not even the bar's background:
+    /// the one way a caller can suppress the bar.
     #[test]
     fn an_empty_line_draws_no_bar() {
         let px = render_at(&clip(Vec::new()), 0.0, "", (0, 0, 1280, 720), 1280, 720);

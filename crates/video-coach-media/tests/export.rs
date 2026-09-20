@@ -20,10 +20,10 @@ use gstreamer_pbutils as pbutils;
 use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::{Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect};
-use video_coach_core::plan::{CompilationPlan, PlanEntry};
-use video_coach_core::project::{Clip, Preferences, Quality, Resolution};
+use video_coach_core::plan::ExportTarget;
+use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
@@ -359,9 +359,9 @@ fn an_h264_export_shows_the_scheduled_frame_every_frame() {
     fiducial(CounterKind::H264Mp4BFrames);
 }
 
-/// Two clips of different sizes and frame rates, one after the other in one
-/// file: every output frame shows the source frame its entry's schedule asked
-/// for, read out of that entry's own rect.
+/// Three clips, one after the other in one file, with a different source
+/// size and frame rate at each join: every output frame shows the source frame
+/// its entry's schedule asked for, read out of that entry's own rect.
 ///
 /// That is the per-entry geometry, the caps change at the join and the
 /// concatenation, in one assertion. It is **not** a reproduction of the
@@ -371,13 +371,19 @@ fn an_h264_export_shows_the_scheduled_frame_every_frame() {
 /// with the rect set eagerly). The race is measured in the spec; keying the
 /// rect to the buffer's PTS is what removes it, and this test is what says the
 /// keying itself is right.
+///
+/// It is also the only multi-entry run, so it carries the per-entry furniture
+/// too: the picture-in-picture on, **off**, on again — the caps change on the
+/// PiP pad that used to fail the export outright — a line of its own on each
+/// entry's bar, and the real audio edit over all three.
 #[test]
-fn a_two_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
+fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
     gst::init().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    // 16:9 at 25 fps, then 4:3 at 50 fps: the fit rect and the source's frame
-    // rate both change at the join. Both rates divide 1000, since WebM's
-    // timecodes are milliseconds and the oracle below counts in nanoseconds.
+    // 16:9 at 25 fps, then 4:3 at 50 fps, then 16:9 again: the fit rect and
+    // the source's frame rate both change at every join. Both rates divide
+    // 1000, since WebM's timecodes are milliseconds and the oracle below
+    // counts in nanoseconds.
     let wide = counter_video(
         &dir.path().join("wide.webm"),
         640,
@@ -394,35 +400,53 @@ fn a_two_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         60,
         CounterKind::Vp8WebmWithAudio,
     );
+    // The inset's own video, for the entries that show one. The middle entry's
+    // recording is a file that isn't there: `show_pip` is off, so it is never
+    // opened, and the pad takes the transparent filler for those frames.
+    let webcam = fixtures::solid_video(&dir.path().join("cam.webm"), 640, 360, 30, 60, GREEN, true);
+    let recordings = [webcam.clone(), dir.path().join("none.webm"), webcam];
+
     let per_entry = 18;
-    let clips = [clip(0.0, 0.6, Vec::new()), clip(0.0, 0.6, Vec::new())];
-    let frames: Vec<FrameSpec> = (0..2 * per_entry)
-        .map(|n| FrameSpec {
-            entry: (n / per_entry) as usize,
-            source_time: f64::from(n % per_entry) / f64::from(OUTPUT_FPS),
-            zoom: Zoom::IDENTITY,
+    let seconds = f64::from(per_entry) / f64::from(OUTPUT_FPS);
+    let clips: Vec<Clip> = [(0, true), (1, false), (0, true)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (source_index, show_pip))| Clip {
+            id: Uuid::new_v4(),
+            name: format!("Clip {i}"),
+            tags: vec![format!("t{i}")],
+            source_index,
+            show_pip,
+            ..clip(0.0, seconds, Vec::new())
         })
         .collect();
+    // 60 frames at 25 and at 50 fps.
+    let compilation = compilation(&clips, &[2.4, 1.2]);
+    let frames = compilation.frames.clone();
+    assert_eq!(frames.len(), 3 * per_entry as usize);
+
     let path = dir.path().join("out.mp4");
     export(ExportJob {
-        compilation: two_entries(&clips, frames.clone(), per_entry as usize),
+        audio: audio_regions(&compilation, &Preferences::default()),
+        compilation,
         sources: vec![wide, narrow],
         entries: clips
             .iter()
-            .map(|clip| EntryMedia {
-                recording: PathBuf::new(),
+            .zip(recordings)
+            .map(|(clip, recording)| EntryMedia {
+                recording,
                 clip: clip.clone(),
             })
             .collect(),
-        audio: Vec::new(),
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
     })
     .unwrap();
 
-    // Entry 0 fills the frame; entry 1 is pillarboxed to (160, 0, 960, 720),
-    // so its counter has to be read out of that rect.
+    // Entries 0 and 2 fill the frame; entry 1 is pillarboxed to
+    // (160, 0, 960, 720), so its counter has to be read out of that rect. The
+    // inset and the bar are clear of every counter block.
     let out = fixtures::decode_gray(&path);
     assert_eq!(
         out.len(),
@@ -437,26 +461,26 @@ fn a_two_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
                 (frame.width, frame.height),
                 (OUT_W as usize, OUT_H as usize)
             );
-            match n < per_entry as usize {
-                true => read_counter(frame),
-                false => read_counter(&frame.crop(160, 0, 960, 720)),
+            match n / per_entry as usize {
+                1 => read_counter(&frame.crop(160, 0, 960, 720)),
+                _ => read_counter(frame),
             }
         })
         .collect();
     let expected: Vec<u32> = frames
         .iter()
         .map(|f| match f.entry {
-            0 => oracle(f.source_time, 25, 60),
-            _ => oracle(f.source_time, 50, 60),
+            1 => oracle(f.source_time, 50, 60),
+            _ => oracle(f.source_time, 25, 60),
         })
         .collect();
     counters_match(&got, &expected);
 
-    // The counter check above is the geometry check: entry 0's frames are read
-    // out of the whole frame and entry 1's out of its pillarbox, so a rect
-    // that arrived four frames early (the measured race) would make the last
-    // frames of entry 0 unreadable. That only means anything if the two rects
-    // really do read differently, which this pins.
+    // The counter check above is the geometry check: entries 0 and 2's frames
+    // are read out of the whole frame and entry 1's out of its pillarbox, so a
+    // rect that arrived four frames early (the measured race) would make the
+    // last frames of entry 0 unreadable. That only means anything if the two
+    // rects really do read differently, which this pins.
     let last_of_entry_0 = &out[per_entry as usize - 1];
     assert_ne!(
         read_counter(&last_of_entry_0.crop(160, 0, 960, 720)),
@@ -464,29 +488,58 @@ fn a_two_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         "the two entries' rects read the same, so the check above is vacuous"
     );
 
+    // The inset is there for the entries that asked for it and nowhere else.
+    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 16.0 / 9.0);
+    let centre = (
+        (pip.x + pip.w / 2.0) as usize,
+        (pip.y + pip.h / 2.0) as usize,
+    );
+    let inset = |entry: usize| {
+        out[entry * per_entry as usize + per_entry as usize / 2].mean(centre.0, centre.1, 4)
+    };
+    for entry in [0, 2] {
+        assert!(inset(entry) > 100.0, "no inset on entry {entry}");
+    }
+    // Entry 1's inset would sit in its pillarbox bar, so with no PiP it is the
+    // mixer's black background.
+    assert!(inset(1) < 40.0, "an inset on the entry that has none");
+
+    // And each entry's own line is on the bar: white glyphs over a strip that
+    // is black in the counter fixture and tinted blacker still by the bar.
+    let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H));
+    let glyphs: Vec<usize> = (0..3)
+        .map(|entry| {
+            let frame = &out[entry * per_entry as usize + per_entry as usize / 2];
+            (bar.y as usize..OUT_H as usize)
+                .flat_map(|y| (0..640).map(move |x| (x, y)))
+                .filter(|&(x, y)| frame.mean(x, y, 0) > 150.0)
+                .count()
+        })
+        .collect();
+    assert!(
+        glyphs.iter().all(|&n| n > 50),
+        "an entry drew no glyphs on its bar: {glyphs:?}"
+    );
+
     duration_is_the_schedule_s(&path, frames.len());
 }
 
-/// A two-entry compilation of `frames`, `per_entry` frames each.
-fn two_entries(clips: &[Clip; 2], frames: Vec<FrameSpec>, per_entry: usize) -> Compilation {
-    let entry = |i: usize, clip: &Clip| PlanEntry {
-        clip_id: clip.id,
-        source_index: i,
-        recording_filename: clip.recording_filename.clone(),
-        show_pip: false,
-        segments: Vec::new(),
-        recording_duration: clip.recording_duration,
-        start_frame: i * per_entry,
-        frames: per_entry,
-        text: String::new(),
-    };
-    Compilation {
-        plan: CompilationPlan {
-            total_duration_seconds: frames.len() as f64 / f64::from(OUTPUT_FPS),
-            entries: vec![entry(0, &clips[0]), entry(1, &clips[1])],
-        },
-        frames,
-    }
+/// The compilation a project of `clips` over `source_durations` plans — the
+/// app's own path, so the entries carry real segments, real text and the audio
+/// edit's input.
+fn compilation(clips: &[Clip], source_durations: &[f64]) -> Compilation {
+    let mut project = Project::new("p");
+    project.source_videos = source_durations
+        .iter()
+        .map(|&duration_seconds| SourceRef {
+            relative_path: "src".into(),
+            display_name: "src".into(),
+            duration_seconds,
+            display_aspect: 16.0 / 9.0,
+        })
+        .collect();
+    project.clips = clips.to_vec();
+    compilation_schedule(&project, &ExportTarget::AllClips)
 }
 
 /// An export of `times` from `source` shows `expected`.

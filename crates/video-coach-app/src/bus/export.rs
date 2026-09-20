@@ -26,7 +26,7 @@
 //! drops [`Command::Export`](super::Command::Export), and `can_record`
 //! refuses to record while a run is going.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -66,10 +66,11 @@ pub enum TargetState {
 /// One target of a run, as the sheet lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportTargetRun {
-    /// What the sheet calls it, and what names its file (spec E6).
+    /// What the sheet calls it, and what names its file (spec E6). Unique
+    /// within the run — see [`de_duplicate`].
     pub label: String,
-    /// The target's output frames — the denominator, and the only honest
-    /// length (see `CompilationPlan::total_duration_seconds`).
+    /// The target's output frames — the denominator, and the only measure of
+    /// its length (see `CompilationPlan::total_frames`).
     pub frames: usize,
     pub state: TargetState,
 }
@@ -117,10 +118,8 @@ pub struct ExportTargetRow {
     pub label: String,
     /// How many clips it covers.
     pub clips: usize,
-    /// How long its output runs, **from its frame count**: per-entry
-    /// quantization rounds every entry up to a whole frame, so the plan's
-    /// `total_duration_seconds` is short of the rendered video by up to one
-    /// frame per entry.
+    /// How long its output runs, from its frame count
+    /// (`CompilationPlan::total_frames`).
     pub seconds: f64,
 }
 
@@ -291,10 +290,23 @@ impl Bus {
         // Every target is checked before any of them runs, so a missing file
         // can't stop a run half-way through (spec E5).
         let exports = open.folder.join(EXPORTS_DIRNAME);
+        let mut labels = Vec::with_capacity(targets.len());
+        for target in &targets {
+            labels.push(label(open, target)?);
+        }
+        de_duplicate(&mut labels);
         let mut jobs = VecDeque::with_capacity(targets.len());
         let mut rows = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let (label, job) = job(open, &self.missing, &exports, target, resolution, quality)?;
+        for (target, label) in targets.iter().zip(labels) {
+            let job = job(
+                open,
+                &self.missing,
+                &exports,
+                target,
+                &label,
+                resolution,
+                quality,
+            )?;
             rows.push(ExportTargetRun {
                 label,
                 frames: job.compilation.frames.len(),
@@ -396,7 +408,41 @@ impl Bus {
     }
 }
 
-/// `target`'s label and the job that renders it, or why it can't run.
+/// What `target` is called, or why it can't run.
+fn label(open: &Open, target: &ExportTarget) -> Result<String, UserError> {
+    match target {
+        ExportTarget::AllClips => Ok(ALL_CLIPS_LABEL.to_owned()),
+        ExportTarget::Tag(tag) => Ok(tag.clone()),
+        ExportTarget::Clip(id) => open
+            .project
+            .clips
+            .iter()
+            .find(|c| c.id == *id)
+            .map(|clip| clip_label(clip).to_owned())
+            .ok_or_else(|| UserError::CantExport("the clip is gone".into())),
+    }
+}
+
+/// Makes every label in a run unique, suffixing the later of a pair.
+///
+/// The label names the file (spec E6), and nothing stops a clip being called
+/// what a tag is called — ticking both would otherwise have the second target
+/// overwrite the first's file half-way through the run.
+fn de_duplicate(labels: &mut [String]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for label in labels {
+        if seen.insert(label.clone()) {
+            continue;
+        }
+        let mut n = 2;
+        while !seen.insert(format!("{label} ({n})")) {
+            n += 1;
+        }
+        *label = format!("{label} ({n})");
+    }
+}
+
+/// The job that renders `target` as `label`, or why it can't run.
 ///
 /// A snapshot: later edits to the project don't reach a running export. The
 /// whole source list goes with it because `PlanEntry::source_index` indexes
@@ -406,21 +452,11 @@ fn job(
     missing: &[bool],
     exports: &Path,
     target: &ExportTarget,
+    label: &str,
     resolution: Resolution,
     quality: Quality,
-) -> Result<(String, ExportJob), UserError> {
+) -> Result<ExportJob, UserError> {
     let refused = |why: String| UserError::CantExport(why);
-    let label = match target {
-        ExportTarget::AllClips => ALL_CLIPS_LABEL.to_owned(),
-        ExportTarget::Tag(tag) => tag.clone(),
-        ExportTarget::Clip(id) => open
-            .project
-            .clips
-            .iter()
-            .find(|c| c.id == *id)
-            .map(|clip| clip_label(clip).to_owned())
-            .ok_or_else(|| refused("the clip is gone".into()))?,
-    };
     let compilation = compilation_schedule(&open.project, target);
     if compilation.frames.is_empty() {
         return Err(refused(format!("{label} has nothing to export")));
@@ -441,7 +477,7 @@ fn job(
                 "{name}'s game video is missing; relink it first"
             )));
         }
-        let recording = recordings.join(&entry.recording_filename);
+        let recording = recordings.join(&clip.recording_filename);
         if !recording.exists() {
             return Err(refused(format!("{name}'s commentary recording is missing")));
         }
@@ -461,11 +497,11 @@ fn job(
             .iter()
             .map(|s| open.folder.join(&s.relative_path))
             .collect(),
-        path: exports.join(file_name(&label, &open.project.name)),
+        path: exports.join(file_name(label, &open.project.name)),
         resolution,
         quality,
     };
-    Ok((label, job))
+    Ok(job)
 }
 
 #[cfg(test)]
