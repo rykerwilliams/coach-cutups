@@ -206,6 +206,9 @@ impl Bus {
     /// isn't there. The caller files it, then publishes, so the snapshot
     /// follows the file.
     fn trash_clip(&mut self, id: Uuid) -> Option<Clip> {
+        // Its recording is about to move into `.trash`, and a preview holds
+        // that file open (spec P5).
+        self.close_preview_of(id);
         let open = self.open.as_mut()?;
         let clip = open.project.remove_clip(id)?;
         if self.save() {

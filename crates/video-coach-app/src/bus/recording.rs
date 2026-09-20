@@ -237,8 +237,9 @@ impl Bus {
         }
     }
 
-    /// Start's preconditions (R6), and no export running. A skip or scrub in flight is not a reason
-    /// to refuse: the recording starts where the player is heading.
+    /// Start's preconditions (R6), and no export or preview running. A skip or
+    /// scrub in flight is not a reason to refuse: the recording starts where
+    /// the player is heading.
     fn can_record(&self) -> Result<(), UserError> {
         let refused = |why| Err(UserError::CantRecord(why));
         match &self.open {
@@ -246,6 +247,9 @@ impl Bus {
             // They never overlap: sharing the video engine costs the
             // recording frames (Phase 5 spec X4).
             Some(_) if self.export.is_some() => refused("an export is running"),
+            // The preview holds the picture and the audio sink, and a
+            // recording is made over the game video (spec P5).
+            Some(_) if self.preview.is_some() => refused("a preview is open; close it first"),
             Some(open) if open.project.source_videos.is_empty() => {
                 refused("add a game video to record over first")
             }

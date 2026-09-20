@@ -23,6 +23,8 @@ use super::{Bus, Event, Input, UserError};
 /// tags its messages.
 pub(super) struct Active {
     generation: u64,
+    /// The clip it shows: deleting that one closes it first (spec P5).
+    clip: Uuid,
     pub(super) preview: Preview,
     /// The commentary is muted for the length of a scrub drag, since every
     /// tick flushes the audio sink (spec P3). Set by the first `ScrubMove`,
@@ -61,6 +63,9 @@ impl Bus {
 
     fn start_preview(&mut self, id: Uuid) -> Result<(), UserError> {
         let refused = |why: &str| Err(UserError::CantPreview(why.into()));
+        // While recording, `Bus::command`'s guard drops `OpenPreview` before
+        // it reaches here, as it does `ExportClip`: the UI greys the button
+        // and the menu item out, so either is only a UI bug.
         if self.export.is_some() {
             return refused("an export is running");
         }
@@ -117,6 +122,7 @@ impl Bus {
         self.preview_position.set(Some(preview.position()));
         self.preview = Some(Active {
             generation,
+            clip: id,
             preview,
             muted_for_scrub: false,
         });
@@ -179,6 +185,14 @@ impl Bus {
             stats.composited, stats.fps, stats.dropped
         );
         self.emit(Event::Preview(None));
+    }
+
+    /// Closes the preview if it is the one showing clip `id`, whose recording
+    /// is about to move into the trash (spec P5).
+    pub(super) fn close_preview_of(&mut self, id: Uuid) {
+        if self.preview.as_ref().is_some_and(|a| a.clip == id) {
+            self.close_preview();
+        }
     }
 
     pub(super) fn preview_message(&mut self, generation: u64, msg: PreviewMessage) {

@@ -158,6 +158,15 @@ impl Harness {
         })
     }
 
+    /// Waits for the next `Preview`: the clip now on screen, or `None` once
+    /// it closed.
+    pub fn wait_preview(&mut self) -> Option<Uuid> {
+        self.wait_map("Preview", |e| match e {
+            Event::Preview(previewing) => Some(*previewing),
+            _ => None,
+        })
+    }
+
     /// Waits for the next `Error` event and returns its payload.
     pub fn wait_for_error(&mut self) -> UserError {
         self.wait_map("an error", |e| match e {
@@ -212,6 +221,12 @@ impl Harness {
     /// The pipeline's position in its current source, in seconds.
     pub fn position_secs(&self) -> Option<f64> {
         self.bus.position_handle().query_position()
+    }
+
+    /// Seconds into the previewed clip, as the UI's tick reads them, or
+    /// `None` with no preview open (spec P3's one position path).
+    pub fn preview_secs(&self) -> Option<f64> {
+        self.bus.preview_position().seconds()
     }
 
     /// Shuts the bus down, which handles every command sent before it, and

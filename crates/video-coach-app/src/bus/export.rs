@@ -44,6 +44,11 @@ impl Bus {
         if self.export.is_some() {
             return refused("an export is running");
         }
+        // Both composite on the UI's GL context, and an export would take the
+        // frames the preview is pacing itself on (spec P5).
+        if self.preview.is_some() {
+            return refused("a preview is open; close it first");
+        }
         let Some(open) = &self.open else {
             return refused("no project is open");
         };

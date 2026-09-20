@@ -27,7 +27,7 @@ use video_coach_app::bus::{
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
-use video_coach_core::project::Project;
+use video_coach_core::project::{Clip, Project};
 use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
@@ -277,6 +277,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     wire_devices(window, bus);
     wire_clips(window, bus);
     wire_export(window, bus, pickers);
+    wire_preview(window, bus);
     // Drag-to-reorder carries the list's name and the dragged row's index,
     // so a source dropped on the clip list (or back) is refused.
     window.on_drag_payload(|list, index| {
@@ -384,6 +385,24 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>, pickers: Picker
     window.on_cancel_export({
         let bus = bus.clone();
         move || bus.borrow().send(Command::CancelExport)
+    });
+}
+
+/// Preview (Phase 7 P6): the inspector's button and the clip menu's "Preview
+/// clip" open one, Close and Esc shut it. Opening is explicit — Space goes on
+/// meaning "play the game video" until one is open (P5).
+fn wire_preview(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_open_preview({
+        let bus = bus.clone();
+        move |id| {
+            if let Some(id) = parse_clip_id(&id) {
+                bus.borrow().send(Command::OpenPreview(id));
+            }
+        }
+    });
+    window.on_close_preview({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::ClosePreview)
     });
 }
 
@@ -871,14 +890,21 @@ fn on_event(w: &AppWindow, event: Event) {
             }
             w.set_selected_clip(id.to_string().into());
         }
-        // The transport runs over the clip while a preview is open. The
-        // indicator and the hidden live stroke layer come with the rest of
-        // the UI.
+        // The transport runs over the clip while a preview is open, and the
+        // window keys the indicator, the identity zoom and the hidden live
+        // stroke layer off `previewing-clip` (P6).
         Event::Preview(previewing) => UI.with_borrow_mut(|ui| {
             let clip = previewing.and_then(|id| {
                 let project = &ui.snapshot.as_ref()?.project;
                 project.clips.iter().find(|c| c.id == id)
             });
+            w.set_previewing_name(clip.map_or("", clip_name).into());
+            w.set_previewing_clip(
+                previewing
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+                    .into(),
+            );
             ui.preview_duration = clip.map(|c| c.recording_duration);
             let total = match (ui.preview_duration, &ui.snapshot) {
                 (Some(duration), _) => duration,
@@ -977,16 +1003,20 @@ fn show_clips(w: &AppWindow, project: &Project) {
         .filter(|c| filter.is_empty() || c.tags.iter().any(|t| *t == filter.as_str()))
         .map(|c| ClipRow {
             id: c.id.to_string().into(),
-            name: if c.name.is_empty() {
-                "Untitled"
-            } else {
-                &c.name
-            }
-            .into(),
+            name: clip_name(c).into(),
             duration: format_hms(c.recording_duration).into(),
         })
         .collect();
     w.set_clips(ModelRc::new(VecModel::from(clips)));
+}
+
+/// A clip's name as the lists and the preview indicator show it.
+fn clip_name(clip: &Clip) -> &str {
+    if clip.name.is_empty() {
+        "Untitled"
+    } else {
+        &clip.name
+    }
 }
 
 /// The inspector's fields, from the selected clip (C7), and empty with none.

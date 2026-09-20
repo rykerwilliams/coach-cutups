@@ -262,6 +262,15 @@ component Inspector inherits Rectangle {
     in-out property <bool> show-pip;
     /// A field has focus: the window's shortcuts yield to it.
     out property <bool> editing: name.has-focus || tags.has-focus || notes.has-focus;
+    /// Preview is possible at all (Phase 7 P6): something to play, and
+    /// neither recording nor exporting, both of which the bus refuses.
+    in property <bool> can-preview;
+    /// This clip is the one on screen, so the button closes it instead.
+    in property <bool> previewing;
+    /// The Preview button: open a preview of this clip, or close the one
+    /// showing it. Opening is explicit (P5) -- Space plays the game video
+    /// until a preview is open.
+    callback preview-clicked();
 
     /// A field gained focus ...
     callback begin-edit();
@@ -356,6 +365,20 @@ component Inspector inherits Rectangle {
             vertical-stretch: 1;
             text <=> root.notes-text;
             changed has-focus => { root.focus-changed(ClipField.notes, self.has-focus, self.text); }
+        }
+
+        Button {
+            text: root.previewing ? "Close Preview" : "Preview";
+            primary: !root.previewing;
+            // Closing is always possible; opening needs the bus to be idle.
+            enabled: root.previewing || root.can-preview;
+            clicked => { root.preview-clicked(); }
+
+            Tooltip {
+                text: root.previewing
+                    ? @markdown("Close the preview (Esc)")
+                    : @markdown("Play this clip as it was recorded");
+            }
         }
     }
 
@@ -628,6 +651,17 @@ export component AppWindow inherits Window {
     /// export runs.
     out property <bool> exporting: root.export-progress >= 0;
 
+    // --- Preview (Phase 7 P6) ---
+
+    /// The clip on screen instead of the game video, empty with none, and its
+    /// name for the indicator. Set from the bus's `Preview` event.
+    in property <string> previewing-clip;
+    in property <string> previewing-name;
+    out property <bool> previewing: root.previewing-clip != "";
+    /// Opening one is refused while recording or exporting (P5), and needs
+    /// something to play.
+    out property <bool> can-preview: root.can-play && !root.recording && !root.exporting;
+
     /// The latest notice (a device fallback, an unclean stop, an export
     /// done), shown in the transport bar without blocking; empty hides it.
     in property <string> notice;
@@ -667,6 +701,10 @@ export component AppWindow inherits Window {
     /// Ask where, then export the clip with this id.
     callback export-clip(string);
     callback cancel-export();
+    /// Preview the clip with this id, in place of the game video, and close
+    /// the one open (P5).
+    callback open-preview(string);
+    callback close-preview();
     callback undo();
     callback redo();
     /// An inspector field's commit for clip `id`.
@@ -733,8 +771,10 @@ export component AppWindow inherits Window {
                 }
                 return accept;
             }
+            // Not while previewing: the picture is at identity zoom then
+            // (P6), so a change would only show once it closes.
             if (event.text == "0") {
-                if (pressed) {
+                if (pressed && !root.previewing) {
                     root.zoom-reset();
                 }
                 return accept;
@@ -768,12 +808,14 @@ export component AppWindow inherits Window {
             }
             return accept;
         }
-        // Esc cascade (C6): the dialog above, then the recording, then the
-        // selection.
+        // Esc cascade (C6, P6): the dialog above, then the recording, then
+        // the preview, then the selection.
         if (event.text == Key.Escape) {
             if (pressed) {
                 if (root.recording) {
                     root.stop-recording();
+                } else if (root.previewing) {
+                    root.close-preview();
                 } else {
                     root.selected-clip = "";
                 }
@@ -805,13 +847,13 @@ export component AppWindow inherits Window {
             return accept;
         }
         if (event.text == "1") {
-            if (pressed) {
+            if (pressed && !root.previewing) {
                 root.zoom-reset();
             }
             return accept;
         }
         if (event.text == "2" || event.text == "3") {
-            if (pressed) {
+            if (pressed && !root.previewing) {
                 root.zoom-step(event.text == "2" ? -0.25 : 0.25, zoom-area.has-hover, zoom-area.mouse-x, zoom-area.mouse-y);
             }
             return accept;
@@ -1062,8 +1104,13 @@ export component AppWindow inherits Window {
                                                     activated => { root.jump-to-clip(clip.id); }
                                                 }
                                                 MenuItem {
+                                                    title: "Preview clip";
+                                                    enabled: root.can-preview;
+                                                    activated => { root.open-preview(clip.id); }
+                                                }
+                                                MenuItem {
                                                     title: "Export video…";
-                                                    enabled: !root.exporting;
+                                                    enabled: !root.exporting && !root.previewing;
                                                     activated => { root.export-clip(clip.id); }
                                                 }
                                                 MenuItem {
@@ -1102,7 +1149,13 @@ export component AppWindow inherits Window {
                 // --- Player area: black, the picture fitted, zoomed and
                 // panned (spec D9) ---
                 player := Rectangle {
-                    property <PictureRect> picture: root.place-picture(root.zoom, root.frame-width, root.frame-height, self.width, self.height);
+                    /// The zoom the picture is drawn at: identity while
+                    /// previewing (P6), since the preview's texture already
+                    /// has the coach's zoom baked in and the scan-time
+                    /// transform would apply it twice. The window's `zoom` is
+                    /// left alone, so closing the preview restores the view.
+                    property <ZoomState> shown-zoom: root.previewing ? { scale: 1, pan-x: 0, pan-y: 0 } : root.zoom;
+                    property <PictureRect> picture: root.place-picture(self.shown-zoom, root.frame-width, root.frame-height, self.width, self.height);
                     // The letterboxed rect at 1×. The zoomed picture is clipped
                     // to it, not to the whole player area, so the view is
                     // exactly the crop export produces (spec D9: one
@@ -1137,10 +1190,10 @@ export component AppWindow inherits Window {
                             source: root.frame;
                             x: player.picture.x - player.content.x;
                             y: player.picture.y - player.content.y;
-                            width: player.picture.width / root.zoom.scale;
-                            height: player.picture.height / root.zoom.scale;
+                            width: player.picture.width / player.shown-zoom.scale;
+                            height: player.picture.height / player.shown-zoom.scale;
                             transform-origin: { x: 0, y: 0 };
-                            transform-scale: root.zoom.scale;
+                            transform-scale: player.shown-zoom.scale;
                             image-fit: fill;
                         }
 
@@ -1148,19 +1201,28 @@ export component AppWindow inherits Window {
                         // and clipped with it. Strokes are drawn where they
                         // were made, on the zoomed picture as seen, so they
                         // don't move with the zoom.
-                        for cmds in root.live-paths: StrokePath {
-                            commands: cmds;
-                        }
-                        // The one under the pen. An empty `commands` draws
-                        // nothing, so it needs no `if`.
-                        StrokePath {
-                            commands: root.drawing-path;
+                        //
+                        // Hidden while previewing (P6): the preview's texture
+                        // already has the clip's drawings rasterized into it,
+                        // and whatever is still on screen from scanning
+                        // belongs to the game video, not to the clip.
+                        if !root.previewing: Rectangle {
+                            for cmds in root.live-paths: StrokePath {
+                                commands: cmds;
+                            }
+                            // The one under the pen. An empty `commands` draws
+                            // nothing, so it needs no `if`.
+                            StrokePath {
+                                commands: root.drawing-path;
+                            }
                         }
                     }
 
                     zoom-area := TouchArea {
-                        // Only over a picture: the empty-state cards cover it otherwise.
-                        enabled: root.can-play;
+                        // Only over a picture: the empty-state cards cover it
+                        // otherwise. Off while previewing, which is at
+                        // identity zoom (P6).
+                        enabled: root.can-play && !root.previewing;
                         scroll-event(event) => {
                             root.zoom-scroll(self.mouse-x, self.mouse-y, event.delta-x, event.delta-y, event.modifiers.control, event.modifiers.shift);
                             accept
@@ -1184,7 +1246,8 @@ export component AppWindow inherits Window {
                     ZoomIndicator {
                         x: (parent.width - self.width) / 2;
                         y: 12px;
-                        scale: root.zoom.scale;
+                        // Identity while previewing, where it hides itself.
+                        scale: player.shown-zoom.scale;
                         notches: root.zoom-notches;
                     }
 
@@ -1292,9 +1355,19 @@ export component AppWindow inherits Window {
                             }
                             root.edit-clip(id, field, text);
                         }
+                        can-preview: root.can-preview;
+                        previewing: root.previewing && root.previewing-clip == root.selected-clip;
                         // The selection, since a click doesn't take focus
                         // from a field.
                         pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
+                        preview-clicked => {
+                            keys.focus();
+                            if (self.previewing) {
+                                root.close-preview();
+                            } else {
+                                root.open-preview(root.selected-clip);
+                            }
+                        }
                         suggest-tags(text) => { return root.suggest-tags(text); }
                         take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
                     }
@@ -1351,7 +1424,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: root.recording ? "Stop" : "Record";
-                            enabled: (root.can-play && !root.exporting) || root.recording;
+                            enabled: (root.can-play && !root.exporting && !root.previewing) || root.recording;
                             min-width: 72px;
                             // Off any field first: a click doesn't take focus
                             // from one, and a field disabled while it has
@@ -1366,7 +1439,9 @@ export component AppWindow inherits Window {
                                     ? @markdown("Stop recording (R or Esc)")
                                     : root.exporting
                                         ? @markdown("Not while exporting")
-                                        : @markdown("Record (R)");
+                                        : root.previewing
+                                            ? @markdown("Not while previewing a clip")
+                                            : @markdown("Record (R)");
                             }
                         }
                         // Drawing's two controls (D6). Always mounted, and
@@ -1444,6 +1519,32 @@ export component AppWindow inherits Window {
                                         border-radius: 3px;
                                         background: root.level > 0.95 ? #ff3b30 : #34c759;
                                     }
+                                }
+                            }
+                        }
+                        // Its own item, so a notice can't overwrite it (P6).
+                        // The transport above drives the preview while it's
+                        // up, over the clip's own duration.
+                        if root.previewing: HorizontalLayout {
+                            spacing: 6px;
+
+                            Text {
+                                text: "Previewing " + root.previewing-name;
+                                color: Palette.foreground;
+                                font-size: 11px;
+                                overflow: elide;
+                                vertical-alignment: center;
+                                max-width: 200px;
+                            }
+                            Button {
+                                text: "Close";
+                                clicked => {
+                                    keys.focus();
+                                    root.close-preview();
+                                }
+
+                                Tooltip {
+                                    text: @markdown("Close the preview and go back to the game video (Esc)");
                                 }
                             }
                         }

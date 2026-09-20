@@ -298,6 +298,8 @@ impl Bus {
     /// Drops the loaded source entirely, so no stale frame stays up: for no
     /// sources, or a current source that is missing.
     pub(super) fn unload(&mut self) {
+        // As in `load`: nothing touches the player under an open preview.
+        self.close_preview();
         self.reset_skip();
         self.player.unload();
         if self.playing {

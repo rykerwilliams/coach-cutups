@@ -151,6 +151,12 @@ impl Bus {
     /// issuing, so a load's new index is out before the pipeline leaves
     /// READY. Returns whether the request was issued.
     pub(super) fn load(&mut self, index: usize, secs: f64, accurate: bool, origin: Origin) -> bool {
+        // The preview owns the picture while it's open, and the paused player
+        // still prerolls into the shared mailbox on a seek (spec P5's
+        // exclusivity). Moving the game video is asking for it back, so the
+        // preview closes here rather than at each caller -- this and
+        // `unload` are the only two ways to the player.
+        self.close_preview();
         let Some(source) = self
             .open
             .as_ref()
