@@ -967,27 +967,34 @@ component MatchSetupSheet inherits Rectangle {
     pure callback hex-color(string) -> color;
     pure callback valid-name(string) -> bool;
     pure callback valid-hex(string) -> bool;
-    pure callback valid-count(string, int, int) -> bool;
+    /// One per numeric field: each knows its own range, which lives in
+    /// `match_panel.rs` beside the parse that builds the config, so a field
+    /// can't be marked good and then refuse to save.
+    pure callback valid-periods(string) -> bool;
+    pure callback valid-overtime-periods(string) -> bool;
+    pure callback valid-minutes(string) -> bool;
     /// The warning for start/stops the format being typed has no period for,
-    /// empty when there are none.
-    pure callback over-cap(string, string) -> string;
+    /// empty when there are none. The back-anchor goes in because its derived
+    /// start takes a period: ticking the box moves the warning.
+    pure callback over-cap(string, string, bool) -> string;
     callback save();
     callback cancel();
 
-    /// The empty-name rule is the command's (S5); Save is off here so the
-    /// coach isn't answered with a dialog on a name that is only spaces --
-    /// which is what the command sees, since the field's text is trimmed.
-    property <bool> names-ok: root.valid-name(root.home-name) && root.valid-name(root.away-name);
-    property <bool> colours-ok:
-        root.valid-hex(root.home-primary) && root.valid-hex(root.home-secondary)
+    /// Every field good. The empty-name rule is the command's (S5); Save is
+    /// off here so the coach isn't answered with a dialog on a name that is
+    /// only spaces -- which is what the command sees, since the field's text
+    /// is trimmed.
+    property <bool> can-save:
+        root.valid-name(root.home-name) && root.valid-name(root.away-name)
+        && root.valid-hex(root.home-primary) && root.valid-hex(root.home-secondary)
         && root.valid-hex(root.home-font) && root.valid-hex(root.away-primary)
-        && root.valid-hex(root.away-secondary) && root.valid-hex(root.away-font);
-    property <bool> format-ok:
-        root.valid-count(root.regulation-periods, 1, 10)
-        && root.valid-count(root.regulation-minutes, 1, 180)
-        && root.valid-count(root.overtime-periods, 0, 10)
-        && root.valid-count(root.overtime-minutes, 1, 180);
-    property <string> orphaned: root.over-cap(root.regulation-periods, root.overtime-periods);
+        && root.valid-hex(root.away-secondary) && root.valid-hex(root.away-font)
+        && root.valid-periods(root.regulation-periods)
+        && root.valid-minutes(root.regulation-minutes)
+        && root.valid-overtime-periods(root.overtime-periods)
+        && root.valid-minutes(root.overtime-minutes);
+    property <string> orphaned:
+        root.over-cap(root.regulation-periods, root.overtime-periods, root.back-anchor);
 
     width: 520px;
     height: sheet.preferred-height;
@@ -1087,12 +1094,12 @@ component MatchSetupSheet inherits Rectangle {
 
             SetupField {
                 label: "Periods";
-                ok: root.valid-count(root.regulation-periods, 1, 10);
+                ok: root.valid-periods(root.regulation-periods);
                 text <=> root.regulation-periods;
             }
             SetupField {
                 label: "Minutes each";
-                ok: root.valid-count(root.regulation-minutes, 1, 180);
+                ok: root.valid-minutes(root.regulation-minutes);
                 text <=> root.regulation-minutes;
             }
         }
@@ -1101,12 +1108,12 @@ component MatchSetupSheet inherits Rectangle {
 
             SetupField {
                 label: "Overtime periods";
-                ok: root.valid-count(root.overtime-periods, 0, 10);
+                ok: root.valid-overtime-periods(root.overtime-periods);
                 text <=> root.overtime-periods;
             }
             SetupField {
                 label: "Minutes each";
-                ok: root.valid-count(root.overtime-minutes, 1, 180);
+                ok: root.valid-minutes(root.overtime-minutes);
                 text <=> root.overtime-minutes;
             }
         }
@@ -1116,7 +1123,7 @@ component MatchSetupSheet inherits Rectangle {
             checked <=> root.back-anchor;
 
             Tooltip {
-                text: @markdown("The first period's start is derived, so tagging half-time puts the clock at the right minute. It counts as one of the format's start/stops.");
+                text: @markdown("The first period's start is derived, so tagging half-time puts the clock at the right minute. It takes the first period, so a fully-tagged format has one start/stop left over -- kept, but without a period until you untick this.");
             }
         }
 
@@ -1140,7 +1147,7 @@ component MatchSetupSheet inherits Rectangle {
             Button {
                 text: "Save";
                 primary: true;
-                enabled: root.names-ok && root.colours-ok && root.format-ok;
+                enabled: root.can-save;
                 clicked => { root.save(); }
             }
         }
@@ -1435,10 +1442,13 @@ export component AppWindow inherits Window {
     pure callback hex-color(string) -> color;
     pure callback valid-name(string) -> bool;
     pure callback valid-hex(string) -> bool;
-    pure callback valid-count(string, int, int) -> bool;
-    /// The sheet's shrink-below-tagged warning for a format of these periods,
-    /// empty when nothing is over its cap.
-    pure callback match-over-cap(string, string) -> string;
+    pure callback valid-periods(string) -> bool;
+    pure callback valid-overtime-periods(string) -> bool;
+    pure callback valid-minutes(string) -> bool;
+    /// The sheet's warning for start/stops the format being typed has no
+    /// period for, empty when there are none. The back-anchor is an argument
+    /// because its derived start takes one of those periods.
+    pure callback match-over-cap(string, string, bool) -> string;
     callback undo();
     callback redo();
     /// An inspector field's commit for clip `id`.
@@ -1485,10 +1495,14 @@ export component AppWindow inherits Window {
     }
 
     /// One of the three match tag keys (S4), under the gate the panel's
-    /// buttons share. A held key must not insert a goal per repeat, and the
-    /// key is swallowed either way, as `c` and `r` are.
+    /// buttons share -- the cap included, which only the start/stop has: the
+    /// bus refuses a tag there, and that refusal is a backstop, not something
+    /// to walk into from the keyboard mid-recording. A held key must not
+    /// insert a goal per repeat, and the key is swallowed either way, as `c`
+    /// and `r` are.
     function tag-key(kind: MatchTag, event: KeyEvent, pressed: bool) -> EventResult {
-        if (pressed && !event.repeat && root.can-tag) {
+        if (pressed && !event.repeat && root.can-tag
+            && !(kind == MatchTag.start-stop && root.match-at-cap)) {
             root.tag-match-event(kind);
         }
         return accept;
@@ -2509,8 +2523,12 @@ export component AppWindow inherits Window {
                 hex-color(text) => { return root.hex-color(text); }
                 valid-name(text) => { return root.valid-name(text); }
                 valid-hex(text) => { return root.valid-hex(text); }
-                valid-count(text, low, high) => { return root.valid-count(text, low, high); }
-                over-cap(regulation, overtime) => { return root.match-over-cap(regulation, overtime); }
+                valid-periods(text) => { return root.valid-periods(text); }
+                valid-overtime-periods(text) => { return root.valid-overtime-periods(text); }
+                valid-minutes(text) => { return root.valid-minutes(text); }
+                over-cap(regulation, overtime, anchor) => {
+                    return root.match-over-cap(regulation, overtime, anchor);
+                }
                 // The bus has the last word on both: it refuses an empty
                 // name, and closing here is the sheet's own Cancel.
                 save => {

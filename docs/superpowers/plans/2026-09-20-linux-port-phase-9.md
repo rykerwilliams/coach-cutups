@@ -39,7 +39,7 @@ Commit: `feat(core): scoreboard clock, score and match interpretation`.
 
 1. **Vendor `DejaVuSans-Bold.ttf`** and its licence. Both faces load under one family, so **set `Attrs::weight` explicitly** everywhere — bold for the four labels, normal for the tail.
 2. **Generalize `draw_text`** with colour and horizontal alignment (all five labels are **centred**), and **turn the `Fitted` memo into `[Option<Fitted>; 3]` indexed by `TextSlot { Bar, HomeName, AwayName }`** — the two names share a size and width, so one slot would still thrash.
-3. **Draw the scoreboard last** in `overlay.rs`, from `OverlayFrame.scoreboard: Option<(&ScoreboardConfig, &ScoreboardState)>`, using `scoreboard_rects`: the accent strip in `secondary_color` above the team columns, the home and away cells filled with `primary_color`, the score and clock cells in their dark fills, the names ellipsized in each team's `font_color`, and the tail outside the bar when in stoppage.
+3. **Draw the scoreboard last** in `overlay.rs`, from `OverlayFrame.scoreboard: Option<(&ScoreboardConfig, ScoreboardState)>` *(the state went by value in Task 4)*, using `scoreboard_rects`: the accent strip in `secondary_color` above the team columns, the home and away cells filled with `primary_color`, the score and clock cells in their dark fills, the names fitted in each team's `font_color`, and the tail outside the bar when in stoppage.
 4. **`scoreboard: Option<ScoreboardContext>` on `ExportJob` and `PreviewJob`,** both drivers calling `state_at(entry.source_index, frame.source_time)`. **The bus passes `None` in this task** so it builds and ships alone; Task 3a fills it in.
 5. **Tests:** drawn inside the bar ∪ tail rect with the area left of the bar untouched; the accent only over the team columns; the tail only in stoppage; each team's `font_color` used; a scoreboard-less job draws nothing.
 
@@ -57,14 +57,16 @@ Commit: `feat(app): match event commands and undo`.
 
 ## Task 3b — UI
 
-1. **`z`, `x`, `v` tag directly,** gated exactly as `pressed && !event.repeat && !root.previewing && root.recording-phase != RecordingPhase.starting && root.can-play`, yielding to `text-editing`.
+1. **`z`, `x`, `v` tag directly,** gated exactly as `pressed && !event.repeat && !root.previewing && root.recording-phase != RecordingPhase.starting && root.can-play`, yielding to `text-editing` — and `v` additionally off **at the cap**, as its button is. `TagMatchEvent` is on the recording allow-list, so an ungated key would put the bus's refusal on screen mid-take.
 2. **A Match panel** in the right-hand column: the live score and clock, the three buttons under the same gate, and the event list with roles, seek and delete.
    - **Its anchor is the position the readout already computes** — `target_abs` while a seek is outstanding, else `abs_seconds(source_index, last_secs)` — mapped back through `locate()`. Reading `source_index` and `last_secs` separately pairs a new index with an old offset across a cross-source seek. Frozen while previewing.
-3. **A setup sheet** for team names, the back-anchor toggle, the format, and the six colours as **hex text fields** (no picker; Slint 1.18 has none, and a field is what the Mac's inspector effectively was), with the shrink-below-tagged warning.
+3. **A setup sheet** for team names, the back-anchor toggle, the format, and the six colours as **hex text fields** (no picker; Slint 1.18 has none, and a field is what the Mac's inspector effectively was), with the over-cap warning.
+   - **Each numeric field's range lives once,** in `match_panel.rs`, behind a validator per field (`valid-periods`, `valid-overtime-periods`, `valid-minutes`) that shares it with the parse building the config. A range written on both sides drifts, and a drift leaves Save enabled on a setup that then fails to read.
+   - **The warning takes the back-anchor,** since the derived start takes a period: the places for stored events are `2 × total_periods − 1` while the box is ticked, and ticking it updates the warning live.
 4. **Its own branch in `handle-key`** — the sheet is modal, so Esc closes it ahead of the existing cascade and the tag keys don't fire behind it. New fields fold into `text-editing`.
 5. **Three consequences of Task 3a to honour:**
    - **`DeleteMatchEvent` is refused while recording** (only tagging is on the allow-list), so the rows' delete buttons must be disabled then, or the click reaches an `eprintln` and nothing happens.
-   - **A role-less row is reachable.** With the back-anchor on, the cap still counts records, so the coach can store one start/stop that `interpret` gives no role to until the anchor is turned off. That is intended — nothing stored is lost — but the row must *look* role-less rather than landing silently.
+   - **A role-less row is reachable.** With the back-anchor on, the cap still counts records, so the coach can store one start/stop that `interpret` gives no role to until the anchor is turned off. That is intended — nothing stored is lost — but the row must *look* role-less rather than landing silently, and the setup sheet's warning must count the same one.
    - **`SetScoreboard` is not an undo step** (the sheet has Cancel, and "Done when #6" names only tagging and deleting). Don't wire the sheet to undo.
 6. **A screenshot pass** with a scratch project driven through callbacks (no camera, no input injection): the panel with events, and an exported frame's scoreboard.
 

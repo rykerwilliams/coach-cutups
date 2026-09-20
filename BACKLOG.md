@@ -512,3 +512,21 @@ Each entry: what, why deferred, when to revisit.
   small "Manchester Utd".
 - **When to revisit:** the first hands-on pass with real team names, which is
   in the batched checklist.
+
+58. **`scan_abs` can pair a new source's index with the old source's offset.**
+  `scan_abs` (`crates/video-coach-app/src/main.rs`) falls back to
+  `abs_seconds(ui.source_index, ui.last_secs)` when `ui.target_abs` is `None`.
+  `last_secs` is written only by a *successful* `query_position()`, while
+  `ui.source_index` is updated by `Event::Position` independently — so in the
+  window after a cross-source seek has settled but before a query succeeds, the
+  readout (and a tag taken in that instant) would pair the new index with the
+  old source's seconds. That is exactly the pairing the function's doc comment
+  says it prevents.
+- **Why deferred:** not reproducible. A settled `Position` is only published
+  once the flight is `Idle`, and the query works by then, so the window is
+  empty in practice. Closing it properly needs either source seconds carried on
+  `Event::Position` or `last_secs` keyed by source index — more machinery on
+  the hot readout path than a window nobody has hit is worth.
+- **When to revisit:** if a tag or the readout is ever seen a whole source's
+  duration out, or when `Event::Position` gains a payload for another reason —
+  add the source seconds to it then and the fallback becomes exact for free.

@@ -312,21 +312,17 @@ fn export(
         // **The displayed frame's source time**, not a per-clip constant plus
         // the record time: that sum is exactly the macOS bug that put the
         // match clock ahead of the footage after every pause (BACKLOG #27).
-        let state = job
-            .scoreboard
-            .as_ref()
-            .and_then(|context| context.state_at(entry.source_index, frame.source_time));
+        let scoreboard = job.scoreboard.as_ref().and_then(|context| {
+            let state = context.state_at(entry.source_index, frame.source_time)?;
+            Some((context.config(), state))
+        });
         let overlay = overlays.render(
             &OverlayFrame {
                 clip: &media.clip,
                 record_time,
                 picture,
                 text: &entry.text,
-                scoreboard: job
-                    .scoreboard
-                    .as_ref()
-                    .zip(state.as_ref())
-                    .map(|(context, state)| (context.config(), state)),
+                scoreboard,
             },
             out_w as u32,
             out_h as u32,

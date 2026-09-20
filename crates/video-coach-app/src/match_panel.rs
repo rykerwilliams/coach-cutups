@@ -9,8 +9,8 @@
 use uuid::Uuid;
 use video_coach_core::project::Project;
 use video_coach_core::scoreboard::{
-    format_clock, interpret, AbsoluteMatchEvent, MatchEventKind, MatchFormat, PeriodRole,
-    ScoreboardConfig, ScoreboardState, TeamConfig,
+    format_clock, interpret, MatchEventKind, MatchFormat, PeriodRole, ScoreboardConfig,
+    ScoreboardState, TeamConfig,
 };
 use video_coach_core::stroke::Rgba;
 
@@ -37,16 +37,7 @@ pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
     let abs = |source_index, source_seconds| project.abs_seconds(source_index, source_seconds);
     // Roles only exist once there is a format to interpret against.
     let roles: Vec<(Uuid, PeriodRole)> = project.scoreboard.as_ref().map_or_else(Vec::new, |c| {
-        let events: Vec<AbsoluteMatchEvent> = project
-            .match_events
-            .iter()
-            .map(|m| AbsoluteMatchEvent {
-                id: Some(m.id),
-                kind: m.kind,
-                abs_seconds: abs(m.source_index, m.source_seconds),
-            })
-            .collect();
-        interpret(&events, c)
+        interpret(&project.absolute_match_events(), c)
             .into_iter()
             .filter_map(|e| Some((e.id?, e.role)))
             .collect()
@@ -110,26 +101,41 @@ pub fn clock_text(state: Option<&ScoreboardState>) -> String {
 }
 
 /// How many tagged start/stops a format of `total_periods` has no period for.
-pub fn over_cap(project: &Project, total_periods: u32) -> usize {
-    project
-        .start_stop_count()
-        .saturating_sub(2 * total_periods as usize)
+///
+/// `back_anchor` is [`ScoreboardConfig::auto_back_anchor_p1`] as the sheet
+/// currently has it: [`interpret`] prepends the derived start and *then* caps
+/// the list, so the anchor takes a period, leaving `2 × total_periods − 1`
+/// places for stored events. Without it this disagreed with the rows, which
+/// already mark the leftover start/stop role-less.
+///
+/// `Project::start_stops_at_cap` deliberately counts records instead, so the
+/// coach never loses a *stored* event to the anchor (spec S1): the two numbers
+/// are different questions, and with the anchor on the last storable start/stop
+/// is over this cap.
+///
+/// The `2 ×` is [`MatchFormat::expected_start_stop_events`]'s rule, which core
+/// keeps in one place — but the caller here has two period counts typed into a
+/// sheet and no format to hand, and building one to ask would be more
+/// ceremony than the rule is long.
+pub fn over_cap(project: &Project, total_periods: u32, back_anchor: bool) -> usize {
+    let places = (2 * total_periods as usize).saturating_sub(usize::from(back_anchor));
+    project.start_stop_count().saturating_sub(places)
 }
 
-/// The setup sheet's warning while the format is being shrunk below what is
-/// already tagged; empty when nothing is over the cap.
+/// The setup sheet's warning for start/stops the format being typed has no
+/// period for; empty when there are none.
 ///
 /// The records are never dropped — the cap is on what [`interpret`] gives a
 /// role to — so this is a warning, not a refusal.
-pub fn over_cap_warning(project: &Project, total_periods: u32) -> String {
-    match over_cap(project, total_periods) {
+pub fn over_cap_warning(project: &Project, total_periods: u32, back_anchor: bool) -> String {
+    match over_cap(project, total_periods, back_anchor) {
         0 => String::new(),
         1 => "1 tagged start/stop has no period in this format. It is kept, but \
-              the scoreboard ignores it until the format grows."
+              the scoreboard ignores it until there is a period for it."
             .to_string(),
         n => format!(
             "{n} tagged start/stops have no period in this format. They are kept, \
-             but the scoreboard ignores them until the format grows."
+             but the scoreboard ignores them until there are periods for them."
         ),
     }
 }
@@ -201,9 +207,29 @@ pub fn parse_hex(text: &str) -> Option<Rgba> {
     })
 }
 
-/// One of the setup sheet's format counts, within its range; `None` for
-/// anything else, which the sheet marks and refuses to save.
-pub fn parse_count(text: &str, min: u32, max: u32) -> Option<u32> {
+// The setup sheet's numeric fields, one function each, so a range is written
+// once: the sheet's "this field is good" mark and the parse that builds the
+// config call the same one and can't drift apart. Written on both sides they
+// did, and a drift leaves Save enabled on a setup that then fails to read.
+// Each returns `None` for anything out of range or not a plain number, which
+// the sheet marks and refuses to save on.
+
+/// Regulation periods: a match has at least one.
+pub fn parse_periods(text: &str) -> Option<u32> {
+    parse_count(text, 1, 10)
+}
+
+/// Overtime periods, which unlike regulation ones may be none at all.
+pub fn parse_overtime_periods(text: &str) -> Option<u32> {
+    parse_count(text, 0, 10)
+}
+
+/// A period's length in whole minutes, regulation or overtime.
+pub fn parse_minutes(text: &str) -> Option<u32> {
+    parse_count(text, 1, 180)
+}
+
+fn parse_count(text: &str, min: u32, max: u32) -> Option<u32> {
     let n: u32 = text.trim().parse().ok()?;
     (min..=max).contains(&n).then_some(n)
 }
@@ -261,7 +287,8 @@ mod tests {
     }
 
     /// The row a back-anchored match can store past the format's last period:
-    /// kept, listed, and visibly without one.
+    /// kept, listed, visibly without one — and counted by the warning, which
+    /// has to agree with the row rather than with the record cap.
     #[test]
     fn a_start_stop_the_format_has_no_period_for_says_so() {
         let mut p = project();
@@ -278,19 +305,29 @@ mod tests {
             ["1H end", "2H start", "2H end", "Start/stop (no period)"]
         );
         assert!(match_rows(&p).last().unwrap().role_less);
-        assert_eq!(over_cap(&p, 2), 0);
-        assert_eq!(over_cap(&p, 1), 2);
-        assert_eq!(over_cap_warning(&p, 2), "");
+        // The anchor takes a period, so four records don't fit two of them:
+        // the warning counts the same one the row marks.
+        assert_eq!(over_cap(&p, 2, true), 1);
+        assert_eq!(over_cap(&p, 1, true), 3);
+        // Turning the anchor off gives that record its role back, and the
+        // warning goes with it.
+        assert_eq!(over_cap(&p, 2, false), 0);
         assert!(
-            over_cap_warning(&p, 1).starts_with("2 tagged start/stops have no period"),
+            over_cap_warning(&p, 2, true).starts_with("1 tagged start/stop has no period"),
             "{}",
-            over_cap_warning(&p, 1)
+            over_cap_warning(&p, 2, true)
+        );
+        assert_eq!(over_cap_warning(&p, 2, false), "");
+        assert!(
+            over_cap_warning(&p, 1, false).starts_with("2 tagged start/stops have no period"),
+            "{}",
+            over_cap_warning(&p, 1, false)
         );
         p.delete_match_event(match_rows(&p)[0].id);
         assert!(
-            over_cap_warning(&p, 1).starts_with("1 tagged start/stop has no period"),
+            over_cap_warning(&p, 1, false).starts_with("1 tagged start/stop has no period"),
             "{}",
-            over_cap_warning(&p, 1)
+            over_cap_warning(&p, 1, false)
         );
     }
 
@@ -344,13 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn a_format_count_has_to_be_a_number_in_range() {
-        assert_eq!(parse_count(" 45 ", 1, 180), Some(45));
-        assert_eq!(parse_count("0", 0, 10), Some(0));
-        assert_eq!(parse_count("0", 1, 10), None);
-        assert_eq!(parse_count("11", 1, 10), None);
-        assert_eq!(parse_count("-1", 0, 10), None);
-        assert_eq!(parse_count("4.5", 1, 10), None);
-        assert_eq!(parse_count("", 1, 10), None);
+    fn a_format_count_has_to_be_a_number_in_its_field_s_range() {
+        assert_eq!(parse_minutes(" 45 "), Some(45));
+        assert_eq!(parse_minutes("180"), Some(180));
+        assert_eq!(parse_minutes("181"), None);
+        assert_eq!(parse_minutes("0"), None);
+        // Only overtime may be none at all.
+        assert_eq!(parse_overtime_periods("0"), Some(0));
+        assert_eq!(parse_periods("0"), None);
+        assert_eq!(parse_periods("10"), Some(10));
+        assert_eq!(parse_periods("11"), None);
+        for bad in ["-1", "4.5", "", "two"] {
+            assert_eq!(parse_periods(bad), None, "{bad}");
+        }
     }
 }

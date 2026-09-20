@@ -26,7 +26,9 @@ use video_coach_app::bus::{
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
-use video_coach_app::match_panel::{self, parse_count, parse_hex};
+use video_coach_app::match_panel::{
+    self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
+};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
@@ -581,21 +583,22 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     // no name.
     window.on_valid_name(|text| !text.trim().is_empty());
     window.on_valid_hex(|text| parse_hex(&text).is_some());
-    window.on_valid_count(|text, low, high| {
-        let (Ok(low), Ok(high)) = (u32::try_from(low), u32::try_from(high)) else {
-            return false;
-        };
-        parse_count(&text, low, high).is_some()
-    });
-    window.on_match_over_cap(|regulation, overtime| {
+    // One validator per field, sharing its range with the parse that builds
+    // the config, so a field can't read good and then fail to save.
+    window.on_valid_periods(|text| parse_periods(&text).is_some());
+    window.on_valid_overtime_periods(|text| parse_overtime_periods(&text).is_some());
+    window.on_valid_minutes(|text| parse_minutes(&text).is_some());
+    // The back-anchor is in here because it takes a period: ticking the box
+    // moves the warning, so the sheet passes the box as it currently stands.
+    window.on_match_over_cap(|regulation, overtime, back_anchor| {
         let Some((regulation, overtime)) =
-            parse_count(&regulation, 1, 10).zip(parse_count(&overtime, 0, 10))
+            parse_periods(&regulation).zip(parse_overtime_periods(&overtime))
         else {
             return SharedString::new();
         };
         UI.with_borrow(|ui| {
             ui.snapshot.as_ref().map_or_else(SharedString::new, |s| {
-                match_panel::over_cap_warning(&s.project, regulation + overtime).into()
+                match_panel::over_cap_warning(&s.project, regulation + overtime, back_anchor).into()
             })
         })
     });
@@ -647,7 +650,7 @@ fn match_setup(w: &AppWindow) -> Option<ScoreboardConfig> {
                 font_color: parse_hex(&font)?,
             })
         };
-    let seconds = |text: SharedString| Some(parse_count(&text, 1, 180)? * 60);
+    let seconds = |text: SharedString| Some(parse_minutes(&text)? * 60);
     Some(ScoreboardConfig {
         home: team(
             w.get_match_home_name(),
@@ -662,9 +665,9 @@ fn match_setup(w: &AppWindow) -> Option<ScoreboardConfig> {
             w.get_match_away_font(),
         )?,
         format: MatchFormat {
-            regulation_periods: parse_count(&w.get_match_regulation_periods(), 1, 10)?,
+            regulation_periods: parse_periods(&w.get_match_regulation_periods())?,
             regulation_period_seconds: seconds(w.get_match_regulation_minutes())?,
-            overtime_periods: parse_count(&w.get_match_overtime_periods(), 0, 10)?,
+            overtime_periods: parse_overtime_periods(&w.get_match_overtime_periods())?,
             overtime_period_seconds: seconds(w.get_match_overtime_minutes())?,
         },
         auto_back_anchor_p1: w.get_match_back_anchor(),
@@ -686,10 +689,6 @@ fn show_match(w: &AppWindow, project: &Project) {
     w.set_match_rows(ModelRc::new(VecModel::from(rows)));
     w.set_match_configured(project.scoreboard.is_some());
     w.set_match_at_cap(project.start_stops_at_cap());
-    if project.scoreboard.is_none() {
-        w.set_match_score(SharedString::new());
-        w.set_match_clock(SharedString::new());
-    }
 }
 
 /// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
@@ -1437,8 +1436,7 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         // time within one clip, and the preview's own scoreboard is already
         // burned into its picture.
         if let (None, Some(scoreboard)) = (ui.preview_duration, &ui.scoreboard) {
-            let (source_index, source_time) = project.locate(current);
-            let state = scoreboard.state_at(source_index, source_time);
+            let state = scoreboard.state_at_abs(current);
             let line = match_panel::score_line(scoreboard.config(), state.as_ref());
             w.set_match_score(line.into());
             w.set_match_clock(match_panel::clock_text(state.as_ref()).into());

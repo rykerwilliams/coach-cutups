@@ -294,8 +294,11 @@ pub enum UserError {
     /// Preview is refused, or the one running gave up.
     #[error("can't preview: {0}")]
     CantPreview(String),
-    /// A match command is refused out loud (spec S5): a team without a name,
-    /// or a start/stop past the format's last period.
+    /// A notice: a match command is refused out loud (spec S5) — a team
+    /// without a name, or a start/stop past the format's last period. Both
+    /// controls are already disabled where this can fire, so it is a backstop;
+    /// a modal for it could land over a live commentary take, where `v` is on
+    /// the recording allow-list, and swallow the transport keys.
     #[error("{0}")]
     Scoreboard(&'static str),
     #[error("{0}")]
@@ -308,7 +311,7 @@ impl UserError {
     pub fn is_notice(&self) -> bool {
         matches!(
             self,
-            UserError::DeviceFallback { .. } | UserError::StopNotClean
+            UserError::DeviceFallback { .. } | UserError::StopNotClean | UserError::Scoreboard(_)
         )
     }
 }

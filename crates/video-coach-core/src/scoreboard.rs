@@ -202,10 +202,13 @@ pub struct InterpretedEvent {
 /// [`ScoreboardConfig::auto_back_anchor_p1`] is set the coach's footage starts
 /// after kick-off, so a period-1 start is prepended at `period_seconds(0)`
 /// before the first tagged start/stop — which is then the *end* of period 1, so
-/// that end lands at exactly one period length and the clock reads 45:00 there.
-/// Before any start/stop is tagged the derived start sits at absolute 0, so the
-/// clock runs from the beginning of the footage through the half the coach most
-/// wants one, and snaps to the true alignment when half-time is tagged. macOS
+/// that tagged end lands at exactly one period length, the instant the clock
+/// turns over to the break. (It is a turnover, not a frame reading 45:00:
+/// [`format_clock`] truncates, so a back-anchored half reads …44:58, 44:59,
+/// `HT`.) Before any start/stop is tagged the derived start sits at absolute 0,
+/// so the clock runs from the beginning of the footage through the half the
+/// coach most wants one, and snaps to the true alignment when half-time is
+/// tagged. macOS
 /// instead stored a flagged `(0, 0)` event and added an offset to the
 /// *displayed* number, which left the clock reading 50:00 while still counted as
 /// running, so stoppage never began.
@@ -435,18 +438,9 @@ impl ScoreboardContext {
             offset += source.duration_seconds;
             source_offsets.push(offset);
         }
-        let events = project
-            .match_events
-            .iter()
-            .map(|m| AbsoluteMatchEvent {
-                id: Some(m.id),
-                kind: m.kind,
-                abs_seconds: project.abs_seconds(m.source_index, m.source_seconds),
-            })
-            .collect();
         Some(ScoreboardContext {
             config,
-            events,
+            events: project.absolute_match_events(),
             source_offsets,
         })
     }
@@ -464,7 +458,14 @@ impl ScoreboardContext {
     /// whole story.
     pub fn state_at(&self, source_index: usize, source_time: f64) -> Option<ScoreboardState> {
         let last = self.source_offsets.len() - 1;
-        let now_abs = self.source_offsets[source_index.min(last)] + source_time;
+        self.state_at_abs(self.source_offsets[source_index.min(last)] + source_time)
+    }
+
+    /// The scoreboard at `now_abs` seconds on the virtual-concat timeline, for
+    /// a caller that already has one — the scan readout, which would otherwise
+    /// split an absolute position only for [`state_at`](Self::state_at) to add
+    /// the same offset straight back.
+    pub fn state_at_abs(&self, now_abs: f64) -> Option<ScoreboardState> {
         scoreboard_state(now_abs, &self.config, &self.events)
     }
 }
@@ -492,6 +493,23 @@ impl Project {
             source_seconds,
         });
         id
+    }
+
+    /// Every tagged event on the virtual-concat timeline, in stored order.
+    ///
+    /// The one way to build [`AbsoluteMatchEvent`]s from a project, so the
+    /// projection lives beside the events it projects. **Never cache the
+    /// result across a source add, move, remove or relink** — see
+    /// [`AbsoluteMatchEvent`].
+    pub fn absolute_match_events(&self) -> Vec<AbsoluteMatchEvent> {
+        self.match_events
+            .iter()
+            .map(|m| AbsoluteMatchEvent {
+                id: Some(m.id),
+                kind: m.kind,
+                abs_seconds: self.abs_seconds(m.source_index, m.source_seconds),
+            })
+            .collect()
     }
 
     /// Remove the event with `id` and return it, or `None` if there is none.

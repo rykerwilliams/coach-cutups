@@ -15,7 +15,7 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 ## Done when
 
 1. **Tagging.** Three keys tag a home goal, an away goal and a start/stop while scanning. The Match panel has the same three as buttons.
-2. **The panel** shows the live score and clock, the event list with each event's role ("1H start", "HT", …), and seek and delete per row.
+2. **The panel** shows the live score and clock, the event list with each event's role ("1H start", "1H end", "Home goal", …), and seek and delete per row.
 3. **Setup.** Team names, their three colours each, and the match format are editable in a sheet and saved with the project.
 4. **Burned in.** Preview and export draw the scoreboard top-left, with the accent strip, and the `+M:SS` tail in stoppage time.
 5. **The clock is right inside a clip.** A clip that pauses for 20 s shows the same match time before and after the pause.
@@ -44,7 +44,7 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 - that derived start is at `p1_end_abs − period_seconds(0)` once a first end is tagged, and **at absolute 0 before then**, so the clock runs from the start of the footage during the first half and snaps to the right alignment when half-time is tagged. Without the fallback there would be no clock at all through the half the coach most wants one.
 - `interpret` returns `(Option<Uuid>, PeriodRole)`: the derived start has no record.
 
-A back-anchored first period **ends at exactly `period_seconds(0)` and never enters stoppage** — that is what the anchor means, since it defines half-time as 45:00. macOS's version instead read 50:00 while still "running". `MatchEventRecord::is_auto_back_anchor` is removed (nothing writes it yet, serde ignores unknown keys, so the format stays at v7), and macOS's test pinning the old behaviour is **not** ported.
+A back-anchored first period **ends at exactly `period_seconds(0)` and never enters stoppage** — that is what the anchor means: tagging half-time *defines* it as one period length. That end is the instant the clock turns over to the break, not a frame reading 45:00 — `format_clock` truncates, so a back-anchored half reads …44:58, 44:59, `HT`. macOS's version instead read 50:00 while still "running". `MatchEventRecord::is_auto_back_anchor` is removed (nothing writes it yet, serde ignores unknown keys, so the format stays at v7), and macOS's test pinning the old behaviour is **not** ported.
 
 ### S2. Per frame, the drivers pass absolute time
 
@@ -63,38 +63,42 @@ Each frame the driver calls `context.state_at(entry.source_index, frame.source_t
 
 ### S3. Drawing: the same overlay, on top
 
-The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes and the text bar (macOS draws it on top of everything). `OverlayFrame` gains `scoreboard: Option<(&ScoreboardConfig, &ScoreboardState)>`, and `layout.rs` gains `SCOREBOARD_*` ratios — **named distinctly**, since the text bar already has a `BAR_HEIGHT_RATIO` that happens to be the same 0.08.
+The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes and the text bar (macOS draws it on top of everything). `OverlayFrame` gains `scoreboard: Option<(&ScoreboardConfig, ScoreboardState)>` (the state **by value** — it is `Copy` and 40 bytes, and a reference would make both drivers keep a temporary alive to borrow from), and `layout.rs` gains `SCOREBOARD_*` ratios — **named distinctly**, since the text bar already has a `BAR_HEIGHT_RATIO` that happens to be the same 0.08.
 
 | Element | Value |
 |---|---|
 | Bar | `0.36 × outW` by `0.08 × outH`, inset `0.015 × outH`, top-left |
 | Accent strip | `0.08 × barH`, **above** the cells, over the home and away columns only |
 | Cells | height `scoreBarH = barH − accentH`, at `top + accentH` |
-| Columns | home `0.30`, score `0.20`, away `0.30`, clock `0.20` |
+| Columns | home `0.27`, score `0.20`, away `0.27`, clock `0.26` |
 | Cell fills | home and away `primary_color`, the accent `secondary_color`, score `#1a1a1a`, clock `#0d0d0d` at 0.95 alpha |
 | Fonts | `0.55 × scoreBarH`, bold, in each team's `font_color` |
 | Stoppage tail | its own rect, gap `0.025 × scoreBarH` off the clock cell, `0.45 × scoreBarH`, **not bold** (macOS used an absolute 2 pt gap) |
 | Team name pad | `0.05 × scoreBarH` (macOS used an absolute 4 pt, which changes meaning with resolution) |
+| Label floor | `0.1375 × scoreBarH` — a quarter of the full size, below which a label is ellipsized instead of shrunk |
 
 **These are fractions of `scoreBarH`, not `barH`** — the parent spec's table says `barH` and is ~9% too large. Correct both.
 
 - **`DejaVuSans-Bold.ttf` is vendored** beside the regular face, with its licence: four of the five labels are bold.
-- **Team names use a fixed size and ellipsize** (`overlay.rs`'s existing `fit`), rather than macOS's shrink-to-fit with a 6 px floor: at a cell 10.8% of the width, a shrunk long name is illegible anyway.
+- **The clock is the second-widest column, not the narrowest.** Measured through the shaping stack at 1080p, bold DejaVu Sans: `BREAK` is 3.76 em and `104:59` is 3.88, and even `00:00` is 3.18 — all of them wider than the 3.16 em a `0.20` column gives. Nothing here clips and every label is centred, so an overflow spilled *both* ways: into the away team's colour on one side and past the bar's right edge into the stoppage tail on the other. `BREAK` is not an edge case — the setup sheet offers 1–10 periods and every break of every format but soccer's first reads it. The width comes off the two name columns, which lose size rather than meaning (below).
+- **Every label is fitted to its cell**, the clock and the score included, because nothing clips. The columns are sized so nothing realistic has to shrink; fitting is what makes an unforeseen string impossible to spill rather than merely unlikely.
+- **Team names shrink to fit, with a floor, and ellipsize only below it** — macOS's behaviour, and the opposite of this spec's first answer. That answer rested on "a shrunk long name is illegible anyway", and measurement says otherwise: `Manchester United` ellipsizes to `Manche…` but fits whole at 17 px on a 1080p frame. The floor is a quarter of the full size (10.9 px at 1080p, 7.3 at 720p, both clear of macOS's absolute 6 px); every real club name measured, up to `Borussia Mönchengladbach`, clears it, and a pasted paragraph — which would otherwise shape at 1.4 px — is cut instead.
 - **All five labels are centred** in their cells, so `draw_text` is generalized with colour and alignment; today it hardcodes white and left-aligns.
 - **Weight is explicit** (`Attrs::weight`), since both faces load under one family: bold for the four labels, normal for the tail.
-- **The fitting memo becomes a 3-slot array** keyed by `TextSlot { Bar, HomeName, AwayName }`: the scoreboard ellipsizes two names that share a size and width, so a second single slot would still thrash.
+- **The fitting memo becomes a 3-slot array** keyed by `TextSlot { Bar, HomeName, AwayName }`: the scoreboard fits two names that share a size and width, so a second single slot would still thrash. The score, clock and tail change every frame and get no slot; `fit` re-runs for them, which is one extra shaping of a six-character string per frame. A slot remembers the line, the size, the floor and the width it was fitted from, and yields the line **and the size to draw it at**.
+- **The text bar does not shrink.** It passes its own size as its floor, which leaves it ellipsizing exactly as it did: it is a whole sentence, and one that resized with its length would leave the bar dancing entry to entry.
 
 ### S4. Entry: three direct keys, and a Match panel
 
 - **No event mode.** macOS needed `E` then `1/2/3` because it had no free keys; this port does. **`z` tags a home goal, `x` an away goal, `v` a start/stop**, directly. That removes a UI mode, a branch in the Esc cascade and a second gate on the zoom keys.
   - They carry `!event.repeat` (a held key must not insert a goal per repeat), and they yield to text fields like every other shortcut.
-  - They are gated exactly as the panel's buttons are: while scanning or recording, never while previewing or during a recording's start-up.
+  - They are gated exactly as the panel's buttons are: while scanning or recording, never while previewing or during a recording's start-up — **the cap included**, so `v` is off where its button is. `TagMatchEvent` is on the recording allow-list, so an ungated key would put the bus's refusal on screen over a live commentary take.
 - **The Match panel** sits in the right-hand column beside the clip inspector and tag overview:
   - the live score and clock as text;
   - the same three actions as buttons, so the feature is discoverable;
   - the auto-back-anchor toggle;
   - the event list in match order, each row with its role, a seek and a delete;
-  - **a warning when the format is shrunk below the number of start/stops already tagged.**
+  - **a warning naming the start/stops the format has no period for** — counted against the places `interpret` actually has, so **with the back-anchor on it counts the anchor's period too** (`2 × total_periods − 1` places) and the warning agrees with the role-less row the list already shows. Ticking the box updates it live.
 - **The panel's clock comes from the scan anchor** (`source_index` and the last good position), computed in the existing tick — **not** from the shared position properties, which a preview repurposes to record time within one clip. **While a preview is open the panel's clock freezes**; the preview's own scoreboard is burned into its picture. No scoreboard clock is computed during an export: that is per-frame in the driver.
 - **No scoreboard is drawn over the scan picture** (user decision, 2026-09-20).
 
@@ -104,7 +108,7 @@ The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes an
 - **The tag's anchor is the position the readout already computes** (`target_abs` when a seek is outstanding, else `abs_seconds(source_index, last_secs)`), mapped back through `locate()`. Reading `source_index` and `last_secs` separately pairs a new index with an old offset across a cross-source seek.
 - **Validation lives at the command,** not in the render path: `SetScoreboard` rejects an empty team name with a message.
 - **One `append_match_event(kind, …)` mutator,** not three that differ by a constant.
-- **One cap rule.** `interpret` truncates the stored start/stops to the format's capacity — that must be total regardless. The UI **disables** the start/stop action at the cap and says why. The mutator does **not** silently no-op, as macOS's did: a command that quietly does nothing is worse than one that refuses out loud.
+- **One cap rule.** `interpret` truncates the stored start/stops to the format's capacity — that must be total regardless. The UI **disables** the start/stop action (button *and* key) at the cap and says why. **The cap counts records,** and the derived anchor is not one, so with the anchor on the last storable start/stop is one `interpret` has no period for. That is deliberate — nothing stored is lost to a setting — and it is the one place the record cap and the role capacity differ, so the role-less row and the setup sheet's warning both count it. The mutator does **not** silently no-op, as macOS's did: a command that quietly does nothing is worse than one that refuses out loud.
 - **Undo:** `UndoAction::EditMatchEvents { before, after }` holding the whole list, as macOS did.
   - **A source move or remove purges `EditMatchEvents` from both stacks,** where trashed clips are already evicted. Those two permute `source_index`; a snapshot on the stack isn't remapped, so undo would restore events pointing at the wrong source.
   - **Add and relink don't need the purge:** events store `(source_index, source_seconds)`, and neither operation permutes indices. (The *derived absolute* events are a different matter — never cache those across any source edit, a relink included, since a duration change moves every later offset.)

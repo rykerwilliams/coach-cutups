@@ -110,9 +110,20 @@ const SCOREBOARD_ACCENT_RATIO: f64 = 0.08;
 
 /// The cell widths, as fractions of the **bar's width**. The clock takes
 /// whatever is left, so the four tile the bar exactly.
-const SCOREBOARD_HOME_RATIO: f64 = 0.30;
+///
+/// **The clock is the second-widest column, not the narrowest.** It carries
+/// the longest string on the board: `BREAK` (3.77 em measured through the
+/// shaping stack, and every break of every format but soccer's first reads it)
+/// and `104:59` (3.88 em, the default soccer format plus overtime). When the
+/// names took 0.30 each the clock was left 0.20, and at that width even
+/// `00:00` (3.18 em) overflowed its 3.16 em cell — and a label is centred, so
+/// an overflow spills *both* ways, into the away team's colour on one side and
+/// past the bar's right edge on the other. The names give the width up: they are
+/// fitted to their cells ([`SCOREBOARD_MIN_FONT_RATIO`]), so they lose size
+/// rather than meaning.
+const SCOREBOARD_HOME_RATIO: f64 = 0.27;
 const SCOREBOARD_SCORE_RATIO: f64 = 0.20;
-const SCOREBOARD_AWAY_RATIO: f64 = 0.30;
+const SCOREBOARD_AWAY_RATIO: f64 = 0.27;
 
 /// The stoppage tail's gap from the clock cell, as a fraction of the **cell
 /// height** (macOS used an absolute 2 pt, which changes meaning with
@@ -126,6 +137,21 @@ pub const SCOREBOARD_FONT_RATIO: f64 = 0.55;
 /// The stoppage tail's font size, as a fraction of the **cell height**. It is
 /// the one label that is not bold.
 pub const SCOREBOARD_TAIL_FONT_RATIO: f64 = 0.45;
+
+/// How small a scoreboard label may be shrunk to make it fit its cell, as a
+/// fraction of the **cell height** — a quarter of [`SCOREBOARD_FONT_RATIO`].
+///
+/// A label that doesn't fit is shrunk to fit and only cut with an ellipsis
+/// once it reaches this floor, because a smaller whole name carries more than
+/// a full-size stub: `Manchester United` in a cell this wide is ellipsized to
+/// `Manche…` but fits whole at 0.38 of the full size. Measured through the
+/// shaping stack, every real club name tried — up to `Borussia
+/// Mönchengladbach` and `Wolverhampton Wanderers`, 24 characters — fits at
+/// 0.265, so the floor sits just under it at 0.25. In pixels that is 10.9 at
+/// 1080p and 7.3 at 720p, both clear of the 6 px floor macOS used; below it a
+/// line is cut rather than smeared to nothing (a pasted paragraph would
+/// otherwise shape at 1.4 px).
+pub const SCOREBOARD_MIN_FONT_RATIO: f64 = SCOREBOARD_FONT_RATIO / 4.0;
 
 /// A team name's padding inside its cell, as a fraction of the **cell height**
 /// (macOS used an absolute 4 pt).

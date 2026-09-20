@@ -412,15 +412,11 @@ fn run(
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), watch)?;
         // The scoreboard's clock is the **displayed** frame's source time, so
         // a pause in the commentary leaves it where it was (BACKLOG #27).
-        let state = job.scoreboard.as_ref().and_then(|context| {
+        let scoreboard = job.scoreboard.as_ref().and_then(|context| {
             let entry = job.compilation.plan.entries.get(frame.entry)?;
-            context.state_at(entry.source_index, frame.source_time)
+            let state = context.state_at(entry.source_index, frame.source_time)?;
+            Some((context.config(), state))
         });
-        let scoreboard = job
-            .scoreboard
-            .as_ref()
-            .zip(state.as_ref())
-            .map(|(context, state)| (context.config(), state));
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
@@ -497,7 +493,7 @@ struct Frame<'a> {
     clip: &'a Clip,
     /// The board at this frame, from the job's context, or `None` when the
     /// project has no scoreboard or nothing has been tagged yet.
-    scoreboard: Option<(&'a ScoreboardConfig, &'a ScoreboardState)>,
+    scoreboard: Option<(&'a ScoreboardConfig, ScoreboardState)>,
 }
 
 /// The composite pipeline: three mixer pads and the tail into the mailbox.

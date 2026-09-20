@@ -12,9 +12,11 @@
 //! **The refusal at the cap lives here, not in core's mutator.** A start/stop
 //! past the format's last period gets no role from `interpret`, so it would be
 //! a record the scoreboard ignores; the Match panel disables the action there
-//! (on core's `Project::start_stops_at_cap`, the one rule), and this refuses
-//! out loud if it is reached anyway. macOS's mutator silently did nothing
-//! instead, which is worse than a refusal.
+//! (on core's `Project::start_stops_at_cap`, the one rule) and so does the key,
+//! and this refuses out loud if it is reached anyway — as a notice, since a
+//! backstop for a disabled control has no business stopping the session with a
+//! dialog. macOS's mutator silently did nothing instead, which is worse than a
+//! refusal.
 
 use uuid::Uuid;
 use video_coach_core::project::Project;
@@ -51,14 +53,10 @@ impl Bus {
     }
 
     pub(super) fn delete_match_event(&mut self, id: Uuid) {
-        let Some(open) = &self.open else {
-            return;
-        };
-        if !open.project.match_events.iter().any(|m| m.id == id) {
-            return eprintln!("bus: DeleteMatchEvent on an event that isn't there: {id}");
-        }
         self.edit_match_events(|project| {
-            project.delete_match_event(id);
+            if project.delete_match_event(id).is_none() {
+                eprintln!("bus: DeleteMatchEvent on an event that isn't there: {id}");
+            }
         });
     }
 

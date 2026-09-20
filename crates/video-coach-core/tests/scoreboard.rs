@@ -424,7 +424,8 @@ fn tagging_half_time_back_dates_the_derived_kick_off() {
 }
 
 /// The whole point of the anchor: the tagged end **is** the end of the period,
-/// so the clock reaches exactly 45:00 and never enters stoppage on the way.
+/// so the clock carries exactly one period's worth there and never enters
+/// stoppage on the way.
 /// macOS offset the displayed number instead, which read 50:00 while still
 /// counted as running.
 #[test]
@@ -433,13 +434,22 @@ fn a_back_anchored_first_period_ends_at_the_period_length_and_never_reaches_stop
     let p1_end = 2280.5;
     let events = starts(&[p1_end]);
 
-    // The last instant of the half reads 45:00, and the next one is the break:
-    // there is no room between them for stoppage.
+    // The last instant of the half carries exactly one period, and the next one
+    // is the break: there is no room between them for stoppage.
     let ClockDisplay::Running { seconds } = clock(p1_end - 1e-9, &cfg, &events) else {
         panic!("the half should still be running")
     };
     assert!((seconds - HALF).abs() < 1e-6, "got {seconds}");
     assert_eq!(clock(p1_end, &cfg, &events), ClockDisplay::OnBreak("HT"));
+
+    // What the cell actually *displays*: `format_clock` truncates, so the half
+    // runs out at 44:59 and turns straight over to the break. No frame of it
+    // ever reads 45:00, and pinning the payload alone hid that.
+    assert_eq!(
+        format_clock(clock(p1_end - 1e-9, &cfg, &events)).main,
+        "44:59"
+    );
+    assert_eq!(format_clock(clock(p1_end, &cfg, &events)).main, "HT");
 
     let mut now = 0.0;
     while now < p1_end {

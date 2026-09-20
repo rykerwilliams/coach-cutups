@@ -43,7 +43,8 @@ use gstreamer_video as gst_video;
 use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, PixmapMut, Rect, Transform};
 use video_coach_core::layout::{
     bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
-    BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO, SCOREBOARD_TAIL_FONT_RATIO,
+    BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO,
+    SCOREBOARD_TAIL_FONT_RATIO,
 };
 use video_coach_core::project::Clip;
 use video_coach_core::scoreboard::{format_clock, ScoreboardConfig, ScoreboardState};
@@ -75,6 +76,11 @@ const CLOCK_FILL: [u8; 4] = [0x0d, 0x0d, 0x0d, 242];
 /// and this is the usual one.
 const LINE_HEIGHT: f32 = 1.2;
 
+/// How many times [`OverlayRenderer::fit`] may shrink a line before it gives
+/// up and cuts it. Measured: every string tried converged in three, and the
+/// bound is only here so a font that rounded the wrong way couldn't spin.
+const FIT_PASSES: usize = 6;
+
 /// One frame's overlay: what to draw, and the spaces to draw it in.
 pub(crate) struct OverlayFrame<'a> {
     /// The drawings' clip.
@@ -94,7 +100,7 @@ pub(crate) struct OverlayFrame<'a> {
     /// tagged yet (`core::scoreboard`'s two "draw nothing" cases). The state
     /// is the driver's per-frame
     /// [`ScoreboardContext::state_at`](video_coach_core::scoreboard::ScoreboardContext::state_at).
-    pub scoreboard: Option<(&'a ScoreboardConfig, &'a ScoreboardState)>,
+    pub scoreboard: Option<(&'a ScoreboardConfig, ScoreboardState)>,
 }
 
 /// Rasterizes overlay frames, holding the fonts between them.
@@ -104,17 +110,19 @@ pub(crate) struct OverlayFrame<'a> {
 pub(crate) struct OverlayRenderer {
     fonts: FontSystem,
     cache: SwashCache,
-    /// The last line fitted in each [`TextSlot`], so the search in
-    /// [`Self::ellipsized`] runs once an entry rather than once a frame: none
-    /// of those lines changes inside one.
+    /// The last line fitted in each [`TextSlot`], so [`Self::fit`]'s shrinking
+    /// and its search run once an entry rather than once a frame: none of
+    /// those lines changes inside one.
     fitted: [Option<Fitted>; TextSlot::COUNT],
 }
 
-/// A line that gets ellipsized to fit, and so gets a memo slot of its own.
+/// A line that holds still for a whole entry, and so gets a memo slot of its
+/// own. The score, the clock and the stoppage tail change every frame and are
+/// fitted afresh each time — a slot for them would only thrash.
 ///
 /// The two team names share a size and very nearly a width, so a single slot
-/// would thrash: each frame would evict the other name's fit and re-run the
-/// search.
+/// would thrash the same way: each frame would evict the other name's fit and
+/// re-run the search.
 #[derive(Debug, Clone, Copy)]
 enum TextSlot {
     Bar,
@@ -126,13 +134,15 @@ impl TextSlot {
     const COUNT: usize = 3;
 }
 
-/// A remembered result of [`OverlayRenderer::ellipsized`], with what it was
-/// fitted to.
+/// A remembered result of [`OverlayRenderer::fit`], with the four inputs it
+/// came from: a hit needs all of them to match.
 struct Fitted {
     line: String,
     font_size: f32,
+    min_font_size: f32,
     max_width: f32,
-    result: String,
+    /// What to draw, and the size to draw it at.
+    result: (String, f32),
 }
 
 /// How a run of text is shaped. **The weight is always stated**: both vendored
@@ -165,18 +175,30 @@ enum Align {
 }
 
 /// One line of text to draw, and everything about how it lands.
+///
+/// **Every label is fitted to its rect**, because nothing here clips and a
+/// centred line that overflows spills out of both ends of its cell. `BREAK` in
+/// the clock cell used to reach into the away team's colour on one side and
+/// past the bar on the other.
 struct Label<'a> {
     text: &'a str,
     /// The rect the line is placed in, in output pixels.
     rect: LayoutRect,
+    /// The size the line is drawn at when it fits, and the largest it is ever
+    /// drawn at.
     style: Style,
+    /// The smallest size the line may be shrunk to before it is ellipsized
+    /// instead. Passing `style`'s own size forbids shrinking, which is what
+    /// the text bar wants: it is one long sentence, and a sentence that shrank
+    /// with its length would leave the bar's size dancing entry to entry.
+    min_font_size: f32,
     color: TextColor,
     align: Align,
     /// The gap kept off `rect`'s left and right edges, in pixels.
     pad: f32,
-    /// Where the ellipsized result is remembered, or `None` to draw the line
-    /// as it is. The score, the clock and the stoppage tail are short by
-    /// construction and are drawn unfitted, as macOS drew them.
+    /// Where the fit is remembered, or `None` to re-run it every frame. Only
+    /// a line that holds still for a whole entry is worth a slot (see
+    /// [`TextSlot`]).
     slot: Option<TextSlot>,
 }
 
@@ -274,6 +296,10 @@ impl OverlayRenderer {
                     text: frame.text,
                     rect: bar,
                     style: Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL),
+                    // Its own size, so the bar never shrinks: it is a whole
+                    // sentence, and one that resized with its length would
+                    // leave the bar dancing from entry to entry.
+                    min_font_size: (bar.h * BAR_FONT_RATIO) as f32,
                     color: TextColor::rgb(255, 255, 255),
                     align: Align::Left,
                     pad: (bar.h * BAR_INSET_RATIO) as f32,
@@ -297,7 +323,7 @@ impl OverlayRenderer {
         &mut self,
         pixmap: &mut PixmapMut,
         config: &ScoreboardConfig,
-        state: &ScoreboardState,
+        state: ScoreboardState,
         out_w: f64,
         out_h: f64,
     ) {
@@ -326,6 +352,11 @@ impl OverlayRenderer {
         let bold = Style::new((cell_h * SCOREBOARD_FONT_RATIO) as f32, Weight::BOLD);
         let white = TextColor::rgb(255, 255, 255);
         let pad = (cell_h * SCOREBOARD_NAME_PAD_RATIO) as f32;
+        // Every cell here is narrow and everything in it is centred, so a
+        // label that overflowed would spill out of both its ends. They are all
+        // allowed to shrink down to the same floor instead; the columns are
+        // sized so that nothing realistic has to (`core::layout`).
+        let min_font_size = (cell_h * SCOREBOARD_MIN_FONT_RATIO) as f32;
         let clock = format_clock(state.clock);
         let score = format!("{} - {}", state.home_score, state.away_score);
 
@@ -334,6 +365,7 @@ impl OverlayRenderer {
                 text: &config.home.name,
                 rect: rects.home,
                 style: bold,
+                min_font_size,
                 color: text_color(config.home.font_color),
                 align: Align::Center,
                 pad,
@@ -343,6 +375,7 @@ impl OverlayRenderer {
                 text: &score,
                 rect: rects.score,
                 style: bold,
+                min_font_size,
                 color: white,
                 align: Align::Center,
                 pad: 0.0,
@@ -352,6 +385,7 @@ impl OverlayRenderer {
                 text: &config.away.name,
                 rect: rects.away,
                 style: bold,
+                min_font_size,
                 color: text_color(config.away.font_color),
                 align: Align::Center,
                 pad,
@@ -361,6 +395,7 @@ impl OverlayRenderer {
                 text: &clock.main,
                 rect: rects.clock,
                 style: bold,
+                min_font_size,
                 color: white,
                 align: Align::Center,
                 pad: 0.0,
@@ -379,6 +414,7 @@ impl OverlayRenderer {
                     text: &clock.trailing,
                     rect: rects.tail,
                     style: Style::new((cell_h * SCOREBOARD_TAIL_FONT_RATIO) as f32, Weight::NORMAL),
+                    min_font_size,
                     color: white,
                     align: Align::Center,
                     pad: 0.0,
@@ -388,19 +424,22 @@ impl OverlayRenderer {
         }
     }
 
-    /// Draws `label` on one row of its rect, centred down it and placed across
-    /// it by its [`Align`], ellipsized if it has a [`TextSlot`].
+    /// Draws `label` on one row of its rect, fitted to it, centred down it and
+    /// placed across it by its [`Align`].
     fn draw_label(&mut self, pixmap: &mut PixmapMut, label: &Label) {
         let max_width = label.rect.w as f32 - 2.0 * label.pad;
         if max_width <= 0.0 || label.style.metrics.font_size <= 0.0 || label.text.is_empty() {
             return;
         }
-        let line = match label.slot {
-            Some(slot) => self.ellipsized(slot, label.text, label.style, max_width),
-            None => label.text.to_owned(),
+        let (line, font_size) = match label.slot {
+            Some(slot) => self.remembered_fit(slot, label, max_width),
+            None => self.fit(label.text, label.style, label.min_font_size, max_width),
         };
+        // The fit may have shrunk the line, and it is drawn at the size it was
+        // fitted at or it no longer fits.
+        let style = Style::new(font_size, label.style.weight);
 
-        let mut buffer = self.shaped(&line, label.style, Some(max_width));
+        let mut buffer = self.shaped(&line, style, Some(max_width));
         // The shaped width comes off this same buffer rather than a second
         // measuring pass: centring a label must not cost an extra shaping a
         // frame.
@@ -412,7 +451,7 @@ impl OverlayRenderer {
         .round() as i32;
         // Vertically centred on the rect: the glyphs' own box is one line
         // high, so centring it centres the ascender and descender together.
-        let line_height = label.style.metrics.line_height;
+        let line_height = style.metrics.line_height;
         let top = (label.rect.y as f32 + (label.rect.h as f32 - line_height) / 2.0).round() as i32;
 
         let (width, height) = (pixmap.width() as i32, pixmap.height() as i32);
@@ -441,43 +480,85 @@ impl OverlayRenderer {
         });
     }
 
-    /// `line` cut to at most `max_width`, with a tail ellipsis if it didn't
-    /// fit, remembered in `slot`.
+    /// [`Self::fit`] for `label`, remembered in `slot`.
     ///
-    /// [`Wrap::None`] puts the whole line on one row whatever its width, so
-    /// without this a realistic clip line runs off the right of the frame
-    /// (measured: 143 characters overflows at every resolution). macOS wrapped
-    /// it onto a second row, which landed over the picture. A long team name
-    /// is cut the same way rather than shrunk to fit as macOS's was: in a cell
-    /// a tenth of the frame wide, a shrunk name is illegible anyway (spec S3).
-    ///
-    /// Each slot keeps one fit, and a slot always holds the same weight, so
-    /// the memo need not key on it.
-    fn ellipsized(&mut self, slot: TextSlot, line: &str, style: Style, max_width: f32) -> String {
-        let size = style.metrics.font_size;
+    /// A slot keeps one fit, and its four inputs with it: a line, a size, a
+    /// floor and a width. A slot always holds the same weight, so the memo
+    /// need not key on that.
+    fn remembered_fit(&mut self, slot: TextSlot, label: &Label, max_width: f32) -> (String, f32) {
+        let font_size = label.style.metrics.font_size;
         if let Some(f) = &self.fitted[slot as usize] {
-            if f.line == line && f.font_size == size && f.max_width == max_width {
+            if f.line == label.text
+                && f.font_size == font_size
+                && f.min_font_size == label.min_font_size
+                && f.max_width == max_width
+            {
                 return f.result.clone();
             }
         }
-        let result = self.fit(line, style, max_width);
+        let result = self.fit(label.text, label.style, label.min_font_size, max_width);
         self.fitted[slot as usize] = Some(Fitted {
-            line: line.to_owned(),
-            font_size: size,
+            line: label.text.to_owned(),
+            font_size,
+            min_font_size: label.min_font_size,
             max_width,
             result: result.clone(),
         });
         result
     }
 
-    /// [`Self::ellipsized`] without the memo.
-    fn fit(&mut self, line: &str, style: Style, max_width: f32) -> String {
-        if self.width(line, style) <= max_width {
-            return line.to_owned();
+    /// `line` made to fit `max_width`, as the line to draw and the size to
+    /// draw it at.
+    ///
+    /// **It is shrunk first, down to `min_font_size`, and only cut once it is
+    /// there.** A smaller whole name says more than a full-size stub:
+    /// `Manchester United` in the home cell ellipsizes to `Manche…` but fits
+    /// whole at 0.38 of the full size, which is 17 px at 1080p. Spec S3
+    /// originally refused shrink-to-fit on the grounds that a shrunk long name
+    /// is illegible anyway; measured, it isn't.
+    ///
+    /// Something has to fit, because nothing here clips: [`Wrap::None`] puts
+    /// the whole line on one row whatever its width, so a realistic clip line
+    /// otherwise runs off the right of the frame (measured: 143 characters
+    /// overflows at every resolution) and a centred clock label spills out of
+    /// both ends of its cell. macOS wrapped the bar onto a second row, which
+    /// landed over the picture.
+    ///
+    /// The text bar passes its own size as the floor, which forbids shrinking
+    /// and leaves it ellipsizing exactly as it did.
+    fn fit(
+        &mut self,
+        line: &str,
+        style: Style,
+        min_font_size: f32,
+        max_width: f32,
+    ) -> (String, f32) {
+        // A floor above the size asked for would make the loop below climb
+        // instead of descend. No caller does it; the clamp is what makes that
+        // true of every future one too.
+        let min_font_size = min_font_size.min(style.metrics.font_size);
+        let mut style = style;
+        // A shaped width is very nearly proportional to the size, so scaling
+        // by the overflow lands within a fraction of a pixel and the next pass
+        // confirms it — measured: two passes for every string tried. It is
+        // measured rather than computed because hinting rounds each advance,
+        // and bounded because a font that rounded the wrong way could
+        // otherwise creep down a pixel at a time.
+        for _ in 0..FIT_PASSES {
+            let width = self.width(line, style);
+            if width <= max_width {
+                return (line.to_owned(), style.metrics.font_size);
+            }
+            let size = (style.metrics.font_size * max_width / width).max(min_font_size);
+            if size >= style.metrics.font_size {
+                break;
+            }
+            style = Style::new(size, style.weight);
         }
-        // The longest prefix that still fits with an ellipsis after it.
-        // Shaping is the cost here, so this bisects the character boundaries
-        // rather than shaping once per character.
+
+        // At the floor and still too wide: the longest prefix that fits with
+        // an ellipsis after it. Shaping is the cost here, so this bisects the
+        // character boundaries rather than shaping once per character.
         let cuts: Vec<usize> = line
             .char_indices()
             .map(|(i, _)| i)
@@ -495,7 +576,7 @@ impl OverlayRenderer {
         }
         // `low` is 0 when even one character and an ellipsis are too wide, and
         // a bare ellipsis is then the honest answer.
-        with_ellipsis(cuts[low])
+        (with_ellipsis(cuts[low]), style.metrics.font_size)
     }
 
     /// How wide `line` is, shaped on one unbounded row.
@@ -678,7 +759,7 @@ mod tests {
         record_time: f64,
         text: &str,
         picture: (i32, i32, i32, i32),
-        scoreboard: Option<(&ScoreboardConfig, &ScoreboardState)>,
+        scoreboard: Option<(&ScoreboardConfig, ScoreboardState)>,
         w: u32,
         h: u32,
     ) -> Vec<[u8; 4]> {
@@ -907,9 +988,11 @@ mod tests {
         let bar = bar_rect(1920.0, 1080.0);
         let style = Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL);
         let max_width = bar.w as f32 - 2.0 * (bar.h * BAR_INSET_RATIO) as f32;
-        let slot = TextSlot::Bar;
 
-        let fitted = renderer.ellipsized(slot, long, style, max_width);
+        let size = style.metrics.font_size;
+        // The bar forbids shrinking by passing its own size as the floor.
+        let (fitted, fitted_size) = renderer.fit(long, style, size, max_width);
+        assert_eq!(fitted_size, size, "the bar shrank");
         assert!(fitted.ends_with(ELLIPSIS), "{fitted:?} has no ellipsis");
         assert!(long.starts_with(fitted.trim_end_matches(ELLIPSIS)));
         assert!(renderer.width(&fitted, style) <= max_width);
@@ -923,7 +1006,7 @@ mod tests {
 
         // A line that fits is left exactly as it is.
         let short = "3 / 7 | Turnover";
-        assert_eq!(renderer.ellipsized(slot, short, style, max_width), short);
+        assert_eq!(renderer.fit(short, style, size, max_width).0, short);
     }
 
     /// The cut line is drawn on one row: the overflow never reaches the
@@ -983,7 +1066,7 @@ mod tests {
 
     /// The scoreboard alone, over an empty clip and no text bar, at the
     /// export's output size.
-    fn render_scoreboard(config: &ScoreboardConfig, state: &ScoreboardState) -> Vec<[u8; 4]> {
+    fn render_scoreboard(config: &ScoreboardConfig, state: ScoreboardState) -> Vec<[u8; 4]> {
         render_frame(
             &clip(Vec::new()),
             0.0,
@@ -1005,13 +1088,11 @@ mod tests {
             .count()
     }
 
-    /// The four cells take their fills, and nothing at all is painted outside
-    /// the bar and the stoppage tail — in particular not the strip left of the
-    /// bar or the rows above it, which the inset leaves clear.
+    /// The four cells take their fills.
     #[test]
-    fn the_scoreboard_fills_its_cells_and_paints_nowhere_else() {
+    fn the_scoreboard_fills_its_cells() {
         let config = scoreboard_config();
-        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 135.0 }));
+        let px = render_scoreboard(&config, state(ClockDisplay::Running { seconds: 135.0 }));
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
 
         // The bottom-left corner of each cell: inside the fill, clear of the
@@ -1026,29 +1107,59 @@ mod tests {
         let clock = corner(&r.clock);
         assert_eq!(clock[3], 242, "the clock cell's alpha");
         assert!(clock[0] < 16, "the clock cell is dark: {clock:?}");
-
-        // Nothing outside the bar or the tail, to within the rounding of a
-        // sub-pixel rect.
-        let touched: Vec<(u32, u32)> = (0..OUT_H)
-            .flat_map(|y| (0..OUT_W).map(move |x| (x, y)))
-            .filter(|&(x, y)| at(&px, OUT_W, x, y)[3] > 0)
-            .filter(|&(x, y)| {
-                let outside = |rect: &LayoutRect| {
-                    f64::from(x) < rect.x - 1.0
-                        || f64::from(x) > rect.x + rect.w + 1.0
-                        || f64::from(y) < rect.y - 1.0
-                        || f64::from(y) > rect.y + rect.h + 1.0
-                };
-                outside(&r.bar) && outside(&r.tail)
-            })
-            // A handful names the mistake; the whole frame would be two
-            // million pairs in the panic message.
-            .take(8)
-            .collect();
-        assert!(touched.is_empty(), "painted outside the board: {touched:?}");
         // Named for what they are: the inset's own margins.
         assert_eq!(at(&px, OUT_W, r.bar.x as u32 - 4, 60), [0, 0, 0, 0]);
         assert_eq!(at(&px, OUT_W, 60, r.bar.y as u32 - 4), [0, 0, 0, 0]);
+    }
+
+    /// Nothing at all is painted outside the bar — and outside the stoppage
+    /// tail **only when the tail is drawn**, which is the hole this test used
+    /// to have: it allowed the tail rect unconditionally, so a clock label
+    /// spilling into it passed.
+    ///
+    /// The clock cell holds the longest strings on the board and every label
+    /// is centred, so an overflow spills *both* ways: into the away team's
+    /// colour on one side and past the bar's right edge on the other. The two
+    /// that used to do it are `BREAK` — every break of every format but
+    /// soccer's first reads it, and the setup sheet offers ten periods — and
+    /// `104:59`, the default soccer format in overtime.
+    #[test]
+    fn the_scoreboard_paints_nowhere_outside_its_bar() {
+        let config = scoreboard_config();
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        let cases = [
+            (ClockDisplay::Running { seconds: 135.0 }, false),
+            (ClockDisplay::OnBreak("BREAK"), false),
+            (ClockDisplay::Running { seconds: 6299.0 }, false),
+            (
+                ClockDisplay::Stoppage {
+                    base: 2700.0,
+                    plus: 125.0,
+                },
+                true,
+            ),
+        ];
+        for (clock, tail_drawn) in cases {
+            let px = render_scoreboard(&config, state(clock));
+            // To within the rounding of a sub-pixel rect.
+            let touched: Vec<(u32, u32)> = (0..OUT_H)
+                .flat_map(|y| (0..OUT_W).map(move |x| (x, y)))
+                .filter(|&(x, y)| at(&px, OUT_W, x, y)[3] > 0)
+                .filter(|&(x, y)| {
+                    let outside = |rect: &LayoutRect| {
+                        f64::from(x) < rect.x - 1.0
+                            || f64::from(x) > rect.x + rect.w + 1.0
+                            || f64::from(y) < rect.y - 1.0
+                            || f64::from(y) > rect.y + rect.h + 1.0
+                    };
+                    outside(&r.bar) && (!tail_drawn || outside(&r.tail))
+                })
+                // A handful names the mistake; the whole frame would be two
+                // million pairs in the panic message.
+                .take(8)
+                .collect();
+            assert!(touched.is_empty(), "{clock:?} painted outside: {touched:?}");
+        }
     }
 
     /// The accent strip is each team's secondary colour over that team's
@@ -1058,7 +1169,7 @@ mod tests {
     #[test]
     fn the_accent_strip_covers_the_team_columns_only() {
         let config = scoreboard_config();
-        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 60.0 }));
+        let px = render_scoreboard(&config, state(ClockDisplay::Running { seconds: 60.0 }));
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
         let row = (r.accent.y + r.accent.h / 2.0) as u32;
         let strip = |cell: &LayoutRect| at(&px, OUT_W, cell.x as u32 + 4, row);
@@ -1078,13 +1189,13 @@ mod tests {
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
         let lit = |px: &[[u8; 4]], rect: &LayoutRect| count_in(px, rect, |p| p[3] > 0);
 
-        let running = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 135.0 }));
+        let running = render_scoreboard(&config, state(ClockDisplay::Running { seconds: 135.0 }));
         assert_eq!(lit(&running, &r.tail), 0, "a tail with the clock running");
         assert!(lit(&running, &r.clock) > 0, "no clock at all");
 
         let stoppage = render_scoreboard(
             &config,
-            &state(ClockDisplay::Stoppage {
+            state(ClockDisplay::Stoppage {
                 base: 2700.0,
                 plus: 125.0,
             }),
@@ -1099,7 +1210,7 @@ mod tests {
     #[test]
     fn each_team_name_is_drawn_in_its_own_font_color() {
         let config = scoreboard_config();
-        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 1.0 }));
+        let px = render_scoreboard(&config, state(ClockDisplay::Running { seconds: 1.0 }));
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
         // Magenta and green over blue and red cells: a glyph pixel is the only
         // place either can come from, and neither fill is close to either.
@@ -1142,7 +1253,7 @@ mod tests {
             1.5,
             "",
             (0, 0, OUT_W as i32, OUT_H as i32),
-            Some((&config, &state(ClockDisplay::Running { seconds: 1.0 }))),
+            Some((&config, state(ClockDisplay::Running { seconds: 1.0 }))),
             OUT_W,
             OUT_H,
         );
@@ -1170,6 +1281,133 @@ mod tests {
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
         assert_eq!(count_in(&px, &r.bar, |p| p[3] > 0), 0);
         assert_eq!(count_in(&px, &r.tail, |p| p[3] > 0), 0);
+    }
+
+    /// The clock column is wide enough for everything the clock can read, so
+    /// the clock is drawn at the board's own size rather than shrinking to
+    /// fit. This is what the column widths are for, and the reason they are
+    /// not the parent spec's: at the 0.20 the clock once had, `BREAK` needed
+    /// 3.76 em in a 3.16 em cell, `104:59` needed 3.88 — and even an ordinary
+    /// `00:00` needed 3.18.
+    #[test]
+    fn every_clock_label_fits_its_cell_at_full_size() {
+        let mut renderer = OverlayRenderer::new();
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        let cell_h = r.home.h;
+        let full = (cell_h * SCOREBOARD_FONT_RATIO) as f32;
+        let floor = (cell_h * SCOREBOARD_MIN_FONT_RATIO) as f32;
+        let style = Style::new(full, Weight::BOLD);
+        // `format_clock`'s whole range: a plain time, a stoppage base, both
+        // break labels, full time, and the longest a clock reaches in
+        // practice — the default soccer format in overtime.
+        for clock in [
+            ClockDisplay::Running { seconds: 0.0 },
+            ClockDisplay::Running { seconds: 6299.0 },
+            ClockDisplay::Stoppage {
+                base: 2700.0,
+                plus: 125.0,
+            },
+            ClockDisplay::OnBreak("HT"),
+            ClockDisplay::OnBreak("BREAK"),
+            ClockDisplay::Fulltime,
+        ] {
+            let labels = format_clock(clock);
+            let (line, size) = renderer.fit(&labels.main, style, floor, r.clock.w as f32);
+            assert_eq!(
+                (line.as_str(), size),
+                (labels.main.as_str(), full),
+                "{clock:?} does not fit the clock cell at full size"
+            );
+            if labels.trailing.is_empty() {
+                continue;
+            }
+            let tail = Style::new((cell_h * SCOREBOARD_TAIL_FONT_RATIO) as f32, Weight::NORMAL);
+            let (line, size) = renderer.fit(&labels.trailing, tail, floor, r.tail.w as f32);
+            assert_eq!(
+                (line.as_str(), size),
+                (labels.trailing.as_str(), tail.metrics.font_size),
+                "{clock:?}'s tail does not fit at full size"
+            );
+        }
+    }
+
+    /// A team name too wide for its cell is **shrunk whole** rather than cut
+    /// to a stub, and only cut once shrinking would take it under the floor.
+    /// Spec S3 originally refused shrink-to-fit because "a shrunk long name is
+    /// illegible anyway"; measured, `Manchester United` fits at 17 px on a
+    /// 1080p frame, which is not.
+    #[test]
+    fn a_long_team_name_is_shrunk_and_only_cut_under_the_floor() {
+        let mut renderer = OverlayRenderer::new();
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        let cell_h = r.home.h;
+        let full = (cell_h * SCOREBOARD_FONT_RATIO) as f32;
+        let floor = (cell_h * SCOREBOARD_MIN_FONT_RATIO) as f32;
+        let max_width = r.home.w as f32 - 2.0 * (cell_h * SCOREBOARD_NAME_PAD_RATIO) as f32;
+        let style = Style::new(full, Weight::BOLD);
+        let fits = |renderer: &mut OverlayRenderer, line: &str, size: f32| {
+            renderer.width(line, Style::new(size, Weight::BOLD)) <= max_width
+        };
+
+        // A name that fits is left exactly as it is, at full size.
+        let (line, size) = renderer.fit("HOME", style, floor, max_width);
+        assert_eq!((line.as_str(), size), ("HOME", full));
+
+        // One that doesn't keeps every character and loses size instead.
+        let (line, size) = renderer.fit("Manchester United", style, floor, max_width);
+        assert_eq!(line, "Manchester United");
+        assert!(
+            size < full && size > floor,
+            "{size} outside ({floor}, {full})"
+        );
+        assert!(fits(&mut renderer, &line, size));
+
+        // The longest real club name measured still clears the floor, and it
+        // is what the floor was chosen against: it needs 0.265 of the full
+        // size where the floor is 0.25. A failure here means the floor wants
+        // revisiting, not that this name is special.
+        let (line, size) = renderer.fit("Wolverhampton Wanderers", style, floor, max_width);
+        assert_eq!(line, "Wolverhampton Wanderers");
+        assert!(fits(&mut renderer, &line, size));
+
+        // Below it a line is cut rather than smeared to nothing: without the
+        // floor this one shapes at about a pixel and a half.
+        let absurd = "Association Football Club of the Northern Riverside Parishes";
+        let (line, size) = renderer.fit(absurd, style, floor, max_width);
+        assert!(line.ends_with(ELLIPSIS), "{line:?} has no ellipsis");
+        assert!(absurd.starts_with(line.trim_end_matches(ELLIPSIS)));
+        assert_eq!(size, floor);
+        assert!(fits(&mut renderer, &line, size));
+    }
+
+    /// The fitted size reaches the **drawing**, not just the fit: a shrunk
+    /// name's ink is a fraction of a full-size one's, and it stays in its own
+    /// cell rather than reaching the score.
+    #[test]
+    fn a_shrunk_team_name_is_drawn_at_its_fitted_size() {
+        let magenta = |p: [u8; 4]| p[0] > 200 && p[1] < 64 && p[2] > 200;
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        // How many rows of the home cell carry the home name's ink.
+        let ink_rows = |name: &str| {
+            let mut config = scoreboard_config();
+            config.home.name = name.into();
+            let px = render_scoreboard(&config, state(ClockDisplay::Running { seconds: 60.0 }));
+            assert_eq!(
+                count_in(&px, &r.score, magenta),
+                0,
+                "{name:?} reached the score cell"
+            );
+            (r.home.y as u32..(r.home.y + r.home.h) as u32)
+                .filter(|&y| {
+                    (r.home.x as u32..(r.home.x + r.home.w) as u32)
+                        .any(|x| magenta(at(&px, OUT_W, x, y)))
+                })
+                .count()
+        };
+        let full = ink_rows("HOME");
+        let shrunk = ink_rows("Wolverhampton Wanderers");
+        assert!(full > 0 && shrunk > 0, "no name drawn: {full}, {shrunk}");
+        assert!(shrunk * 2 < full, "{shrunk} rows is not shrunk from {full}");
     }
 
     /// Both faces are loaded under one family, so the weight is what picks

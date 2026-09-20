@@ -2,7 +2,7 @@
 
 use video_coach_core::layout::{
     bar_rect, pip_rect, scoreboard_rects, stroke_line_width, Rect, BAR_HEIGHT_RATIO,
-    PIP_WIDTH_RATIO,
+    PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
 };
 
 #[test]
@@ -101,8 +101,35 @@ fn the_scoreboard_s_cells_tile_its_bar_under_the_accent_strip() {
     assert_eq!(s.away.x, s.score.x + s.score.w);
     assert_eq!(s.clock.x, s.away.x + s.away.w);
     assert_eq!(s.clock.x + s.clock.w, s.bar.x + s.bar.w);
-    // The score and clock columns are the narrow ones.
-    assert!(s.score.w < s.home.w && s.clock.w < s.away.w);
+    // The two teams get the same room as each other, and the score is the
+    // narrow column. The clock is NOT: see the next test.
+    assert_eq!(s.home.w, s.away.w);
+    assert!(s.score.w < s.home.w);
+}
+
+/// The clock column holds the longest strings on the board, and a label that
+/// overflows is centred, so it spills out of *both* ends of its cell. The
+/// budget is in ems because that is what a cell's width means to a line of
+/// text, and it is checked here — where there are no fonts to shape with —
+/// because it is the column ratios that decide it.
+///
+/// Measured through the shaping stack in `video-coach-media`, bold DejaVu
+/// Sans: `BREAK` is 3.76 em and `104:59` is 3.88. Those are the worst cases
+/// the clock can reach — every break of every format but soccer's first reads
+/// `BREAK`, and `104:59` is the default soccer format in overtime.
+/// `overlay.rs` pins them against the real faces; this pins the room.
+#[test]
+fn the_clock_column_has_room_for_the_longest_label_the_clock_can_read() {
+    let s = scoreboard_rects(1920.0, 1080.0);
+    let em = s.clock.h * SCOREBOARD_FONT_RATIO;
+    assert!(
+        s.clock.w / em >= 4.0,
+        "the clock cell is {} em wide",
+        s.clock.w / em
+    );
+    // And the tail's rect is the clock's, so `+15:59` at the smaller tail size
+    // has room too.
+    assert_eq!(s.tail.w, s.clock.w);
 }
 
 #[test]
