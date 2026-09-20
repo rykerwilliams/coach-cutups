@@ -180,6 +180,26 @@ Commit: `feat(app): preview a clip`.
 2. `CLAUDE.md`: a paragraph on the composite module (the two tails, the GL context rule, the overlay's picture-rect space, and the measured UI budget).
 3. The hands-on checklist items, in the Task 5 notes.
 
+### Task 5 notes (closeout, 2026-09-19)
+
+**Status: Phase 7 complete** apart from the hands-on checks below.
+
+**Gate met** (Task 2 notes have the detail): 30.005 fps on the user's HEVC 1440p footage, audio leading the picture by 2–7 ms and not growing, 1 dropped frame of 900, and the UI no worse than the scanning control.
+
+**Code review** (`41624da`), both passes applied. The one real bug: a seek while the end-of-clip tail drained wedged the preview and killed it after 5 s; a regression test now reproduces it. Also fixed: the last composited frame staying on screen after a close, the GL context chosen by timing, a stale position for skips and the readout, and a meaningless fps log line.
+
+**Known and accepted:** opening preview B while A is open re-prerolls the game video between them, so a single game frame can flash. BACKLOG #51 covers the unbounded wait on a corrupt recording.
+
+**Hands-on checklist for the user** (batched with Phases 2–6):
+1. **Open a preview:** select a clip, then the **Preview** button or the right-click item. Space still plays the game video when no preview is open.
+2. **Watch it:** the picture, zoom, drawings and webcam inset match what you recorded, and the commentary is in sync.
+3. **Transport:** Space pauses and resumes; the scrubber lands frame-accurately; skips work; the commentary mutes while you drag.
+4. **End of clip:** it pauses on the last frame. Check whether the freeze lands on the frame you expect, or about a second late — if late, say so, and about 50 lines of drain machinery can go.
+5. **Close:** Esc or Close returns to the game video where you left it, and the preview's last frame does not linger.
+6. **Guards:** Record and "Export video…" are greyed out while previewing.
+7. **Switch clips:** preview one clip, then another; note any flash of the game video in between.
+8. **A non-16:9 source,** if you have one: drawings stay on the picture and don't stretch into the black bars.
+
 ## Deliberately not in this phase
 
 - Game audio, the splice and the ramps: Phase 8 (which must drain audio appsinks before pulling video).

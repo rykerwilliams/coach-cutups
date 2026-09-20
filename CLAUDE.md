@@ -147,6 +147,13 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Never block a push or pull without a bound.** A blocking `appsrc` push hangs forever after a downstream error.
 - **To test CI's path locally,** hide the GPU with `GST_REGISTRY=<scratch>/reg.bin bwrap --dev-bind / / --tmpfs /dev/dri cargo test …`. See `docs/superpowers/specs/2026-09-19-linux-port-phase-5-design.md`.
 
+**Preview and export share one composite** (`video-coach-media/src/composite/`).
+- **Common:** `decode.rs` (`Decoder::frame_at`: reuse, pull ≤0.5 s, else `KEY_UNIT|SNAP_BEFORE` and walk forward), the pump, `frame_time`/`stamp`, `install_zoom`'s PTS-keyed probe, and the mixer geometry.
+- **Tails:** `export.rs` encodes as fast as it can on a private surfaceless display; `preview.rs` ends in a `sync=true` appsink filling the shared `FrameMailbox`, on **Slint's** GL context (chosen by sink kind: the app never falls back to a private display, and tests pass `Gl::shared()`).
+- **Preview's pads:** the pumped source through `gltransformation`, the recording played **natively** for PiP and commentary audio (record time *is* output time, so it needs no pump), and a second appsrc carrying the overlay.
+- **The overlay rasterizes at the picture rect,** not the output frame: strokes are normalized to the content rect.
+- **Measured:** 30.005 fps on 1440p HEVC, audio leading the picture by 2–7 ms. Don't measure the rate first-frame-to-last-frame; the mixer flushes its tail late. The UI budget is relative to a scanning control in the same session, not to an idle window.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not
