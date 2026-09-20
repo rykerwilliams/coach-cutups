@@ -456,3 +456,14 @@ Each entry: what, why deferred, when to revisit.
   1440p footage. `Resolution::R2160` stays in the project format.
 - **When to revisit:** a 4K camera, or a machine that encodes 4K faster than
   realtime.
+
+### 54. Preview has no game audio
+- **Why deferred:** Phase 8 gives export the full mix, but preview still plays
+  only the commentary. Phase 7 made the recording's native branch the pipeline
+  clock and the only volume-controlled element, so a second pumped audio track
+  needs an `audiomixer` pad that stalls the graph if unfed, breaks the pacing
+  loop (the pump is paced by the clock it would feed), needs seek and EOS
+  handling for a third appsrc, and needs the scrub mute to cover both tracks.
+  Export is what gets shared, so it took the audio work first.
+- **When to revisit:** when judging levels by ear matters, i.e. alongside the
+  volume UI (#52).

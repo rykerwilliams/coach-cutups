@@ -67,10 +67,16 @@ Export **compilations**: all clips, one tag's clips, or a single clip, each as o
 ### E3. Audio
 
 - **One audio-only pipeline per file** (each source video, each recording), ending in an appsink at F32LE/48k/2ch. This avoids Phase 7's measured deadlock by construction, so the drain-first rule isn't needed; audio decode runs ~90× realtime.
-- **Rust mixes per output block,** interleaved with the video pump: audio for frame range [n, n+k) is pushed alongside those frames, bounded a little ahead. It is **not** pushed after the last frame: `mp4mux` advances only when both pads have data, so a late audio track would wedge the pump.
+- **Rust mixes per output block,** interleaved with the video pump: audio for frame range [n, n+k) is pushed **at or ahead of** those video frames, never behind.
+  - **The audio appsrc is effectively unbounded** and the pump never waits for room on it. Measured: bounding it at 0.27 s deadlocks the pump, because the encoder keeps the muxer ~0.43 s behind the pushed video; pushing audio 1 s behind stalls the video appsrc (`QUEUED` is only 0.13 s); pushing it all after the last frame stalls it too. The right bound depends on the encoder's latency, so there is no tuned constant.
 - **The game's audio plays only during `play` segments.** Each play segment seeks its source's audio pipeline to the segment's source time, rather than holding decoded audio (F32/48k/2ch is 384 KB/s, so an hour-long match would be ~1.4 GB).
+  - Those seeks are **flushing and ACCURATE**, which measured 1–11 ms and sample-exact. They must not reuse `Decoder::seek`'s `KEY_UNIT | SNAP_BEFORE`, which lands early.
+  - **A file with no audio track contributes silence**, rather than failing or stalling the muxer.
 - **5 ms linear fades at the start and end of every contiguous region on either track,** clamped at t=0 — the parent spec's uniform rule. macOS clicked at every clip join and mic start, and no macOS test pinned that.
-- **AAC priming is compensated.** The encoder delays by 1024 samples (21.3 ms, measured), and nothing trims it, so the mixed stream is pushed with its timestamps shifted earlier by that delay (clamped at zero). A known-tone fixture pins it: a tone at 1.000 s must decode back within a millisecond.
+- **AAC priming is compensated by dropping the first 1024 samples** of the mixed stream (21.3 ms, measured).
+  - Shifting the timestamps and clamping at zero **does nothing**: the encoder re-derives its output times by counting samples from the first buffer, so the shift is absorbed and the tone still lands at 1.0214 s. Dropping the samples puts it at exactly 1.000 s and the track's duration back to the video's.
+  - **The ramps are computed on the emitted timeline,** after the drop, or the first region starts mid-fade — a click, which is what the ramp rule exists to remove.
+  - A known-tone fixture pins it: a tone at 1.000 s must decode back within a millisecond.
 - **Volumes** come from `preview_source_volume` and `preview_commentary_volume`, both defaulting to 1.0. There is no UI for them yet (backlog).
 - **The splice, gain and ramp maths are pure functions in core.**
 
@@ -95,11 +101,11 @@ Export **compilations**: all clips, one tag's clips, or a single clip, each as o
 
 `<project>/exports/`, created on demand; `<label> - <project>.mp4` with `/` and `:` replaced; `.part` then rename. Re-running replaces the file. **There is no folder picker**: the exports folder is fixed, and the finished state offers to open it.
 
-### E7. Preview keeps matching export
+### E7. Preview gains the text bar
 
-Phase 7 deferred two things to here, and both land so the shared composite keeps its meaning:
-- **Preview draws the text bar** with `n / total = 1 / 1`.
-- **Preview plays the game audio** through the same Rust mixer, at the same volumes, with the same ramps.
+Preview draws the text bar with `n / total = 1 / 1`, so the picture keeps matching export.
+
+**Preview's game audio is deferred** (BACKLOG #54). Phase 7 made the recording's native branch the pipeline clock and the only volume-controlled element, so adding a second, pumped audio track there means a `audiomixer` pad that stalls the graph if it is ever unfed, a feedback loop between the pump and the clock it is paced by, seek and EOS handling for a third appsrc, and a scrub mute that currently only silences the commentary. Export is what gets sent to players, so it takes the audio work; preview keeps commentary-only playback until that is designed on its own.
 
 ### E8. UI
 
