@@ -13,7 +13,7 @@ pub mod layout;
 pub mod plan;
 pub mod project;
 pub mod recording;
-pub mod scoreboard_config;
+pub mod scoreboard;
 pub mod skip;
 pub mod store;
 pub mod stroke;

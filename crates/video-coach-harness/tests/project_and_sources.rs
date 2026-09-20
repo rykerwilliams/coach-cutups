@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{Command, Event, StateFile, UserError};
 use video_coach_core::project::Project;
-use video_coach_core::scoreboard_config::{MatchEventKind, MatchEventRecord};
+use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
 use video_coach_core::store;
 use video_coach_harness::{clip, write_project, Harness, ReadOnly};
 use video_coach_media::{fixtures, ProbeError};
@@ -67,7 +67,6 @@ fn match_event(source_index: usize) -> MatchEventRecord {
         kind: MatchEventKind::HomeGoal,
         source_index,
         source_seconds: 1.0,
-        is_auto_back_anchor: false,
     }
 }
 

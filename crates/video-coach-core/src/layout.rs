@@ -3,8 +3,8 @@
 //! Every value here is a ratio, never a pixel count, so preview (1280×720) and
 //! export (1920×1080) lay out identically from one set of numbers — the parent
 //! spec's "Layout constants the port must reproduce". Phase 7 needs the stroke
-//! and PiP rows; the text bar (Phase 8) and the scoreboard (Phase 9) join this
-//! module when something draws them.
+//! and PiP rows; the text bar (Phase 8) and the scoreboard (Phase 9) joined
+//! them when something drew them.
 //!
 //! **Two spaces, and they differ only on a non-16:9 source** (BACKLOG #20,
 //! settled here the way the parent spec recommended):
@@ -82,6 +82,114 @@ pub fn pip_rect(out_w: f64, out_h: f64, cam_aspect: f64) -> Rect {
         y: bar_rect(out_w, out_h).y - margin - h,
         w,
         h,
+    }
+}
+
+// --------------------------------------------------------------- scoreboard
+//
+// The scoreboard's own ratios, deliberately **not** shared with the text bar's:
+// `SCOREBOARD_HEIGHT_RATIO` happens to equal `BAR_HEIGHT_RATIO` today, and
+// tying the two together would make one of them impossible to change.
+//
+// Everything below the bar itself is a fraction of the **cell height**
+// (`bar.h` less the accent strip), not of the bar — the parent spec's table
+// says `bar.h` and is ~9% too large.
+
+/// The bar's width, as a fraction of the **output width**.
+const SCOREBOARD_WIDTH_RATIO: f64 = 0.36;
+
+/// The bar's height, as a fraction of the **output height**.
+const SCOREBOARD_HEIGHT_RATIO: f64 = 0.08;
+
+/// The bar's gap from the top and left edges, as a fraction of the **output
+/// height** — the same fraction on both axes, so the gap is square in pixels.
+const SCOREBOARD_INSET_RATIO: f64 = 0.015;
+
+/// The accent strip's height, as a fraction of the **bar's height**.
+const SCOREBOARD_ACCENT_RATIO: f64 = 0.08;
+
+/// The cell widths, as fractions of the **bar's width**. The clock takes
+/// whatever is left, so the four tile the bar exactly.
+const SCOREBOARD_HOME_RATIO: f64 = 0.30;
+const SCOREBOARD_SCORE_RATIO: f64 = 0.20;
+const SCOREBOARD_AWAY_RATIO: f64 = 0.30;
+
+/// The stoppage tail's gap from the clock cell, as a fraction of the **cell
+/// height** (macOS used an absolute 2 pt, which changes meaning with
+/// resolution).
+const SCOREBOARD_TAIL_GAP_RATIO: f64 = 0.025;
+
+/// The four labels' font size, as a fraction of the **cell height**
+/// ([`ScoreboardRects::home`]`.h`).
+pub const SCOREBOARD_FONT_RATIO: f64 = 0.55;
+
+/// The stoppage tail's font size, as a fraction of the **cell height**. It is
+/// the one label that is not bold.
+pub const SCOREBOARD_TAIL_FONT_RATIO: f64 = 0.45;
+
+/// A team name's padding inside its cell, as a fraction of the **cell height**
+/// (macOS used an absolute 4 pt).
+pub const SCOREBOARD_NAME_PAD_RATIO: f64 = 0.05;
+
+/// Where every piece of the scoreboard sits, in output space.
+///
+/// The five labels are centred in `home`, `score`, `away`, `clock` and `tail`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreboardRects {
+    /// The whole bar: the accent strip plus the row of cells.
+    pub bar: Rect,
+    /// The accent strip, **above** the cells and spanning the bar. It is drawn
+    /// over the **home and away columns only**, in each team's secondary
+    /// color, so the drawer intersects it with those two cells' `x` and `w`.
+    pub accent: Rect,
+    pub home: Rect,
+    pub score: Rect,
+    pub away: Rect,
+    pub clock: Rect,
+    /// The `+M:SS` stoppage tail, which hangs **outside** the bar past the
+    /// clock cell and is drawn only while the clock is in stoppage.
+    pub tail: Rect,
+}
+
+/// The scoreboard's rects in output space, anchored to the top-left.
+pub fn scoreboard_rects(out_w: f64, out_h: f64) -> ScoreboardRects {
+    let inset = SCOREBOARD_INSET_RATIO * out_h;
+    let bar = Rect {
+        x: inset,
+        y: inset,
+        w: SCOREBOARD_WIDTH_RATIO * out_w,
+        h: SCOREBOARD_HEIGHT_RATIO * out_h,
+    };
+    let accent = Rect {
+        h: SCOREBOARD_ACCENT_RATIO * bar.h,
+        ..bar
+    };
+    let cell = |x: f64, w: f64| Rect {
+        x,
+        y: bar.y + accent.h,
+        w,
+        h: bar.h - accent.h,
+    };
+
+    let home = cell(bar.x, SCOREBOARD_HOME_RATIO * bar.w);
+    let score = cell(home.x + home.w, SCOREBOARD_SCORE_RATIO * bar.w);
+    let away = cell(score.x + score.w, SCOREBOARD_AWAY_RATIO * bar.w);
+    // The clock closes the bar rather than taking a fourth ratio, so the cells
+    // tile it exactly instead of to within a rounding error.
+    let clock = cell(away.x + away.w, bar.x + bar.w - (away.x + away.w));
+    let tail = cell(
+        clock.x + clock.w + SCOREBOARD_TAIL_GAP_RATIO * clock.h,
+        clock.w,
+    );
+
+    ScoreboardRects {
+        bar,
+        accent,
+        home,
+        score,
+        away,
+        clock,
+        tail,
     }
 }
 

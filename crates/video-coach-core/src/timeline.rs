@@ -6,12 +6,17 @@
 //! - [`playback_segments`] is authoritative for **which frame to pull**. It
 //!   caps freeze anchors at `source_duration - 0.05` so a pull-based decoder is
 //!   never asked for a frame at or past the end of the file.
-//! - [`source_time`] is authoritative for **the clock** — it is the sole input
-//!   to the scoreboard's match time on both the preview and the export path.
+//! - [`source_time`] is authoritative for **where the coach actually was**: the
+//!   uncapped answer, and the reference the segment walk is checked against.
 //!
 //! The 50 ms cap is a decoder-safety pullback, not a semantic answer, so the
 //! two agree to within 50 ms past EOF and exactly everywhere else. That gap is
 //! pinned by a test on purpose; do not "fix" one side to match the other.
+//!
+//! **The scoreboard's match clock reads the displayed frame**, so it is
+//! [`crate::export::FrameSpec::source_time`] — the segment walk's answer — not
+//! this module's. A clock that disagreed with the picture by 50 ms at a freeze
+//! would be showing a frame that is not on screen.
 //!
 //! For that claim to hold, **both functions clamp the play/pause anchor to
 //! `[0, source_duration]` at assignment.** The Swift original assigns anchors

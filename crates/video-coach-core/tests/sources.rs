@@ -8,7 +8,7 @@
 use uuid::Uuid;
 
 use video_coach_core::project::{AspectMismatch, Clip, Project, SourceRef, SourceReferenced};
-use video_coach_core::scoreboard_config::{MatchEventKind, MatchEventRecord};
+use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
 
 const WIDE: f64 = 16.0 / 9.0;
 
@@ -55,7 +55,6 @@ fn match_event_on(source_index: usize) -> MatchEventRecord {
         kind: MatchEventKind::HomeGoal,
         source_index,
         source_seconds: 1.0,
-        is_auto_back_anchor: false,
     }
 }
 

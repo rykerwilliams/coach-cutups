@@ -9,7 +9,7 @@ use uuid::Uuid;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
 use video_coach_core::recording::PendingClip;
-use video_coach_core::scoreboard_config::{
+use video_coach_core::scoreboard::{
     MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
 };
 use video_coach_core::store::{self, StoreError, CURRENT_FORMAT_VERSION};
@@ -64,13 +64,15 @@ fn sample_project() -> Project {
             },
         ),
         format: MatchFormat::default(),
+        // On, so the round trip covers the key Phase 9 added in place of the
+        // per-event `isAutoBackAnchor` flag.
+        auto_back_anchor_p1: true,
     });
     p.match_events.push(MatchEventRecord {
         id: Uuid::nil(),
         kind: MatchEventKind::StartStop,
         source_index: 0,
         source_seconds: 0.0,
-        is_auto_back_anchor: false,
     });
     p
 }

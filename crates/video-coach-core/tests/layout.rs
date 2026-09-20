@@ -1,7 +1,8 @@
 //! The composite's layout ratios.
 
 use video_coach_core::layout::{
-    bar_rect, pip_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
+    bar_rect, pip_rect, scoreboard_rects, stroke_line_width, Rect, BAR_HEIGHT_RATIO,
+    PIP_WIDTH_RATIO,
 };
 
 #[test]
@@ -65,6 +66,74 @@ fn a_camera_of_another_aspect_changes_the_pip_s_height_only() {
     assert!((four_three.y + four_three.h - (wide.y + wide.h)).abs() < 1e-9);
     // The camera is neither stretched nor letterboxed inside the inset.
     assert!((four_three.w / four_three.h - 4.0 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn the_scoreboard_sits_inset_from_the_top_left() {
+    let s = scoreboard_rects(1920.0, 1080.0);
+    // 0.015 × 1080 in from both edges, 0.36 × 1920 by 0.08 × 1080.
+    assert_eq!(s.bar.x, 16.2);
+    assert_eq!(s.bar.y, 16.2);
+    assert!((s.bar.w - 691.2).abs() < 1e-9);
+    assert_eq!(s.bar.h, 86.4);
+    // Square gap: the same pixels from the top as from the left, at any aspect.
+    assert_eq!(s.bar.x, s.bar.y);
+}
+
+#[test]
+fn the_scoreboard_s_cells_tile_its_bar_under_the_accent_strip() {
+    let s = scoreboard_rects(1920.0, 1080.0);
+    let cells = [s.home, s.score, s.away, s.clock];
+
+    // The accent strip spans the bar's top; the cells fill the rest.
+    assert_eq!(s.accent.x, s.bar.x);
+    assert_eq!(s.accent.y, s.bar.y);
+    assert_eq!(s.accent.w, s.bar.w);
+    assert_eq!(s.accent.h, s.bar.h * 0.08);
+
+    for cell in cells {
+        assert_eq!(cell.y, s.accent.y + s.accent.h);
+        assert_eq!(cell.h, s.bar.h - s.accent.h);
+    }
+    // Edge to edge with no seam and no overhang: the clock closes the bar.
+    assert_eq!(s.home.x, s.bar.x);
+    assert_eq!(s.score.x, s.home.x + s.home.w);
+    assert_eq!(s.away.x, s.score.x + s.score.w);
+    assert_eq!(s.clock.x, s.away.x + s.away.w);
+    assert_eq!(s.clock.x + s.clock.w, s.bar.x + s.bar.w);
+    // The score and clock columns are the narrow ones.
+    assert!(s.score.w < s.home.w && s.clock.w < s.away.w);
+}
+
+#[test]
+fn the_stoppage_tail_hangs_outside_the_bar() {
+    let s = scoreboard_rects(1920.0, 1080.0);
+    assert!(s.tail.x > s.bar.x + s.bar.w);
+    // Its gap off the clock cell is a fraction of the cell height, so it holds
+    // at every output size rather than being an absolute 2 pt.
+    assert!((s.tail.x - (s.clock.x + s.clock.w) - s.clock.h * 0.025).abs() < 1e-9);
+    assert_eq!(s.tail.y, s.clock.y);
+    assert_eq!(s.tail.h, s.clock.h);
+}
+
+#[test]
+fn the_scoreboard_is_the_same_fraction_of_the_frame_at_every_output_size() {
+    let big = scoreboard_rects(1920.0, 1080.0);
+    let small = scoreboard_rects(1280.0, 720.0);
+    for (b, s) in [
+        (big.bar, small.bar),
+        (big.accent, small.accent),
+        (big.home, small.home),
+        (big.score, small.score),
+        (big.away, small.away),
+        (big.clock, small.clock),
+        (big.tail, small.tail),
+    ] {
+        assert!((b.x / 1920.0 - s.x / 1280.0).abs() < 1e-12);
+        assert!((b.y / 1080.0 - s.y / 720.0).abs() < 1e-12);
+        assert!((b.w / 1920.0 - s.w / 1280.0).abs() < 1e-12);
+        assert!((b.h / 1080.0 - s.h / 720.0).abs() < 1e-12);
+    }
 }
 
 #[test]

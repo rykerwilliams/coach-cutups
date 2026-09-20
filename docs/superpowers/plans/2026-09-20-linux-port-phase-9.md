@@ -23,7 +23,7 @@
 
 1. **Merge** `scoreboard_config.rs` into a new `scoreboard.rs`: the on-disk types plus the behaviour. Re-export from `lib.rs` so callers don't churn.
 2. **Port** `interpret`, `MatchFormat`'s derived accessors, `ClockDisplay`, `format_clock`, and `scoreboard_state(now_abs, config, events) -> Option<ScoreboardState { home_score, away_score, clock }>`.
-   - `interpret(events, config) -> Vec<(Option<Uuid>, PeriodRole)>`: start/stops stably sorted by absolute time with an input-order tie-break, **truncated to `2 × total_periods`**, then — if `auto_back_anchor_p1` — a derived start prepended, so the anchor never costs a slot. Even indices start a period, odd ones end it.
+   - `interpret(events, config) -> Vec<InterpretedEvent { id, abs_seconds, role }>`: start/stops stably sorted by absolute time with an input-order tie-break, the derived start prepended if `auto_back_anchor_p1`, and **then** the whole list capped at `2 × total_periods`. Even indices start a period, odd ones end it. Capping the stored list first and prepending after would assign a period index outside the format.
    - **The derived start's time** is `p1_end_abs − period_seconds(0)` once a first end has been tagged, and **absolute 0 before then**. Without that fallback there is no clock at all through the first half.
 3. **Remove `MatchEventRecord::is_auto_back_anchor`** — it touches `scoreboard_config.rs:93,178,189`, `core/tests/project_format.rs:73`, `core/tests/sources.rs:58` and `harness/tests/project_and_sources.rs:70`. Nothing writes it, serde ignores unknown keys, so **the format stays at v7**.
 4. `AbsoluteMatchEvent` and `ScoreboardContext { config, events, source_offsets }`, with **`for_project(&Project) -> Option<Self>`** and `state_at(source_index, source_time)`.
@@ -31,7 +31,7 @@
 6. **`scoreboard_rects(out_w, out_h) -> ScoreboardRects { bar, accent, home, score, away, clock, tail }`** in `layout.rs`, per the spec's table, with the ratios private to that module and the scoreboard named in its doc.
 7. **Amend the two module docs** (`timeline.rs`, `plan.rs:58`).
 8. **Tests,** drawing on macOS's 651 lines: stoppage in both halves, HT/FT, quarters, overtime, the goal window, the tie-break and truncation, the roles map, format names and labels, `scoreboard_rects`' geometry (cells tile the bar, accent above, tail outside), and **the pause test** — a schedule whose clip pauses for N seconds yields the same `state_at` clock at record time `p` and `p + N`. That is `compilation_schedule` plus `state_at`, pure core, and it pins BACKLOG #27 shut.
-9. **The back-anchor tests:** before any end is tagged the clock runs from 0; once half-time is tagged the first period **ends at exactly `period_seconds(0)`**; it **never enters stoppage** (that is what the anchor means — macOS's read 50:00 while still "running", and that test is *not* ported); and a full-capacity match plus the anchor keeps every tagged event.
+9. **The back-anchor tests:** before any end is tagged the clock runs from 0; once half-time is tagged the first period **ends at exactly `period_seconds(0)`**; it **never enters stoppage** (that is what the anchor means — macOS's read 50:00 while still "running", and that test is *not* ported); and an over-tagged anchored match loses the last start/stop's **role** but never its **record**, so turning the anchor off restores it.
 
 Commit: `feat(core): scoreboard clock, score and match interpretation`.
 

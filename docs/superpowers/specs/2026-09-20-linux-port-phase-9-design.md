@@ -40,7 +40,7 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 
 **The P1 back-anchor is derived, not stored.** macOS inserted a flagged `(0, 0)` event at index 0, relied on `interpret`'s tie-break, bypassed its own cap, and then added an offset to the *displayed* number — which left the clock reading 50:00 while still counted as running, so stoppage never began. Instead:
 - `ScoreboardConfig` gains `auto_back_anchor_p1: bool`, set in the setup sheet (it is setup: "my video starts after kick-off");
-- `interpret` **truncates the stored start/stops to the format's capacity first**, then prepends a derived start, so the anchor never costs the coach a slot;
+- `interpret` prepends the derived start and **then** caps the whole list at `expected_start_stop_events`, so the effective capacity for *stored* events is `2 × total_periods − 1` while the anchor is on. Capping the stored list first and prepending after would assign a period index the format does not have — `Start(2)` in a two-period match, which names an overtime period, never displays full time and never closes the goal window. Nothing stored is lost either way: the cap the UI enforces is on the records, and the anchor is not one, so turning it off restores every role;
 - that derived start is at `p1_end_abs − period_seconds(0)` once a first end is tagged, and **at absolute 0 before then**, so the clock runs from the start of the footage during the first half and snaps to the right alignment when half-time is tagged. Without the fallback there would be no clock at all through the half the coach most wants one.
 - `interpret` returns `(Option<Uuid>, PeriodRole)`: the derived start has no record.
 

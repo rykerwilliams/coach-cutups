@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::event::CommentaryEvent;
 use crate::recording::PendingClip;
-use crate::scoreboard_config::{MatchEventRecord, ScoreboardConfig};
+use crate::scoreboard::{MatchEventRecord, ScoreboardConfig};
 use crate::undo::ClipEdit;
 
 /// Export frame size. `source` is deliberately absent — it was ill-defined

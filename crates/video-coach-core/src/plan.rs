@@ -56,7 +56,10 @@ pub struct PlanEntry {
 
 impl PlanEntry {
     /// The record time that output frame `frame` shows — the clock for stroke
-    /// replay and the scoreboard.
+    /// replay. **Not the scoreboard's clock**, which runs on the source video
+    /// and comes from [`crate::export::FrameSpec::source_time`]: a per-clip
+    /// constant plus record time is exactly the macOS bug that put the match
+    /// clock ahead of the footage after every pause (BACKLOG #27).
     ///
     /// Derived from the entry and the frame index rather than stored on every
     /// [`crate::export::FrameSpec`]; `frame` is a global output frame index
