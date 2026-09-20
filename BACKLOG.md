@@ -421,3 +421,10 @@ Each entry: what, why deferred, when to revisit.
   Phase 6 review, and passed on re-run. Live test sources plus a loaded
   machine.
 - **When to revisit:** if CI flakes; widen the tolerance to a few frames.
+
+### 50. `tests/recorder.rs` fails when its tests run in parallel
+- **Why deferred:** verified pre-existing (on a stashed tree): 1–2 of 3 fail
+  under parallel execution, and pass serially. Live test sources contending
+  for the VA encoder is the likely cause. Found during Phase 7.
+- **When to revisit:** if CI flakes; mark the recorder tests serial, or give
+  them their own encoder instance.
