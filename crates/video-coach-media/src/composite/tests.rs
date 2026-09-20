@@ -35,6 +35,26 @@ fn fit_rect_scales_with_the_output_size() {
     );
 }
 
+/// A seek names a frame by its time, and a buffer by its PTS; both come back
+/// through `frame_index`, so it has to invert `frame_time` exactly -- at 30
+/// fps neither is a whole number of nanoseconds.
+#[test]
+fn frame_index_inverts_frame_time() {
+    for n in [0u64, 1, 29, 30, 31, 899, 54_000] {
+        assert_eq!(frame_index(frame_time(n)), n, "frame {n}");
+    }
+    // And rounds to the nearest frame either side of one.
+    let frame_30 = frame_time(30);
+    assert_eq!(
+        frame_index(frame_30 - gst::ClockTime::from_mseconds(16)),
+        30
+    );
+    assert_eq!(
+        frame_index(frame_30 + gst::ClockTime::from_mseconds(16)),
+        30
+    );
+}
+
 #[test]
 fn zoom_params_follow_the_measured_mapping() {
     assert_eq!(zoom_params(Zoom::IDENTITY), (1.0, 0.0, 0.0));

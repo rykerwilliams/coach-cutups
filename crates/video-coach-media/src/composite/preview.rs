@@ -26,11 +26,20 @@
 //! **The audio sink is the clock** (measured: `GstPulseSinkClock`), so the
 //! composite follows the commentary — the track the coach hears. The video
 //! appsink syncs to that clock, and its backpressure is the whole of the
-//! pump's pacing: there is no sleep loop.
+//! pump's pacing: there is no sleep loop, and PAUSED stops the pump through
+//! that same backpressure (measured), so pausing is a state change and
+//! nothing else.
+//!
+//! **Transport runs through the pipeline, not around it** (spec P3). A seek is
+//! one pipeline seek: the recording branch seeks natively, and both appsrcs,
+//! being `stream-type=seekable`, answer `seek-data` by moving the pump's
+//! [`Cursor`]. Everything the owner steers — state, seeks, volume — goes
+//! through [`Control`], because the graph itself lives and dies on the pump's
+//! thread.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -45,11 +54,11 @@ use video_coach_core::zoom::Zoom;
 
 use super::decode::Decoder;
 use super::{
-    display_aspect, fit_rect, frame_time, head, install_zoom, place, push_buffer, CompositeError,
-    Gl, Stopper, Watch, POLL, QUEUED,
+    display_aspect, fit_rect, frame_index, frame_time, head, install_zoom, place, push_buffer,
+    wait_for_room, CompositeError, Gl, Stopper, Watch, POLL, QUEUED,
 };
-use crate::mailbox::{Frame, FrameMailbox};
-use crate::player::{gl_caps, seconds_to_clock};
+use crate::mailbox::FrameMailbox;
+use crate::player::{fill_mailbox, gain, gl_caps, seconds_to_clock};
 use crate::{now_ns, render_overlay};
 
 /// The preview's output size. Measured (spec P1): of the sizes tried, 720p
@@ -73,6 +82,9 @@ pub struct PreviewJob {
     pub clip: Clip,
     /// The clip's frame schedule (`video_coach_core::export::frame_schedule`).
     pub frames: Vec<FrameSpec>,
+    /// The commentary's volume, the project's `preview_commentary_volume`, in
+    /// the volume slider's `0..=1` space.
+    pub commentary_volume: f64,
 }
 
 /// What a running preview reports, on its own thread.
@@ -91,17 +103,40 @@ pub enum PreviewMessage {
 pub struct PreviewStats {
     /// Frames out of the mixer.
     pub composited: u64,
-    /// Frames the sink reported dropping, from its QoS messages.
+    /// Frames the sink reported dropping, from its QoS messages. **Since the
+    /// last flush**: the sink restarts its own statistics at every seek.
     pub dropped: u64,
     /// Their steady-state rate, from the first sample to the last.
     pub fps: f64,
+}
+
+/// Where a preview is, in output frames — the counter the pump stores and the
+/// UI's 30 Hz tick reads, so a preview needs no position event of its own
+/// (spec P3).
+///
+/// It is the frame the pump last pushed, which leads the picture by whatever
+/// is queued (at most [`QUEUED`] frames, 0.13 s), and reaches the schedule's
+/// length when it ends.
+#[derive(Debug, Clone, Default)]
+pub struct PreviewPosition(Arc<AtomicU64>);
+
+impl PreviewPosition {
+    pub fn seconds(&self) -> f64 {
+        self.0.load(Ordering::SeqCst) as f64 / f64::from(OUTPUT_FPS)
+    }
+
+    fn store(&self, frame: u64) {
+        self.0.store(frame, Ordering::SeqCst);
+    }
 }
 
 /// A running preview. It owns its thread, and every GStreamer object it
 /// creates lives and dies on that thread. Dropping it closes and joins.
 pub struct Preview {
     cancel: Arc<AtomicBool>,
-    counters: Arc<Counters>,
+    shared: Arc<Shared>,
+    /// The schedule's length, for clamping a seek.
+    frames: u64,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -120,21 +155,33 @@ impl Preview {
     ) -> Preview {
         debug_assert!(!job.frames.is_empty(), "a preview needs frames");
         let cancel = Arc::new(AtomicBool::new(false));
-        let counters = Arc::new(Counters::default());
+        let frames = job.frames.len() as u64;
+        let shared = Arc::new(Shared {
+            counters: Counters::default(),
+            cursor: Mutex::new(Cursor::default()),
+            control: Mutex::new(Control {
+                graph: None,
+                playing: true,
+                gain: gain(job.commentary_volume),
+                pending_seek: None,
+            }),
+            position: PreviewPosition::default(),
+        });
         let thread = std::thread::Builder::new()
             .name("preview".into())
             .spawn({
-                let (cancel, counters) = (cancel.clone(), counters.clone());
+                let (cancel, shared) = (cancel.clone(), shared.clone());
                 move || {
                     let watch = Watch {
                         cancel: &cancel,
                         error: Arc::default(),
                     };
+                    let result = run(&job, &gl, &mailbox, &shared, &watch, &mut on_message);
+                    // Nothing outside may steer a graph that has stopped.
+                    shared.control().graph = None;
                     // `Cancelled` is the close the user asked for, and has
                     // nothing to report. Anything else is the graph giving up.
-                    if let Err(CompositeError::Failed(e)) =
-                        run(&job, &gl, &mailbox, &counters, &watch, &mut on_message)
-                    {
+                    if let Err(CompositeError::Failed(e)) = result {
                         on_message(PreviewMessage::Failed(e));
                     }
                 }
@@ -142,14 +189,78 @@ impl Preview {
             .expect("spawn the preview thread");
         Preview {
             cancel,
-            counters,
+            shared,
+            frames,
             thread: Some(thread),
         }
     }
 
     /// What the sink has seen so far.
     pub fn stats(&self) -> PreviewStats {
-        self.counters.stats()
+        self.shared.counters.stats()
+    }
+
+    /// Where the preview is, shared with whoever draws the readout.
+    pub fn position(&self) -> PreviewPosition {
+        self.shared.position.clone()
+    }
+
+    /// Plays or holds the picture, through the pipeline's state: PAUSED stops
+    /// the pump through the appsrcs' backpressure, and the recording branch
+    /// and the audio clock stop with it.
+    pub fn set_playing(&self, playing: bool) {
+        // There is nothing to play on from the end: the schedule has run out
+        // and the picture is frozen on its last frame, so a play there starts
+        // the clip again.
+        if playing && self.shared.cursor().frame >= self.frames {
+            self.seek(0.0);
+        }
+        let state = match playing {
+            true => gst::State::Playing,
+            false => gst::State::Paused,
+        };
+        // The lock is held across the state change so it can't cross the
+        // graph being published, which starts it in `playing`'s state -- and
+        // the graph isn't built until the first source frame is decoded, so
+        // that is a real couple of hundred milliseconds.
+        let mut control = self.shared.control();
+        control.playing = playing;
+        if let Some(graph) = &control.graph {
+            if graph.pipeline.set_state(state).is_err() {
+                eprintln!("preview: could not go to {state:?}");
+            }
+        }
+    }
+
+    /// Seeks to `seconds` into the clip, frame-accurately (spec P3: 25–40 ms
+    /// a tick, so a scrub needs no keyframe tolerance).
+    ///
+    /// One pipeline seek: the recording branch seeks natively and both
+    /// appsrcs answer `seek-data` by moving the pump.
+    pub fn seek(&self, seconds: f64) {
+        let frame = ((seconds.max(0.0) * f64::from(OUTPUT_FPS)).round() as u64)
+            .min(self.frames.saturating_sub(1));
+        // The lock is held across the seek so it can't cross the graph being
+        // published. A seek the graph won't take yet -- before it exists, or
+        // before it has prerolled -- is left for the pump to retry, since
+        // only the pump can get it to preroll.
+        let mut control = self.shared.control();
+        let taken = control
+            .graph
+            .as_ref()
+            .is_some_and(|graph| seek_to(&graph.pipeline, frame));
+        control.pending_seek = (!taken).then_some(frame);
+    }
+
+    /// Sets the commentary's volume from a slider value in `0..=1`. A live
+    /// property set on the `volume` element (spec P2), which is how the bus
+    /// mutes the drag of a scrub.
+    pub fn set_volume(&self, linear: f64) {
+        let mut control = self.shared.control();
+        control.gain = gain(linear);
+        if let Some(graph) = &control.graph {
+            graph.volume.set_property("volume", control.gain);
+        }
     }
 }
 
@@ -162,6 +273,78 @@ impl Drop for Preview {
     }
 }
 
+/// What the preview's owner and its thread share. Two locks, never held at
+/// once except by a seek, which takes `control` and then `cursor` through
+/// `seek-data`.
+struct Shared {
+    counters: Counters,
+    cursor: Mutex<Cursor>,
+    control: Mutex<Control>,
+    position: PreviewPosition,
+}
+
+impl Shared {
+    fn cursor(&self) -> std::sync::MutexGuard<'_, Cursor> {
+        self.cursor.lock().expect("the cursor isn't poisoned")
+    }
+
+    fn control(&self) -> std::sync::MutexGuard<'_, Control> {
+        self.control.lock().expect("the control isn't poisoned")
+    }
+}
+
+/// Where the pump is, and which seek put it there.
+///
+/// **One mutex over both, and the generation is load-bearing.** `seek-data`
+/// arrives on the *seeking* thread, not the pump's, so the pump re-reads the
+/// generation under this lock immediately before it pushes: a push that
+/// crosses a `FLUSH_STOP` is accepted silently (measured), and would put a
+/// frame from before the seek onto the segment after it.
+#[derive(Default)]
+struct Cursor {
+    /// The next output frame to push.
+    frame: u64,
+    /// Bumped by every seek. A pipeline seek reaches both appsrcs, so one
+    /// seek may bump it twice; only a change matters.
+    generation: u64,
+    /// Where the last seek left the pump: the first frame the mixer has
+    /// produced since, which is what [`Composite::end`] counts from.
+    resumed: u64,
+}
+
+impl Cursor {
+    fn read(&self) -> (u64, u64) {
+        (self.frame, self.generation)
+    }
+
+    fn seek_to(&mut self, frame: u64) {
+        self.frame = frame;
+        self.generation += 1;
+        self.resumed = frame;
+    }
+}
+
+/// The graph, once the pump has built it, and what the owner asked for before
+/// then. The graph isn't built until the first source frame has been decoded,
+/// so a state or volume change made meanwhile is remembered here and applied
+/// when it starts.
+struct Control {
+    graph: Option<Graph>,
+    playing: bool,
+    gain: f64,
+    /// A seek the graph hasn't taken yet, retried by the pump. It has to be
+    /// a real pipeline seek and not a nudge of the [`Cursor`]: the recording
+    /// branch moves with the pump, and `appsrc` answers its own start-up
+    /// `seek-data` at 0, which would undo one.
+    pending_seek: Option<u64>,
+}
+
+/// What the owner reaches into the running graph for.
+struct Graph {
+    pipeline: gst::Pipeline,
+    volume: gst::Element,
+}
+
 /// Runs the preview until it is closed or fails, reporting
 /// [`PreviewMessage::Ended`] when the schedule runs out. It returns only once
 /// the preview is over: the pipeline lives on this thread, so the thread has
@@ -170,42 +353,61 @@ fn run(
     job: &PreviewJob,
     gl: &Gl,
     mailbox: &FrameMailbox,
-    counters: &Arc<Counters>,
+    shared: &Arc<Shared>,
     watch: &Watch,
     on_message: &mut impl FnMut(PreviewMessage),
 ) -> Result<(), CompositeError> {
+    let total = job.frames.len() as u64;
     let mut decoder = Decoder::start(&job.source, gl, watch)?;
-    let mut composite = None;
-    for (n, frame) in job.frames.iter().enumerate() {
+    let mut composite: Option<Composite> = None;
+    // Set once the schedule has run out and the tail has been flushed, and
+    // cleared by a seek back into the schedule.
+    let mut ended = false;
+    loop {
+        watch.check()?;
+        if let Some(composite) = &composite {
+            composite.retry_pending_seek();
+        }
+        let (n, generation) = shared.cursor().read();
+        if n >= total {
+            if !ended {
+                let composite = composite
+                    .as_ref()
+                    .ok_or_else(|| CompositeError::Failed("the clip has no frames".into()))?;
+                composite.end(total, watch)?;
+                shared.position.store(total);
+                on_message(PreviewMessage::Ended);
+                ended = true;
+            }
+            // The picture is held, and the thread with it, until the preview
+            // is closed or seeked back inside the schedule (spec P3).
+            std::thread::sleep(POLL.into());
+            continue;
+        }
+        ended = false;
+        let frame = &job.frames[n as usize];
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), watch)?;
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
             let zooms = job.frames.iter().map(|f| f.zoom).collect();
             composite = Some(Composite::start(
-                sample, job, zooms, gl, mailbox, counters, watch,
+                sample, job, zooms, gl, mailbox, shared, watch,
             )?);
         }
         let composite = composite.as_ref().expect("started above");
-        composite.push(n as u64, sample, &job.clip, watch)?;
-    }
-    let composite =
-        composite.ok_or_else(|| CompositeError::Failed("the clip has no frames".into()))?;
-    // Freeze on the last frame rather than running on into the recording's
-    // tail (spec P3). The sink accounts for every frame it was given as
-    // rendered or, when it fell behind the audio clock, dropped, so the pair
-    // reaching the schedule's length is the end of the picture. PAUSED then
-    // stops the mixer where it stands.
-    composite.await_end(job.frames.len() as u64, watch)?;
-    composite.pause(watch)?;
-    on_message(PreviewMessage::Ended);
-    loop {
-        watch.check()?;
-        std::thread::sleep(POLL.into());
+        composite.push(n, generation, sample, &job.clip, watch)?;
     }
 }
 
 /// What the sink counts, shared with [`Preview::stats`].
+///
+/// **The end of the schedule is a count, not a timestamp**, because a late
+/// frame is dropped rather than delivered: rendered plus dropped is the only
+/// complete account of what the mixer produced. The account is kept *since
+/// the last flush*, so a seek doesn't leave [`Composite::end`] waiting for
+/// frames that were never going to be composited -- and the sink resets its
+/// own QoS statistics on a flush anyway, so `dropped` is that span too.
 #[derive(Default)]
 struct Counters {
     composited: AtomicU64,
@@ -213,6 +415,7 @@ struct Counters {
     /// `now_ns()` at the first sample and at the latest, for the rate.
     first_ns: AtomicU64,
     last_ns: AtomicU64,
+    rendered_since_flush: AtomicU64,
 }
 
 impl Counters {
@@ -223,6 +426,20 @@ impl Counters {
             .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
         self.last_ns.store(now, Ordering::SeqCst);
         self.composited.fetch_add(1, Ordering::SeqCst);
+        self.rendered_since_flush.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A flush: the sink's own QoS statistics restart here, so this account
+    /// does too.
+    fn flushed(&self) {
+        self.rendered_since_flush.store(0, Ordering::SeqCst);
+        self.dropped.store(0, Ordering::SeqCst);
+    }
+
+    /// Frames the mixer has produced since the last flush, rendered or
+    /// dropped.
+    fn since_flush(&self) -> u64 {
+        self.rendered_since_flush.load(Ordering::SeqCst) + self.dropped.load(Ordering::SeqCst)
     }
 
     fn stats(&self) -> PreviewStats {
@@ -253,12 +470,13 @@ struct Composite {
     overlay: gst_app::AppSrc,
     /// That rect's size.
     picture: (u32, u32),
-    counters: Arc<Counters>,
+    shared: Arc<Shared>,
 }
 
 impl Composite {
-    /// Builds the graph for source frames shaped like `first` and sets it
-    /// PLAYING. Output frame `n` gets `zooms[n]`. Its errors reach `watch`.
+    /// Builds the graph for source frames shaped like `first` and starts it in
+    /// the state the owner has asked for. Output frame `n` gets `zooms[n]`.
+    /// Its errors reach `watch`.
     ///
     /// **Never waits for PLAYING:** the graph can't preroll until the pump
     /// pushes, and the pump is the caller.
@@ -268,7 +486,7 @@ impl Composite {
         zooms: Vec<Zoom>,
         gl: &Gl,
         mailbox: &FrameMailbox,
-        counters: &Arc<Counters>,
+        shared: &Arc<Shared>,
         watch: &Watch,
     ) -> Result<Composite, CompositeError> {
         let caps = first
@@ -321,6 +539,26 @@ impl Composite {
         let src = appsrc("src");
         src.set_caps(Some(&caps));
         let overlay = appsrc("ov");
+        // Both are seekable, and answer a pipeline seek by moving the pump
+        // (spec P3). `format=time`, so `seek-data`'s offset is nanoseconds on
+        // the output timeline.
+        for appsrc in [&src, &overlay] {
+            appsrc.set_stream_type(gst_app::AppStreamType::Seekable);
+            appsrc.set_callbacks(
+                gst_app::AppSrcCallbacks::builder()
+                    .seek_data({
+                        let shared = shared.clone();
+                        move |_, offset| {
+                            shared
+                                .cursor()
+                                .seek_to(frame_index(gst::ClockTime::from_nseconds(offset)));
+                            shared.counters.flushed();
+                            true
+                        }
+                    })
+                    .build(),
+            );
+        }
 
         let mix = by_name("mix");
         let mix_pad = |name: &str| {
@@ -330,10 +568,18 @@ impl Composite {
         // Base and overlay share the picture rect, so a drawing lands on the
         // picture and not across the letterbox bars (spec P4). The PiP is
         // chrome in output space and waits for the camera's shape.
-        place(&mix_pad("sink_0"), picture, 0);
+        let base_pad = mix_pad("sink_0");
+        place(&base_pad, picture, 0);
         let overlay_pad = mix_pad("sink_2");
         place(&overlay_pad, picture, 2);
         overlay_pad.set_property_from_str("blend-function-src-rgb", "one");
+        // The two pumped pads are sent EOS at the end of the schedule (see
+        // `Composite::end`), and an EOS pad is otherwise not drawn at all:
+        // with the recording still running on pad 1, the freeze would be on
+        // a black frame (measured -- the composite test caught one).
+        for pad in [&base_pad, &overlay_pad] {
+            pad.set_property("repeat-after-eos", true);
+        }
         if job.clip.show_pip {
             place_pip(&mix_pad("sink_1"));
         }
@@ -343,19 +589,12 @@ impl Composite {
             .downcast::<gst_app::AppSink>()
             .expect("`out` is an appsink");
         out.set_caps(Some(&gl_caps()));
-        out.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample({
-                    let (mailbox, counters) = (mailbox.clone(), counters.clone());
-                    move |sink| {
-                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?;
-                        mailbox.put(Frame::from_sample(sample)?);
-                        counters.sample();
-                        Ok(gst::FlowSuccess::Ok)
-                    }
-                })
-                .build(),
-        );
+        // The preroll half of this is what puts a frame up when a scrub lands
+        // while the preview is paused.
+        fill_mailbox(&out, mailbox.clone(), {
+            let shared = shared.clone();
+            move || shared.counters.sample()
+        });
 
         link_recording(&pipeline, job, &by_name)?;
         // The sink's QoS reports are the only place a dropped frame shows up
@@ -363,17 +602,34 @@ impl Composite {
         // audio is the clock, and a late picture kept would slide further and
         // further behind the words it belongs to.
         gl.install(&pipeline, watch, {
-            let counters = counters.clone();
+            let shared = shared.clone();
             move |msg| {
                 if let gst::MessageView::Qos(qos) = msg.view() {
                     // `(processed, dropped)`, both cumulative for the sink.
                     let dropped = qos.stats().1.value().max(0) as u64;
-                    counters.dropped.store(dropped, Ordering::SeqCst);
+                    shared.counters.dropped.store(dropped, Ordering::SeqCst);
                 }
             }
         });
+
+        let volume = by_name("vol");
         let pipeline = Stopper(pipeline);
-        if pipeline.set_state(gst::State::Playing).is_err() {
+        // The owner may already have asked for a state and a volume, so the
+        // graph is published and started under one lock.
+        let started = {
+            let mut control = shared.control();
+            volume.set_property("volume", control.gain);
+            let state = match control.playing {
+                true => gst::State::Playing,
+                false => gst::State::Paused,
+            };
+            control.graph = Some(Graph {
+                pipeline: pipeline.0.clone(),
+                volume,
+            });
+            pipeline.set_state(state)
+        };
+        if started.is_err() {
             return Err(watch.failure("could not start the preview"));
         }
         Ok(Composite {
@@ -381,18 +637,20 @@ impl Composite {
             src,
             overlay,
             picture: (pw as u32, ph as u32),
-            counters: counters.clone(),
+            shared: shared.clone(),
         })
     }
 
     /// Pushes output frame `n`: `sample`'s texture on the base pad and the
     /// clip's overlay at `n/30` on the overlay pad, **both stamped `n/30`**.
+    /// A seek that landed since `generation` was read discards both.
     ///
     /// The base is a buffer reference, not a pixel copy: a freeze sends the
     /// same texture out many times.
     fn push(
         &self,
         n: u64,
+        generation: u64,
         sample: &gst::Sample,
         clip: &Clip,
         watch: &Watch,
@@ -414,19 +672,66 @@ impl Composite {
         let (w, h) = self.picture;
         let mut overlay = render_overlay(clip, n as f64 / f64::from(OUTPUT_FPS), w, h);
         stamp(&mut overlay);
+
+        // Room for both first, so the cursor's lock is never held across a
+        // wait: `seek-data` runs on the seeking thread, which must not queue
+        // behind the pump. PAUSED is what makes this wait the pump's pause.
+        wait_for_room(&self.src, watch)?;
+        wait_for_room(&self.overlay, watch)?;
+        let mut cursor = self.shared.cursor();
+        if cursor.generation != generation {
+            // A seek landed while this frame was being prepared. See `Cursor`.
+            return Ok(());
+        }
         push_buffer(&self.src, base, &format!("frame {n}"), watch)?;
-        push_buffer(&self.overlay, overlay, &format!("overlay {n}"), watch)
+        push_buffer(&self.overlay, overlay, &format!("overlay {n}"), watch)?;
+        cursor.frame = n + 1;
+        drop(cursor);
+        self.shared.position.store(n);
+        Ok(())
     }
 
-    /// Waits until the sink has accounted for `n` frames.
+    /// Issues the seek the graph wouldn't take when it was asked for. A
+    /// pipeline that hasn't prerolled refuses one, and only the pump can get
+    /// it to preroll, so this is the pump's.
+    fn retry_pending_seek(&self) {
+        let mut control = self.shared.control();
+        if control
+            .pending_seek
+            .is_some_and(|frame| seek_to(&self.pipeline, frame))
+        {
+            control.pending_seek = None;
+        }
+    }
+
+    /// The schedule is over: flush the tail, then hold the picture there.
+    ///
+    /// **Both appsrcs go EOS first,** which is what tells the aggregator those
+    /// pads are done rather than merely quiet. Phase 7's Task 2 measured the
+    /// last seven frames -- the ones in flight -- arriving about a second
+    /// after the rest on the reference laptop, taking the freeze with them;
+    /// this is the signal that should stop `glvideomixer` waiting. It is not
+    /// reproducible on a graph whose latency is zero, where those seven
+    /// frames drain in their own 0.23 s either way, so the gain is unverified
+    /// and the hands-on pass on real footage is what confirms it.
+    fn end(&self, total: u64, watch: &Watch) -> Result<(), CompositeError> {
+        let _ = self.src.end_of_stream();
+        let _ = self.overlay.end_of_stream();
+        // Then wait for the frames the mixer owes since the last seek. PAUSED
+        // stops it where it stands, rather than running on into the
+        // recording's tail (spec P3).
+        let owed = total - self.shared.cursor().resumed.min(total);
+        self.await_end(owed, watch)?;
+        self.pause(watch)
+    }
+
+    /// Waits until the sink has accounted for `n` frames since the last
+    /// flush.
     fn await_end(&self, n: u64, watch: &Watch) -> Result<(), CompositeError> {
         let deadline = Instant::now() + STALL;
         loop {
             watch.check()?;
-            let counters = &self.counters;
-            let seen = counters.composited.load(Ordering::SeqCst)
-                + counters.dropped.load(Ordering::SeqCst);
-            if seen >= n {
+            if self.shared.counters.since_flush() >= n {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -438,13 +743,32 @@ impl Composite {
         }
     }
 
-    /// Holds the picture where it is, and with it the recording.
+    /// Holds the picture where it is, and with it the recording. The owner's
+    /// wish is updated too, so its next play is a real state change.
     fn pause(&self, watch: &Watch) -> Result<(), CompositeError> {
+        let mut control = self.shared.control();
+        control.playing = false;
         match self.pipeline.set_state(gst::State::Paused) {
             Ok(_) => Ok(()),
             Err(_) => Err(watch.failure("could not pause the preview")),
         }
     }
+}
+
+/// Seeks the whole graph to output frame `frame`, frame-accurately (spec P3:
+/// 25-40 ms a tick, so a scrub needs no keyframe tolerance).
+///
+/// One seek does both branches: the recording seeks natively, and the two
+/// appsrcs, being `stream-type=seekable`, answer `seek-data` by moving the
+/// pump's [`Cursor`].
+/// Returns whether the graph took it.
+fn seek_to(pipeline: &gst::Pipeline, frame: u64) -> bool {
+    pipeline
+        .seek_simple(
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            frame_time(frame),
+        )
+        .is_ok()
 }
 
 /// Adds `filesrc ! decodebin3` for the recording and links its streams: video

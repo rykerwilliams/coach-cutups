@@ -21,7 +21,8 @@ use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot, UserError,
+    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, PreviewPositionSlot,
+    RecordingStatus, Snapshot, UserError,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{format_hms, sentence};
@@ -81,6 +82,9 @@ struct UiState {
     paths_rect: (f64, f64),
     /// When the notice line clears, if one is up.
     notice_until: Option<Instant>,
+    /// The previewed clip's duration while a preview is open. The transport
+    /// then runs over the clip rather than the concat timeline (spec P6).
+    preview_duration: Option<f64>,
 }
 
 impl Default for UiState {
@@ -97,6 +101,7 @@ impl Default for UiState {
             drawing: None,
             paths_rect: (0.0, 0.0),
             notice_until: None,
+            preview_duration: None,
         }
     }
 }
@@ -128,6 +133,7 @@ fn main() {
         }),
     );
     let position = bus.position_handle().clone();
+    let preview_position = bus.preview_position().clone();
     let bus = Rc::new(RefCell::new(bus));
     video::install(&window, bus.clone());
     wire_callbacks(&window, &bus);
@@ -139,7 +145,7 @@ fn main() {
         let weak = window.as_weak();
         move || {
             if let Some(w) = weak.upgrade() {
-                tick(&w, &position);
+                tick(&w, &position, &preview_position);
             }
         }
     });
@@ -865,9 +871,22 @@ fn on_event(w: &AppWindow, event: Event) {
             }
             w.set_selected_clip(id.to_string().into());
         }
-        // Nothing in the window reflects a preview yet: the transport, the
-        // indicator and the hidden live stroke layer come with it.
-        Event::Preview(_) => {}
+        // The transport runs over the clip while a preview is open. The
+        // indicator and the hidden live stroke layer come with the rest of
+        // the UI.
+        Event::Preview(previewing) => UI.with_borrow_mut(|ui| {
+            let clip = previewing.and_then(|id| {
+                let project = &ui.snapshot.as_ref()?.project;
+                project.clips.iter().find(|c| c.id == id)
+            });
+            ui.preview_duration = clip.map(|c| c.recording_duration);
+            let total = match (ui.preview_duration, &ui.snapshot) {
+                (Some(duration), _) => duration,
+                (None, Some(snapshot)) => snapshot.project.total_source_duration(),
+                (None, None) => 0.0,
+            };
+            w.set_total_seconds(total as f32);
+        }),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {
@@ -912,7 +931,11 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     let first_missing = (0..rows.len()).find(|&i| missing(i));
     w.set_has_project(true);
     w.set_saved_project_name(project.name.as_str().into());
-    w.set_total_seconds(project.total_source_duration() as f32);
+    // Not while a preview is open: the transport is over the clip then, and
+    // an unrelated save must not snap the scrubber back to the timeline.
+    if UI.with_borrow(|ui| ui.preview_duration.is_none()) {
+        w.set_total_seconds(project.total_source_duration() as f32);
+    }
     w.set_missing_index(first_missing.map_or(-1, |i| i as i32));
     w.set_missing_name(
         first_missing
@@ -995,7 +1018,7 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
 /// position on the current source. Also the recording's elapsed time (R11),
 /// the notice's expiry, and the drawings' (Phase 6 D5, which reuses this
 /// timer rather than adding one).
-fn tick(w: &AppWindow, position: &PositionHandle) {
+fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPositionSlot) {
     let content = content_size(w);
     UI.with_borrow_mut(|ui| {
         if let Some(rect) = content {
@@ -1021,14 +1044,20 @@ fn tick(w: &AppWindow, position: &PositionHandle) {
         let Some(project) = ui.snapshot.as_ref().map(|s| s.project.clone()) else {
             return;
         };
-        let total = project.total_source_duration();
+        // While a preview is open the transport is over the clip, and its
+        // position is the pump's frame index rather than a pipeline query
+        // (spec P3).
+        let total = ui
+            .preview_duration
+            .unwrap_or_else(|| project.total_source_duration());
         let current = if w.get_scrubbing() {
             f64::from(w.get_position_seconds())
         } else {
-            let abs = match ui.target_abs {
-                Some(target) => target,
-                None if project.source_videos.is_empty() => 0.0,
-                None => {
+            let abs = match (preview.seconds(), ui.target_abs) {
+                (Some(secs), _) => secs,
+                (None, Some(target)) => target,
+                (None, None) if project.source_videos.is_empty() => 0.0,
+                (None, None) => {
                     if let Some(secs) = position.query_position() {
                         ui.last_secs = secs;
                     }

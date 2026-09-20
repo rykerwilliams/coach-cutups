@@ -49,7 +49,7 @@ pub(super) fn video_sink(kind: SinkKind, mailbox: FrameMailbox) -> VideoSink {
         .enable_last_sample(false)
         .max_buffers(1u32)
         .build();
-    install_callbacks(&appsink, mailbox);
+    fill_mailbox(&appsink, mailbox, || {});
 
     match kind {
         SinkKind::System => VideoSink {
@@ -107,7 +107,17 @@ pub(crate) fn gl_bin(appsink: &gst_app::AppSink) -> (gst::Element, gst::Element)
     (bin.upcast(), upload)
 }
 
-fn install_callbacks(appsink: &gst_app::AppSink, mailbox: FrameMailbox) {
+/// Makes `appsink` fill `mailbox`, calling `on_sample` for each sample
+/// delivered while running — never for a preroll, which is a frame reached
+/// while paused and not one the composite produced.
+///
+/// The preview's tail uses this too, so a scrub while paused puts the frame
+/// it lands on up: without the preroll half, a paused seek shows nothing.
+pub(crate) fn fill_mailbox(
+    appsink: &gst_app::AppSink,
+    mailbox: FrameMailbox,
+    on_sample: impl Fn() + Send + Sync + 'static,
+) {
     let deliver = move |sample: gst::Sample| -> Result<gst::FlowSuccess, gst::FlowError> {
         mailbox.put(Frame::from_sample(sample)?);
         Ok(gst::FlowSuccess::Ok)
@@ -146,6 +156,9 @@ fn install_callbacks(appsink: &gst_app::AppSink, mailbox: FrameMailbox) {
             .new_sample(move |sink| {
                 let result = deliver(sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?);
                 fresh.store(false, Ordering::SeqCst);
+                if result.is_ok() {
+                    on_sample();
+                }
                 result
             })
             .new_preroll(move |sink| {

@@ -30,7 +30,7 @@ use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
 
 pub use sink::SinkKind;
-pub(crate) use sink::{gl_bin, gl_caps};
+pub(crate) use sink::{fill_mailbox, gl_bin, gl_caps};
 
 use crate::mailbox::FrameMailbox;
 
@@ -285,15 +285,10 @@ impl SourcePlayer {
         self.mailbox.take();
     }
 
-    /// Sets the volume from a linear slider value in `0..=1`, mapped as `x³`
-    /// (mpv's perceptual curve). Survives source changes.
+    /// Sets the volume from a linear slider value in `0..=1` (see [`gain`]).
+    /// Survives source changes.
     pub fn set_volume(&self, linear: f64) {
-        let x = if linear.is_finite() {
-            linear.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self.pipeline.set_property("volume", x.powi(3));
+        self.pipeline.set_property("volume", gain(linear));
     }
 
     /// The source time the slot is heading for: the pending request's, else
@@ -561,6 +556,18 @@ pub(crate) fn answer_need_context(
 
 fn seconds(t: gst::ClockTime) -> f64 {
     t.nseconds() as f64 / 1e9
+}
+
+/// A `volume` element's gain for a linear slider value in `0..=1`, mapped as
+/// `x³` (mpv's perceptual curve). The scan slider and the preview's
+/// commentary volume are both stored in that slider's space, so both come
+/// through here.
+pub(crate) fn gain(linear: f64) -> f64 {
+    if linear.is_finite() {
+        linear.clamp(0.0, 1.0).powi(3)
+    } else {
+        0.0
+    }
 }
 
 /// Seconds to a `ClockTime`, **rounded** to the nanosecond. Truncating lands

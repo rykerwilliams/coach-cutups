@@ -18,7 +18,7 @@ pub use capture::{
     Recorder, RecorderMessage, StopOutcome,
 };
 pub use composite::export::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
-pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewStats};
+pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
 pub use composite::{CompositeError, Gl};
 pub use mailbox::{Frame, FrameMailbox};
 pub use overlay::render_overlay;

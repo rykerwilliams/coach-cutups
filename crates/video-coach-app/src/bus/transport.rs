@@ -26,6 +26,12 @@ impl Bus {
     /// While recording, a change is logged at `host_ns`, anchored where the
     /// player is heading, with `ui_secs` as the position the UI saw.
     pub(super) fn toggle_play(&mut self, host_ns: u64, ui_secs: Option<f64>) {
+        // While a preview is open the transport drives it, and nothing here
+        // applies: there is no source to load, and a preview can't be
+        // recorded over (spec P5).
+        if self.preview.is_some() {
+            return self.set_playing(!self.playing);
+        }
         let was_playing = self.playing;
         let play = !self.playing
             && self.seekable()
@@ -41,9 +47,14 @@ impl Bus {
         }
     }
 
+    /// Plays or pauses whichever of the two is on screen. The bus keeps only
+    /// one of them PLAYING, so this is the single play state (spec P5).
     pub(super) fn set_playing(&mut self, playing: bool) {
         self.playing = playing;
-        self.player.set_playing(playing);
+        match &self.preview {
+            Some(active) => active.preview.set_playing(playing),
+            None => self.player.set_playing(playing),
+        }
         self.emit(Event::Playing(playing));
     }
 
@@ -69,7 +80,13 @@ impl Bus {
     /// recording to the clip's source, short of its end by the same margin
     /// (R10), and the requested delta is logged at `host_ns`.
     pub(super) fn skip(&mut self, delta: f64, host_ns: u64) {
-        if !delta.is_finite() || !self.seekable() {
+        if !delta.is_finite() {
+            return;
+        }
+        if self.preview.is_some() {
+            return self.preview_skip(delta);
+        }
+        if !self.seekable() {
             return;
         }
         let Some(open) = &self.open else {
@@ -111,6 +128,11 @@ impl Bus {
     /// Scrub moves are keyframe seeks, latest wins. A release is a new user
     /// context: it abandons any skip burst, then lands frame-accurate.
     pub(super) fn scrub(&mut self, abs: f64, release: bool) {
+        // A preview's scrubber is over the clip's own duration, not concat
+        // time, so it bypasses everything below (spec P5).
+        if self.preview.is_some() {
+            return self.preview_scrub(abs, release);
+        }
         if release {
             self.reset_skip();
         }

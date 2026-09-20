@@ -10,10 +10,12 @@
 //! already queued is still in the channel, and must not be taken for the next
 //! preview's.
 
+use std::sync::{Arc, Mutex};
+
 use uuid::Uuid;
 use video_coach_core::export::frame_schedule;
 use video_coach_core::store::RECORDINGS_DIRNAME;
-use video_coach_media::{Gl, Preview, PreviewJob, PreviewMessage};
+use video_coach_media::{Gl, Preview, PreviewJob, PreviewMessage, PreviewPosition};
 
 use super::{Bus, Event, Input, UserError};
 
@@ -21,7 +23,32 @@ use super::{Bus, Event, Input, UserError};
 /// tags its messages.
 pub(super) struct Active {
     generation: u64,
-    preview: Preview,
+    pub(super) preview: Preview,
+    /// The commentary is muted for the length of a scrub drag, since every
+    /// tick flushes the audio sink (spec P3). Set by the first `ScrubMove`,
+    /// cleared by the `ScrubRelease`.
+    muted_for_scrub: bool,
+}
+
+/// Where the preview is, for the UI's 30 Hz tick. Empty while no preview is
+/// open, when the game video's `PositionHandle` answers instead: one position
+/// path, and no position event of the preview's own (spec P3).
+#[derive(Clone, Default)]
+pub struct PreviewPositionSlot(Arc<Mutex<Option<PreviewPosition>>>);
+
+impl PreviewPositionSlot {
+    /// Seconds into the clip, or `None` with no preview open.
+    pub fn seconds(&self) -> Option<f64> {
+        self.slot().as_ref().map(PreviewPosition::seconds)
+    }
+
+    fn set(&self, position: Option<PreviewPosition>) {
+        *self.slot() = position;
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<PreviewPosition>> {
+        self.0.lock().expect("the position slot isn't poisoned")
+    }
 }
 
 impl Bus {
@@ -72,23 +99,62 @@ impl Bus {
             recording,
             clip: clip.clone(),
             frames,
+            commentary_volume: open.project.preferences.preview_commentary_volume,
         };
 
         // Whatever was on screen stops first, and takes its frame with it.
         self.close_preview();
-        self.set_playing(false);
+        if self.playing {
+            self.set_playing(false);
+        }
         self.preview_generation += 1;
         let generation = self.preview_generation;
         let tx = self.tx.clone();
+        let preview = Preview::start(job, gl, self.mailbox.clone(), move |msg| {
+            // Fails only once the bus thread has exited.
+            let _ = tx.send(Input::Preview(generation, msg));
+        });
+        self.preview_position.set(Some(preview.position()));
         self.preview = Some(Active {
             generation,
-            preview: Preview::start(job, gl, self.mailbox.clone(), move |msg| {
-                // Fails only once the bus thread has exited.
-                let _ = tx.send(Input::Preview(generation, msg));
-            }),
+            preview,
+            muted_for_scrub: false,
         });
         self.emit(Event::Preview(Some(id)));
+        // A preview starts playing, and the transport now drives it (spec P5).
+        self.set_playing(true);
         Ok(())
+    }
+
+    /// Scrubbing a preview (spec P3): a frame-accurate seek per tick, with
+    /// the commentary muted for the length of the drag.
+    pub(super) fn preview_scrub(&mut self, secs: f64, release: bool) {
+        let volume = self.open.as_ref().map_or(1.0, |open| {
+            open.project.preferences.preview_commentary_volume
+        });
+        let Some(active) = &mut self.preview else {
+            return;
+        };
+        if release {
+            active.muted_for_scrub = false;
+            active.preview.set_volume(volume);
+        } else if !active.muted_for_scrub {
+            active.muted_for_scrub = true;
+            active.preview.set_volume(0.0);
+        }
+        active.preview.seek(secs);
+    }
+
+    /// Skipping in a preview: a seek from where it is, clamped to the clip.
+    /// It bypasses `SkipCoordinator`, whose targets are concat source time
+    /// (spec P5).
+    pub(super) fn preview_skip(&mut self, delta: f64) {
+        let Some(active) = &self.preview else {
+            return;
+        };
+        active
+            .preview
+            .seek(active.preview.position().seconds() + delta);
     }
 
     /// Closes the preview, if one is open, and clears the picture it left.
@@ -101,7 +167,13 @@ impl Bus {
         };
         let stats = active.preview.stats();
         drop(active.preview);
+        self.preview_position.set(None);
         self.mailbox.take();
+        // The game video is paused, not unloaded, so this is the whole of the
+        // restore -- but the play state was the preview's, and isn't now.
+        if self.playing {
+            self.set_playing(false);
+        }
         eprintln!(
             "bus: preview closed: {} frames composited at {:.2} fps, {} dropped",
             stats.composited, stats.fps, stats.dropped
@@ -118,9 +190,10 @@ impl Bus {
             return;
         }
         match msg {
-            // The preview stays open on its last frame (spec P3); Task 3's
-            // transport work is what reports the stop to the UI.
-            PreviewMessage::Ended => {}
+            // The preview stays open, holding its last frame, with the
+            // position at the end of the clip (spec P3). It paused itself, so
+            // this only tells the UI.
+            PreviewMessage::Ended => self.set_playing(false),
             PreviewMessage::Failed(e) => {
                 eprintln!("bus: preview failed: {e}");
                 self.close_preview();

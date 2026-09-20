@@ -38,6 +38,7 @@ use video_coach_media::{
 };
 
 pub use export::ExportStatus;
+pub use preview::PreviewPositionSlot;
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
 
@@ -380,6 +381,8 @@ pub struct Bus {
     export: Option<Exporter>,
     /// The preview on screen.
     preview: Option<preview::Active>,
+    /// Where it is, for the UI's tick. Filled while one is open.
+    preview_position: PreviewPositionSlot,
     /// The latest preview's generation. Messages from any other are stale.
     preview_generation: u64,
 }
@@ -414,6 +417,7 @@ impl Bus {
         gst::init().expect("GStreamer failed to initialize");
         let (tx, rx) = mpsc::channel();
         let mailbox = FrameMailbox::default();
+        let preview_position = PreviewPositionSlot::default();
         let player = SourcePlayer::new(sinks, mailbox.clone(), {
             let tx = tx.clone();
             move |msg| {
@@ -444,6 +448,7 @@ impl Bus {
             history: UndoController::default(),
             export: None,
             preview: None,
+            preview_position: preview_position.clone(),
             preview_generation: 0,
         };
         let thread = std::thread::Builder::new()
@@ -455,6 +460,7 @@ impl Bus {
             thread: Some(thread),
             mailbox,
             position,
+            preview_position,
         }
     }
 
@@ -601,6 +607,7 @@ pub struct BusHandle {
     thread: Option<JoinHandle<()>>,
     mailbox: FrameMailbox,
     position: PositionHandle,
+    preview_position: PreviewPositionSlot,
 }
 
 impl BusHandle {
@@ -618,6 +625,12 @@ impl BusHandle {
     /// access permitted outside the bus thread (D5).
     pub fn position_handle(&self) -> &PositionHandle {
         &self.position
+    }
+
+    /// Where the preview is, while one is open; the game video's position
+    /// comes from [`BusHandle::position_handle`] otherwise (spec P3).
+    pub fn preview_position(&self) -> &PreviewPositionSlot {
+        &self.preview_position
     }
 
     /// Sends [`Command::Shutdown`], waits for the ack and joins the thread.

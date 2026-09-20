@@ -52,6 +52,53 @@ pub fn webm(dir: &Path, name: &str, secs: u32, w: u32, h: u32, fps: u32, keyint:
     run(&pipeline, &dir.join(name))
 }
 
+/// A `frames`-frame VP8 WebM of one flat colour at `path`, `w`×`h` at `fps`,
+/// with `rgb` as `0xRRGGBB`.
+///
+/// `with_audio` adds a **silent** Vorbis track sized to the video, as the
+/// commentary recordings the preview plays natively have: silent so a test
+/// that reaches a real sound card is inaudible, and sized to the video so the
+/// container's duration is the video's.
+///
+/// A flat colour is what the composite tests measure geometry against: every
+/// pixel of a pad's rect is the same value, so a rect's edges are the only
+/// thing the assertions can be reading.
+pub fn solid_video(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fps: u32,
+    frames: u32,
+    rgb: u32,
+    with_audio: bool,
+) -> PathBuf {
+    let audio = if with_audio {
+        assert!(
+            fps > 0 && AUDIO_RATE.is_multiple_of(fps),
+            "fps {fps} must divide {AUDIO_RATE} so the audio matches the video duration"
+        );
+        format!(
+            "audiotestsrc wave=silence num-buffers={frames} samplesperbuffer={} \
+               ! audio/x-raw,rate={AUDIO_RATE},channels=1 \
+               ! audioconvert ! vorbisenc ! queue ! mux. ",
+            AUDIO_RATE / fps
+        )
+    } else {
+        String::new()
+    };
+    run(
+        &format!(
+            "videotestsrc num-buffers={frames} pattern=solid-color \
+               foreground-color=0x{:08x} \
+               ! video/x-raw,format=I420,width={w},height={h},framerate={fps}/1 \
+               ! vp8enc deadline=1 keyframe-max-dist={fps} ! queue ! mux. \
+             {audio}webmmux name=mux ! filesink name=out",
+            0xff00_0000u32 | (rgb & 0x00ff_ffff)
+        ),
+        path,
+    )
+}
+
 /// A one-second 320×180 MJPEG MP4 at `dir/rotated.mp4` whose global tag list
 /// carries `image-orientation=rotate-90`, as a phone writes for portrait
 /// footage.

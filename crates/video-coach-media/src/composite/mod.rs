@@ -210,20 +210,29 @@ fn head(out_w: i32, out_h: i32) -> String {
     )
 }
 
-/// Pushes `buffer` into `appsrc` once it has room, waiting in [`POLL`] steps.
+/// Waits until `appsrc` has room for another buffer, in [`POLL`]/5 steps.
 ///
 /// `block=false` never waits, so the wait is here, where the pipeline's errors
-/// and the cancel flag are seen. `what` names the buffer in a failure.
+/// and the cancel flag are seen. Preview waits on both its appsrcs *before* it
+/// takes the pump's lock, so a seek arriving on another thread never queues
+/// behind the wait.
+fn wait_for_room(appsrc: &gst_app::AppSrc, watch: &Watch) -> Result<(), CompositeError> {
+    while appsrc.current_level_buffers() >= QUEUED {
+        watch.check()?;
+        std::thread::sleep(Duration::from(POLL) / 5);
+    }
+    Ok(())
+}
+
+/// Pushes `buffer` into `appsrc` once it has room. `what` names the buffer in
+/// a failure.
 fn push_buffer(
     appsrc: &gst_app::AppSrc,
     buffer: gst::Buffer,
     what: &str,
     watch: &Watch,
 ) -> Result<(), CompositeError> {
-    while appsrc.current_level_buffers() >= QUEUED {
-        watch.check()?;
-        std::thread::sleep(Duration::from(POLL) / 5);
-    }
+    wait_for_room(appsrc, watch)?;
     appsrc
         .push_buffer(buffer)
         .map_err(|e| watch.failure(format!("pushing {what}: {e:?}")))?;
@@ -235,6 +244,15 @@ fn frame_time(n: u64) -> gst::ClockTime {
     gst::ClockTime::SECOND
         .mul_div_floor(n, u64::from(OUTPUT_FPS))
         .expect("no overflow")
+}
+
+/// The output frame at `t`, to the nearest frame: [`frame_time`] inverted,
+/// which is how a seek's position and a buffer's PTS name a frame.
+fn frame_index(t: gst::ClockTime) -> u64 {
+    t.nseconds()
+        .saturating_mul(u64::from(OUTPUT_FPS))
+        .saturating_add(gst::ClockTime::SECOND.nseconds() / 2)
+        / gst::ClockTime::SECOND.nseconds()
 }
 
 /// Sets each buffer's zoom on `transform` as it arrives, keyed on its PTS, so
@@ -274,12 +292,7 @@ fn install_zoom(transform: &gst::Element, zooms: Vec<Zoom>) {
             else {
                 return gst::PadProbeReturn::Ok;
             };
-            let n = pts
-                .nseconds()
-                .saturating_mul(u64::from(OUTPUT_FPS))
-                .saturating_add(500_000_000)
-                / 1_000_000_000;
-            if let Some(zoom) = zooms.get(n as usize) {
+            if let Some(zoom) = zooms.get(frame_index(pts) as usize) {
                 let (s, tx, ty) = zoom_params(*zoom);
                 transform.set_property("scale-x", s);
                 transform.set_property("scale-y", s);
