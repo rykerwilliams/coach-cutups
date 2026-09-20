@@ -62,7 +62,11 @@ Commit: `feat(app): match event commands and undo`.
    - **Its anchor is the position the readout already computes** — `target_abs` while a seek is outstanding, else `abs_seconds(source_index, last_secs)` — mapped back through `locate()`. Reading `source_index` and `last_secs` separately pairs a new index with an old offset across a cross-source seek. Frozen while previewing.
 3. **A setup sheet** for team names, the back-anchor toggle, the format, and the six colours as **hex text fields** (no picker; Slint 1.18 has none, and a field is what the Mac's inspector effectively was), with the shrink-below-tagged warning.
 4. **Its own branch in `handle-key`** — the sheet is modal, so Esc closes it ahead of the existing cascade and the tag keys don't fire behind it. New fields fold into `text-editing`.
-5. **A screenshot pass** with a scratch project driven through callbacks (no camera, no input injection): the panel with events, and an exported frame's scoreboard.
+5. **Three consequences of Task 3a to honour:**
+   - **`DeleteMatchEvent` is refused while recording** (only tagging is on the allow-list), so the rows' delete buttons must be disabled then, or the click reaches an `eprintln` and nothing happens.
+   - **A role-less row is reachable.** With the back-anchor on, the cap still counts records, so the coach can store one start/stop that `interpret` gives no role to until the anchor is turned off. That is intended — nothing stored is lost — but the row must *look* role-less rather than landing silently.
+   - **`SetScoreboard` is not an undo step** (the sheet has Cancel, and "Done when #6" names only tagging and deleting). Don't wire the sheet to undo.
+6. **A screenshot pass** with a scratch project driven through callbacks (no camera, no input injection): the panel with events, and an exported frame's scoreboard.
 
 Commit: `feat(app): the Match panel and scoreboard setup`.
 
