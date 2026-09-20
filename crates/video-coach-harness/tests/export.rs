@@ -15,13 +15,27 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{Command, Event, ExportRun, RecordingStatus, TargetState, UserError};
+use video_coach_core::layout::scoreboard_rects;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Quality, Resolution};
+use video_coach_core::scoreboard::{MatchEventKind, MatchFormat, ScoreboardConfig, TeamConfig};
 use video_coach_core::store::{self, EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
+use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{add_clips, write_project, Harness};
+use video_coach_media::fixtures;
 
 const FRAME: f64 = 1.0 / 30.0;
+
+/// A team colour as `0xRRGGBB`.
+fn rgb(c: u32) -> Rgba {
+    Rgba {
+        r: f64::from((c >> 16) as u8) / 255.0,
+        g: f64::from((c >> 8) as u8) / 255.0,
+        b: f64::from(c as u8) / 255.0,
+        a: 1.0,
+    }
+}
 
 /// A project called `Game` with a 2-second fixture video and one clip per
 /// entry of `secs`, opened on a fresh bus.
@@ -387,4 +401,49 @@ fn an_export_while_recording_is_dropped() {
         "a dropped run made {:?}",
         rig.exports
     );
+}
+
+/// The `ScoreboardContext` the bus builds from the open project reaches the
+/// export driver, so the board is burned into the file (Phase 9 spec S2).
+/// What it draws, and the clock it reads, are the media crate's tests and
+/// core's; this pins the wiring, which was `None` until the bus filled it in.
+#[test]
+fn an_export_carries_the_projects_scoreboard() {
+    let mut rig = Rig::open_with(&[0.3], |folder, _| {
+        let mut project = store::read(folder).unwrap();
+        project.scoreboard = Some(ScoreboardConfig {
+            home: TeamConfig::new("HOME", rgb(0x00ff00), rgb(0xffffff)),
+            away: TeamConfig::new("AWAY", rgb(0x0000ff), rgb(0xffffff)),
+            format: MatchFormat::default(),
+            auto_back_anchor_p1: false,
+        });
+        // Kick-off at the top of the game video, so every exported frame is
+        // inside the first half and the board has a clock to show.
+        project.append_match_event(MatchEventKind::StartStop, 0, 0.0);
+        store::write(folder, &mut project).unwrap();
+    });
+    rig.export(vec![rig.tag(0)]);
+
+    let done = outcome(&mut rig.h);
+    assert!(
+        matches!(done.targets[0].state, TargetState::Done(_)),
+        "{:?}",
+        done.targets[0]
+    );
+    rig.h.shutdown();
+
+    // `Rig::export` renders at 720p.
+    let rects = scoreboard_rects(1280.0, 720.0);
+    let frames = fixtures::decode_rgb(&rig.exports.join("t0 - Game.mp4"));
+    let frame = frames.last().expect("frames out");
+    for (what, cell, expected) in [
+        ("the home cell", &rects.home, [0x00u8, 0xff, 0x00]),
+        ("the away cell", &rects.away, [0x00u8, 0x00, 0xff]),
+    ] {
+        // A corner of the cell, clear of its centred name.
+        let (x, y) = ((cell.x + 4.0) as usize, (cell.y + cell.h - 4.0) as usize);
+        let actual = frame.at(x, y);
+        let off = (0..3).any(|c| (i32::from(actual[c]) - i32::from(expected[c])).abs() > 40);
+        assert!(!off, "{what} at ({x}, {y}): got {actual:?}");
+    }
 }

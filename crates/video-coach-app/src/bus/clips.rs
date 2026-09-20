@@ -159,10 +159,11 @@ impl Bus {
         }
     }
 
-    /// Applies an edit or a reorder for a redo (`forward`) or an undo, saves
-    /// it, and returns it to be filed. `None` (and nothing saved) for an edit
-    /// of a clip that's gone, which eviction's purge makes unreachable. A
-    /// delete moves a file, so `undo` and `redo` handle it themselves.
+    /// Applies an edit, a reorder or a match-event snapshot for a redo
+    /// (`forward`) or an undo, saves it, and returns it to be filed. `None`
+    /// (and nothing saved) for an edit of a clip that's gone, which eviction's
+    /// purge makes unreachable. A delete moves a file, so `undo` and `redo`
+    /// handle it themselves.
     fn replay(&mut self, action: UndoAction, forward: bool) -> Option<UndoAction> {
         let open = self.open.as_mut()?;
         match &action {
@@ -181,22 +182,29 @@ impl Bus {
                     .apply_clip_order(if forward { after } else { before });
                 self.project_changed();
             }
+            // The whole list either way: a source change purges these, so
+            // neither side can hold an index the project has moved on from.
+            UndoAction::EditMatchEvents { before, after } => {
+                open.project.match_events = if forward { after } else { before }.clone();
+                self.project_changed();
+            }
             UndoAction::DeleteClip(_) => unreachable!("deletes aren't replayed"),
         }
         Some(action)
     }
 
-    /// Evicts every delete on the undo stack and shreds its file, after a
-    /// source change: a trashed clip's `source_index` wasn't remapped, so
-    /// restored it would point at the wrong video (spec C4).
-    pub(super) fn evict_trashed_clips(&mut self) {
-        let evicted = self.history.evict_deletes();
+    /// Drops the history entries a source move or removal invalidated — the
+    /// deletes on the undo stack (spec C4) and the match-event snapshots on
+    /// both (Phase 9 spec S5) — and shreds the trashed recordings that leaves
+    /// unreachable.
+    pub(super) fn purge_history_for_source_change(&mut self) {
+        let evicted = self.history.purge_for_source_change();
         self.shred(evicted);
     }
 
     /// Pushes `action` onto the history and shreds any delete the cap drops.
     /// The one way onto the history.
-    fn record(&mut self, action: UndoAction) {
+    pub(super) fn record(&mut self, action: UndoAction) {
         let dropped = self.history.push(action);
         self.shred(dropped);
     }

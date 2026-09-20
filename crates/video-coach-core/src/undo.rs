@@ -9,8 +9,8 @@
 //! - **Any number of deletes can be undone.** macOS kept at most one delete
 //!   across both stacks and evicted the previous one on every delete. Here a
 //!   delete leaves the history only when the cap drops it or
-//!   [`UndoController::evict_deletes`] removes it, so there is one `push`:
-//!   deletes need no separate entry point.
+//!   [`UndoController::purge_for_source_change`] removes it, so there is one
+//!   `push`: deletes need no separate entry point.
 //! - **Eviction purges the clip's edits.** An evicted clip can never return,
 //!   so its `EditClip` entries could only no-op; macOS kept them, and Ctrl+Z
 //!   silently consumed them.
@@ -24,6 +24,7 @@
 use uuid::Uuid;
 
 use crate::project::Clip;
+use crate::scoreboard::MatchEventRecord;
 
 /// The most actions the undo stack holds. Excess entries drop from the front
 /// (oldest first). The redo stack inherits the bound: it only ever holds what
@@ -55,6 +56,13 @@ pub enum UndoAction {
     DeleteClip(Clip),
     /// Clip id order around a move or a sort.
     ReorderClips { before: Vec<Uuid>, after: Vec<Uuid> },
+    /// The whole match-event list around a tag or a delete (Phase 9 spec S5).
+    /// The list is a handful of records, and snapshotting it keeps undo one
+    /// step per action without a per-event inverse.
+    EditMatchEvents {
+        before: Vec<MatchEventRecord>,
+        after: Vec<MatchEventRecord>,
+    },
 }
 
 /// The undo and redo stacks, newest entry last.
@@ -112,17 +120,27 @@ impl UndoController {
         self.undo.push(action);
     }
 
-    /// Evict every delete on the undo stack and return its clip, whose
-    /// trashed file the caller must shred.
+    /// Drop what a source move or removal invalidates, returning the deleted
+    /// clips whose trashed files the caller must shred.
     ///
-    /// For source changes: a trashed clip's `source_index` isn't remapped, so
-    /// restored later it would point at the wrong video. A delete on the redo
-    /// stack is left alone — that clip is live, was remapped, and is
-    /// re-snapshotted when redone.
+    /// Two kinds of entry hold a `source_index` the permutation didn't reach:
+    ///
+    /// - **every delete on the undo stack** — a trashed clip isn't remapped,
+    ///   so restored later it would point at the wrong video. A delete on the
+    ///   redo stack is left alone: that clip is live, was remapped, and is
+    ///   re-snapshotted when redone;
+    /// - **every match-event snapshot, on either stack** (Phase 9 spec S5) —
+    ///   both sides of one are lists of records, neither of them live, so
+    ///   undoing *or* redoing would restore stale indices.
+    ///
+    /// A source add or relink needs none of this: neither permutes indices.
     #[must_use]
-    pub fn evict_deletes(&mut self) -> Vec<Clip> {
+    pub fn purge_for_source_change(&mut self) -> Vec<Clip> {
+        let stale_events = |a: &UndoAction| matches!(a, UndoAction::EditMatchEvents { .. });
+        self.redo.retain(|a| !stale_events(a));
         let (deletes, kept) = std::mem::take(&mut self.undo)
             .into_iter()
+            .filter(|a| !stale_events(a))
             .partition(|a| matches!(a, UndoAction::DeleteClip(_)));
         self.undo = kept;
         self.evict(deletes)

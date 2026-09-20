@@ -9,6 +9,7 @@
 use uuid::Uuid;
 
 use video_coach_core::project::Clip;
+use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
 use video_coach_core::undo::{ClipEdit, UndoAction, UndoController, STACK_CAP};
 
 fn clip(id: Uuid) -> Clip {
@@ -43,6 +44,19 @@ fn edit_of(id: Uuid) -> UndoAction {
 
 fn edit() -> UndoAction {
     edit_of(Uuid::new_v4())
+}
+
+/// A tag on source `source_index`, as the bus records one.
+fn match_events(source_index: usize) -> UndoAction {
+    UndoAction::EditMatchEvents {
+        before: Vec::new(),
+        after: vec![MatchEventRecord {
+            id: Uuid::new_v4(),
+            kind: MatchEventKind::StartStop,
+            source_index,
+            source_seconds: 1.0,
+        }],
+    }
 }
 
 fn ids(clips: &[Clip]) -> Vec<Uuid> {
@@ -224,10 +238,10 @@ fn a_cap_dropped_delete_is_returned_and_its_edits_purged() {
     assert_eq!(c.undo_stack().len(), STACK_CAP - 1);
 }
 
-/// New: `evict_deletes` returns every delete on the undo stack and purges
-/// their edits from both stacks, keeping everything else in order.
+/// New: `purge_for_source_change` returns every delete on the undo stack and
+/// purges their edits from both stacks, keeping everything else in order.
 #[test]
-fn evict_deletes_purges_their_edits() {
+fn a_source_change_evicts_deletes_and_purges_their_edits() {
     let mut c = UndoController::default();
     let (a, b, live) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let reorder = UndoAction::ReorderClips {
@@ -240,24 +254,42 @@ fn evict_deletes_purges_their_edits() {
     let _ = c.push(edit_of(live));
     let _ = c.push(delete(b));
 
-    let evicted = c.evict_deletes();
+    let evicted = c.purge_for_source_change();
 
     assert_eq!(ids(&evicted), [a, b]);
     assert_eq!(c.undo_stack(), [reorder, edit_of(live)]);
-    assert!(c.evict_deletes().is_empty());
+    assert!(c.purge_for_source_change().is_empty());
 }
 
 /// New: a delete on the redo stack is a live clip (it was restored), so
 /// source changes leave it alone; it is re-snapshotted when redone.
 #[test]
-fn evict_deletes_leaves_a_redo_delete() {
+fn a_source_change_leaves_a_redo_delete() {
     let mut c = UndoController::default();
     let id = Uuid::new_v4();
     let _ = c.push(delete(id));
     undo(&mut c);
 
-    assert!(c.evict_deletes().is_empty());
+    assert!(c.purge_for_source_change().is_empty());
     assert_eq!(c.redo_stack(), [delete(id)]);
+}
+
+/// Phase 9: a match-event snapshot goes from **both** stacks, unlike a
+/// delete. Neither side of one is live, so undoing or redoing it would
+/// restore indices the permutation didn't reach (spec S5).
+#[test]
+fn a_source_change_purges_match_events_from_both_stacks() {
+    let mut c = UndoController::default();
+    let kept = edit();
+    let _ = c.push(kept.clone());
+    let _ = c.push(match_events(1));
+    let _ = c.push(match_events(2));
+    // One of the two goes to the redo stack, the other stays on the undo one.
+    undo(&mut c);
+
+    assert!(c.purge_for_source_change().is_empty());
+    assert_eq!(c.undo_stack(), [kept]);
+    assert!(c.redo_stack().is_empty());
 }
 
 // ------------------------------------------------------------ clear

@@ -14,6 +14,7 @@ mod export;
 mod preview;
 mod project;
 mod recording;
+mod scoreboard;
 mod sources;
 mod state;
 mod transport;
@@ -28,6 +29,7 @@ use gstreamer_gl as gst_gl;
 use uuid::Uuid;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{AspectMismatch, Project, Quality, Resolution, SourceReferenced};
+use video_coach_core::scoreboard::{MatchEventKind, ScoreboardConfig};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
 use video_coach_core::stroke::Stroke;
@@ -83,6 +85,21 @@ pub enum Command {
     JumpToClip(Uuid),
     Undo,
     Redo,
+
+    // Match events (Phase 9 spec S5). Tagging and deleting are undo steps of
+    // their own; the setup is not.
+    /// Tag a goal or a start/stop where the game video is. The position is
+    /// the readout's at the keypress, captured by the caller like `host_ns`
+    /// (never by the bus: queue delay would move where the event landed).
+    TagMatchEvent {
+        kind: MatchEventKind,
+        source_index: usize,
+        source_seconds: f64,
+    },
+    DeleteMatchEvent(Uuid),
+    /// The teams, their colours, the match format and the back-anchor flag,
+    /// from the setup sheet. A team without a name is refused.
+    SetScoreboard(ScoreboardConfig),
 
     // Transport. Positions are concat-timeline seconds unless named `source_`.
     // `host_ns` is `now_ns()` at the input event, captured by the caller
@@ -277,6 +294,10 @@ pub enum UserError {
     /// Preview is refused, or the one running gave up.
     #[error("can't preview: {0}")]
     CantPreview(String),
+    /// A match command is refused out loud (spec S5): a team without a name,
+    /// or a start/stop past the format's last period.
+    #[error("{0}")]
+    Scoreboard(&'static str),
     #[error("{0}")]
     Io(String),
 }
@@ -560,6 +581,10 @@ impl Bus {
                     // field's focus-loss commit arrives after the
                     // `ToggleRecording` that took its focus.
                     | Command::EditClip { .. }
+                    // The coach tags the match while scanning *or* recording
+                    // (spec S4): the three keys are live throughout. Deleting
+                    // and the setup sheet wait, as every other edit does.
+                    | Command::TagMatchEvent { .. }
             )
         {
             return eprintln!("bus: refused while recording: {cmd:?}");
@@ -579,6 +604,13 @@ impl Bus {
             Command::JumpToClip(id) => self.jump_to_clip(id),
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
+            Command::TagMatchEvent {
+                kind,
+                source_index,
+                source_seconds,
+            } => self.tag_match_event(kind, source_index, source_seconds),
+            Command::DeleteMatchEvent(id) => self.delete_match_event(id),
+            Command::SetScoreboard(config) => self.set_scoreboard(config),
             Command::TogglePlay {
                 host_ns,
                 source_secs,

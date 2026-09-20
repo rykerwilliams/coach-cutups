@@ -35,6 +35,7 @@ use video_coach_core::audio::audio_regions;
 use video_coach_core::export::{compilation_schedule, RateWindow, OUTPUT_FPS};
 use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
 use video_coach_media::{EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
@@ -500,8 +501,9 @@ fn job(
         path: exports.join(file_name(label, &open.project.name)),
         resolution,
         quality,
-        // Phase 9 Task 3a builds the context here.
-        scoreboard: None,
+        // Frozen with the project as it is now: the run's own copy of the
+        // events on the concat timeline (spec S2).
+        scoreboard: ScoreboardContext::for_project(&open.project),
     };
     Ok(job)
 }

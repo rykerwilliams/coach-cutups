@@ -14,6 +14,7 @@
 use uuid::Uuid;
 use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::ExportTarget;
+use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store::RECORDINGS_DIRNAME;
 use video_coach_media::{Gl, Origin, Preview, PreviewJob, PreviewMessage, SinkKind};
 
@@ -95,8 +96,7 @@ impl Bus {
             clip: clip.clone(),
             compilation,
             commentary_volume: open.project.preferences.preview_commentary_volume,
-            // Phase 9 Task 3a builds the context here.
-            scoreboard: None,
+            scoreboard: ScoreboardContext::for_project(&open.project),
         };
 
         // Whatever was on screen stops first, and takes its frame with it.
