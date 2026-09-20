@@ -366,6 +366,7 @@ mod tests {
         let path = dir.path().join("out.mp4");
         let frames = (0..60)
             .map(|n| FrameSpec {
+                entry: 0,
                 source_time: f64::from(n) / 30.0,
                 zoom: Zoom::IDENTITY,
             })

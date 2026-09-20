@@ -5,7 +5,8 @@
 
 use uuid::Uuid;
 
-use crate::project::Project;
+use crate::export::{frame_count, OUTPUT_FPS};
+use crate::project::{Clip, Project};
 use crate::timeline::{playback_segments, PlaybackSegment};
 
 /// Which clips an export covers.
@@ -24,17 +25,55 @@ pub enum ExportTarget {
     AllClips,
     /// Only clips carrying this tag.
     Tag(String),
+    /// One clip. A single-clip export is a one-entry compilation rather than a
+    /// path of its own: one plan, one schedule, one progress model, one cancel.
+    Clip(Uuid),
 }
 
 /// One clip's contribution to the output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanEntry {
     pub clip_id: Uuid,
+    /// Index into `Project::source_videos`. Every frame of this entry pulls
+    /// from it, so [`crate::export::FrameSpec`] does not repeat it.
+    pub source_index: usize,
+    /// `<uuid>.mkv`, relative to the project's `recordings/` directory: the
+    /// picture-in-picture's video.
+    pub recording_filename: String,
+    pub show_pip: bool,
     /// Walked play/freeze segments for this clip.
     pub segments: Vec<PlaybackSegment>,
     /// The clip's recording duration, for display. **Not** a timing source —
     /// see `CompilationPlan::total_duration_seconds`.
     pub recording_duration: f64,
+    /// This entry's first output frame.
+    ///
+    /// Entries are quantized to whole output frames: `frames` is the `ceil` of
+    /// this entry's segment total and the next entry starts on the next frame
+    /// boundary. That keeps "record time is output time" exact *inside* every
+    /// entry, at the cost of up to one frame of output per entry.
+    pub start_frame: usize,
+    /// How many output frames this entry gets.
+    pub frames: usize,
+    /// The text bar's line: `"<n> / <total> | <name> | tag1, tag2"`, where
+    /// `<total>` is the target's clip count. An empty part is dropped along
+    /// with its separator, so an unnamed, untagged clip reads `"3 / 7"`.
+    pub text: String,
+}
+
+impl PlanEntry {
+    /// The record time that output frame `frame` shows — the clock for stroke
+    /// replay and the scoreboard.
+    ///
+    /// Derived from the entry and the frame index rather than stored on every
+    /// [`crate::export::FrameSpec`]; `frame` is a global output frame index
+    /// lying inside this entry.
+    pub fn record_time(&self, frame: usize) -> f64 {
+        debug_assert!(frame >= self.start_frame && frame < self.start_frame + self.frames);
+        // In f64 so an out-of-range `frame` is merely wrong, not a wrapped
+        // `usize` the size of the address space.
+        (frame as f64 - self.start_frame as f64) / f64::from(OUTPUT_FPS)
+    }
 }
 
 /// A description of one output video.
@@ -46,11 +85,56 @@ pub struct CompilationPlan {
     /// only when every event's `record_time` lies inside
     /// `[0, recording_duration]`: an out-of-range event advances the record
     /// cursor past the end, the closing emit then produces nothing, and the
-    /// segment sum exceeds the recording duration. Since this value is the
-    /// export-progress denominator, the disagreement would surface as progress
-    /// climbing past 100%. Defining it from segments removes the class.
+    /// segment sum exceeds the recording duration.
+    ///
+    /// **Nothing measures the output with it.** Every denominator, every
+    /// displayed length and every remaining-time estimate comes from
+    /// [`CompilationPlan::total_frames`] instead: per-entry quantization rounds
+    /// each entry up to a whole frame, so the rendered video can be up to one
+    /// frame per entry longer than this. Progress against this value would
+    /// climb past 100%, which is the same failure defining it from segments
+    /// already removed once.
     pub total_duration_seconds: f64,
     pub entries: Vec<PlanEntry>,
+}
+
+impl CompilationPlan {
+    /// Output frames in total — **the** denominator, and the only honest
+    /// output length (see `total_duration_seconds`).
+    pub fn total_frames(&self) -> usize {
+        self.entries.last().map_or(0, |e| e.start_frame + e.frames)
+    }
+}
+
+/// The clips `target` covers, in stored order (Phase 3 spec C3).
+///
+/// One definition of the selection: [`compilation_plan`] builds its entries
+/// from this, and [`crate::export::compilation_schedule`] pairs those entries
+/// back with their clips from it, so the two cannot disagree about which clips
+/// or which order.
+pub(crate) fn selected_clips<'a>(project: &'a Project, target: &ExportTarget) -> Vec<&'a Clip> {
+    project
+        .clips
+        .iter()
+        .filter(|c| match target {
+            ExportTarget::AllClips => true,
+            ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
+            ExportTarget::Clip(id) => c.id == *id,
+        })
+        .collect()
+}
+
+/// The bar's line for the `n`th of `total` clips, empty parts collapsed.
+fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
+    [
+        format!("{n} / {total}"),
+        clip.name.trim().to_string(),
+        clip.tags.join(", "),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" | ")
 }
 
 /// Build a plan for `target`.
@@ -67,16 +151,14 @@ pub struct CompilationPlan {
 /// to cover any in-range position the clip visits at rate 1, so the segment
 /// builder never clamps a forward skip it should not have.
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
-    // The stored order is the order (Phase 3 spec C3).
-    let clips = project.clips.iter().filter(|c| match target {
-        ExportTarget::AllClips => true,
-        ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
-    });
+    let clips = selected_clips(project, target);
+    let count = clips.len();
 
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(count);
     let mut total = 0.0;
+    let mut start_frame = 0;
 
-    for clip in clips {
+    for (i, clip) in clips.into_iter().enumerate() {
         let source_duration = project
             .source_videos
             .get(clip.source_index)
@@ -84,13 +166,24 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
             .unwrap_or(clip.start_source_seconds + clip.recording_duration);
 
         let segments = playback_segments(clip, source_duration);
-        total += segments.iter().map(|s| s.out_duration).sum::<f64>();
+        let entry_seconds: f64 = segments.iter().map(|s| s.out_duration).sum();
+        total += entry_seconds;
+
+        // Quantized per entry, so the next one starts on a frame boundary.
+        let frames = frame_count(entry_seconds);
 
         entries.push(PlanEntry {
             clip_id: clip.id,
+            source_index: clip.source_index,
+            recording_filename: clip.recording_filename.clone(),
+            show_pip: clip.show_pip,
             segments,
             recording_duration: clip.recording_duration,
+            start_frame,
+            frames,
+            text: entry_text(clip, i + 1, count),
         });
+        start_frame += frames;
     }
 
     CompilationPlan {

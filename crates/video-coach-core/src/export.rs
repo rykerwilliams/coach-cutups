@@ -6,8 +6,10 @@
 //! `source_time`", so a repeated `source_time` re-pushes the same buffer. That
 //! one rule covers freezes, 25→30 fps duplication and 60→30 fps drops.
 
-use crate::project::Clip;
-use crate::timeline::{playback_segments, SegmentKind};
+use crate::event::CommentaryEvent;
+use crate::plan::{compilation_plan, selected_clips, CompilationPlan, ExportTarget};
+use crate::project::{Clip, Project};
+use crate::timeline::{playback_segments, PlaybackSegment, SegmentKind};
 use crate::zoom::{zoom_at, Zoom};
 
 /// Output frame rate. Frame `n` sits at `n / OUTPUT_FPS` seconds.
@@ -21,32 +23,91 @@ pub const OUTPUT_FPS: u32 = 30;
 /// count and the segment lookup use the same slack so they can't disagree.
 const FRAME_EPSILON: f64 = 1e-6;
 
+/// How many output frames a span of `seconds` gets.
+///
+/// Frame `n` exists at `t = n/30` for every `t` inside the span, so the count
+/// is `ceil(seconds·30 − ε)`. A segment gets a frame **if and only if it
+/// contains some `n/30`**, so one shorter than a frame interval can still get
+/// one.
+pub(crate) fn frame_count(seconds: f64) -> usize {
+    (seconds * f64::from(OUTPUT_FPS) - FRAME_EPSILON)
+        .ceil()
+        .max(0.0) as usize
+}
+
 /// One output frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameSpec {
+    /// Index into `CompilationPlan::entries` of the clip this frame belongs
+    /// to. The source video and the record time are derived from that entry
+    /// rather than repeated on every frame.
+    pub entry: usize,
     /// Source-video time to show: the pump pushes the last decoded frame at or
     /// before it.
     pub source_time: f64,
     pub zoom: Zoom,
 }
 
+/// Every output frame of one export target, with the plan they came from.
+///
+/// `frames` is flat across entries: frame `n` of the output is `frames[n]`, at
+/// `n/30` seconds. Everything else a frame needs — its source video, its
+/// record time, its picture-in-picture and its text — hangs off
+/// `plan.entries[frames[n].entry]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compilation {
+    pub frames: Vec<FrameSpec>,
+    pub plan: CompilationPlan,
+}
+
+/// Schedule every output frame of `target`.
+///
+/// Built on [`compilation_plan`] rather than walking the clips again, so the
+/// plan's frame counts and the frames actually produced cannot disagree: each
+/// entry emits exactly its `frames`, starting at its `start_frame`.
+pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compilation {
+    let plan = compilation_plan(project, target);
+    let clips = selected_clips(project, target);
+
+    let mut frames = Vec::with_capacity(plan.total_frames());
+    for (i, (entry, clip)) in plan.entries.iter().zip(clips).enumerate() {
+        debug_assert_eq!(entry.clip_id, clip.id, "the plan and the clips diverged");
+        debug_assert_eq!(entry.start_frame, frames.len());
+        walk(&entry.segments, &clip.events, entry.frames, i, &mut frames);
+    }
+
+    Compilation { frames, plan }
+}
+
 /// Every output frame of `clip`, in order.
 ///
-/// Frame `n` exists at `t = n/30` for every `t` inside the segment total, so the
-/// count is `ceil(total·30 − ε)`. A segment gets a frame **if and only if it
-/// contains some `n/30`**, so one shorter than a frame interval can still get
-/// one.
+/// Superseded by [`compilation_schedule`], which covers a single clip as a
+/// one-entry compilation; the media and preview pumps still call this.
+pub fn frame_schedule(clip: &Clip, source_duration: f64) -> Vec<FrameSpec> {
+    let segments = playback_segments(clip, source_duration);
+    let count = frame_count(segments.iter().map(|s| s.out_duration).sum());
+    let mut frames = Vec::with_capacity(count);
+    walk(&segments, &clip.events, count, 0, &mut frames);
+    frames
+}
+
+/// Append `count` frames covering `segments`, tagged with `entry`.
 ///
 /// Play maps `t` 1:1 onto the source from the segment's start; a freeze holds
 /// its anchor, which [`playback_segments`] already caps short of the source
 /// end. Zoom comes from [`zoom_at`], independent of segment boundaries.
-pub fn frame_schedule(clip: &Clip, source_duration: f64) -> Vec<FrameSpec> {
+fn walk(
+    segments: &[PlaybackSegment],
+    events: &[CommentaryEvent],
+    count: usize,
+    entry: usize,
+    out: &mut Vec<FrameSpec>,
+) {
+    if segments.is_empty() {
+        return;
+    }
     let fps = f64::from(OUTPUT_FPS);
-    let segments = playback_segments(clip, source_duration);
-    let total: f64 = segments.iter().map(|s| s.out_duration).sum();
-    let count = (total * fps - FRAME_EPSILON).ceil().max(0.0) as usize;
 
-    let mut frames = Vec::with_capacity(count);
     // Forward walk: output times only increase, so the segment index does too.
     let mut idx = 0;
     let mut out_start = 0.0;
@@ -68,10 +129,10 @@ pub fn frame_schedule(clip: &Clip, source_duration: f64) -> Vec<FrameSpec> {
             SegmentKind::Play => seg.source_start + (t - out_start).max(0.0),
             SegmentKind::Freeze => seg.source_start,
         };
-        frames.push(FrameSpec {
+        out.push(FrameSpec {
+            entry,
             source_time,
-            zoom: zoom_at(&clip.events, t),
+            zoom: zoom_at(events, t),
         });
     }
-    frames
 }

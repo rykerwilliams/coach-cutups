@@ -268,6 +268,7 @@ fn exports_as(source: PathBuf, times: &[f64], expected: &[u32]) {
     let frames = times
         .iter()
         .map(|&source_time| FrameSpec {
+            entry: 0,
             source_time,
             zoom: Zoom::IDENTITY,
         })
@@ -345,6 +346,7 @@ fn a_4_3_source_is_pillarboxed_and_zoomed_as_predicted() {
     let zoom = Zoom::new(2.0, 0.2, -0.2);
     let frames = [Zoom::IDENTITY, zoom, zoom]
         .map(|zoom| FrameSpec {
+            entry: 0,
             source_time: 1.6,
             zoom,
         })
@@ -405,6 +407,7 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     std::fs::write(&path, b"the previous export").unwrap();
     let frames = (0..60)
         .map(|n| FrameSpec {
+            entry: 0,
             source_time: 1.0 + f64::from(n) / 30.0,
             zoom: Zoom::IDENTITY,
         })
