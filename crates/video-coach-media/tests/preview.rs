@@ -20,8 +20,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use uuid::Uuid;
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::frame_schedule;
-use video_coach_core::layout::pip_rect;
+use video_coach_core::layout::{pip_rect, BAR_HEIGHT_RATIO};
 use video_coach_core::project::Clip;
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_media::fixtures::{self, counter_video, read_counter, CounterKind, GrayFrame};
@@ -109,13 +108,16 @@ struct Running {
 impl Running {
     fn start(source: PathBuf, recording: PathBuf, clip: Clip, source_duration: f64) -> Running {
         gst::init().unwrap();
-        let frames = frame_schedule(&clip, source_duration);
-        assert!(!frames.is_empty(), "the clip has no frames to preview");
+        let compilation = fixtures::one_clip(&clip, source_duration);
+        assert!(
+            !compilation.frames.is_empty(),
+            "the clip has no frames to preview"
+        );
         let job = PreviewJob {
             source,
             recording,
             clip,
-            frames,
+            compilation,
             commentary_volume: 0.0,
         };
         let mailbox = FrameMailbox::default();
@@ -250,7 +252,8 @@ impl Picture {
 
 /// The mixer lays the three pads out as `core::layout` says: the source
 /// pillarboxed, the overlay over the *picture* and not the output, and the
-/// PiP as chrome in output space. And the overlay blends premultiplied.
+/// PiP as chrome in output space, above the text bar. And the overlay blends
+/// premultiplied.
 #[test]
 fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
     gst::init().unwrap();
@@ -301,6 +304,19 @@ fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
     // the source blend function left at `src-alpha` the red would be halved
     // twice, to about 64.
     picture.assert_rgb("the translucent stroke", (640, 540), 0x7f197f);
+
+    // And the text bar the export burns in is here too (spec E7): its tint
+    // over the picture is 40% of it, ...
+    let bar_top = (OUT_H as f64 * (1.0 - BAR_HEIGHT_RATIO)) as usize;
+    picture.assert_rgb("the bar's tint", (300, bar_top + 40), 0x000066);
+    picture.assert_rgb("one row above the bar", (300, bar_top - 4), BLUE);
+    // ... with the line `1 / 1 | c` drawn in it. White glyphs are the only
+    // thing in this frame with a red channel that high.
+    let glyphs = (bar_top..OUT_H)
+        .flat_map(|y| (0..300).map(move |x| (x, y)))
+        .filter(|&(x, y)| picture.at(x, y)[0] > 200)
+        .count();
+    assert!(glyphs > 20, "{glyphs} pixels of text in the preview's bar");
 }
 
 /// A seek lands on the frame it asked for, and nothing from before it

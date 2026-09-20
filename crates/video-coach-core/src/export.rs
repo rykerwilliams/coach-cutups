@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 
 use crate::event::CommentaryEvent;
 use crate::plan::{compilation_plan, selected_clips, CompilationPlan, ExportTarget};
-use crate::project::{Clip, Project};
-use crate::timeline::{playback_segments, PlaybackSegment, SegmentKind};
+use crate::project::Project;
+use crate::timeline::{PlaybackSegment, SegmentKind};
 use crate::zoom::{zoom_at, Zoom};
 
 /// Output frame rate. Frame `n` sits at `n / OUTPUT_FPS` seconds.
@@ -136,18 +136,6 @@ pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compila
     }
 
     Compilation { frames, plan }
-}
-
-/// Every output frame of `clip`, in order.
-///
-/// Superseded by [`compilation_schedule`], which covers a single clip as a
-/// one-entry compilation; the media and preview pumps still call this.
-pub fn frame_schedule(clip: &Clip, source_duration: f64) -> Vec<FrameSpec> {
-    let segments = playback_segments(clip, source_duration);
-    let count = frame_count(segments.iter().map(|s| s.out_duration).sum());
-    let mut frames = Vec::with_capacity(count);
-    walk(&segments, &clip.events, count, 0, &mut frames);
-    frames
 }
 
 /// Append `count` frames covering `segments`, tagged with `entry`.

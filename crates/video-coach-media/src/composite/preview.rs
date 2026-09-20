@@ -17,6 +17,11 @@
 //! it plays natively and the mixer aligns the pads by running time. It is also
 //! why the overlay's `record_time` is simply `n/30`.
 //!
+//! **The bar is export's own** (spec E7). Preview runs the clip's one-entry
+//! compilation, so its overlay carries the same text bar the file gets, and
+//! the line reads `1 / 1 | <name> | tags` because the target is that one clip.
+//! What the coach checks here is what the export shows.
+//!
 //! **One pump, both appsrcs, one PTS.** `glvideomixer` waits indefinitely on
 //! every pad, so frame `n`'s overlay goes out with frame `n` or the mixer
 //! starves. For the same reason the PiP pad is requested **only** when
@@ -47,7 +52,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::Clip;
 
@@ -79,8 +84,13 @@ pub struct PreviewJob {
     pub recording: PathBuf,
     /// The clip itself, for its drawings and its `show_pip`.
     pub clip: Clip,
-    /// The clip's frame schedule (`video_coach_core::export::frame_schedule`).
-    pub frames: Vec<FrameSpec>,
+    /// The clip as a **one-entry compilation**
+    /// (`video_coach_core::export::compilation_schedule` on
+    /// `ExportTarget::Clip`): the frames to pump, and the entry whose `text`
+    /// the bar draws — `1 / 1 | <name> | tags`, since the target is this one
+    /// clip (spec E7). One schedule builds preview and export, so the picture
+    /// the coach checks is the picture the file gets.
+    pub compilation: Compilation,
     /// The commentary's volume, the project's `preview_commentary_volume`, in
     /// the volume slider's `0..=1` space.
     pub commentary_volume: f64,
@@ -154,9 +164,9 @@ impl Preview {
         position: PreviewPosition,
         mut on_message: impl FnMut(PreviewMessage) + Send + 'static,
     ) -> Preview {
-        debug_assert!(!job.frames.is_empty(), "a preview needs frames");
+        debug_assert!(!job.compilation.frames.is_empty(), "a preview needs frames");
         let cancel = Arc::new(AtomicBool::new(false));
-        let frames = job.frames.len() as u64;
+        let frames = job.compilation.frames.len() as u64;
         let shared = Arc::new(Shared {
             counters: Counters::default(),
             cursor: Mutex::new(Cursor::default()),
@@ -358,7 +368,7 @@ fn run(
     watch: &Watch,
     on_message: &mut impl FnMut(PreviewMessage),
 ) -> Result<(), CompositeError> {
-    let total = job.frames.len() as u64;
+    let total = job.compilation.frames.len() as u64;
     let mut decoder = Decoder::start(&job.source, gl, watch)?;
     let mut overlays = OverlayRenderer::new();
     let mut composite: Option<Composite> = None;
@@ -391,7 +401,7 @@ fn run(
             continue;
         }
         ended = false;
-        let frame = &job.frames[n as usize];
+        let frame = &job.compilation.frames[n as usize];
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), watch)?;
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
@@ -455,6 +465,9 @@ struct Composite {
     overlay: gst_app::AppSrc,
     /// The picture rect the strokes are mapped into, `(x, y, w, h)`.
     picture: (i32, i32, i32, i32),
+    /// The bar's line, from the compilation's one entry: fixed for the run,
+    /// since the entry is.
+    text: String,
     shared: Arc<Shared>,
 }
 
@@ -571,7 +584,10 @@ impl Composite {
         }
         // One entry, laid out once above rather than per entry, so the
         // schedule here carries only the zoom.
-        install_zoom(&by_name("zoom"), &Schedule::new(job.frames.clone(), 1));
+        install_zoom(
+            &by_name("zoom"),
+            &Schedule::new(job.compilation.frames.clone(), 1),
+        );
 
         let out = by_name("out")
             .downcast::<gst_app::AppSink>()
@@ -625,6 +641,12 @@ impl Composite {
             src,
             overlay,
             picture,
+            text: job
+                .compilation
+                .plan
+                .entries
+                .first()
+                .map_or_else(String::new, |entry| entry.text.clone()),
             shared: shared.clone(),
         })
     }
@@ -647,14 +669,12 @@ impl Composite {
         let base = stamp(sample, n);
         // Record time is output time (see the module docs), so the overlay's
         // moment is the output frame's own, and its stamp the frame's own.
-        // The bar's line is empty until Phase 8's Task 5, which draws
-        // `1 / 1` here.
         let mut overlay = overlays.render(
             &OverlayFrame {
                 clip,
                 record_time: n as f64 / f64::from(OUTPUT_FPS),
                 picture: self.picture,
-                text: "",
+                text: &self.text,
             },
             OUTPUT_WIDTH as u32,
             OUTPUT_HEIGHT as u32,

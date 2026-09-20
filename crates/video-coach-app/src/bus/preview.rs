@@ -12,7 +12,8 @@
 //! preview's.
 
 use uuid::Uuid;
-use video_coach_core::export::frame_schedule;
+use video_coach_core::export::compilation_schedule;
+use video_coach_core::plan::ExportTarget;
 use video_coach_core::store::RECORDINGS_DIRNAME;
 use video_coach_media::{Gl, Origin, Preview, PreviewJob, PreviewMessage, SinkKind};
 
@@ -66,8 +67,10 @@ impl Bus {
         if !recording.exists() {
             return refused("the clip's commentary recording is missing");
         }
-        let frames = frame_schedule(clip, video.duration_seconds);
-        if frames.is_empty() {
+        // The clip as a one-entry compilation: the same schedule export runs,
+        // down to the bar's `1 / 1 | ...` line (spec E1, E7).
+        let compilation = compilation_schedule(&open.project, &ExportTarget::Clip(id));
+        if compilation.frames.is_empty() {
             return refused("the clip has nothing to preview");
         }
         // Which context composites follows the sink, not what has arrived:
@@ -90,7 +93,7 @@ impl Bus {
             source: open.folder.join(&video.relative_path),
             recording,
             clip: clip.clone(),
-            frames,
+            compilation,
             commentary_volume: open.project.preferences.preview_commentary_volume,
         };
 

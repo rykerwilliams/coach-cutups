@@ -20,9 +20,9 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
-use video_coach_core::export::{Compilation, FrameSpec, OUTPUT_FPS};
-use video_coach_core::plan::{CompilationPlan, PlanEntry};
-use video_coach_core::project::Clip;
+use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::plan::{CompilationPlan, ExportTarget, PlanEntry};
+use video_coach_core::project::{Clip, Project, SourceRef};
 
 /// How long a fixture pipeline may run before it is declared hung.
 const TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(30);
@@ -277,6 +277,25 @@ pub fn block_centre(bit: u32) -> (f64, f64) {
         (f64::from(col) + 0.5) / f64::from(COUNTER_COLUMNS),
         (f64::from(row) + 0.5) / f64::from(COUNTER_GRID_ROWS),
     )
+}
+
+/// A one-clip compilation built the way the app builds one: through a project
+/// whose only source video runs `source_duration` seconds.
+///
+/// [`one_entry`] can't stand in here: its frame lists are synthetic, so it
+/// leaves the entry's play/freeze segments empty, and those segments **are**
+/// the game track's audio edit. Its entry's text is the real one too —
+/// `1 / 1 | <name> | tags`, which is what preview's bar draws (spec E7).
+pub fn one_clip(clip: &Clip, source_duration: f64) -> Compilation {
+    let mut project = Project::new("p");
+    project.source_videos.push(SourceRef {
+        relative_path: "src".into(),
+        display_name: "src".into(),
+        duration_seconds: source_duration,
+        display_aspect: 16.0 / 9.0,
+    });
+    project.clips = vec![clip.clone()];
+    compilation_schedule(&project, &ExportTarget::AllClips)
 }
 
 /// A `frames`-frame video at `path`, `w`×`h` at `fps`, whose frame `i` shows
