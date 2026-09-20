@@ -117,6 +117,27 @@ Commit: `feat(app): the export sheet`.
 3. `CLAUDE.md`: the export's audio rules (one pipeline per file, the priming drop, ramps on the emitted timeline, the unbounded audio appsrc) and the layer order.
 4. The hands-on checklist items, in the Task 8 notes.
 
+### Task 8 notes (closeout, 2026-09-20)
+
+**Status: Phase 8 complete** apart from the hands-on checks below.
+
+**Verified end to end** by the review, on a real three-clip compilation across a 16:9@25 and a 4:3@50 source: every frame's counter correct in its own rect, the PiP placed from each recording's probed aspect and absent where `show_pip` is off, the bar text changing only at entry boundaries, audio onsets at −0.9/−0.9/−0.6 ms across an entry join and a mid-source seek, and video and audio durations equal to the millisecond.
+
+**Code review** (`eba03bb`): the PiP filler bug (a `show_pip:false` entry before a `show_pip:true` one killed the export) and its test gap; label de-duplication; the encoder hoisted; `total_duration_seconds` deleted; the overlay branch shared.
+
+**Deferred:** BACKLOG #52 (volume UI), #53 (2160p), #54 (preview game audio), #55 (dmabuf fds leaking per export run).
+
+**Hands-on checklist for the user** (batched with Phases 2–7):
+1. **Export… → All clips** on a project with several tagged clips: one file per target lands in `<project>/exports/`.
+2. **Watch an export:** the zoom, drawings and webcam inset match the clip, and the bar reads `n / total | name | tags`.
+3. **Listen:** the game audio plays only while the clip is playing, the commentary runs throughout, and no clicks at the joins.
+4. **The inset** appears only for clips with "Show webcam in export" ticked. Export a mix of both in one target.
+5. **Quality and resolution:** export the same target at 720p and 1080p, and at Low and High, and compare size and sharpness.
+6. **Progress:** the finish time appears after a few seconds and is roughly right. **Cancel** mid-run leaves the finished files and no `.part`.
+7. **Re-run** the same target: the file is replaced without complaint.
+8. **A long clip name or many tags:** the bar clips with an ellipsis rather than spilling.
+9. **YouTube:** upload one and check it looks right after their re-encode.
+
 ## Deliberately not in this phase
 
 - HEVC, a combined single file, per-clip settings.

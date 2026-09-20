@@ -154,6 +154,12 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The overlay rasterizes at the picture rect,** not the output frame: strokes are normalized to the content rect.
 - **Measured:** 30.005 fps on 1440p HEVC, audio leading the picture by 2–7 ms. Don't measure the rate first-frame-to-last-frame; the mixer flushes its tail late. The UI budget is relative to a scanning control in the same session, not to an idle window.
 
+**Export burns in the overlay and mixes the audio** (Phase 8).
+- **Layers:** the pumped source (zoom, per-entry fit rect), the webcam PiP, then one output-size overlay carrying strokes (mapped into the picture rect), the text bar's background and its glyphs. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
+- **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
+- **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
+- **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not
