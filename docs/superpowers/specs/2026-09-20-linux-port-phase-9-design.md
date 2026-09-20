@@ -35,13 +35,16 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 - **It returns `None`** when no start/stop has been tagged yet, or when the first tagged start is still ahead of `now`. Not being configured is `Option<ScoreboardConfig>` at the caller, and **empty team names are rejected by the command** (S5), so the render path has one guard.
 - Stoppage and half-time are **derived**: past the period's length it is stoppage; past `.end` it is the break, or full time on the last period.
 - **Goals count inside `[first start, last end]`,** the end being infinite unless the interpreted start/stops exactly fill the format, so a part-tagged match still counts late goals.
-- **`ScoreboardContext::state_at(source_index, source_time)`** lives here too, so the one piece of arithmetic in S2 exists once.
+- **`ScoreboardContext::for_project(&Project)`** and **`state_at(source_index, source_time)`** live here too, so the context is assembled and the arithmetic done in one place.
+- **`scoreboard_rects(out_w, out_h) -> ScoreboardRects { bar, accent, home, score, away, clock, tail }`** in `layout.rs`, beside `bar_rect` and `pip_rect`: the phase's fiddliest arithmetic, unit-tested without GStreamer.
 
 **The P1 back-anchor is derived, not stored.** macOS inserted a flagged `(0, 0)` event at index 0, relied on `interpret`'s tie-break, bypassed its own cap, and then added an offset to the *displayed* number — which left the clock reading 50:00 while still counted as running, so stoppage never began. Instead:
-- `ScoreboardConfig` gains `auto_back_anchor_p1: bool`;
-- when set, `interpret` prepends a **derived** start at `p1_end_abs − period_seconds(0)`.
+- `ScoreboardConfig` gains `auto_back_anchor_p1: bool`, set in the setup sheet (it is setup: "my video starts after kick-off");
+- `interpret` **truncates the stored start/stops to the format's capacity first**, then prepends a derived start, so the anchor never costs the coach a slot;
+- that derived start is at `p1_end_abs − period_seconds(0)` once a first end is tagged, and **at absolute 0 before then**, so the clock runs from the start of the footage during the first half and snaps to the right alignment when half-time is tagged. Without the fallback there would be no clock at all through the half the coach most wants one.
+- `interpret` returns `(Option<Uuid>, PeriodRole)`: the derived start has no record.
 
-Then the first period's start is a real start, and stoppage, half-time and full time fall out unchanged. `MatchEventRecord::is_auto_back_anchor` is removed (nothing writes it yet; the format is unshipped v7). macOS's test pinning the old behaviour is **not** ported.
+A back-anchored first period **ends at exactly `period_seconds(0)` and never enters stoppage** — that is what the anchor means, since it defines half-time as 45:00. macOS's version instead read 50:00 while still "running". `MatchEventRecord::is_auto_back_anchor` is removed (nothing writes it yet, serde ignores unknown keys, so the format stays at v7), and macOS's test pinning the old behaviour is **not** ported.
 
 ### S2. Per frame, the drivers pass absolute time
 
@@ -68,16 +71,18 @@ The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes an
 | Accent strip | `0.08 × barH`, **above** the cells, over the home and away columns only |
 | Cells | height `scoreBarH = barH − accentH`, at `top + accentH` |
 | Columns | home `0.30`, score `0.20`, away `0.30`, clock `0.20` |
-| Cell fills | score `#1a1a1a`, clock `#0d0d0d` at 0.95 alpha |
+| Cell fills | home and away `primary_color`, the accent `secondary_color`, score `#1a1a1a`, clock `#0d0d0d` at 0.95 alpha |
 | Fonts | `0.55 × scoreBarH`, bold, in each team's `font_color` |
-| Stoppage tail | its own rect off the clock cell's right edge, `0.45 × scoreBarH`, **not bold** |
+| Stoppage tail | its own rect, gap `0.025 × scoreBarH` off the clock cell, `0.45 × scoreBarH`, **not bold** (macOS used an absolute 2 pt gap) |
 | Team name pad | `0.05 × scoreBarH` (macOS used an absolute 4 pt, which changes meaning with resolution) |
 
 **These are fractions of `scoreBarH`, not `barH`** — the parent spec's table says `barH` and is ~9% too large. Correct both.
 
 - **`DejaVuSans-Bold.ttf` is vendored** beside the regular face, with its licence: four of the five labels are bold.
 - **Team names use a fixed size and ellipsize** (`overlay.rs`'s existing `fit`), rather than macOS's shrink-to-fit with a 6 px floor: at a cell 10.8% of the width, a shrunk long name is illegible anyway.
-- **`draw_text` is generalized** with colour and horizontal alignment; today it hardcodes white and left-aligns. The scoreboard's fitting gets **its own memo slot**, since the existing one is a single slot that the bar's line already uses.
+- **All five labels are centred** in their cells, so `draw_text` is generalized with colour and alignment; today it hardcodes white and left-aligns.
+- **Weight is explicit** (`Attrs::weight`), since both faces load under one family: bold for the four labels, normal for the tail.
+- **The fitting memo becomes a 3-slot array** keyed by `TextSlot { Bar, HomeName, AwayName }`: the scoreboard ellipsizes two names that share a size and width, so a second single slot would still thrash.
 
 ### S4. Entry: three direct keys, and a Match panel
 
@@ -95,11 +100,14 @@ The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes an
 
 ### S5. Commands, undo and storage
 
-- **Commands:** `TagMatchEvent { kind, source_index, source_seconds }` — captured on the UI thread per the bus contract, with the same `last_secs` fallback the readout uses when a position query returns nothing — plus `DeleteMatchEvent(Uuid)`, `SetScoreboard(Option<ScoreboardConfig>)` and `SetAutoBackAnchorP1(bool)`.
+- **Commands:** `TagMatchEvent { kind, source_index, source_seconds }` and `DeleteMatchEvent(Uuid)`, plus `SetScoreboard(ScoreboardConfig)` — which carries the back-anchor flag, so there is no separate toggle command.
+- **The tag's anchor is the position the readout already computes** (`target_abs` when a seek is outstanding, else `abs_seconds(source_index, last_secs)`), mapped back through `locate()`. Reading `source_index` and `last_secs` separately pairs a new index with an old offset across a cross-source seek.
 - **Validation lives at the command,** not in the render path: `SetScoreboard` rejects an empty team name with a message.
-- **One cap rule.** `interpret` truncates to the format's capacity — that must be total regardless. The UI **disables** the start/stop action at the cap and says why. The mutator does **not** silently no-op, as macOS's did: a command that quietly does nothing is worse than one that refuses out loud.
+- **One `append_match_event(kind, …)` mutator,** not three that differ by a constant.
+- **One cap rule.** `interpret` truncates the stored start/stops to the format's capacity — that must be total regardless. The UI **disables** the start/stop action at the cap and says why. The mutator does **not** silently no-op, as macOS's did: a command that quietly does nothing is worse than one that refuses out loud.
 - **Undo:** `UndoAction::EditMatchEvents { before, after }` holding the whole list, as macOS did.
-  - **A source add, move, remove or relink purges `EditMatchEvents` from both undo stacks,** in the same place delete entries are already evicted. The project's events are remapped by those operations, but a snapshot on the stack is not, so undo would otherwise restore events pointing at the wrong source — or resurrect one pointing at a source since removed.
+  - **A source move or remove purges `EditMatchEvents` from both stacks,** where trashed clips are already evicted. Those two permute `source_index`; a snapshot on the stack isn't remapped, so undo would restore events pointing at the wrong source.
+  - **Add and relink don't need the purge:** events store `(source_index, source_seconds)`, and neither operation permutes indices. (The *derived absolute* events are a different matter — never cache those across any source edit, a relink included, since a duration change moves every later offset.)
 - **Match events belong to the project,** as the format already has them: a goal must appear on every clip spanning it, and the clock runs across all sources. Source moves and deletions already remap them, and removing a source an event points at is already refused. **Phase 9 changes none of that.**
 
 ---
