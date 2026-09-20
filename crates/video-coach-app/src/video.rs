@@ -37,8 +37,7 @@ impl FrameStats {
     /// atlases -- hundreds of milliseconds, once, before anything is playing.
     /// It is startup, not a frame time, so it is not one of the samples.
     fn record(&mut self, ms: f64) {
-        if self.frames.is_empty() && !self.warmed {
-            self.warmed = true;
+        if !std::mem::replace(&mut self.warmed, true) {
             return;
         }
         self.frames.push(ms);
@@ -50,14 +49,13 @@ impl FrameStats {
         }
         // No NaN reaches this: every value is an elapsed duration.
         self.frames.sort_by(f64::total_cmp);
-        let last = self.frames.len() - 1;
         let at = |q: usize| self.frames[self.frames.len() * q / 100];
         eprintln!(
             "video: UI frame time over {} frames: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms",
             self.frames.len(),
             at(50),
             at(95),
-            self.frames[last],
+            self.frames.last().copied().unwrap_or_default(),
         );
     }
 }

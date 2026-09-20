@@ -26,7 +26,7 @@ use video_coach_core::project::Clip;
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_media::fixtures::{self, counter_video, read_counter, CounterKind, GrayFrame};
 use video_coach_media::{
-    Frame, FrameMailbox, Gl, Preview, PreviewJob, PreviewMessage, PreviewStats,
+    Frame, FrameMailbox, Gl, Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats,
 };
 
 /// The composite's output size (`composite::preview`), which every pixel
@@ -100,6 +100,9 @@ fn bar(y: f64, color: Rgba) -> CommentaryEvent {
 struct Running {
     preview: Preview,
     mailbox: FrameMailbox,
+    /// Where the preview is, as the bus's readout reads it: the owner holds
+    /// it, as it holds the mailbox.
+    position: PreviewPosition,
     messages: mpsc::Receiver<PreviewMessage>,
 }
 
@@ -116,11 +119,13 @@ impl Running {
             commentary_volume: 0.0,
         };
         let mailbox = FrameMailbox::default();
+        let position = PreviewPosition::default();
         let (tx, messages) = mpsc::channel();
         let preview = Preview::start(
             job,
             Gl::shared().expect("a surfaceless EGL context"),
             mailbox.clone(),
+            position.clone(),
             move |msg| {
                 let _ = tx.send(msg);
             },
@@ -128,7 +133,27 @@ impl Running {
         Running {
             preview,
             mailbox,
+            position,
             messages,
+        }
+    }
+
+    /// The output frame the pump has reached, from [`Running::position`].
+    fn frame(&self) -> f64 {
+        self.position.seconds() * FPS
+    }
+
+    /// Waits until `cond` holds of the pump's frame, failing the test if the
+    /// preview gives up meanwhile. It consumes the messages that arrive
+    /// while it waits, so it doesn't mix with [`Running::play_out`].
+    fn poll_frame(&self, what: &str, cond: impl Fn(f64) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !cond(self.frame()) {
+            if let Ok(PreviewMessage::Failed(e)) = self.messages.try_recv() {
+                panic!("the preview failed waiting for {what}: {e}");
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -331,7 +356,7 @@ fn a_seek_lands_on_the_frame_it_asked_for() {
         "the preview ended holding frame {held}, not one from after the seek"
     );
     // The position reads the end of the clip (spec P3).
-    let position = running.preview.position().seconds();
+    let position = running.position.seconds();
     assert!(
         (position - f64::from(total) / FPS).abs() < 1e-9,
         "the position ended at {position} s"
@@ -345,4 +370,45 @@ fn a_seek_lands_on_the_frame_it_asked_for() {
         counter, last_seek,
         "a seek out of the end landed on {counter}"
     );
+}
+
+/// A seek while the end-of-schedule tail is draining leaves the preview
+/// running: it used to wedge the pump, which waited out its stall timeout for
+/// frames the flush had thrown away and then failed the preview.
+#[test]
+fn a_seek_while_the_tail_drains_keeps_the_preview_running() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let frames = 45;
+    let source = counter_video(
+        &dir.path().join("src.webm"),
+        640,
+        360,
+        30,
+        90,
+        CounterKind::Vp8WebmWithAudio,
+    );
+    let recording = fixtures::solid_video(
+        &dir.path().join("rec.webm"),
+        640,
+        360,
+        30,
+        frames,
+        GREEN,
+        true,
+    );
+    let total = f64::from(frames);
+    let running = Running::start(source, recording, clip(total / FPS, false, Vec::new()), 3.0);
+
+    // The pump has pushed the last frame of the schedule, so it is in the
+    // drain -- or just past it, which the seek must also survive.
+    running.poll_frame("the end of the schedule", |n| n >= total - 1.0);
+    running.preview.seek(0.0);
+    // A drain that finished first paused the preview on its last frame.
+    running.preview.set_playing(true);
+
+    // It picks the schedule up from the seek and composes it again, rather
+    // than failing with "the preview stopped composing frames".
+    running.poll_frame("the seek to take", |n| n < total / 2.0);
+    running.poll_frame("the schedule a second time", |n| n >= total - 1.0);
 }

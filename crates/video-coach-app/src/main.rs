@@ -21,8 +21,7 @@ use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, PreviewPositionSlot,
-    RecordingStatus, Snapshot, UserError,
+    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot, UserError,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{format_hms, sentence};
@@ -32,7 +31,7 @@ use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
-use video_coach_media::{list_devices, now_ns, Devices, PositionHandle, SinkKind};
+use video_coach_media::{list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind};
 
 use pickers::{Pick, Pickers};
 
@@ -905,13 +904,9 @@ fn on_event(w: &AppWindow, event: Event) {
                     .unwrap_or_default()
                     .into(),
             );
+            // The duration alone: `tick` is the one writer of
+            // `total-seconds`, and picks it up from here.
             ui.preview_duration = clip.map(|c| c.recording_duration);
-            let total = match (ui.preview_duration, &ui.snapshot) {
-                (Some(duration), _) => duration,
-                (None, Some(snapshot)) => snapshot.project.total_source_duration(),
-                (None, None) => 0.0,
-            };
-            w.set_total_seconds(total as f32);
         }),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
@@ -957,11 +952,6 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     let first_missing = (0..rows.len()).find(|&i| missing(i));
     w.set_has_project(true);
     w.set_saved_project_name(project.name.as_str().into());
-    // Not while a preview is open: the transport is over the clip then, and
-    // an unrelated save must not snap the scrubber back to the timeline.
-    if UI.with_borrow(|ui| ui.preview_duration.is_none()) {
-        w.set_total_seconds(project.total_source_duration() as f32);
-    }
     w.set_missing_index(first_missing.map_or(-1, |i| i as i32));
     w.set_missing_name(
         first_missing
@@ -1048,7 +1038,7 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
 /// position on the current source. Also the recording's elapsed time (R11),
 /// the notice's expiry, and the drawings' (Phase 6 D5, which reuses this
 /// timer rather than adding one).
-fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPositionSlot) {
+fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
     let content = content_size(w);
     UI.with_borrow_mut(|ui| {
         if let Some(rect) = content {
@@ -1083,11 +1073,11 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPositionSlot)
         let current = if w.get_scrubbing() {
             f64::from(w.get_position_seconds())
         } else {
-            let abs = match (preview.seconds(), ui.target_abs) {
-                (Some(secs), _) => secs,
-                (None, Some(target)) => target,
-                (None, None) if project.source_videos.is_empty() => 0.0,
-                (None, None) => {
+            let abs = match (ui.preview_duration.is_some(), ui.target_abs) {
+                (true, _) => preview.seconds(),
+                (false, Some(target)) => target,
+                (false, None) if project.source_videos.is_empty() => 0.0,
+                (false, None) => {
                     if let Some(secs) = position.query_position() {
                         ui.last_secs = secs;
                     }
@@ -1098,6 +1088,11 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPositionSlot)
             w.set_position_seconds(abs as f32);
             abs
         };
+        // The one writer of both: the transport's scale is the previewed
+        // clip's while a preview is open, and the concat timeline's
+        // otherwise, and the readout and the scrubber never disagree about
+        // which.
+        w.set_total_seconds(total as f32);
         w.set_readout(format!("{} / {}", format_hms(current), format_hms(total)).into());
     });
 }

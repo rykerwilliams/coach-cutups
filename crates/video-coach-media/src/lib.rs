@@ -9,7 +9,7 @@ pub mod composite;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod mailbox;
-pub mod overlay;
+mod overlay;
 pub mod player;
 pub mod probe;
 
@@ -19,9 +19,8 @@ pub use capture::{
 };
 pub use composite::export::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
 pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
-pub use composite::{CompositeError, Gl};
+pub use composite::Gl;
 pub use mailbox::{Frame, FrameMailbox};
-pub use overlay::render_overlay;
 pub use player::{Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer};
 pub use probe::{probe, Probe, ProbeError};
 

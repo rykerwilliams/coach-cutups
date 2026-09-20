@@ -11,12 +11,11 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
-use video_coach_core::zoom::Zoom;
 
 use super::decode::Decoder;
 use super::{
-    fit_rect, frame_time, head, install_zoom, place, push_buffer, CompositeError, Gl, Stopper,
-    Watch, POLL,
+    fit_rect, frame_time, head, install_zoom, place, push_buffer, stamp, CompositeError, Gl,
+    Stopper, Watch, POLL,
 };
 use crate::player::{seconds_to_clock, Diagnostics};
 
@@ -173,8 +172,14 @@ fn export(
         // The first frame's caps shape the encode side: its size, PAR and
         // memory.
         if encoder.is_none() {
-            let zooms = job.frames.iter().map(|f| f.zoom).collect();
-            encoder = Some(Encoder::start(sample, part, zooms, &gl, inject, &watch)?);
+            encoder = Some(Encoder::start(
+                sample,
+                part,
+                &job.frames,
+                &gl,
+                inject,
+                &watch,
+            )?);
         }
         let encoder = encoder.as_ref().expect("started above");
         encoder.push(n as u64, sample, &watch)?;
@@ -222,15 +227,15 @@ struct Encoder {
 impl Encoder {
     /// Builds the graph for frames shaped like `first` (the decoder's),
     /// writing to `part`, and sets it PLAYING. Output frame `n` gets
-    /// `zooms[n]`. Its errors reach `watch`. `inject` is spliced in before the
-    /// encoder (tests).
+    /// `frames[n]`'s zoom. Its errors reach `watch`. `inject` is spliced in
+    /// before the encoder (tests).
     ///
     /// The encoder is the first of [`encoders`] installed. A presence check
     /// only: one that fails at start fails the export (BACKLOG #39).
     fn start(
         first: &gst::Sample,
         part: &Path,
-        zooms: Vec<Zoom>,
+        frames: &[FrameSpec],
         gl: &Gl,
         inject: Option<&str>,
         watch: &Watch,
@@ -280,8 +285,8 @@ impl Encoder {
         // `moov` goes first, in space reserved up front, with no temp file
         // (`faststart` writes the whole `mdat` to `$TMPDIR`, which a crash
         // leaks). The reserve must cover the whole file, so it gets a margin.
-        let duration = frame_time(zooms.len() as u64);
-        install_zoom(&by_name("zoom"), zooms);
+        let duration = frame_time(frames.len() as u64);
+        install_zoom(&by_name("zoom"), frames);
         by_name("mux").set_property(
             "reserved-max-duration",
             (duration + duration / 10 + gst::ClockTime::SECOND).nseconds(),
@@ -306,20 +311,9 @@ impl Encoder {
         self.name
     }
 
-    /// Pushes `sample`'s buffer as output frame `n`. A reference, not a pixel
-    /// copy: the same GL texture may go out many times.
+    /// Pushes `sample`'s buffer as output frame `n`.
     fn push(&self, n: u64, sample: &gst::Sample, watch: &Watch) -> Result<(), ExportError> {
-        let mut out = sample
-            .buffer()
-            .expect("the decoder keeps only samples with a buffer")
-            .copy();
-        {
-            let out = out.get_mut().expect("a fresh copy is writable");
-            out.set_pts(frame_time(n));
-            out.set_dts(gst::ClockTime::NONE);
-            out.set_duration(frame_time(n + 1) - frame_time(n));
-        }
-        push_buffer(&self.appsrc, out, &format!("frame {n}"), watch)
+        push_buffer(&self.appsrc, stamp(sample, n), &format!("frame {n}"), watch)
     }
 
     /// Ends the stream and waits for the muxer to finish the file.
@@ -341,6 +335,8 @@ impl Encoder {
 mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    use video_coach_core::zoom::Zoom;
 
     use super::*;
     use crate::fixtures::{self, CounterKind};

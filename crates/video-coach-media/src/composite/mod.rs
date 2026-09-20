@@ -42,7 +42,7 @@ use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl_egl as gst_gl_egl;
 use gstreamer_video as gst_video;
-use video_coach_core::export::OUTPUT_FPS;
+use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
 use video_coach_core::zoom::Zoom;
 
 use crate::player::answer_need_context;
@@ -246,6 +246,27 @@ fn frame_time(n: u64) -> gst::ClockTime {
         .expect("no overflow")
 }
 
+/// `sample`'s buffer as output frame `n`. A reference, not a pixel copy: a
+/// freeze (and every held source frame) sends the same texture out again.
+fn stamp(sample: &gst::Sample, n: u64) -> gst::Buffer {
+    let mut buffer = sample
+        .buffer()
+        .expect("the decoder keeps only samples with a buffer")
+        .copy();
+    stamp_buffer(&mut buffer, n);
+    buffer
+}
+
+/// The PTS contract both tails push on: output frame `n` is at `n/30` and one
+/// frame long, with no DTS. The overlay takes the source frame's own stamp,
+/// which is what keeps the mixer's pads together.
+fn stamp_buffer(buffer: &mut gst::Buffer, n: u64) {
+    let buffer = buffer.get_mut().expect("a buffer of our own is writable");
+    buffer.set_pts(frame_time(n));
+    buffer.set_dts(gst::ClockTime::NONE);
+    buffer.set_duration(frame_time(n + 1) - frame_time(n));
+}
+
 /// The output frame at `t`, to the nearest frame: [`frame_time`] inverted,
 /// which is how a seek's position and a buffer's PTS name a frame.
 fn frame_index(t: gst::ClockTime) -> u64 {
@@ -263,7 +284,8 @@ fn frame_index(t: gst::ClockTime) -> u64 {
 /// transformation meta, and the mixer draws the transformed quad unclipped:
 /// a zoomed 4:3 source spills into its pillarbox bars (measured). Rendered
 /// into its own source-sized texture, the zoom is clipped to the picture.
-fn install_zoom(transform: &gst::Element, zooms: Vec<Zoom>) {
+fn install_zoom(transform: &gst::Element, frames: &[FrameSpec]) {
+    let zooms: Vec<Zoom> = frames.iter().map(|f| f.zoom).collect();
     transform
         .static_pad("src")
         .expect("gltransformation has a src pad")

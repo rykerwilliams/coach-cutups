@@ -36,7 +36,7 @@ use video_coach_core::stroke_replay::visible_strokes;
 ///
 /// The buffer carries no timestamp: the pump stamps it with the same PTS as
 /// the base frame it belongs to, or the mixer starves.
-pub fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buffer {
+pub(crate) fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buffer {
     // tiny-skia assumes a tightly packed `w * 4` stride, which is what the
     // default allocator gives; the `VideoMeta` states it rather than leaving
     // `glupload` to infer it from the caps.

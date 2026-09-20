@@ -33,12 +33,11 @@ use video_coach_core::stroke::Stroke;
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
-    ExportMessage, Exporter, FrameMailbox, Gl, PositionHandle, PreviewMessage, ProbeError,
-    RecorderMessage, SinkKind, SourcePlayer,
+    ExportMessage, Exporter, FrameMailbox, Gl, PositionHandle, PreviewMessage, PreviewPosition,
+    ProbeError, RecorderMessage, SinkKind, SourcePlayer,
 };
 
 pub use export::ExportStatus;
-pub use preview::PreviewPositionSlot;
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
 
@@ -348,7 +347,10 @@ pub struct Bus {
     /// The one mailbox: the player and the preview both fill it, and the bus
     /// keeps only one of them PLAYING.
     mailbox: FrameMailbox,
-    /// The UI's GL display and context, once they arrive. `None` headless,
+    /// Which sinks the player was built with, and with them which GL context
+    /// a preview may composite on (spec P1).
+    sinks: SinkKind,
+    /// The UI's GL display and context, once they arrive. Never set headless,
     /// where a preview composites on `Gl::shared()` instead (spec P1).
     gl: Option<Gl>,
     state: StateFile,
@@ -381,8 +383,10 @@ pub struct Bus {
     export: Option<Exporter>,
     /// The preview on screen.
     preview: Option<preview::Active>,
-    /// Where it is, for the UI's tick. Filled while one is open.
-    preview_position: PreviewPositionSlot,
+    /// Where the preview is, for the UI's tick: handed to each one started,
+    /// as the mailbox is, so there is no position event of the preview's own
+    /// (spec P3). Meaningless with no preview open.
+    preview_position: PreviewPosition,
     /// The latest preview's generation. Messages from any other are stale.
     preview_generation: u64,
 }
@@ -417,7 +421,7 @@ impl Bus {
         gst::init().expect("GStreamer failed to initialize");
         let (tx, rx) = mpsc::channel();
         let mailbox = FrameMailbox::default();
-        let preview_position = PreviewPositionSlot::default();
+        let preview_position = PreviewPosition::default();
         let player = SourcePlayer::new(sinks, mailbox.clone(), {
             let tx = tx.clone();
             move |msg| {
@@ -432,6 +436,7 @@ impl Bus {
             player,
             position: position.clone(),
             mailbox: mailbox.clone(),
+            sinks,
             gl: None,
             state,
             open: None,
@@ -607,7 +612,7 @@ pub struct BusHandle {
     thread: Option<JoinHandle<()>>,
     mailbox: FrameMailbox,
     position: PositionHandle,
-    preview_position: PreviewPositionSlot,
+    preview_position: PreviewPosition,
 }
 
 impl BusHandle {
@@ -628,8 +633,9 @@ impl BusHandle {
     }
 
     /// Where the preview is, while one is open; the game video's position
-    /// comes from [`BusHandle::position_handle`] otherwise (spec P3).
-    pub fn preview_position(&self) -> &PreviewPositionSlot {
+    /// comes from [`BusHandle::position_handle`] otherwise (spec P3). With
+    /// none open it holds whatever the last one left.
+    pub fn preview_position(&self) -> &PreviewPosition {
         &self.preview_position
     }
 

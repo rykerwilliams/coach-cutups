@@ -223,9 +223,10 @@ impl Harness {
         self.bus.position_handle().query_position()
     }
 
-    /// Seconds into the previewed clip, as the UI's tick reads them, or
-    /// `None` with no preview open (spec P3's one position path).
-    pub fn preview_secs(&self) -> Option<f64> {
+    /// Seconds into the previewed clip, as the UI's tick reads them (spec
+    /// P3's one position path). Meaningless with no preview open: the UI
+    /// reads it only while one is.
+    pub fn preview_secs(&self) -> f64 {
         self.bus.preview_position().seconds()
     }
 

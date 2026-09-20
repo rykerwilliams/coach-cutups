@@ -298,7 +298,10 @@ impl Bus {
     /// Drops the loaded source entirely, so no stale frame stays up: for no
     /// sources, or a current source that is missing.
     pub(super) fn unload(&mut self) {
-        // As in `load`: nothing touches the player under an open preview.
+        // As in `load`: nothing touches the player under an open preview. The
+        // close asks the player for its own frame back, which the unload
+        // below then drops along with the source -- it is the mailbox being
+        // emptied that matters here, not the picture.
         self.close_preview();
         self.reset_skip();
         self.player.unload();

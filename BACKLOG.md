@@ -428,3 +428,16 @@ Each entry: what, why deferred, when to revisit.
   for the VA encoder is the likely cause. Found during Phase 7.
 - **When to revisit:** if CI flakes; mark the recorder tests serial, or give
   them their own encoder instance.
+
+### 51. A video-less recording would hang the preview's pump on a frozen picture
+- **Why deferred:** `composite::wait_for_room` waits without a deadline, which
+  is exactly what makes PAUSED work: the pump stops because the appsrcs stop
+  draining. If a clip's recording had no video stream while `show_pip` is
+  true, the requested PiP pad would never produce and `glvideomixer` would
+  wait on it forever, leaving the pump blocked on a picture that never moves.
+  Not fixed: a deadline in `wait_for_room` would break pause, and the recorder
+  never writes a recording without video — only a corrupt or hand-made file
+  reaches this.
+- **When to revisit:** if a preview is ever seen frozen with the transport
+  still saying it is playing; the fix is to check the recording's streams when
+  the job is built (a probe) and drop `show_pip` when there is no video.

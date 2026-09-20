@@ -50,16 +50,15 @@ use gstreamer_video as gst_video;
 use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::Clip;
-use video_coach_core::zoom::Zoom;
 
 use super::decode::Decoder;
 use super::{
-    display_aspect, fit_rect, frame_index, frame_time, head, install_zoom, place, push_buffer,
-    wait_for_room, CompositeError, Gl, Stopper, Watch, POLL, QUEUED,
+    display_aspect, fit_rect, frame_index, frame_time, head, install_zoom, place, stamp,
+    stamp_buffer, wait_for_room, CompositeError, Gl, Stopper, Watch, POLL, QUEUED,
 };
 use crate::mailbox::FrameMailbox;
+use crate::overlay::render_overlay;
 use crate::player::{fill_mailbox, gain, gl_caps, seconds_to_clock};
-use crate::{now_ns, render_overlay};
 
 /// The preview's output size. Measured (spec P1): of the sizes tried, 720p
 /// gave the best UI frame time by a wide margin, and a bigger composite buys
@@ -106,17 +105,16 @@ pub struct PreviewStats {
     /// Frames the sink reported dropping, from its QoS messages. **Since the
     /// last flush**: the sink restarts its own statistics at every seek.
     pub dropped: u64,
-    /// Their steady-state rate, from the first sample to the last.
-    pub fps: f64,
 }
 
 /// Where a preview is, in output frames — the counter the pump stores and the
 /// UI's 30 Hz tick reads, so a preview needs no position event of its own
-/// (spec P3).
+/// (spec P3). The owner holds it, as it holds the mailbox, and passes it to
+/// each preview it starts.
 ///
-/// It is the frame the pump last pushed, which leads the picture by whatever
-/// is queued (at most [`QUEUED`] frames, 0.13 s), and reaches the schedule's
-/// length when it ends.
+/// It is the frame the pump last pushed (or the one a seek asked for), which
+/// leads the picture by whatever is queued (at most [`QUEUED`] frames,
+/// 0.13 s), and reaches the schedule's length when it ends.
 #[derive(Debug, Clone, Default)]
 pub struct PreviewPosition(Arc<AtomicU64>);
 
@@ -143,7 +141,9 @@ pub struct Preview {
 impl Preview {
     /// Starts previewing `job` into `mailbox`, compositing on `gl` — Slint's
     /// display and context in the app, [`Gl::shared`] with no UI (spec P1:
-    /// "no private GL context" is an app rule, not a test rule).
+    /// "no private GL context" is an app rule, not a test rule). `position`
+    /// is where the pump publishes, for whoever draws the readout; it starts
+    /// again at the top of the clip.
     ///
     /// `on_message` is called on the preview thread. `job` must have frames:
     /// the bus refuses an empty clip.
@@ -151,6 +151,7 @@ impl Preview {
         job: PreviewJob,
         gl: Gl,
         mailbox: FrameMailbox,
+        position: PreviewPosition,
         mut on_message: impl FnMut(PreviewMessage) + Send + 'static,
     ) -> Preview {
         debug_assert!(!job.frames.is_empty(), "a preview needs frames");
@@ -165,8 +166,9 @@ impl Preview {
                 gain: gain(job.commentary_volume),
                 pending_seek: None,
             }),
-            position: PreviewPosition::default(),
+            position,
         });
+        shared.position.store(0);
         let thread = std::thread::Builder::new()
             .name("preview".into())
             .spawn({
@@ -198,11 +200,6 @@ impl Preview {
     /// What the sink has seen so far.
     pub fn stats(&self) -> PreviewStats {
         self.shared.counters.stats()
-    }
-
-    /// Where the preview is, shared with whoever draws the readout.
-    pub fn position(&self) -> PreviewPosition {
-        self.shared.position.clone()
     }
 
     /// Plays or holds the picture, through the pipeline's state: PAUSED stops
@@ -240,6 +237,10 @@ impl Preview {
     pub fn seek(&self, seconds: f64) {
         let frame = ((seconds.max(0.0) * f64::from(OUTPUT_FPS)).round() as u64)
             .min(self.frames.saturating_sub(1));
+        // Where the preview is, from here on: a skip reads it back, and the
+        // readout must not show the frame the seek left behind -- a pipeline
+        // that hasn't taken the seek yet pushes nothing for a while.
+        self.shared.position.store(frame);
         // The lock is held across the seek so it can't cross the graph being
         // published. A seek the graph won't take yet -- before it exists, or
         // before it has prerolled -- is left for the pump to retry, since
@@ -374,7 +375,11 @@ fn run(
                 let composite = composite
                     .as_ref()
                     .ok_or_else(|| CompositeError::Failed("the clip has no frames".into()))?;
-                composite.end(total, watch)?;
+                // A seek during the drain leaves the schedule unfinished, and
+                // the pump picks it up from the top of the loop instead.
+                if !composite.end(total, generation, watch)? {
+                    continue;
+                }
                 shared.position.store(total);
                 on_message(PreviewMessage::Ended);
                 ended = true;
@@ -390,10 +395,7 @@ fn run(
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
-            let zooms = job.frames.iter().map(|f| f.zoom).collect();
-            composite = Some(Composite::start(
-                sample, job, zooms, gl, mailbox, shared, watch,
-            )?);
+            composite = Some(Composite::start(sample, job, gl, mailbox, shared, watch)?);
         }
         let composite = composite.as_ref().expect("started above");
         composite.push(n, generation, sample, &job.clip, watch)?;
@@ -412,19 +414,11 @@ fn run(
 struct Counters {
     composited: AtomicU64,
     dropped: AtomicU64,
-    /// `now_ns()` at the first sample and at the latest, for the rate.
-    first_ns: AtomicU64,
-    last_ns: AtomicU64,
     rendered_since_flush: AtomicU64,
 }
 
 impl Counters {
     fn sample(&self) {
-        let now = now_ns();
-        let _ = self
-            .first_ns
-            .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
-        self.last_ns.store(now, Ordering::SeqCst);
         self.composited.fetch_add(1, Ordering::SeqCst);
         self.rendered_since_flush.fetch_add(1, Ordering::SeqCst);
     }
@@ -443,20 +437,9 @@ impl Counters {
     }
 
     fn stats(&self) -> PreviewStats {
-        let composited = self.composited.load(Ordering::SeqCst);
-        let span = self
-            .last_ns
-            .load(Ordering::SeqCst)
-            .saturating_sub(self.first_ns.load(Ordering::SeqCst));
         PreviewStats {
-            composited,
+            composited: self.composited.load(Ordering::SeqCst),
             dropped: self.dropped.load(Ordering::SeqCst),
-            // The first sample starts the clock, so it is the gaps between
-            // frames that are counted, not the frames.
-            fps: match (composited, span) {
-                (2.., 1..) => (composited - 1) as f64 * 1e9 / span as f64,
-                _ => 0.0,
-            },
         }
     }
 }
@@ -475,15 +458,14 @@ struct Composite {
 
 impl Composite {
     /// Builds the graph for source frames shaped like `first` and starts it in
-    /// the state the owner has asked for. Output frame `n` gets `zooms[n]`.
-    /// Its errors reach `watch`.
+    /// the state the owner has asked for. Output frame `n` gets the zoom of
+    /// `job.frames[n]`. Its errors reach `watch`.
     ///
     /// **Never waits for PLAYING:** the graph can't preroll until the pump
     /// pushes, and the pump is the caller.
     fn start(
         first: &gst::Sample,
         job: &PreviewJob,
-        zooms: Vec<Zoom>,
         gl: &Gl,
         mailbox: &FrameMailbox,
         shared: &Arc<Shared>,
@@ -583,7 +565,7 @@ impl Composite {
         if job.clip.show_pip {
             place_pip(&mix_pad("sink_1"));
         }
-        install_zoom(&by_name("zoom"), zooms);
+        install_zoom(&by_name("zoom"), &job.frames);
 
         let out = by_name("out")
             .downcast::<gst_app::AppSink>()
@@ -655,23 +637,12 @@ impl Composite {
         clip: &Clip,
         watch: &Watch,
     ) -> Result<(), CompositeError> {
-        let (pts, duration) = (frame_time(n), frame_time(n + 1) - frame_time(n));
-        let stamp = |buffer: &mut gst::Buffer| {
-            let buffer = buffer.get_mut().expect("a buffer of our own is writable");
-            buffer.set_pts(pts);
-            buffer.set_dts(gst::ClockTime::NONE);
-            buffer.set_duration(duration);
-        };
-        let mut base = sample
-            .buffer()
-            .expect("the decoder keeps only samples with a buffer")
-            .copy();
-        stamp(&mut base);
+        let base = stamp(sample, n);
         // Record time is output time (see the module docs), so the overlay's
-        // moment is the output frame's own.
+        // moment is the output frame's own, and its stamp the frame's own.
         let (w, h) = self.picture;
         let mut overlay = render_overlay(clip, n as f64 / f64::from(OUTPUT_FPS), w, h);
-        stamp(&mut overlay);
+        stamp_buffer(&mut overlay, n);
 
         // Room for both first, so the cursor's lock is never held across a
         // wait: `seek-data` runs on the seeking thread, which must not queue
@@ -683,8 +654,14 @@ impl Composite {
             // A seek landed while this frame was being prepared. See `Cursor`.
             return Ok(());
         }
-        push_buffer(&self.src, base, &format!("frame {n}"), watch)?;
-        push_buffer(&self.overlay, overlay, &format!("overlay {n}"), watch)?;
+        // Both appsrcs have room, so neither push waits under the lock.
+        let push = |appsrc: &gst_app::AppSrc, buffer: gst::Buffer, what: &str| {
+            appsrc
+                .push_buffer(buffer)
+                .map_err(|e| watch.failure(format!("pushing {what}: {e:?}")))
+        };
+        push(&self.src, base, &format!("frame {n}"))?;
+        push(&self.overlay, overlay, &format!("overlay {n}"))?;
         cursor.frame = n + 1;
         drop(cursor);
         self.shared.position.store(n);
@@ -705,6 +682,8 @@ impl Composite {
     }
 
     /// The schedule is over: flush the tail, then hold the picture there.
+    /// Returns whether it really ended — a seek landing meanwhile takes the
+    /// preview back into the schedule, and nothing of the end applies.
     ///
     /// **Both appsrcs go EOS first,** which is what tells the aggregator those
     /// pads are done rather than merely quiet. Phase 7's Task 2 measured the
@@ -714,25 +693,42 @@ impl Composite {
     /// reproducible on a graph whose latency is zero, where those seven
     /// frames drain in their own 0.23 s either way, so the gain is unverified
     /// and the hands-on pass on real footage is what confirms it.
-    fn end(&self, total: u64, watch: &Watch) -> Result<(), CompositeError> {
+    fn end(&self, total: u64, generation: u64, watch: &Watch) -> Result<bool, CompositeError> {
+        // The frames the mixer owes since the last seek, read with the
+        // generation that says the seek is still the one the caller saw: a
+        // seek landing here would leave the pump owing frames it is no longer
+        // going to push, and the wait below would run out and fail the
+        // preview on a scrub the user is allowed to make.
+        let owed = {
+            let cursor = self.shared.cursor();
+            if cursor.generation != generation {
+                return Ok(false);
+            }
+            total - cursor.resumed.min(total)
+        };
         let _ = self.src.end_of_stream();
         let _ = self.overlay.end_of_stream();
-        // Then wait for the frames the mixer owes since the last seek. PAUSED
-        // stops it where it stands, rather than running on into the
-        // recording's tail (spec P3).
-        let owed = total - self.shared.cursor().resumed.min(total);
-        self.await_end(owed, watch)?;
-        self.pause(watch)
+        // Then wait for those frames. PAUSED stops the mixer where it stands,
+        // rather than running on into the recording's tail (spec P3).
+        if !self.await_end(owed, generation, watch)? {
+            return Ok(false);
+        }
+        self.pause(watch)?;
+        Ok(true)
     }
 
     /// Waits until the sink has accounted for `n` frames since the last
-    /// flush.
-    fn await_end(&self, n: u64, watch: &Watch) -> Result<(), CompositeError> {
+    /// flush. False if a seek landed meanwhile: the frames it flushed are
+    /// never coming, and the schedule is running again.
+    fn await_end(&self, n: u64, generation: u64, watch: &Watch) -> Result<bool, CompositeError> {
         let deadline = Instant::now() + STALL;
         loop {
             watch.check()?;
+            if self.shared.cursor().generation != generation {
+                return Ok(false);
+            }
             if self.shared.counters.since_flush() >= n {
-                return Ok(());
+                return Ok(true);
             }
             if Instant::now() >= deadline {
                 return Err(CompositeError::Failed(
