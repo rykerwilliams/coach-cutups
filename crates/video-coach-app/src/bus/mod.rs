@@ -26,18 +26,19 @@ use std::time::Instant;
 use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use uuid::Uuid;
-use video_coach_core::project::{AspectMismatch, Project, SourceReferenced};
+use video_coach_core::plan::ExportTarget;
+use video_coach_core::project::{AspectMismatch, Project, Quality, Resolution, SourceReferenced};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
 use video_coach_core::stroke::Stroke;
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
-    ExportMessage, Exporter, FrameMailbox, Gl, PositionHandle, PreviewMessage, PreviewPosition,
-    ProbeError, RecorderMessage, SinkKind, SourcePlayer,
+    ExportMessage, FrameMailbox, Gl, PositionHandle, PreviewMessage, PreviewPosition, ProbeError,
+    RecorderMessage, SinkKind, SourcePlayer,
 };
 
-pub use export::ExportStatus;
+pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
 
@@ -143,15 +144,18 @@ pub enum Command {
     /// The project's preferred microphone, likewise.
     SetMic(Option<String>),
 
-    // Export (Phase 5 spec X4).
-    /// Export the clip to an MP4 at `path`, in the background. Refused while
-    /// another export runs; dropped while recording.
-    ExportClip {
-        id: Uuid,
-        path: PathBuf,
+    // Export (Phase 5 spec X4, Phase 8 spec E1).
+    /// Render each target into `<project>/exports/`, one after another, in
+    /// the background. `resolution` and `quality` are the sheet's pickers,
+    /// and become the project's (spec E4). Refused while another run is
+    /// going; dropped while recording.
+    Export {
+        targets: Vec<ExportTarget>,
+        resolution: Resolution,
+        quality: Quality,
     },
     /// Stop the running export, if any. Its outcome still arrives as the
-    /// export's own: a cancel too late to stop it reports `Done`.
+    /// run's own: a cancel too late to stop a target reports it done.
     CancelExport,
 
     // Preview (Phase 7 spec P5).
@@ -210,8 +214,10 @@ pub enum Event {
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
     Level(f64),
-    /// The export's progress, and how it ended.
-    Export(ExportStatus),
+    /// The export run: every target, how far each has got, and the rate.
+    /// Sent as each target's whole percent moves, and last with nothing left
+    /// running.
+    Export(ExportRun),
     /// The clip being previewed, or `None` once the preview closed.
     Preview(Option<Uuid>),
     /// Select this clip: an undo restored or edited it, or a redo edited it.
@@ -379,8 +385,8 @@ pub struct Bus {
     generation: u64,
     /// The clip undo history (Phase 3 spec C1). Cleared on every open.
     history: UndoController,
-    /// The export in progress, until its `Finished` arrives.
-    export: Option<Exporter>,
+    /// The export run in progress, until its last target finishes.
+    export: Option<export::Active>,
     /// The preview on screen.
     preview: Option<preview::Active>,
     /// Where the preview is, for the UI's tick: handed to each one started,
@@ -588,7 +594,11 @@ impl Bus {
             Command::ClearAll { host_ns } => self.log_clear_all(host_ns),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
-            Command::ExportClip { id, path } => self.export_clip(id, path),
+            Command::Export {
+                targets,
+                resolution,
+                quality,
+            } => self.export(targets, resolution, quality),
             Command::CancelExport => self.cancel_export(),
             Command::OpenPreview(id) => self.open_preview(id),
             Command::ClosePreview => self.close_preview(),

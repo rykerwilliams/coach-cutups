@@ -95,8 +95,14 @@ pub struct EntryMedia {
 /// What a running export reports, on its own thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportMessage {
-    /// Whole percent of the frames pushed, sent each time it changes.
-    Progress(u8),
+    /// Output frames pushed so far, sent each time the whole percent of them
+    /// changes.
+    ///
+    /// **Frames, not the percent** (spec E5): the run's estimate divides
+    /// remaining frames by a rate, and a percent of one target can't be added
+    /// across the targets of a compilation run. The percent is only the
+    /// throttle, so a long export doesn't send a message per frame.
+    Progress(usize),
     /// Sent exactly once, last.
     Finished(Result<ExportDone, ExportError>),
 }
@@ -321,10 +327,10 @@ fn export(
             &watch,
         )?;
 
-        let now = ((n + 1) * 100 / total) as u8;
+        let now = (n + 1) * 100 / total;
         if now != percent {
             percent = now;
-            on_message(ExportMessage::Progress(percent));
+            on_message(ExportMessage::Progress(n + 1));
         }
     }
     let encoder = encoder.ok_or_else(|| ExportError::Failed("the target has no frames".into()))?;

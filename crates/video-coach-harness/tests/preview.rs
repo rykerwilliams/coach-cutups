@@ -8,14 +8,16 @@
 //! is an app rule, not a test rule), llvmpipe on CI.
 //!
 //! Layout per test: `<tmp>/config` holds the state file, `<tmp>/project` the
-//! project and its `recordings/`, `<tmp>/media` the fixture game video,
-//! `<tmp>/out` the exports.
+//! project, its `recordings/` and (once one runs) its `exports/`, and
+//! `<tmp>/media` the fixture game video.
 
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 use uuid::Uuid;
-use video_coach_app::bus::{Command, Event, ExportStatus, RecordingStatus, UserError};
+use video_coach_app::bus::{Command, Event, RecordingStatus, UserError};
+use video_coach_core::plan::ExportTarget;
+use video_coach_core::project::{Quality, Resolution};
 use video_coach_core::store;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{clip, write_project, Harness};
@@ -32,7 +34,6 @@ struct Rig {
     h: Harness,
     clip: Uuid,
     folder: PathBuf,
-    out: PathBuf,
     tmp: TempDir,
 }
 
@@ -48,8 +49,7 @@ impl Rig {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("project");
         let media = tmp.path().join("media");
-        let out = tmp.path().join("out");
-        for dir in [&folder, &media, &out] {
+        for dir in [&folder, &media] {
             std::fs::create_dir(dir).unwrap();
         }
         let mut project = write_project(&folder, &media, &[("a.webm", 3)]);
@@ -85,7 +85,6 @@ impl Rig {
             h,
             clip: id,
             folder,
-            out,
             tmp,
         }
     }
@@ -105,10 +104,12 @@ impl Rig {
         self.folder.join(store::RECORDINGS_DIRNAME).join(RECORDING)
     }
 
-    fn export(&self, name: &str) {
-        self.h.send(Command::ExportClip {
-            id: self.clip,
-            path: self.out.join(name),
+    /// Exports the clip as a one-clip target, into the project's `exports/`.
+    fn export(&self) {
+        self.h.send(Command::Export {
+            targets: vec![ExportTarget::Clip(self.clip)],
+            resolution: Resolution::R720,
+            quality: Quality::Low,
         });
     }
 }
@@ -186,7 +187,7 @@ fn a_preview_pauses_the_game_video_and_gives_it_back() {
 fn a_preview_and_an_export_refuse_each_other() {
     let mut rig = Rig::open(2.0);
     rig.previewing();
-    rig.export("first.mp4");
+    rig.export();
     assert_eq!(
         rig.h.wait_for_error(),
         UserError::CantExport("a preview is open; close it first".into())
@@ -194,8 +195,8 @@ fn a_preview_and_an_export_refuse_each_other() {
 
     rig.h.send(Command::ClosePreview);
     assert_eq!(rig.h.wait_preview(), None);
-    rig.export("second.mp4");
-    assert_eq!(rig.h.wait_export(), ExportStatus::Running(0));
+    rig.export();
+    assert!(rig.h.wait_export().is_running());
     rig.preview();
     assert_eq!(
         rig.h.wait_for_error(),

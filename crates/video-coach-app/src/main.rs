@@ -21,11 +21,12 @@ use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, ExportStatus, RecordingStatus, Snapshot, UserError,
+    Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot, TargetState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
+use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
@@ -275,7 +276,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
     wire_devices(window, bus);
     wire_clips(window, bus);
-    wire_export(window, bus, pickers);
+    wire_export(window, bus);
     wire_preview(window, bus);
     // Drag-to-reorder carries the list's name and the dragged row's index,
     // so a source dropped on the clip list (or back) is refused.
@@ -343,41 +344,26 @@ fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
 }
 
-/// Export (Phase 5 X5): the clip menu's "Export video…" asks where, with the
-/// clip's name suggested in the project folder; the transport's Cancel stops
-/// it.
-fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>, pickers: Pickers) {
+/// Export (Phase 8 E1, E6): the clip menu's "Export video…" runs that one
+/// clip as a target, into the project's own `exports/` folder — there is no
+/// save picker any more, since the folder is fixed. The sheet with the rest
+/// of the target list is Task 7; the transport's Cancel stops a run.
+fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_export_clip({
-        let (weak, bus) = (window.as_weak(), bus.clone());
+        let bus = bus.clone();
         move |id| {
-            let (Some(w), Some(id)) = (weak.upgrade(), parse_clip_id(&id)) else {
+            let Some(id) = parse_clip_id(&id) else { return };
+            // The pickers' last values, until the sheet offers them again.
+            let Some((resolution, quality)) = UI.with_borrow(|ui| {
+                let prefs = &ui.snapshot.as_ref()?.project.preferences;
+                Some((prefs.last_export_resolution, prefs.last_export_quality))
+            }) else {
                 return;
             };
-            let suggested = UI.with_borrow(|ui| {
-                let s = ui.snapshot.as_ref()?;
-                let clip = s.project.clips.iter().find(|c| c.id == id)?;
-                Some((s.folder.clone(), export_file_name(&clip.name)))
-            });
-            let Some((folder, file_name)) = suggested else {
-                return;
-            };
-            let (weak, bus) = (weak.clone(), bus.clone());
-            pickers.open(&w, Pick::Export { folder, file_name }, move |mut path| {
-                // The portal adds no extension to a typed name. The picker
-                // confirmed an overwrite of the name as typed, not of this
-                // one, so an existing file is refused.
-                if path.extension().is_none() {
-                    path.set_extension("mp4");
-                    if path.exists() {
-                        if let Some(w) = weak.upgrade() {
-                            let name = path.file_name().unwrap_or_default().to_string_lossy();
-                            let why = format!("{name} already exists");
-                            show_error(&w, &UserError::CantExport(why).to_string());
-                        }
-                        return;
-                    }
-                }
-                bus.borrow().send(Command::ExportClip { id, path });
+            bus.borrow().send(Command::Export {
+                targets: vec![ExportTarget::Clip(id)],
+                resolution,
+                quality,
             });
         }
     });
@@ -403,13 +389,6 @@ fn wire_preview(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let bus = bus.clone();
         move || bus.borrow().send(Command::ClosePreview)
     });
-}
-
-/// `<clip name>.mp4`, with any `/` (which a file name can't hold) replaced.
-fn export_file_name(clip_name: &str) -> String {
-    let name = clip_name.trim();
-    let name = if name.is_empty() { "Untitled" } else { name };
-    format!("{}.mp4", name.replace('/', "-"))
 }
 
 /// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
@@ -859,19 +838,11 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
-        Event::Export(status) => match status {
-            ExportStatus::Running(percent) => w.set_export_progress(percent.into()),
-            ExportStatus::Done(path) => {
-                w.set_export_progress(-1);
-                let name = path.file_name().unwrap_or(path.as_os_str());
-                show_notice(w, format!("Exported to {}", name.to_string_lossy()));
-            }
-            ExportStatus::Cancelled => w.set_export_progress(-1),
-            ExportStatus::Failed(e) => {
-                w.set_export_progress(-1);
-                show_error(w, &format!("export failed: {e}"));
-            }
-        },
+        // The run list is the export sheet's (Phase 8 Task 7). Until then the
+        // transport's inline row shows the whole run as one percentage, and
+        // the last event of a run -- the one with nothing left running --
+        // reports how it went.
+        Event::Export(run) => show_export(w, &run),
         // After the operation's `ProjectChanged`, so the clip is in the
         // project; a tag filter that hides it is cleared, so it's listed too.
         // The window re-renders the inspector when the selection changes.
@@ -931,6 +902,39 @@ fn show_error(w: &AppWindow, text: &str) {
 fn show_notice(w: &AppWindow, text: String) {
     w.set_notice(text.into());
     UI.with_borrow_mut(|ui| ui.notice_until = Some(Instant::now() + NOTICE));
+}
+
+/// The run in the transport's inline row, which Task 7's export sheet
+/// replaces: one percentage over every target's frames, and a word about how
+/// it went once nothing is left running.
+fn show_export(w: &AppWindow, run: &ExportRun) {
+    let total: usize = run.targets.iter().map(|t| t.frames).sum();
+    if run.is_running() {
+        let done = total.saturating_sub(run.remaining_frames());
+        w.set_export_progress((done * 100 / total.max(1)) as i32);
+        return;
+    }
+    w.set_export_progress(-1);
+    // A run stops at nothing: the first failure is what to say, since a run
+    // of one target is still the common case.
+    if let Some(why) = run.targets.iter().find_map(|t| match &t.state {
+        TargetState::Failed(e) => Some(e.clone()),
+        _ => None,
+    }) {
+        return show_error(w, &format!("export failed: {why}"));
+    }
+    let written = run
+        .targets
+        .iter()
+        .filter(|t| matches!(t.state, TargetState::Done(_)))
+        .count();
+    if written > 0 {
+        let plural = if written == 1 { "" } else { "s" };
+        show_notice(
+            w,
+            format!("Exported {written} video{plural} to the project's exports folder"),
+        );
+    }
 }
 
 /// The sidebar, the missing-source card, whether playback is possible and

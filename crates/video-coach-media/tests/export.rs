@@ -20,10 +20,10 @@ use gstreamer_pbutils as pbutils;
 use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect};
-use video_coach_core::plan::{CompilationPlan, ExportTarget, PlanEntry};
-use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::plan::{CompilationPlan, PlanEntry};
+use video_coach_core::project::{Clip, Preferences, Quality, Resolution};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
@@ -66,11 +66,11 @@ fn source(dir: &Path, kind: CounterKind) -> Source {
     Source { path, fps, frames }
 }
 
-/// Runs `job` to its `Finished`, calling `on_progress` for each progress
-/// message on the export thread.
+/// Runs `job` to its `Finished`, calling `on_progress` with the frames pushed
+/// so far for each progress message, on the export thread.
 fn export_with(
     job: ExportJob,
-    mut on_progress: impl FnMut(u8) + Send + 'static,
+    mut on_progress: impl FnMut(usize) + Send + 'static,
     with_exporter: impl FnOnce(&Exporter),
 ) -> Result<ExportDone, ExportError> {
     let frames = job.compilation.frames.len();
@@ -132,23 +132,6 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         resolution: Resolution::R720,
         quality: Quality::Medium,
     }
-}
-
-/// A one-clip compilation built the way the bus builds one, through a project.
-///
-/// [`one_entry`] can't stand in here: its frame lists are synthetic, so it
-/// leaves the entry's play/freeze segments empty, and those segments **are**
-/// the game track's audio edit.
-fn compilation(clip: &Clip, source_duration: f64) -> Compilation {
-    let mut project = Project::new("p");
-    project.source_videos.push(SourceRef {
-        relative_path: "src".into(),
-        display_name: "src".into(),
-        duration_seconds: source_duration,
-        display_aspect: 16.0 / 9.0,
-    });
-    project.clips = vec![clip.clone()];
-    compilation_schedule(&project, &ExportTarget::AllClips)
 }
 
 /// Plays, a freeze, skips forward (near and far) and back, with every anchor
@@ -335,7 +318,7 @@ fn fiducial(kind: CounterKind) {
     let dir = tempfile::tempdir().unwrap();
     let src = source(dir.path(), kind);
     let clip = steered_clip();
-    let compilation = compilation(&clip, f64::from(src.frames) / f64::from(src.fps));
+    let compilation = fixtures::one_clip(&clip, f64::from(src.frames) / f64::from(src.fps));
     assert_eq!(compilation.frames.len(), 87);
     let expected: Vec<u32> = compilation
         .frames
@@ -819,7 +802,7 @@ fn sounded_job(
     source_duration: f64,
     path: PathBuf,
 ) -> ExportJob {
-    let compilation = compilation(&clip, source_duration);
+    let compilation = fixtures::one_clip(&clip, source_duration);
     ExportJob {
         audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
@@ -1043,10 +1026,11 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     let mut stopped = false;
     let result = export_with(
         job(src.path, frames, path.clone()),
-        move |percent| {
-            if percent >= 30 && !stopped {
+        move |frames_done| {
+            // A third of the 60 frames.
+            if frames_done >= 20 && !stopped {
                 stopped = true;
-                let _ = reached_tx.send(percent);
+                let _ = reached_tx.send(frames_done);
                 let _ = go_rx.recv_timeout(TIMEOUT);
             }
         },

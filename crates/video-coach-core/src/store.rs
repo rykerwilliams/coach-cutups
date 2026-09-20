@@ -21,6 +21,10 @@ pub const CURRENT_FORMAT_VERSION: u32 = 7;
 
 pub const PROJECT_FILENAME: &str = "project.json";
 pub const RECORDINGS_DIRNAME: &str = "recordings";
+/// Where exports land (spec E6). Unlike `recordings/` it is **not** created by
+/// [`write`]: a project that has never been exported has no use for an empty
+/// folder, so the export run creates it on demand.
+pub const EXPORTS_DIRNAME: &str = "exports";
 
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {

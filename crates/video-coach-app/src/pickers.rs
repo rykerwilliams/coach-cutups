@@ -19,11 +19,6 @@ pub enum Pick {
     Video {
         title: &'static str,
     },
-    /// Where to save an export: `file_name` in `folder` suggested.
-    Export {
-        folder: PathBuf,
-        file_name: String,
-    },
 }
 
 /// Video extensions offered by default. Both cases: a portal's glob match
@@ -58,15 +53,6 @@ impl Pickers {
                         .add_filter("Video", VIDEO_EXTENSIONS)
                         .add_filter("All files", &["*"])
                         .pick_file()
-                        .await
-                }
-                Pick::Export { folder, file_name } => {
-                    dialog
-                        .set_title("Export Video")
-                        .set_directory(folder)
-                        .set_file_name(file_name)
-                        .add_filter("MP4 video", &["mp4", "MP4"])
-                        .save_file()
                         .await
                 }
             };
