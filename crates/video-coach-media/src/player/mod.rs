@@ -5,8 +5,8 @@
 //! The player is driven from one thread — the bus thread. The sync handler
 //! forwards every GStreamer message through `on_message`; the driving thread
 //! feeds each one back into [`SourcePlayer::handle`], which turns it into
-//! [`PlayerEvent`]s. Only the [`FrameMailbox`] and the [`PositionHandle`] are
-//! shared with other threads.
+//! [`PlayerEvent`]s. Only the [`FrameMailbox`](crate::FrameMailbox) and the
+//! [`PositionHandle`] are shared with other threads.
 //!
 //! **Why a slot.** `ASYNC_DONE` carries no seek seqnum, so the only way to know
 //! which seek finished is to have one in flight. A request made while one is
@@ -29,8 +29,10 @@ use gstreamer::prelude::*;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
 
+pub use sink::SinkKind;
 pub(crate) use sink::{gl_bin, gl_caps};
-pub use sink::{Frame, FrameMailbox, SinkKind};
+
+use crate::mailbox::FrameMailbox;
 
 /// Who asked for a seek. Reported back on completion, displacement and
 /// failure, so the bus can tell a skip's outcome from a scrub's.
@@ -144,12 +146,16 @@ pub struct SourcePlayer {
 
 impl SourcePlayer {
     /// Creates the `playbin3` with the sinks `kind` names, in NULL. Frames
-    /// arrive in [`SourcePlayer::mailbox`].
+    /// arrive in `mailbox`, which the bus owns and shares with the preview.
     ///
     /// `on_message` receives every bus message except GL context requests,
     /// which are answered here. It is called on GStreamer's threads.
-    pub fn new(kind: SinkKind, on_message: impl Fn(gst::Message) + Send + Sync + 'static) -> Self {
-        let video = sink::video_sink(kind);
+    pub fn new(
+        kind: SinkKind,
+        mailbox: FrameMailbox,
+        on_message: impl Fn(gst::Message) + Send + Sync + 'static,
+    ) -> Self {
+        let video = sink::video_sink(kind, mailbox.clone());
         let pipeline = gst::ElementFactory::make("playbin3")
             .property("video-sink", &video.element)
             .property("audio-sink", sink::audio_sink(kind))
@@ -182,7 +188,7 @@ impl SourcePlayer {
             pipeline,
             glupload: video.glupload,
             gl_slot,
-            mailbox: video.mailbox,
+            mailbox,
             flight: Flight::Idle,
             pending: None,
             loaded_uri: None,
@@ -288,12 +294,6 @@ impl SourcePlayer {
             0.0
         };
         self.pipeline.set_property("volume", x.powi(3));
-    }
-
-    /// Where the video sink delivers frames. Clone it to hand to the drawing
-    /// thread.
-    pub fn mailbox(&self) -> &FrameMailbox {
-        &self.mailbox
     }
 
     /// The source time the slot is heading for: the pending request's, else

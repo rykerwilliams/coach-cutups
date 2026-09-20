@@ -7,7 +7,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use super::{ExportError, SharedGl, Stopper, Watch, POLL};
+use super::{CompositeError, Gl, Stopper, Watch, POLL};
 use crate::player::{diagnostics, gl_bin, gl_caps, Diagnostics};
 
 /// A target at most this far ahead of the current frame is reached by
@@ -42,16 +42,12 @@ pub(super) struct Decoder {
 impl Decoder {
     /// Builds the pipeline, prerolls it, and sets it PLAYING. Its errors
     /// reach `watch`.
-    pub(super) fn start(
-        source: &Path,
-        gl: &SharedGl,
-        watch: &Watch,
-    ) -> Result<Decoder, ExportError> {
+    pub(super) fn start(source: &Path, gl: &Gl, watch: &Watch) -> Result<Decoder, CompositeError> {
         let pipeline = gst::Pipeline::new();
         let make = |factory: &str| {
             gst::ElementFactory::make(factory)
                 .build()
-                .map_err(|e| ExportError::Failed(format!("{factory} is missing: {e}")))
+                .map_err(|e| CompositeError::Failed(format!("{factory} is missing: {e}")))
         };
         let filesrc = make("filesrc")?;
         filesrc.set_property("location", source);
@@ -78,7 +74,7 @@ impl Decoder {
             }
         });
         // The appsink reports the end of the stream.
-        gl.install(&pipeline, watch);
+        gl.install(&pipeline, watch, |_| {});
         let pipeline = Stopper(pipeline);
 
         // Preroll first: a seek before the stream is up is dropped.
@@ -91,7 +87,7 @@ impl Decoder {
                 (Ok(_), gst::State::Paused, gst::State::VoidPending) => break,
                 (Err(_), ..) => {
                     watch.check()?;
-                    return Err(ExportError::Failed("could not read the source".into()));
+                    return Err(CompositeError::Failed("could not read the source".into()));
                 }
                 _ => {}
             }
@@ -120,7 +116,7 @@ impl Decoder {
         &mut self,
         target: gst::ClockTime,
         watch: &Watch,
-    ) -> Result<&gst::Sample, ExportError> {
+    ) -> Result<&gst::Sample, CompositeError> {
         // Past the end, the last frame answers every later target.
         let far = self
             .current
@@ -146,7 +142,7 @@ impl Decoder {
         self.current
             .as_ref()
             .map(|c| &c.sample)
-            .ok_or_else(|| ExportError::Failed(format!("the source has no frame at {target}")))
+            .ok_or_else(|| CompositeError::Failed(format!("the source has no frame at {target}")))
     }
 
     pub(super) fn diagnostics(&self) -> Diagnostics {
@@ -158,7 +154,7 @@ impl Decoder {
     /// whose duration ends before `target` although it is the last one
     /// before it (a gap, or VFR), and past the video's end it finds nothing.
     /// The frames held are from before it.
-    fn seek(&mut self, target: gst::ClockTime) -> Result<(), ExportError> {
+    fn seek(&mut self, target: gst::ClockTime) -> Result<(), CompositeError> {
         self.current = None;
         self.next = None;
         self.eos = false;
@@ -167,22 +163,22 @@ impl Decoder {
                 gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE,
                 target,
             )
-            .map_err(|_| ExportError::Failed(format!("the source refused a seek to {target}")))
+            .map_err(|_| CompositeError::Failed(format!("the source refused a seek to {target}")))
     }
 
     /// The next decoded frame, or `None` at the end of the stream. Waits in
     /// [`POLL`] steps, checking `watch` between them.
-    fn pull(&mut self, watch: &Watch) -> Result<Option<Decoded>, ExportError> {
+    fn pull(&mut self, watch: &Watch) -> Result<Option<Decoded>, CompositeError> {
         loop {
             if let Some(sample) = self.appsink.try_pull_sample(POLL) {
                 let pts = sample.buffer().and_then(|b| b.pts()).ok_or_else(|| {
-                    ExportError::Failed("a decoded frame has no timestamp".into())
+                    CompositeError::Failed("a decoded frame has no timestamp".into())
                 })?;
                 let segment = sample
                     .segment()
                     .and_then(|s| s.downcast_ref::<gst::ClockTime>())
                     .ok_or_else(|| {
-                        ExportError::Failed("a decoded frame has no time segment".into())
+                        CompositeError::Failed("a decoded frame has no time segment".into())
                     })?;
                 // Negative only for a frame straddling the segment start,
                 // which then is the first frame: 0 orders it correctly.

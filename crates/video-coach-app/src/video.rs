@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
@@ -17,6 +18,49 @@ use slint::ComponentHandle;
 use video_coach_app::bus::{BusHandle, Command};
 
 use crate::AppWindow;
+
+/// The UI's own frame time, collected while `COACH_FRAME_STATS=1` is set and
+/// printed at teardown. It is the budget the clip preview has to stay inside:
+/// a p95 of 4 ms, against an idle control of about 1.3 ms (Phase 7 "Gates").
+/// A measuring tool, not a log, so it is off unless asked for.
+#[derive(Default)]
+struct FrameStats {
+    /// `BeforeRendering`'s moment, read again at `AfterRendering`.
+    started: Option<Instant>,
+    /// Every frame's milliseconds, bar the first (see [`FrameStats::record`]).
+    frames: Vec<f64>,
+    warmed: bool,
+}
+
+impl FrameStats {
+    /// The window's very first draw compiles Skia's shaders and uploads its
+    /// atlases -- hundreds of milliseconds, once, before anything is playing.
+    /// It is startup, not a frame time, so it is not one of the samples.
+    fn record(&mut self, ms: f64) {
+        if self.frames.is_empty() && !self.warmed {
+            self.warmed = true;
+            return;
+        }
+        self.frames.push(ms);
+    }
+
+    fn report(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        // No NaN reaches this: every value is an elapsed duration.
+        self.frames.sort_by(f64::total_cmp);
+        let last = self.frames.len() - 1;
+        let at = |q: usize| self.frames[self.frames.len() * q / 100];
+        eprintln!(
+            "video: UI frame time over {} frames: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+            self.frames.len(),
+            at(50),
+            at(95),
+            self.frames[last],
+        );
+    }
+}
 
 /// The mapped frame Slint is drawing from. Mapping holds the texture; it stays
 /// mapped until the next frame replaces it.
@@ -35,6 +79,9 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
     let weak = window.as_weak();
     let mut context: Option<gst_gl::GLContext> = None;
     let mut current: Option<MappedFrame> = None;
+    let mut stats = std::env::var_os("COACH_FRAME_STATS")
+        .is_some_and(|v| v == "1")
+        .then(FrameStats::default);
     window
         .window()
         .set_rendering_notifier(move |state, api| match state {
@@ -47,6 +94,9 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
                 });
             }
             slint::RenderingState::BeforeRendering => {
+                if let Some(stats) = &mut stats {
+                    stats.started = Some(Instant::now());
+                }
                 let Some(context) = &context else {
                     return;
                 };
@@ -90,7 +140,19 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
                 }
                 current.replace(mapped);
             }
+            // Everything Skia drew this frame sits between the two, so this
+            // is the whole of the UI's draw, not just taking the frame.
+            slint::RenderingState::AfterRendering => {
+                if let Some(stats) = &mut stats {
+                    if let Some(started) = stats.started.take() {
+                        stats.record(started.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+            }
             slint::RenderingState::RenderingTeardown => {
+                if let Some(stats) = &mut stats {
+                    stats.report();
+                }
                 // GStreamer must stop using the shared context before Slint
                 // destroys it: the bus takes the pipeline to NULL and acks.
                 bus.borrow_mut().shutdown();

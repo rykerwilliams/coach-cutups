@@ -11,6 +11,7 @@
 
 mod clips;
 mod export;
+mod preview;
 mod project;
 mod recording;
 mod sources;
@@ -32,8 +33,8 @@ use video_coach_core::stroke::Stroke;
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
-    ExportMessage, Exporter, FrameMailbox, PositionHandle, ProbeError, RecorderMessage, SinkKind,
-    SourcePlayer,
+    ExportMessage, Exporter, FrameMailbox, Gl, PositionHandle, PreviewMessage, ProbeError,
+    RecorderMessage, SinkKind, SourcePlayer,
 };
 
 pub use export::ExportStatus;
@@ -153,6 +154,14 @@ pub enum Command {
     /// export's own: a cancel too late to stop it reports `Done`.
     CancelExport,
 
+    // Preview (Phase 7 spec P5).
+    /// Show the clip's composite -- its source edited by the coach's plays,
+    /// zoomed as they zoomed, with the webcam inset, the drawings and the
+    /// commentary -- in place of the game video, which pauses.
+    OpenPreview(Uuid),
+    /// Close the preview and go back to the game video.
+    ClosePreview,
+
     // Lifecycle.
     /// The UI's wrapped GL display and context (spec D3). Until it arrives, a
     /// GL-sink player stays in NULL.
@@ -203,6 +212,8 @@ pub enum Event {
     Level(f64),
     /// The export's progress, and how it ended.
     Export(ExportStatus),
+    /// The clip being previewed, or `None` once the preview closed.
+    Preview(Option<Uuid>),
     /// Select this clip: an undo restored or edited it, or a redo edited it.
     /// Always sent after that change's `ProjectChanged`, which drops a
     /// selection whose clip is gone.
@@ -257,6 +268,9 @@ pub enum UserError {
     /// Export is refused: there's nothing (or no way) to export yet.
     #[error("can't export: {0}")]
     CantExport(String),
+    /// Preview is refused, or the one running gave up.
+    #[error("can't preview: {0}")]
+    CantPreview(String),
     #[error("{0}")]
     Io(String),
 }
@@ -310,6 +324,9 @@ enum Input {
     Recorder(u64, RecorderMessage),
     /// From the running exporter: there is only ever one.
     Export(ExportMessage),
+    /// From the preview with this generation. A closed preview's last
+    /// message can still be in the channel.
+    Preview(u64, PreviewMessage),
 }
 
 /// The project the bus has open: folder and document, committed together.
@@ -327,6 +344,12 @@ pub struct Bus {
     tx: mpsc::Sender<Input>,
     player: SourcePlayer,
     position: PositionHandle,
+    /// The one mailbox: the player and the preview both fill it, and the bus
+    /// keeps only one of them PLAYING.
+    mailbox: FrameMailbox,
+    /// The UI's GL display and context, once they arrive. `None` headless,
+    /// where a preview composites on `Gl::shared()` instead (spec P1).
+    gl: Option<Gl>,
     state: StateFile,
     open: Option<Open>,
     /// Index of the latest request's source: the one the player holds, or is
@@ -355,6 +378,10 @@ pub struct Bus {
     history: UndoController,
     /// The export in progress, until its `Finished` arrives.
     export: Option<Exporter>,
+    /// The preview on screen.
+    preview: Option<preview::Active>,
+    /// The latest preview's generation. Messages from any other are stale.
+    preview_generation: u64,
 }
 
 impl Bus {
@@ -386,7 +413,8 @@ impl Bus {
     ) -> BusHandle {
         gst::init().expect("GStreamer failed to initialize");
         let (tx, rx) = mpsc::channel();
-        let player = SourcePlayer::new(sinks, {
+        let mailbox = FrameMailbox::default();
+        let player = SourcePlayer::new(sinks, mailbox.clone(), {
             let tx = tx.clone();
             move |msg| {
                 // Fails only once the bus thread has exited.
@@ -394,12 +422,13 @@ impl Bus {
             }
         });
         let position = player.position_handle();
-        let mailbox = player.mailbox().clone();
         let bus = Bus {
             events,
             tx: tx.clone(),
             player,
             position: position.clone(),
+            mailbox: mailbox.clone(),
+            gl: None,
             state,
             open: None,
             current: 0,
@@ -414,6 +443,8 @@ impl Bus {
             generation: 0,
             history: UndoController::default(),
             export: None,
+            preview: None,
+            preview_generation: 0,
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -455,10 +486,14 @@ impl Bus {
                 }
                 Some(Input::Recorder(generation, msg)) => self.recorder_message(generation, msg),
                 Some(Input::Export(msg)) => self.export_message(msg),
+                Some(Input::Preview(generation, msg)) => self.preview_message(generation, msg),
                 Some(Input::Cmd(Command::Shutdown { ack })) => {
                     // A recording keeps its clip (or is aborted while still
-                    // starting) before anything is torn down.
+                    // starting) before anything is torn down. The preview's
+                    // pipelines use the UI's GL context, so they go to NULL
+                    // before the ack the UI's teardown waits for.
                     self.stop_recording();
+                    self.close_preview();
                     // Dropping the player takes the pipeline to NULL before
                     // the ack, which the UI's GL teardown waits for. An
                     // export is cancelled and joined, its partial file
@@ -544,7 +579,10 @@ impl Bus {
             Command::SetMic(mic) => self.set_mic(mic),
             Command::ExportClip { id, path } => self.export_clip(id, path),
             Command::CancelExport => self.cancel_export(),
+            Command::OpenPreview(id) => self.open_preview(id),
+            Command::ClosePreview => self.close_preview(),
             Command::GlReady { display, context } => {
+                self.gl = Some(Gl::wrapped(display.clone(), context.clone()));
                 let events = self.player.set_gl_context(display, context);
                 self.player_events(events);
             }

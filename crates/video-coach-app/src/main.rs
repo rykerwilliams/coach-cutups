@@ -865,6 +865,9 @@ fn on_event(w: &AppWindow, event: Event) {
             }
             w.set_selected_clip(id.to_string().into());
         }
+        // Nothing in the window reflects a preview yet: the transport, the
+        // indicator and the hidden live stroke layer come with it.
+        Event::Preview(_) => {}
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {

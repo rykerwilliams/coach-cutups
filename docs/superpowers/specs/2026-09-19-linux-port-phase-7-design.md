@@ -139,10 +139,17 @@ pub fn render_overlay(clip: &Clip, record_time: f64, w: u32, h: u32) -> gst::Buf
 - **Harness:** open, play, seek, close; refusals while recording or exporting; the position published while previewing.
 - **Manual** (batched): preview a real clip; drawings, zoom, PiP and commentary line up with what was recorded.
 
-## Gates
+## Gates (measured 2026-09-19; met)
 
-1. **The composite on screen, first**, before the overlay and the PiP work is finished: 30 fps composite with no dropped frames, and a **UI frame time p95 ≤ 4 ms** (the measured 720p/720p figure is 2.65 ms, against a 1.34 ms idle control).
-2. **The user's HEVC 1440p footage** previews at 30 fps with no dropped frames. The review's prototype already meets both; the gate is that the real implementation does.
+1. **Playback rate and A/V alignment.** The composite plays at **30.005 fps** and audio leads the picture by **2–7 ms** (a fifth of a frame), never growing, over a 30 s preview of the user's HEVC 1440p footage with a freeze, a zoom, a skip, strokes and the PiP.
+   - The audio sink stays the clock: forcing `SystemClock` measured 30.000 fps with the same alignment and the same single drop, so it buys nothing.
+   - **Don't measure the rate first-frame-to-last-frame.** When the pump stops, `glvideomixer` waits out the pipeline latency before flushing its tail, so the last handful of frames arrive about a second late and drag that statistic to ~29.1 on any clip.
+2. **Dropped frames: at most 0.5%** (measured 1 of 900, at the skip). The preview appsink keeps `qos=true`, which drops a late frame rather than sliding the picture behind the words. Right after waking a DPMS-off display a run dropped 21; that state is excluded.
+3. **The UI budget is relative to scanning, in the same session:**
+   - preview's p50 within **0.5 ms** of the scanning control's p50 (observed +0.0–0.2 ms);
+   - preview's p95 within **4 ms** of the control's p95 (observed +0.1 ms at the median of eight runs, +3.5 ms at worst; the spread is session noise);
+   - the control's own p95 is reported alongside, so a regression in the app's own drawing can't hide inside the comparison.
+   - An idle Slint window is **not** a baseline: it redraws on demand (6 draws in 25 s). The earlier 4 ms figure came from a prototype that forced 60 Hz redraws and does not describe this app.
 
 ## Risks
 

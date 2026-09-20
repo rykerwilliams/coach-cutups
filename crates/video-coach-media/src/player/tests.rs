@@ -31,10 +31,10 @@ impl Rig {
     fn new() -> Self {
         gst::init().unwrap();
         let (tx, rx) = mpsc::channel();
-        let player = SourcePlayer::new(SinkKind::System, move |m| {
+        let mailbox = FrameMailbox::default();
+        let player = SourcePlayer::new(SinkKind::System, mailbox.clone(), move |m| {
             let _ = tx.send(m);
         });
-        let mailbox = player.mailbox().clone();
         Rig {
             player,
             mailbox,
@@ -536,7 +536,7 @@ fn a_gl_sink_holds_the_pipeline_in_null_until_the_context_arrives() {
         eprintln!("skipped: glupload is not installed (gstreamer1.0-gl)");
         return;
     }
-    let mut player = SourcePlayer::new(SinkKind::Gl, |_| {});
+    let mut player = SourcePlayer::new(SinkKind::Gl, FrameMailbox::default(), |_| {});
     let dir = tempfile::tempdir().unwrap();
     let a = uri(&fixtures::webm(dir.path(), "a.webm", 1, 320, 180, 30, 15));
 

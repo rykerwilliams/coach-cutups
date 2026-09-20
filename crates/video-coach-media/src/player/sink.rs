@@ -1,13 +1,16 @@
-//! The injected video sink and the frame mailbox it fills (spec D1, D3).
+//! The injected video sink, which fills the bus's [`FrameMailbox`]
+//! (spec D1, D3).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
+
+use crate::mailbox::{Frame, FrameMailbox};
 
 /// Which sinks a [`SourcePlayer`](super::SourcePlayer) builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,73 +26,19 @@ pub enum SinkKind {
     System,
 }
 
-/// One decoded frame: the buffer and the negotiated `VideoInfo` it is laid out
-/// by, which carries the pixel aspect ratio.
-///
-/// For [`SinkKind::Gl`] the buffer is GL memory carrying a `GLSyncMeta` whose
-/// sync point is already set; wait on it before sampling the texture.
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub buffer: gst::Buffer,
-    pub info: gst_video::VideoInfo,
-}
-
-type Redraw = Arc<dyn Fn() + Send + Sync>;
-
-#[derive(Default)]
-struct MailboxInner {
-    frame: Mutex<Option<Frame>>,
-    redraw: Mutex<Option<Redraw>>,
-}
-
-/// Single-slot, latest-wins handoff from the appsink's streaming thread to
-/// whoever draws. Every `new_sample` fills it. A preroll fills it only when it
-/// is the first frame since a flush or a new stream (a seek or a load), so a
-/// frame reached by a seek while paused arrives too. A pause's preroll is the
-/// *next* frame while the position stays on the displayed one, so it is not
-/// shown (spec R10). Cheap to clone; clones share the slot.
-#[derive(Clone, Default)]
-pub struct FrameMailbox {
-    inner: Arc<MailboxInner>,
-}
-
-impl FrameMailbox {
-    /// Takes the newest frame, leaving the slot empty.
-    pub fn take(&self) -> Option<Frame> {
-        self.inner.frame.lock().unwrap().take()
-    }
-
-    /// Called on the streaming thread after every new frame, e.g. to request
-    /// a redraw. Replaces any earlier callback.
-    pub fn set_redraw(&self, redraw: impl Fn() + Send + Sync + 'static) {
-        *self.inner.redraw.lock().unwrap() = Some(Arc::new(redraw));
-    }
-
-    fn put(&self, frame: Frame) {
-        *self.inner.frame.lock().unwrap() = Some(frame);
-        // Cloned out so the callback never runs under the lock.
-        let redraw = self.inner.redraw.lock().unwrap().clone();
-        if let Some(redraw) = redraw {
-            redraw();
-        }
-    }
-}
-
 /// A built video sink and the handles the player keeps into it.
 pub(super) struct VideoSink {
     pub element: gst::Element,
-    pub mailbox: FrameMailbox,
     /// `glupload` inside a [`SinkKind::Gl`] sink; `None` for
     /// [`SinkKind::System`].
     pub glupload: Option<gst::Element>,
 }
 
-/// Builds the video sink for `kind`, and the mailbox it delivers frames to.
+/// Builds the video sink for `kind`, delivering into `mailbox`.
 ///
 /// Every sample is pulled, so the sink always reaches EOS (an appsink whose
 /// samples are never pulled never posts it).
-pub(super) fn video_sink(kind: SinkKind) -> VideoSink {
-    let mailbox = FrameMailbox::default();
+pub(super) fn video_sink(kind: SinkKind, mailbox: FrameMailbox) -> VideoSink {
     let appsink = gst_app::AppSink::builder()
         .caps(&match kind {
             SinkKind::Gl => gl_caps(),
@@ -100,19 +49,17 @@ pub(super) fn video_sink(kind: SinkKind) -> VideoSink {
         .enable_last_sample(false)
         .max_buffers(1u32)
         .build();
-    install_callbacks(&appsink, mailbox.clone());
+    install_callbacks(&appsink, mailbox);
 
     match kind {
         SinkKind::System => VideoSink {
             element: appsink.upcast(),
-            mailbox,
             glupload: None,
         },
         SinkKind::Gl => {
             let (element, glupload) = gl_bin(&appsink);
             VideoSink {
                 element,
-                mailbox,
                 glupload: Some(glupload),
             }
         }
@@ -162,25 +109,7 @@ pub(crate) fn gl_bin(appsink: &gst_app::AppSink) -> (gst::Element, gst::Element)
 
 fn install_callbacks(appsink: &gst_app::AppSink, mailbox: FrameMailbox) {
     let deliver = move |sample: gst::Sample| -> Result<gst::FlowSuccess, gst::FlowError> {
-        let mut buffer = sample.buffer_owned().ok_or(gst::FlowError::Error)?;
-        let info = sample
-            .caps()
-            .and_then(|caps| gst_video::VideoInfo::from_caps(caps).ok())
-            .ok_or(gst::FlowError::NotNegotiated)?;
-        // GL memory: set a sync point so the drawing context can wait for
-        // `glcolorconvert` to finish. System memory needs nothing.
-        let gl_context = buffer
-            .peek_memory(0)
-            .downcast_memory_ref::<gst_gl::GLBaseMemory>()
-            .map(|m| m.context().clone());
-        if let Some(context) = gl_context {
-            if let Some(meta) = buffer.meta::<gst_gl::GLSyncMeta>() {
-                meta.set_sync_point(&context);
-            } else {
-                gst_gl::GLSyncMeta::add(buffer.make_mut(), &context).set_sync_point(&context);
-            }
-        }
-        mailbox.put(Frame { buffer, info });
+        mailbox.put(Frame::from_sample(sample)?);
         Ok(gst::FlowSuccess::Ok)
     };
     let deliver = Arc::new(deliver);
