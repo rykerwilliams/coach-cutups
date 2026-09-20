@@ -9,11 +9,12 @@
 //! but it does hold source indices, so a source move or removal purges it from
 //! both stacks (`clips::purge_history_for_source_change`).
 //!
-//! **The cap lives here, not in core's mutator.** A start/stop past the
-//! format's last period gets no role from `interpret`, so it would be a record
-//! the scoreboard ignores; the Match panel disables the action there, and this
-//! refuses out loud if it is reached anyway. macOS's mutator silently did
-//! nothing instead, which is worse than a refusal.
+//! **The refusal at the cap lives here, not in core's mutator.** A start/stop
+//! past the format's last period gets no role from `interpret`, so it would be
+//! a record the scoreboard ignores; the Match panel disables the action there
+//! (on core's `Project::start_stops_at_cap`, the one rule), and this refuses
+//! out loud if it is reached anyway. macOS's mutator silently did nothing
+//! instead, which is worse than a refusal.
 
 use uuid::Uuid;
 use video_coach_core::project::Project;
@@ -36,21 +37,9 @@ impl Bus {
         if source_index >= open.project.source_videos.len() {
             return eprintln!("bus: TagMatchEvent on source {source_index}, which isn't there");
         }
-        // The cap counts *records*: a back-anchored first period's start is
-        // derived, not stored, so it never takes one of these places. With no
-        // scoreboard set up there is no format to cap against, and `interpret`
-        // truncates whatever is stored once there is one.
-        let at_cap = kind == MatchEventKind::StartStop
-            && open.project.scoreboard.as_ref().is_some_and(|scoreboard| {
-                let tagged = open
-                    .project
-                    .match_events
-                    .iter()
-                    .filter(|m| m.kind == MatchEventKind::StartStop)
-                    .count();
-                tagged >= scoreboard.format.expected_start_stop_events()
-            });
-        if at_cap {
+        // `Project::start_stops_at_cap` is the one cap rule, shared with the
+        // Match panel, which disables the action on it.
+        if kind == MatchEventKind::StartStop && open.project.start_stops_at_cap() {
             return self.emit(Event::Error(UserError::Scoreboard(
                 "every period of this match format is already tagged; \
                  change the format to tag more",

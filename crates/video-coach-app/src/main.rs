@@ -26,9 +26,13 @@ use video_coach_app::bus::{
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
+use video_coach_app::match_panel::{self, parse_count, parse_hex};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::scoreboard::{
+    MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
+};
 use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
@@ -90,6 +94,10 @@ struct UiState {
     /// The window holds the labels and the ticks; the targets are here, since
     /// it has no type for one.
     export_targets: Vec<ExportTarget>,
+    /// The scoreboard the Match panel's clock is read from (Phase 9 S2).
+    /// Rebuilt on every project change and **never carried across one**: a
+    /// source add, move, remove or relink moves the offsets it froze.
+    scoreboard: Option<ScoreboardContext>,
 }
 
 impl Default for UiState {
@@ -108,6 +116,7 @@ impl Default for UiState {
             notice_until: None,
             preview_duration: None,
             export_targets: Vec::new(),
+            scoreboard: None,
         }
     }
 }
@@ -284,6 +293,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     wire_clips(window, bus);
     wire_export(window, bus);
     wire_preview(window, bus);
+    wire_match(window, bus);
     // Drag-to-reorder carries the list's name and the dragged row's index,
     // so a source dropped on the clip list (or back) is refused.
     window.on_drag_payload(|list, index| {
@@ -309,7 +319,7 @@ fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let by_id = |bus: &Rc<RefCell<BusHandle>>, command: fn(Uuid) -> Command| {
         let bus = bus.clone();
         move |id: SharedString| {
-            if let Some(id) = parse_clip_id(&id) {
+            if let Some(id) = parse_id(&id) {
                 bus.borrow().send(command(id));
             }
         }
@@ -368,7 +378,7 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_export_clip({
         let weak = window.as_weak();
         move |id| {
-            let (Some(w), Some(id)) = (weak.upgrade(), parse_clip_id(&id)) else {
+            let (Some(w), Some(id)) = (weak.upgrade(), parse_id(&id)) else {
                 return;
             };
             // This clip was asked for, so it is the only thing ticked.
@@ -478,7 +488,7 @@ fn wire_preview(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_open_preview({
         let bus = bus.clone();
         move |id| {
-            if let Some(id) = parse_clip_id(&id) {
+            if let Some(id) = parse_id(&id) {
                 bus.borrow().send(Command::OpenPreview(id));
             }
         }
@@ -487,6 +497,199 @@ fn wire_preview(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let bus = bus.clone();
         move || bus.borrow().send(Command::ClosePreview)
     });
+}
+
+/// The Match panel and the three tag keys (Phase 9 S4). Tagging, deleting and
+/// the setup all go through the bus; the panel renders what comes back.
+fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_tag_match_event({
+        let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
+        move |tag| {
+            // Captured here, at the input event, as the bus contract
+            // requires, and mapped back through `locate`: reading the index
+            // and the offset separately would pair a new source with the old
+            // one's offset across a cross-source seek (spec S5).
+            let Some((source_index, source_seconds)) = UI.with_borrow_mut(|ui| {
+                let project = ui.snapshot.as_ref()?.project.clone();
+                let abs = scan_abs(ui, &project, &position);
+                (!project.source_videos.is_empty()).then(|| project.locate(abs))
+            }) else {
+                return;
+            };
+            bus.borrow().send(Command::TagMatchEvent {
+                kind: match tag {
+                    MatchTag::HomeGoal => MatchEventKind::HomeGoal,
+                    MatchTag::AwayGoal => MatchEventKind::AwayGoal,
+                    MatchTag::StartStop => MatchEventKind::StartStop,
+                },
+                source_index,
+                source_seconds,
+            });
+        }
+    });
+    // One frame-accurate seek, the same one a scrub release makes.
+    window.on_seek_match_event({
+        let bus = bus.clone();
+        move |id| {
+            let Some(abs) = parse_id(&id).and_then(|id| {
+                UI.with_borrow(|ui| {
+                    let project = &ui.snapshot.as_ref()?.project;
+                    let event = project.match_events.iter().find(|m| m.id == id)?;
+                    Some(project.abs_seconds(event.source_index, event.source_seconds))
+                })
+            }) else {
+                return;
+            };
+            bus.borrow().send(Command::ScrubRelease { abs });
+        }
+    });
+    window.on_delete_match_event({
+        let bus = bus.clone();
+        move |id| {
+            if let Some(id) = parse_id(&id) {
+                bus.borrow().send(Command::DeleteMatchEvent(id));
+            }
+        }
+    });
+    window.on_open_match_setup({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                open_match_setup(&w);
+            }
+        }
+    });
+    window.on_save_match_setup({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            // Save is disabled while a field doesn't parse, so this is a UI
+            // bug rather than something the coach did.
+            match match_setup(&w) {
+                Some(config) => bus.borrow().send(Command::SetScoreboard(config)),
+                None => show_error(&w, "that match setup couldn't be read"),
+            }
+        }
+    });
+    // The sheet's validators. Each takes the text it judges, so the bindings
+    // that call it re-evaluate as it's typed.
+    window.on_hex_color(|text| match parse_hex(&text) {
+        Some(c) => slint::Color::from_rgb_f32(c.r as f32, c.g as f32, c.b as f32),
+        None => slint::Color::from_argb_u8(0, 0, 0, 0),
+    });
+    // The name the command sees: `match_setup` trims it, so spaces alone are
+    // no name.
+    window.on_valid_name(|text| !text.trim().is_empty());
+    window.on_valid_hex(|text| parse_hex(&text).is_some());
+    window.on_valid_count(|text, low, high| {
+        let (Ok(low), Ok(high)) = (u32::try_from(low), u32::try_from(high)) else {
+            return false;
+        };
+        parse_count(&text, low, high).is_some()
+    });
+    window.on_match_over_cap(|regulation, overtime| {
+        let Some((regulation, overtime)) =
+            parse_count(&regulation, 1, 10).zip(parse_count(&overtime, 0, 10))
+        else {
+            return SharedString::new();
+        };
+        UI.with_borrow(|ui| {
+            ui.snapshot.as_ref().map_or_else(SharedString::new, |s| {
+                match_panel::over_cap_warning(&s.project, regulation + overtime).into()
+            })
+        })
+    });
+}
+
+/// Seeds the setup sheet from the project's scoreboard — or from a blank one
+/// when there is none yet — and opens it. The only way in, so the fields are
+/// never stale.
+fn open_match_setup(w: &AppWindow) {
+    let Some(config) = UI.with_borrow(|ui| {
+        let project = &ui.snapshot.as_ref()?.project;
+        Some(
+            project
+                .scoreboard
+                .clone()
+                .unwrap_or_else(match_panel::blank_config),
+        )
+    }) else {
+        return;
+    };
+    // The sheet writes whole minutes back, so this only ever rounds a config
+    // some other build wrote.
+    let minutes = |seconds: u32| SharedString::from(((seconds + 30) / 60).max(1).to_string());
+    w.set_match_home_name(config.home.name.as_str().into());
+    w.set_match_home_primary(match_panel::hex(config.home.primary_color).into());
+    w.set_match_home_secondary(match_panel::hex(config.home.secondary_color).into());
+    w.set_match_home_font(match_panel::hex(config.home.font_color).into());
+    w.set_match_away_name(config.away.name.as_str().into());
+    w.set_match_away_primary(match_panel::hex(config.away.primary_color).into());
+    w.set_match_away_secondary(match_panel::hex(config.away.secondary_color).into());
+    w.set_match_away_font(match_panel::hex(config.away.font_color).into());
+    w.set_match_regulation_periods(config.format.regulation_periods.to_string().into());
+    w.set_match_regulation_minutes(minutes(config.format.regulation_period_seconds));
+    w.set_match_overtime_periods(config.format.overtime_periods.to_string().into());
+    w.set_match_overtime_minutes(minutes(config.format.overtime_period_seconds));
+    w.set_match_back_anchor(config.auto_back_anchor_p1);
+    w.set_match_sheet_open(true);
+}
+
+/// The setup sheet's fields as a config; `None` if one of them doesn't parse.
+/// The bus has the last word on it — it refuses a team without a name.
+fn match_setup(w: &AppWindow) -> Option<ScoreboardConfig> {
+    let team =
+        |name: SharedString, primary: SharedString, secondary: SharedString, font: SharedString| {
+            Some(TeamConfig {
+                name: name.trim().to_string(),
+                primary_color: parse_hex(&primary)?,
+                secondary_color: parse_hex(&secondary)?,
+                font_color: parse_hex(&font)?,
+            })
+        };
+    let seconds = |text: SharedString| Some(parse_count(&text, 1, 180)? * 60);
+    Some(ScoreboardConfig {
+        home: team(
+            w.get_match_home_name(),
+            w.get_match_home_primary(),
+            w.get_match_home_secondary(),
+            w.get_match_home_font(),
+        )?,
+        away: team(
+            w.get_match_away_name(),
+            w.get_match_away_primary(),
+            w.get_match_away_secondary(),
+            w.get_match_away_font(),
+        )?,
+        format: MatchFormat {
+            regulation_periods: parse_count(&w.get_match_regulation_periods(), 1, 10)?,
+            regulation_period_seconds: seconds(w.get_match_regulation_minutes())?,
+            overtime_periods: parse_count(&w.get_match_overtime_periods(), 0, 10)?,
+            overtime_period_seconds: seconds(w.get_match_overtime_minutes())?,
+        },
+        auto_back_anchor_p1: w.get_match_back_anchor(),
+    })
+}
+
+/// The Match panel's rows, and what its actions are gated on. The live score
+/// and clock aren't here: they follow the scan, so the tick renders them.
+fn show_match(w: &AppWindow, project: &Project) {
+    let rows: Vec<MatchRow> = match_panel::match_rows(project)
+        .into_iter()
+        .map(|row| MatchRow {
+            id: row.id.to_string().into(),
+            time: row.time.into(),
+            label: row.label.into(),
+            role_less: row.role_less,
+        })
+        .collect();
+    w.set_match_rows(ModelRc::new(VecModel::from(rows)));
+    w.set_match_configured(project.scoreboard.is_some());
+    w.set_match_at_cap(project.start_stops_at_cap());
+    if project.scoreboard.is_none() {
+        w.set_match_score(SharedString::new());
+        w.set_match_clock(SharedString::new());
+    }
 }
 
 /// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
@@ -501,7 +704,7 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                 ClipField::Tags => ClipEdit::Tags(normalize_tags(&text)),
                 ClipField::Notes => ClipEdit::Notes(text.into()),
             };
-            let id = parse_clip_id(&id);
+            let id = parse_id(&id);
             // Whether the bus will apply it: it skips an edit that sets the
             // value already there.
             let changes = UI.with_borrow(|ui| {
@@ -524,7 +727,7 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_set_show_pip({
         let bus = bus.clone();
         move |id, on| {
-            if let Some(id) = parse_clip_id(&id) {
+            if let Some(id) = parse_id(&id) {
                 bus.borrow().send(Command::EditClip {
                     id,
                     edit: ClipEdit::ShowPip(on),
@@ -552,11 +755,11 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_take_suggestion(|text, tag| take_suggestion(&text, &tag).into());
 }
 
-/// A clip id from the UI, which always sends valid ones: a bad one is
-/// logged, as a bug.
-fn parse_clip_id(id: &str) -> Option<Uuid> {
+/// A clip or match-event id from the UI, which always sends valid ones: a bad
+/// one is logged, as a bug.
+fn parse_id(id: &str) -> Option<Uuid> {
     Uuid::parse_str(id)
-        .inspect_err(|_| eprintln!("ui: not a clip id: {id:?}"))
+        .inspect_err(|_| eprintln!("ui: not an id: {id:?}"))
         .ok()
 }
 
@@ -1114,7 +1317,14 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         })
         .collect();
     w.set_tag_rows(ModelRc::new(VecModel::from(tags)));
-    UI.with_borrow_mut(|ui| ui.snapshot = Some(snapshot));
+    show_match(w, project);
+    UI.with_borrow_mut(|ui| {
+        // Rebuilt here and nowhere else: a source add, move, remove or
+        // relink moves the offsets a context froze (spec S2), and every one
+        // of them arrives as one of these.
+        ui.scoreboard = ScoreboardContext::for_project(&snapshot.project);
+        ui.snapshot = Some(snapshot);
+    });
     show_clip(w);
 }
 
@@ -1208,16 +1418,9 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         let current = if w.get_scrubbing() {
             f64::from(w.get_position_seconds())
         } else {
-            let abs = match (ui.preview_duration.is_some(), ui.target_abs) {
-                (true, _) => preview.seconds(),
-                (false, Some(target)) => target,
-                (false, None) if project.source_videos.is_empty() => 0.0,
-                (false, None) => {
-                    if let Some(secs) = position.query_position() {
-                        ui.last_secs = secs;
-                    }
-                    project.abs_seconds(ui.source_index, ui.last_secs)
-                }
+            let abs = match ui.preview_duration.is_some() {
+                true => preview.seconds(),
+                false => scan_abs(ui, &project, position),
             };
             let abs = abs.clamp(0.0, total.max(0.0));
             w.set_position_seconds(abs as f32);
@@ -1229,5 +1432,38 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         // which.
         w.set_total_seconds(total as f32);
         w.set_readout(format!("{} / {}", format_hms(current), format_hms(total)).into());
+        // The Match panel's live line (spec S4), from the same anchor. It
+        // **freezes while a preview is open**: the transport is then record
+        // time within one clip, and the preview's own scoreboard is already
+        // burned into its picture.
+        if let (None, Some(scoreboard)) = (ui.preview_duration, &ui.scoreboard) {
+            let (source_index, source_time) = project.locate(current);
+            let state = scoreboard.state_at(source_index, source_time);
+            let line = match_panel::score_line(scoreboard.config(), state.as_ref());
+            w.set_match_score(line.into());
+            w.set_match_clock(match_panel::clock_text(state.as_ref()).into());
+        }
     });
+}
+
+/// Where the game video is on the concat timeline, as the readout has it: an
+/// outstanding seek's target — published before its request is issued, so a
+/// new source's index is never paired with the old one's offset — else the
+/// player's position on the source it holds. The query is the one direct
+/// pipeline access outside the bus (D5), and `last_secs` stands in when it
+/// fails (mid-load, nothing loaded).
+///
+/// Not a preview's position, which is record time within one clip: [`tick`]
+/// takes that from the preview, and a tag is refused while one is open.
+fn scan_abs(ui: &mut UiState, project: &Project, position: &PositionHandle) -> f64 {
+    if let Some(target) = ui.target_abs {
+        return target;
+    }
+    if project.source_videos.is_empty() {
+        return 0.0;
+    }
+    if let Some(secs) = position.query_position() {
+        ui.last_secs = secs;
+    }
+    project.abs_seconds(ui.source_index, ui.last_secs)
 }

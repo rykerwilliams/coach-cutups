@@ -499,6 +499,30 @@ impl Project {
         let i = self.match_events.iter().position(|m| m.id == id)?;
         Some(self.match_events.remove(i))
     }
+
+    /// How many start/stops are tagged. Goals don't count against the cap.
+    pub fn start_stop_count(&self) -> usize {
+        self.match_events
+            .iter()
+            .filter(|m| m.kind == MatchEventKind::StartStop)
+            .count()
+    }
+
+    /// True when every period the format has is already tagged, so another
+    /// start/stop would be a record [`interpret`] gives no role to.
+    ///
+    /// **The cap counts records:** a back-anchored period-1 start is derived,
+    /// not stored, so it never takes one of these places. With no scoreboard
+    /// there is no format to cap against, and `interpret` truncates whatever
+    /// is stored once there is one.
+    ///
+    /// The Match panel disables the start/stop action on this and the command
+    /// refuses out loud if it is reached anyway — one rule, in one place.
+    pub fn start_stops_at_cap(&self) -> bool {
+        self.scoreboard
+            .as_ref()
+            .is_some_and(|s| self.start_stop_count() >= s.format.expected_start_stop_events())
+    }
 }
 
 #[cfg(test)]

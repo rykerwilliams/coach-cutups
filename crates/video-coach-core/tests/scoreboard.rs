@@ -555,6 +555,29 @@ fn tagging_past_the_cap_still_stores_the_record() {
     assert_eq!(p.match_events.len(), 6);
 }
 
+/// One cap rule for the command that refuses and the panel that disables:
+/// records only, so the derived back-anchor never takes a place, and no cap at
+/// all without a format to cap against.
+#[test]
+fn the_cap_counts_stored_start_stops_against_the_format() {
+    let mut p = project_with_sources(&[60.0]);
+    p.scoreboard = Some(ScoreboardConfig {
+        auto_back_anchor_p1: true,
+        ..soccer()
+    });
+    for i in 0..3 {
+        p.append_match_event(MatchEventKind::StartStop, 0, f64::from(i) * 10.0);
+        p.append_match_event(MatchEventKind::HomeGoal, 0, f64::from(i) * 10.0);
+        assert!(!p.start_stops_at_cap());
+    }
+    p.append_match_event(MatchEventKind::StartStop, 0, 40.0);
+    assert_eq!(p.start_stop_count(), 4);
+    assert!(p.start_stops_at_cap());
+
+    p.scoreboard = None;
+    assert!(!p.start_stops_at_cap());
+}
+
 /// Events are positioned on a source, and the clock runs on the concatenation
 /// of all of them.
 #[test]

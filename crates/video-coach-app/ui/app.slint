@@ -55,6 +55,27 @@ export struct RunRow {
     status: string,
 }
 
+/// One row of the Match panel's event list (Phase 9 S4).
+export struct MatchRow {
+    /// The event's UUID.
+    id: string,
+    /// Where it sits on the concat timeline, already formatted.
+    time: string,
+    /// "1H start", "Home goal", … — already formatted.
+    label: string,
+    /// A start/stop this format has no period for. It keeps its place; the
+    /// scoreboard ignores it until the format grows or the back-anchor goes
+    /// off, so the row says so rather than looking like every other one.
+    role-less: bool,
+}
+
+/// What a tag key or one of the Match panel's buttons records (Phase 9 S4).
+export enum MatchTag {
+    home-goal,
+    away-goal,
+    start-stop,
+}
+
 /// The inspector's text fields, for `edit-clip`.
 export enum ClipField {
     name,
@@ -493,6 +514,161 @@ component TagOverview inherits VerticalLayout {
     }
 }
 
+/// The Match panel (Phase 9 S4), under the inspector's column: the live score
+/// and clock, the three tag actions the `z`, `x` and `v` keys also fire, and
+/// the tagged events in match order with a seek and a delete each.
+///
+/// Everything it shows is rendered by `src/main.rs`: the rows from the
+/// project, the score and clock from the scan anchor on the 30 Hz tick.
+component MatchPanel inherits VerticalLayout {
+    /// The project has teams. Without them there is no scoreboard to show,
+    /// and the setup sheet is the way in.
+    in property <bool> configured;
+    /// "Rovers 2 – 1 United", or the two names before kick-off.
+    in property <string> score;
+    /// "45:00", "45:00 +2:13", "HT", "FT", or a dash before kick-off. Frozen
+    /// while a preview is open, whose own scoreboard is in its picture.
+    in property <string> clock;
+    in property <[MatchRow]> rows;
+    /// Tagging is possible: while scanning or recording, never while
+    /// previewing or during a recording's start-up (spec S4).
+    in property <bool> can-tag;
+    /// Every period of the format is tagged already, so another start/stop
+    /// would get no role: that action is off and the panel says why (S5).
+    in property <bool> at-cap;
+    /// A row's buttons: the bus refuses both a seek and a delete while
+    /// recording, and the panel doesn't act on the game video behind a
+    /// preview.
+    in property <bool> can-edit;
+    callback tag(MatchTag);
+    callback seek(string);
+    callback remove(string);
+    callback setup();
+
+    padding: 12px;
+    spacing: 6px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        FieldLabel {
+            text: "Match";
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: root.configured ? "Setup…" : "Set up teams…";
+            clicked => { root.setup(); }
+
+            Tooltip {
+                text: @markdown("Team names, colours and the match format");
+            }
+        }
+    }
+
+    if !root.configured: Text {
+        text: "No teams yet. The clock and score are drawn into previews and exports once they're set up.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+    if root.configured: HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.score;
+            color: Palette.foreground;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.clock;
+            color: Palette.foreground;
+            font-family: "monospace";
+            vertical-alignment: center;
+        }
+    }
+
+    Button {
+        text: "Home goal  (Z)";
+        enabled: root.can-tag;
+        clicked => { root.tag(MatchTag.home-goal); }
+    }
+    Button {
+        text: "Away goal  (X)";
+        enabled: root.can-tag;
+        clicked => { root.tag(MatchTag.away-goal); }
+    }
+    Button {
+        text: "Start / stop  (V)";
+        enabled: root.can-tag && !root.at-cap;
+        clicked => { root.tag(MatchTag.start-stop); }
+    }
+    if root.at-cap: Text {
+        text: "Every period of this format is tagged. Delete a start/stop, or change the format, to tag another.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    FieldLabel { text: "Events"; }
+    if root.rows.length == 0: Text {
+        text: "Nothing tagged yet.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+    }
+    // A height of its own, so a long match scrolls rather than pushing the
+    // inspector out of the column.
+    ListView {
+        height: min(112px, root.rows.length * 28px);
+        for row in root.rows: HorizontalLayout {
+            height: 28px;
+            spacing: 6px;
+
+            Text {
+                text: row.time;
+                color: Palette.alternate-foreground;
+                font-family: "monospace";
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: row.label;
+                color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: "→";
+                    accessible-label: "Seek";
+                    enabled: root.can-edit;
+                    clicked => { root.seek(row.id); }
+
+                    Tooltip {
+                        text: @markdown("Play the game video from here");
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: "×";
+                    accessible-label: "Delete";
+                    enabled: root.can-edit;
+                    clicked => { root.remove(row.id); }
+
+                    Tooltip {
+                        text: @markdown("Delete this event (undoable)");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One live telestration stroke (Phase 6 D5). Its `commands` are in the
 /// content rect's logical pixels, which `fit: preserve` takes as they are:
 /// it short-circuits before any bounding-box or stroke-width fitting, so no
@@ -719,6 +895,258 @@ component ExportSheet inherits Rectangle {
     }
 }
 
+/// One field of the match setup sheet: its caption, a mark when what's typed
+/// isn't something the sheet can save, and the swatch a colour field shows.
+///
+/// The text is two-way bound all the way out to the window's property: a
+/// `text:` binding breaks the moment the user types into it.
+component SetupField inherits VerticalLayout {
+    in property <string> label;
+    in property <string> placeholder;
+    in property <bool> ok: true;
+    /// A colour field shows what its text parses to, beside the caption.
+    in property <bool> has-swatch;
+    in property <color> swatch;
+    in-out property <string> text;
+
+    spacing: 2px;
+
+    HorizontalLayout {
+        spacing: 4px;
+        FieldLabel {
+            text: root.label;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if !root.ok: Text {
+            text: "✕";
+            color: #ff6b6b;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+        if root.has-swatch: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 2px;
+                border-width: 1px;
+                border-color: Palette.border;
+                background: root.swatch;
+            }
+        }
+    }
+    LineEdit {
+        placeholder-text: root.placeholder;
+        text <=> root.text;
+    }
+}
+
+/// The match setup sheet (Phase 9 S4): both teams with their three colours,
+/// the match format, and the back-anchor -- "my video starts after kick-off".
+///
+/// Colours are **hex fields**: Slint 1.18 has no colour picker, and the Mac's
+/// inspector cell was effectively a field too. Nothing here is an undo step:
+/// the sheet has Cancel, and the history is the coach's tagging (spec S5).
+component MatchSetupSheet inherits Rectangle {
+    in-out property <string> home-name;
+    in-out property <string> home-primary;
+    in-out property <string> home-secondary;
+    in-out property <string> home-font;
+    in-out property <string> away-name;
+    in-out property <string> away-primary;
+    in-out property <string> away-secondary;
+    in-out property <string> away-font;
+    in-out property <string> regulation-periods;
+    in-out property <string> regulation-minutes;
+    in-out property <string> overtime-periods;
+    in-out property <string> overtime-minutes;
+    in-out property <bool> back-anchor;
+    /// The window's validators. They take the text so the bindings below
+    /// re-evaluate on every keystroke.
+    pure callback hex-color(string) -> color;
+    pure callback valid-name(string) -> bool;
+    pure callback valid-hex(string) -> bool;
+    pure callback valid-count(string, int, int) -> bool;
+    /// The warning for start/stops the format being typed has no period for,
+    /// empty when there are none.
+    pure callback over-cap(string, string) -> string;
+    callback save();
+    callback cancel();
+
+    /// The empty-name rule is the command's (S5); Save is off here so the
+    /// coach isn't answered with a dialog on a name that is only spaces --
+    /// which is what the command sees, since the field's text is trimmed.
+    property <bool> names-ok: root.valid-name(root.home-name) && root.valid-name(root.away-name);
+    property <bool> colours-ok:
+        root.valid-hex(root.home-primary) && root.valid-hex(root.home-secondary)
+        && root.valid-hex(root.home-font) && root.valid-hex(root.away-primary)
+        && root.valid-hex(root.away-secondary) && root.valid-hex(root.away-font);
+    property <bool> format-ok:
+        root.valid-count(root.regulation-periods, 1, 10)
+        && root.valid-count(root.regulation-minutes, 1, 180)
+        && root.valid-count(root.overtime-periods, 0, 10)
+        && root.valid-count(root.overtime-minutes, 1, 180);
+    property <string> orphaned: root.over-cap(root.regulation-periods, root.overtime-periods);
+
+    width: 520px;
+    height: sheet.preferred-height;
+    background: Palette.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    sheet := VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: "Match setup";
+            color: Palette.foreground;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+
+            VerticalLayout {
+                spacing: 6px;
+                FieldLabel { text: "HOME TEAM"; }
+                SetupField {
+                    label: "Name";
+                    placeholder: "Home";
+                    ok: root.valid-name(root.home-name);
+                    text <=> root.home-name;
+                }
+                SetupField {
+                    label: "Primary";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.home-primary);
+                    ok: root.valid-hex(root.home-primary);
+                    placeholder: "#rrggbb";
+                    text <=> root.home-primary;
+                }
+                SetupField {
+                    label: "Accent";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.home-secondary);
+                    ok: root.valid-hex(root.home-secondary);
+                    placeholder: "#rrggbb";
+                    text <=> root.home-secondary;
+                }
+                SetupField {
+                    label: "Text";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.home-font);
+                    ok: root.valid-hex(root.home-font);
+                    placeholder: "#rrggbb";
+                    text <=> root.home-font;
+                }
+            }
+            VerticalLayout {
+                spacing: 6px;
+                FieldLabel { text: "AWAY TEAM"; }
+                SetupField {
+                    label: "Name";
+                    placeholder: "Away";
+                    ok: root.valid-name(root.away-name);
+                    text <=> root.away-name;
+                }
+                SetupField {
+                    label: "Primary";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.away-primary);
+                    ok: root.valid-hex(root.away-primary);
+                    placeholder: "#rrggbb";
+                    text <=> root.away-primary;
+                }
+                SetupField {
+                    label: "Accent";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.away-secondary);
+                    ok: root.valid-hex(root.away-secondary);
+                    placeholder: "#rrggbb";
+                    text <=> root.away-secondary;
+                }
+                SetupField {
+                    label: "Text";
+                    has-swatch: true;
+                    swatch: root.hex-color(root.away-font);
+                    ok: root.valid-hex(root.away-font);
+                    placeholder: "#rrggbb";
+                    text <=> root.away-font;
+                }
+            }
+        }
+
+        FieldLabel { text: "FORMAT"; }
+        // Two rows of two: four fields abreast don't fit the sheet's width.
+        HorizontalLayout {
+            spacing: 16px;
+
+            SetupField {
+                label: "Periods";
+                ok: root.valid-count(root.regulation-periods, 1, 10);
+                text <=> root.regulation-periods;
+            }
+            SetupField {
+                label: "Minutes each";
+                ok: root.valid-count(root.regulation-minutes, 1, 180);
+                text <=> root.regulation-minutes;
+            }
+        }
+        HorizontalLayout {
+            spacing: 16px;
+
+            SetupField {
+                label: "Overtime periods";
+                ok: root.valid-count(root.overtime-periods, 0, 10);
+                text <=> root.overtime-periods;
+            }
+            SetupField {
+                label: "Minutes each";
+                ok: root.valid-count(root.overtime-minutes, 1, 180);
+                text <=> root.overtime-minutes;
+            }
+        }
+
+        CheckBox {
+            text: "My video starts after kick-off";
+            checked <=> root.back-anchor;
+
+            Tooltip {
+                text: @markdown("The first period's start is derived, so tagging half-time puts the clock at the right minute. It counts as one of the format's start/stops.");
+            }
+        }
+
+        // The records are never dropped -- the cap is on what gets a role --
+        // so this is a warning, not a refusal (spec S5).
+        if root.orphaned != "": Text {
+            text: root.orphaned;
+            color: #ffcc00;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+
+            Button {
+                text: "Cancel";
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: "Save";
+                primary: true;
+                enabled: root.names-ok && root.colours-ok && root.format-ok;
+                clicked => { root.save(); }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     min-width: 1100px;
@@ -902,6 +1330,45 @@ export component AppWindow inherits Window {
     /// something to play.
     out property <bool> can-preview: root.can-play && !root.recording && !root.exporting;
 
+    // --- Match (Phase 9 S4): the panel, the three tag keys, the setup sheet ---
+
+    /// The project has teams: the scoreboard is drawn, and the panel shows a
+    /// score and clock rather than the way in to the sheet.
+    in property <bool> match-configured;
+    /// The live line and clock, rendered by `src/main.rs` from the scan
+    /// anchor on the tick. Frozen while a preview is open (S4).
+    in property <string> match-score;
+    in property <string> match-clock;
+    /// Every tagged event in match order.
+    in property <[MatchRow]> match-rows;
+    /// Every period of the format is tagged, so the bus would refuse another
+    /// start/stop: the action is off and the panel says why (S5).
+    in property <bool> match-at-cap;
+    /// The one gate on tagging, shared by the three keys and the panel's
+    /// buttons: while scanning or recording, never while previewing or during
+    /// a recording's start-up.
+    out property <bool> can-tag:
+        root.can-play && !root.previewing && root.recording-phase != RecordingPhase.starting;
+    /// The setup sheet is up. UI state: the panel's button opens it, its own
+    /// buttons and Esc close it.
+    in-out property <bool> match-sheet-open;
+    /// Its fields, seeded from the project when it opens and read back on
+    /// Save (`src/main.rs`). Two-way bound down to the fields, since a
+    /// `text:` or `checked:` binding breaks once the user edits it.
+    in-out property <string> match-home-name;
+    in-out property <string> match-home-primary;
+    in-out property <string> match-home-secondary;
+    in-out property <string> match-home-font;
+    in-out property <string> match-away-name;
+    in-out property <string> match-away-primary;
+    in-out property <string> match-away-secondary;
+    in-out property <string> match-away-font;
+    in-out property <string> match-regulation-periods;
+    in-out property <string> match-regulation-minutes;
+    in-out property <string> match-overtime-periods;
+    in-out property <string> match-overtime-minutes;
+    in-out property <bool> match-back-anchor;
+
     /// The latest notice (a device fallback, an unclean stop, an export
     /// done), shown in the transport bar without blocking; empty hides it.
     in property <string> notice;
@@ -952,6 +1419,26 @@ export component AppWindow inherits Window {
     /// the one open (P5).
     callback open-preview(string);
     callback close-preview();
+    /// Match events (Phase 9 S4), by the event's id where they name one. The
+    /// tag's position is the readout's, taken in `src/main.rs` at the input
+    /// event, as the bus contract requires.
+    callback tag-match-event(MatchTag);
+    callback seek-match-event(string);
+    callback delete-match-event(string);
+    /// Seed the setup sheet's fields from the project and open it; the sheet
+    /// is opened nowhere else, so the fields are never stale.
+    callback open-match-setup();
+    /// Save the setup sheet's fields as the project's scoreboard.
+    callback save-match-setup();
+    /// A colour field's text as a colour, and the sheet's validators, which
+    /// take their text so the bindings re-evaluate as it's typed.
+    pure callback hex-color(string) -> color;
+    pure callback valid-name(string) -> bool;
+    pure callback valid-hex(string) -> bool;
+    pure callback valid-count(string, int, int) -> bool;
+    /// The sheet's shrink-below-tagged warning for a format of these periods,
+    /// empty when nothing is over its cap.
+    pure callback match-over-cap(string, string) -> string;
     callback undo();
     callback redo();
     /// An inspector field's commit for clip `id`.
@@ -990,6 +1477,23 @@ export component AppWindow inherits Window {
         Palette.color-scheme = ColorScheme.dark;
     }
 
+    /// Closes the setup sheet, however it was closed, and puts focus back on
+    /// the window so the shortcuts work again.
+    function close-match-setup() {
+        root.match-sheet-open = false;
+        keys.focus();
+    }
+
+    /// One of the three match tag keys (S4), under the gate the panel's
+    /// buttons share. A held key must not insert a goal per repeat, and the
+    /// key is swallowed either way, as `c` and `r` are.
+    function tag-key(kind: MatchTag, event: KeyEvent, pressed: bool) -> EventResult {
+        if (pressed && !event.repeat && root.can-tag) {
+            root.tag-match-event(kind);
+        }
+        return accept;
+    }
+
     /// Spec D10: every shortcut, ahead of whichever child has focus, so a
     /// touched slider never turns arrows into volume or scrub steps. Called
     /// for releases too (`pressed` false), which are swallowed for the same
@@ -1009,6 +1513,17 @@ export component AppWindow inherits Window {
                 root.export-sheet-open = false;
             }
             return accept;
+        }
+        // The match setup sheet is modal too, and it has fields of its own:
+        // Esc closes it, and everything else goes to whatever in it has
+        // focus. Ahead of the Esc cascade and the tag keys, so neither fires
+        // behind it.
+        if (root.match-sheet-open) {
+            if (pressed && event.text == Key.Escape) {
+                root.close-match-setup();
+                return accept;
+            }
+            return reject;
         }
         // The field gets them all, Esc included: it bubbles back to
         // `key-pressed` below.
@@ -1055,6 +1570,19 @@ export component AppWindow inherits Window {
                 root.clear-drawings();
             }
             return accept;
+        }
+        // The three match tags (S4): direct keys, since this port has them
+        // free -- no event mode, so no second gate on the zoom keys and no
+        // extra layer in the Esc cascade. After the Ctrl branch, so Ctrl+Z
+        // isn't one of them.
+        if (event.text == "z" || event.text == "Z") {
+            return root.tag-key(MatchTag.home-goal, event, pressed);
+        }
+        if (event.text == "x" || event.text == "X") {
+            return root.tag-key(MatchTag.away-goal, event, pressed);
+        }
+        if (event.text == "v" || event.text == "V") {
+            return root.tag-key(MatchTag.start-stop, event, pressed);
         }
         // R and Space toggle, so an auto-repeat would toggle straight back.
         if (event.text == "r" || event.text == "R") {
@@ -1581,7 +2109,7 @@ export component AppWindow inherits Window {
                 }
 
                 // --- Inspector: the selected clip, else the tag overview
-                // (C7, C8) ---
+                // (C7, C8) -- with the Match panel under it (Phase 9 S4) ---
                 Rectangle {
                     width: 280px;
                     background: Palette.alternate-background;
@@ -1591,45 +2119,86 @@ export component AppWindow inherits Window {
                         clicked => { keys.focus(); }
                     }
 
-                    // Hidden rather than removed, so `editing` always binds.
-                    inspector := Inspector {
-                        visible: root.selected-clip != "";
-                        enabled: !root.recording;
-                        name-text <=> root.clip-name;
-                        tags-text <=> root.clip-tags;
-                        notes-text <=> root.clip-notes;
-                        show-pip <=> root.clip-show-pip;
-                        begin-edit => { root.editing-clip-id = root.selected-clip; }
-                        commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
-                        end-edit(field, text) => {
-                            let id = root.editing-clip-id;
-                            // Unless focus moved to another field, which
-                            // goes on editing the same clip.
-                            if (!self.editing) {
-                                root.editing-clip-id = "";
+                    VerticalLayout {
+                        // The clip inspector, or the tag overview with
+                        // nothing selected; the Match panel is always under
+                        // it, since a match is the project's, not a clip's.
+                        Rectangle {
+                            vertical-stretch: 1;
+
+                            // Hidden rather than removed, so `editing` always binds.
+                            inspector := Inspector {
+                                visible: root.selected-clip != "";
+                                enabled: !root.recording;
+                                name-text <=> root.clip-name;
+                                tags-text <=> root.clip-tags;
+                                notes-text <=> root.clip-notes;
+                                show-pip <=> root.clip-show-pip;
+                                begin-edit => { root.editing-clip-id = root.selected-clip; }
+                                commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
+                                end-edit(field, text) => {
+                                    let id = root.editing-clip-id;
+                                    // Unless focus moved to another field, which
+                                    // goes on editing the same clip.
+                                    if (!self.editing) {
+                                        root.editing-clip-id = "";
+                                    }
+                                    root.edit-clip(id, field, text);
+                                }
+                                can-preview: root.can-preview;
+                                previewing: root.previewing && root.previewing-clip == root.selected-clip;
+                                // The selection, since a click doesn't take focus
+                                // from a field.
+                                pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
+                                preview-clicked => {
+                                    keys.focus();
+                                    if (self.previewing) {
+                                        root.close-preview();
+                                    } else {
+                                        root.open-preview(root.selected-clip);
+                                    }
+                                }
+                                suggest-tags(text) => { return root.suggest-tags(text); }
+                                take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
                             }
-                            root.edit-clip(id, field, text);
-                        }
-                        can-preview: root.can-preview;
-                        previewing: root.previewing && root.previewing-clip == root.selected-clip;
-                        // The selection, since a click doesn't take focus
-                        // from a field.
-                        pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
-                        preview-clicked => {
-                            keys.focus();
-                            if (self.previewing) {
-                                root.close-preview();
-                            } else {
-                                root.open-preview(root.selected-clip);
+                            if root.selected-clip == "": TagOverview {
+                                rows: root.tag-rows;
+                                clip-count: root.clip-count;
+                                filter <=> root.tag-filter;
                             }
                         }
-                        suggest-tags(text) => { return root.suggest-tags(text); }
-                        take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
-                    }
-                    if root.selected-clip == "": TagOverview {
-                        rows: root.tag-rows;
-                        clip-count: root.clip-count;
-                        filter <=> root.tag-filter;
+
+                        MatchPanel {
+                            configured: root.match-configured;
+                            score: root.match-score;
+                            clock: root.match-clock;
+                            rows: root.match-rows;
+                            can-tag: root.can-tag;
+                            at-cap: root.match-at-cap;
+                            // The bus refuses a scrub and an edit while
+                            // recording, and neither belongs to the game
+                            // video behind a preview.
+                            can-edit: root.can-play && !root.recording && !root.previewing;
+                            // Off any field first, as every other button
+                            // does: a click doesn't take focus from one, and
+                            // the tag keys have to keep working after it.
+                            tag(kind) => {
+                                keys.focus();
+                                root.tag-match-event(kind);
+                            }
+                            seek(id) => {
+                                keys.focus();
+                                root.seek-match-event(id);
+                            }
+                            remove(id) => {
+                                keys.focus();
+                                root.delete-match-event(id);
+                            }
+                            setup => {
+                                keys.focus();
+                                root.open-match-setup();
+                            }
+                        }
                     }
                 }
             }
@@ -1913,6 +2482,42 @@ export component AppWindow inherits Window {
                     root.export-sheet-open = false;
                     keys.focus();
                 }
+            }
+        }
+
+        // --- Match setup sheet: modal over the whole window (Phase 9 S4) ---
+        if root.match-sheet-open: Rectangle {
+            background: #000000a0;
+
+            // Swallows clicks meant for the window behind.
+            TouchArea { }
+
+            MatchSetupSheet {
+                home-name <=> root.match-home-name;
+                home-primary <=> root.match-home-primary;
+                home-secondary <=> root.match-home-secondary;
+                home-font <=> root.match-home-font;
+                away-name <=> root.match-away-name;
+                away-primary <=> root.match-away-primary;
+                away-secondary <=> root.match-away-secondary;
+                away-font <=> root.match-away-font;
+                regulation-periods <=> root.match-regulation-periods;
+                regulation-minutes <=> root.match-regulation-minutes;
+                overtime-periods <=> root.match-overtime-periods;
+                overtime-minutes <=> root.match-overtime-minutes;
+                back-anchor <=> root.match-back-anchor;
+                hex-color(text) => { return root.hex-color(text); }
+                valid-name(text) => { return root.valid-name(text); }
+                valid-hex(text) => { return root.valid-hex(text); }
+                valid-count(text, low, high) => { return root.valid-count(text, low, high); }
+                over-cap(regulation, overtime) => { return root.match-over-cap(regulation, overtime); }
+                // The bus has the last word on both: it refuses an empty
+                // name, and closing here is the sheet's own Cancel.
+                save => {
+                    root.save-match-setup();
+                    root.close-match-setup();
+                }
+                cancel => { root.close-match-setup(); }
             }
         }
 

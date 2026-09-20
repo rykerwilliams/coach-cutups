@@ -7,4 +7,5 @@
 pub mod bus;
 pub mod drawing;
 pub mod format;
+pub mod match_panel;
 pub mod zoom_input;
