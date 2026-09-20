@@ -4,7 +4,9 @@
 //! Every function writes into a directory the caller supplies, so the caller
 //! owns cleanup (normally a `tempfile::TempDir`) and this crate carries no
 //! test-only dependency. The pipelines use the GStreamer base, good and ugly
-//! (`x264enc`) plugin sets, all of which CI installs.
+//! (`x264enc`) plugin sets; reading an export back also needs libav
+//! (`avdec_aac`, and `avdec_h264` where it outranks `openh264dec`). CI
+//! installs all of them.
 //!
 //! These are test helpers, so they **panic** on any failure — a pipeline that
 //! fails to build, posts an `ERROR`, or does not reach EOS within
@@ -27,6 +29,11 @@ const TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(30);
 
 /// Audio sample rate for fixtures that carry audio.
 const AUDIO_RATE: u32 = 44_100;
+
+/// Sample rate of a [`tone_video`]: the export's own mixing rate, so the tone
+/// is neither resampled on its way in nor on its way out and its onset can be
+/// read back to the sample.
+const TONE_RATE: u32 = 48_000;
 
 /// A one-entry compilation of `frames` for `clip`, with `text` on the bar: the
 /// plan `compilation_schedule` builds for a single-clip target.
@@ -146,6 +153,85 @@ pub fn rotated_mp4(dir: &Path) -> PathBuf {
            ! qtmux ! filesink name=out",
         &dir.join("rotated.mp4"),
     )
+}
+
+/// The sound of a [`tone_video`].
+#[derive(Debug, Clone, Copy)]
+pub struct Tone {
+    pub freq: f64,
+    pub amplitude: f64,
+    /// `(from, to)` in seconds: the tone sounds only in there, and the track
+    /// is silent outside it. `None` sounds for the whole file.
+    pub window: Option<(f64, f64)>,
+}
+
+/// A `frames`-frame video at `path`, `w`×`h` at `fps`, whose sound is `tone`.
+///
+/// The audio is **raw F32 in Matroska** at [`TONE_RATE`], not a codec: a lossy
+/// one smears a burst's onset by up to its window (Vorbis: ~21 ms), which is
+/// the very quantity the priming test measures. One buffer per video frame, so
+/// the two tracks are the same length.
+///
+/// Panics if `fps` does not divide [`TONE_RATE`] (25, 30 and 60 do).
+pub fn tone_video(path: &Path, w: u32, h: u32, fps: u32, frames: u32, tone: Tone) -> PathBuf {
+    assert!(
+        fps > 0 && TONE_RATE.is_multiple_of(fps),
+        "fps {fps} must divide {TONE_RATE} so the tone matches the video duration"
+    );
+    let per_frame = (TONE_RATE / fps) as usize;
+    let description = format!(
+        "videotestsrc num-buffers={frames} pattern=solid-color foreground-color=0xff202020 \
+           ! video/x-raw,format=I420,width={w},height={h},framerate={fps}/1 \
+           ! vp8enc deadline=1 keyframe-max-dist={fps} ! queue ! mux.video_0 \
+         appsrc name=src format=time \
+           caps=audio/x-raw,format=F32LE,rate={TONE_RATE},channels=1,layout=interleaved \
+           ! queue ! mux.audio_0 \
+         matroskamux name=mux ! filesink name=out"
+    );
+    run_with(&description, path, |pipeline| {
+        let src = pipeline
+            .by_name("src")
+            .and_downcast::<gst_app::AppSrc>()
+            .expect("tone pipeline has an appsrc named `src`");
+        let mut next = 0u32;
+        src.set_callbacks(
+            gst_app::AppSrcCallbacks::builder()
+                .need_data(move |src, _| {
+                    if next == frames {
+                        let _ = src.end_of_stream();
+                        return;
+                    }
+                    let first = next as usize * per_frame;
+                    let data: Vec<u8> = (first..first + per_frame)
+                        .flat_map(|i| {
+                            let t = i as f64 / f64::from(TONE_RATE);
+                            let on = tone.window.is_none_or(|(a, b)| t >= a && t < b);
+                            let v = match on {
+                                true => {
+                                    tone.amplitude * (std::f64::consts::TAU * tone.freq * t).sin()
+                                }
+                                false => 0.0,
+                            };
+                            (v as f32).to_le_bytes()
+                        })
+                        .collect();
+                    let mut buffer = gst::Buffer::from_mut_slice(data);
+                    {
+                        let at = |i: usize| {
+                            gst::ClockTime::SECOND
+                                .mul_div_floor(i as u64, u64::from(TONE_RATE))
+                                .expect("no overflow")
+                        };
+                        let buffer = buffer.get_mut().expect("a new buffer is writable");
+                        buffer.set_pts(at(first));
+                        buffer.set_duration(at(first + per_frame) - at(first));
+                    }
+                    let _ = src.push_buffer(buffer);
+                    next += 1;
+                })
+                .build(),
+        );
+    })
 }
 
 /// A one-second Vorbis-in-Ogg file at `dir/audio_only.ogg` with no video
@@ -428,6 +514,36 @@ pub fn decode_rgb(path: &Path) -> Vec<RgbFrame> {
     frames
 }
 
+/// Every audio sample of `path`, mixed down to mono at the export's own rate.
+/// Holds them all: for short files.
+///
+/// Mono because what the assertions ask of a mixed track — where a tone
+/// starts, how loud it is, whether it is silent — is the same in both
+/// channels, and one channel of indices is easier to reason about than two.
+pub fn decode_audio(path: &Path) -> Vec<f32> {
+    let mut samples = Vec::new();
+    decode_each(
+        &format!(
+            "decodebin3 name=dec ! audio/x-raw(ANY) ! audioconvert ! audioresample \
+             ! audio/x-raw,format=F32LE,rate={TONE_RATE},channels=1 \
+             ! appsink name=sink sync=false"
+        ),
+        path,
+        |sample| {
+            let buffer = sample.buffer().expect("sample has a buffer");
+            let map = buffer.map_readable().expect("the decoded samples map");
+            samples.extend(
+                map.as_slice()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+        },
+    );
+    samples
+}
+
 /// Decodes `path` and calls `visit` with each video frame's luma.
 fn for_each_gray(path: &Path, mut visit: impl FnMut(GrayFrame)) {
     for_each_frame(path, "GRAY8", 1, |width, height, data| {
@@ -453,7 +569,33 @@ fn for_each_frame(
         "decodebin3 name=dec ! video/x-raw(ANY) ! videoconvert \
          ! video/x-raw,format={format} ! appsink name=sink sync=false"
     );
-    let pipeline = gst::parse::launch(&description)
+    decode_each(&description, path, |sample| {
+        let info = sample
+            .caps()
+            .and_then(|caps| gst_video::VideoInfo::from_caps(caps).ok())
+            .expect("decoded sample has video caps");
+        let buffer = sample.buffer().expect("sample has a buffer");
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+            .expect("the decoded frame maps");
+        let (width, height) = (info.width() as usize, info.height() as usize);
+        let stride = frame.plane_stride()[0] as usize;
+        let plane = frame.plane_data(0).expect("the format has one plane");
+        let data = plane
+            .chunks(stride)
+            .take(height)
+            .flat_map(|row| row[..width * bytes].iter().copied())
+            .collect();
+        visit(width, height, data);
+    })
+}
+
+/// Runs `description` — a `decodebin3` named `dec` fed from `path`, ending in
+/// an `appsink` named `sink` — and calls `visit` with every sample it yields.
+///
+/// The decoder is whatever the machine ranks first, and the stream is picked
+/// by the caller's caps, so the other streams of the file are left alone.
+fn decode_each(description: &str, path: &Path, mut visit: impl FnMut(&gst::Sample)) {
+    let pipeline = gst::parse::launch(description)
         .expect("decode pipeline parses")
         .downcast::<gst::Pipeline>()
         .expect("a multi-element launch string yields a pipeline");
@@ -476,22 +618,7 @@ fn for_each_frame(
         .expect("decode pipeline starts");
     let bus = pipeline.bus().expect("a pipeline has a bus");
     while let Some(sample) = sink.try_pull_sample(TIMEOUT) {
-        let info = sample
-            .caps()
-            .and_then(|caps| gst_video::VideoInfo::from_caps(caps).ok())
-            .expect("decoded sample has video caps");
-        let buffer = sample.buffer().expect("sample has a buffer");
-        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-            .expect("the decoded frame maps");
-        let (width, height) = (info.width() as usize, info.height() as usize);
-        let stride = frame.plane_stride()[0] as usize;
-        let plane = frame.plane_data(0).expect("the format has one plane");
-        let data = plane
-            .chunks(stride)
-            .take(height)
-            .flat_map(|row| row[..width * bytes].iter().copied())
-            .collect();
-        visit(width, height, data);
+        visit(&sample);
     }
     let error = bus.pop_filtered(&[gst::MessageType::Error]);
     let eos = sink.is_eos();

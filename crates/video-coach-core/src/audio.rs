@@ -39,7 +39,7 @@ pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 /// Exact by construction — the const assert below fails the build if a future
 /// rate or fps makes it fractional, because a fractional value would put entry
 /// boundaries between samples and let rounding drift across a long run.
-const SAMPLES_PER_FRAME: u64 = (AUDIO_SAMPLE_RATE / OUTPUT_FPS) as u64;
+pub const SAMPLES_PER_FRAME: u64 = (AUDIO_SAMPLE_RATE / OUTPUT_FPS) as u64;
 const _: () = assert!(AUDIO_SAMPLE_RATE.is_multiple_of(OUTPUT_FPS));
 
 /// Samples `avenc_aac` prepends as priming, and therefore the number media

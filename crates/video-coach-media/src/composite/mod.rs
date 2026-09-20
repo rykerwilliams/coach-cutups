@@ -9,6 +9,8 @@
 //! head:   appsrc ! gltransformation ! glvideomixer ! <out_w>x<out_h> 30/1
 //! export: ! glcolorconvert ! NV12 ! gldownload ! queue ! <encoder>
 //!         ! h264parse ! mp4mux ! filesink <path>.part
+//!         plus, per output frame, the mixed [`audio`] block
+//!         ! avenc_aac ! aacparse ! that same mp4mux
 //! preview:! glcolorconvert ! RGBA GL ! appsink sync=true -> the FrameMailbox
 //! ```
 //!
@@ -26,6 +28,7 @@
 //! timeouts, and every wait polls the cancel flag and the first error either
 //! pipeline posted.
 
+mod audio;
 mod decode;
 pub mod export;
 pub mod preview;

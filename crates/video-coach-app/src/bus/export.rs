@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
+use video_coach_core::audio::audio_regions;
 use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::store::RECORDINGS_DIRNAME;
@@ -99,6 +100,7 @@ impl Bus {
                         .clone(),
                 })
                 .collect(),
+            audio: audio_regions(&compilation, &open.project.preferences),
             compilation,
             sources: open
                 .project

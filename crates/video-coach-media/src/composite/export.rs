@@ -8,6 +8,10 @@
 //! pad 2, z 2: the overlay -- drawings and the text bar -- at the output size
 //! ```
 //!
+//! The sound goes into the same muxer, mixed per output frame by
+//! [`Mixer`](super::audio::Mixer) and pushed **at or ahead of** the frames it
+//! covers.
+//!
 //! **Every pad gets a buffer for every frame.** A requested pad that never
 //! receives one produced no output at all and backed the base `appsrc` up,
 //! with no error (measured), so an entry with the PiP off, or with a recording
@@ -30,14 +34,16 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use video_coach_core::audio::Region;
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::plan::PlanEntry;
 use video_coach_core::project::{Clip, Quality, Resolution};
 
+use super::audio::Mixer;
 use super::decode::Decoder;
 use super::{
-    fit_rect, frame_time, head, install_geometry, install_zoom, place, push_buffer, stamp,
+    audio, fit_rect, frame_time, head, install_geometry, install_zoom, place, push_buffer, stamp,
     stamp_buffer, CompositeError, Gl, Layout, Schedule, Stopper, Watch, POLL, QUEUED,
 };
 use crate::overlay::{OverlayFrame, OverlayRenderer};
@@ -63,6 +69,11 @@ pub struct ExportJob {
     pub sources: Vec<PathBuf>,
     /// One per `compilation.plan.entries`, in the same order.
     pub entries: Vec<EntryMedia>,
+    /// The audio edit over the same compilation, from
+    /// `video_coach_core::audio::audio_regions`: which span of which file is
+    /// heard at each emitted sample, and how loud. Empty is a silent track,
+    /// which is still a track — the muxer needs one either way.
+    pub audio: Vec<Region>,
     /// The output file. Written as `<path>.part` and renamed on success, so a
     /// failed export never touches a file already there.
     pub path: PathBuf,
@@ -237,6 +248,7 @@ fn export(
     // compilation normally walks one match video over and over, and reopening
     // it per entry would cost a preroll each time.
     let mut sources: HashMap<usize, Decoder> = HashMap::new();
+    let mut mixer = Mixer::new(job);
     let mut overlays = OverlayRenderer::new();
     let mut encoder: Option<Encoder> = None;
     // The entry the layout and the caps are currently for, and its PiP, which
@@ -286,17 +298,28 @@ fn export(
             laid_out = Some(frame.entry);
         }
 
+        let record_time = entry.record_time(n);
         let overlay = overlays.render(
             &OverlayFrame {
                 clip: &media.clip,
-                record_time: entry.record_time(n),
+                record_time,
                 picture,
                 text: &entry.text,
             },
             out_w as u32,
             out_h as u32,
         );
-        encoder.push(n as u64, sample, &mut pip, overlay, entry, &watch)?;
+        encoder.push(
+            Frame {
+                n: n as u64,
+                sample,
+                record_time,
+                overlay,
+            },
+            &mut pip,
+            &mut mixer,
+            &watch,
+        )?;
 
         let now = ((n + 1) * 100 / total) as u8;
         if now != percent {
@@ -495,6 +518,21 @@ fn encoders(qp: u32) -> [(&'static str, String); 2] {
     ]
 }
 
+/// One output frame's own inputs. The [`Pip`], the [`Mixer`] and the
+/// [`Watch`] belong to the run rather than the frame, so they stay arguments
+/// of their own.
+struct Frame<'a> {
+    /// The output frame index: its PTS is `n/30`.
+    n: u64,
+    /// The decoded source frame to show.
+    sample: &'a gst::Sample,
+    /// Where `n` sits in the entry's recording — the picture-in-picture's
+    /// cursor, and the clock the overlay was drawn at.
+    record_time: f64,
+    /// The drawings and the text bar, rasterized at the output size.
+    overlay: gst::Buffer,
+}
+
 struct Encoder {
     /// Held to go to NULL with the encoder.
     _pipeline: Stopper,
@@ -504,6 +542,8 @@ struct Encoder {
     pip: gst_app::AppSrc,
     /// The drawings and the text bar, at the output size: pad 2.
     overlay: gst_app::AppSrc,
+    /// The mixed sound, straight into the muxer's AAC branch.
+    audio: gst_app::AppSrc,
     name: &'static str,
     /// Set when the file is complete.
     eos: Arc<AtomicBool>,
@@ -533,12 +573,26 @@ impl Encoder {
                     "no H.264 encoder: install gst-plugins-ugly (x264enc) or VA drivers".into(),
                 )
             })?;
+        // `avenc_aac` is rank none, so it is never auto-plugged and has to be
+        // named — which also means a missing gst-libav shows up as a parse
+        // failure unless it is checked for by name first.
+        if gst::ElementFactory::find("avenc_aac").is_none() {
+            return Err(ExportError::Failed(
+                "no AAC encoder: install gstreamer1.0-libav (avenc_aac)".into(),
+            ));
+        }
         let inject = inject.map(|i| format!("{i} ! ")).unwrap_or_default();
         // The readback before the encoder is required, and so is the queue.
         // The overlay branch is RGBA end to end; `OverlayRenderer` hands over
         // premultiplied pixels and GStreamer's `RGBA` means straight alpha, so
         // the pad's `blend-function-src-rgb=one` (set below) does the
         // premultiplied-over on the GPU rather than anything demultiplying.
+        //
+        // **The audio appsrc alone is unbounded** (`max-buffers=0`) and the
+        // pump never waits for room on it. Bounding it at 0.27 s deadlocked
+        // the pump: the encoder keeps the muxer about 0.43 s behind the pushed
+        // video, and the right bound depends on the encoder's latency, so
+        // there is no number to tune (measured).
         let description = format!(
             "{head} \
              ! glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 \
@@ -546,6 +600,9 @@ impl Encoder {
              ! {inject}{name} {settings} \
              ! h264parse ! video/x-h264,profile=high,stream-format=avc,alignment=au \
              ! mp4mux name=mux ! filesink name=out \
+             appsrc name=audio format=time is-live=false block=false \
+               max-buffers=0 max-bytes=0 max-time=0 caps={audio_caps} \
+             ! audioconvert ! avenc_aac bitrate=192000 ! aacparse ! mux. \
              appsrc name=pip format=time is-live=false block=false \
                max-buffers={QUEUED} max-bytes=0 max-time=0 \
              ! glupload ! glcolorconvert ! mix.sink_1 \
@@ -555,7 +612,8 @@ impl Encoder {
                  framerate={OUTPUT_FPS}/1 \
              ! glupload ! glcolorconvert \
              ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2",
-            head = head(out_w, out_h)
+            head = head(out_w, out_h),
+            audio_caps = audio::caps_description()
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| ExportError::Failed(format!("could not build the export graph: {e}")))?
@@ -594,7 +652,8 @@ impl Encoder {
         by_name("out").set_property("location", part);
 
         let eos = gl.install(&pipeline, watch, |_| {});
-        let (src, pip, overlay) = (appsrc("src"), appsrc("pip"), appsrc("ov"));
+        let (src, pip, overlay, audio) =
+            (appsrc("src"), appsrc("pip"), appsrc("ov"), appsrc("audio"));
         let pipeline = Stopper(pipeline);
         if pipeline.set_state(gst::State::Playing).is_err() {
             return Err(watch.failure("could not start the encoder"));
@@ -604,6 +663,7 @@ impl Encoder {
             src,
             pip,
             overlay,
+            audio,
             name,
             eos,
         })
@@ -614,20 +674,34 @@ impl Encoder {
         self.name
     }
 
-    /// Pushes output frame `n` onto all three pads, in z-order.
+    /// Pushes output frame `n` onto all three pads, in z-order, with the sound
+    /// it covers.
     ///
     /// The base is a buffer reference, not a pixel copy: a freeze (and every
     /// held source frame) sends the same texture out again.
+    ///
+    /// **The sound goes first, and never waits.** Its block covers exactly
+    /// this frame, so it reaches the muxer at or ahead of the picture, which
+    /// is the whole ordering rule (spec E3): pushing it behind the video, or
+    /// waiting for room on an appsrc the encoder keeps 0.43 s behind, stalls
+    /// the pump.
     fn push(
         &self,
-        n: u64,
-        sample: &gst::Sample,
+        frame: Frame,
         pip: &mut Pip,
-        mut overlay: gst::Buffer,
-        entry: &PlanEntry,
+        mixer: &mut Mixer,
         watch: &Watch,
     ) -> Result<(), ExportError> {
-        let (inset, caps) = pip.frame(n, entry.record_time(n as usize), watch.cancel);
+        let Frame {
+            n,
+            sample,
+            record_time,
+            mut overlay,
+        } = frame;
+        self.audio
+            .push_buffer(mixer.block(n, watch.cancel))
+            .map_err(|e| watch.failure(format!("pushing the sound of frame {n}: {e:?}")))?;
+        let (inset, caps) = pip.frame(n, record_time, watch.cancel);
         set_caps(&self.pip, &caps);
         stamp_buffer(&mut overlay, n);
 
@@ -643,7 +717,7 @@ impl Encoder {
 
     /// Ends the streams and waits for the muxer to finish the file.
     fn finish(&self, watch: &Watch) -> Result<(), ExportError> {
-        for appsrc in [&self.src, &self.pip, &self.overlay] {
+        for appsrc in [&self.src, &self.pip, &self.overlay, &self.audio] {
             let _ = appsrc.end_of_stream();
         }
         loop {
@@ -738,6 +812,7 @@ mod tests {
                 recording: dir.path().join("missing.mkv"),
                 clip,
             }],
+            audio: Vec::new(),
             path: path.clone(),
             resolution: Resolution::R720,
             quality: Quality::Medium,

@@ -6,7 +6,8 @@
 //! the whole suite renders at 720p and keeps every target to a second or two.
 //!
 //! The sources are counter fixtures, so every output frame is checked against
-//! the schedule by the number it shows.
+//! the schedule by the number it shows; the sound is checked the same way,
+//! against fixtures whose tone is known to the sample.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -17,11 +18,12 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_pbutils as pbutils;
 use uuid::Uuid;
+use video_coach_core::audio::audio_regions;
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::{frame_schedule, Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect};
-use video_coach_core::plan::{CompilationPlan, PlanEntry};
-use video_coach_core::project::{Clip, Quality, Resolution};
+use video_coach_core::plan::{CompilationPlan, ExportTarget, PlanEntry};
+use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
@@ -112,8 +114,9 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
     }
 }
 
-/// A one-entry export of `frames` from `source`, with no picture-in-picture
-/// and no text bar: the plain picture, which most of these tests are about.
+/// A one-entry export of `frames` from `source`, with no picture-in-picture,
+/// no text bar and **no audio edit**: the plain picture, which most of these
+/// tests are about. An empty edit still writes a full-length silent track.
 fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
     let clip = clip(0.0, frames.len() as f64 / f64::from(OUTPUT_FPS), Vec::new());
     ExportJob {
@@ -124,10 +127,28 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
             recording: PathBuf::new(),
             clip,
         }],
+        audio: Vec::new(),
         path,
         resolution: Resolution::R720,
         quality: Quality::Medium,
     }
+}
+
+/// A one-clip compilation built the way the bus builds one, through a project.
+///
+/// [`one_entry`] can't stand in here: its frame lists are synthetic, so it
+/// leaves the entry's play/freeze segments empty, and those segments **are**
+/// the game track's audio edit.
+fn compilation(clip: &Clip, source_duration: f64) -> Compilation {
+    let mut project = Project::new("p");
+    project.source_videos.push(SourceRef {
+        relative_path: "src".into(),
+        display_name: "src".into(),
+        duration_seconds: source_duration,
+        display_aspect: 16.0 / 9.0,
+    });
+    project.clips = vec![clip.clone()];
+    compilation_schedule(&project, &ExportTarget::AllClips)
 }
 
 /// Plays, a freeze, skips forward (near and far) and back, with every anchor
@@ -234,6 +255,24 @@ fn duration_is_the_schedule_s(path: &Path, frames: usize) {
         (duration - expected).abs() <= 1.0 / f64::from(OUTPUT_FPS),
         "{duration} s of output for a {expected} s schedule"
     );
+    has_one_aac_track(path);
+}
+
+/// Every export writes exactly one 48 kHz stereo AAC track, whatever its
+/// sources carry. Silence is still a track: a muxer pad that never sees a
+/// buffer leaves one it cannot finish, and the duration above is the max of
+/// the two tracks, so it only means anything with both of them present.
+fn has_one_aac_track(path: &Path) {
+    let uri = gst::glib::filename_to_uri(path, None).unwrap();
+    let info = pbutils::Discoverer::new(gst::ClockTime::from_seconds(10))
+        .unwrap()
+        .discover_uri(&uri)
+        .unwrap();
+    let streams = info.audio_streams();
+    assert_eq!(streams.len(), 1, "one audio stream");
+    let audio = streams.into_iter().next().expect("checked just above");
+    assert_eq!((audio.sample_rate(), audio.channels()), (48_000, 2));
+    assert!(audio.bitrate() > 0, "the audio track carries no data");
 }
 
 fn round_trip(kind: CounterKind) {
@@ -284,17 +323,38 @@ fn the_h264_fixture_has_an_edit_list() {
     assert!(start > gst::ClockTime::ZERO, "segment start {start}");
 }
 
+/// The fiducial export: every frame of a steered clip checked against the
+/// schedule, **with its sound**, so the file the duration is asserted on is
+/// the one the app writes rather than a picture-only variant.
+///
+/// The VP8 source carries a tone and the H.264 one carries nothing, so between
+/// the two this also runs the game track's seeks (a freeze, three skips) and
+/// the silent-source path. The recording is silent and shorter than the entry:
+/// the commentary track runs out and pads with silence.
 fn fiducial(kind: CounterKind) {
     let dir = tempfile::tempdir().unwrap();
     let src = source(dir.path(), kind);
-    let frames = frame_schedule(&steered_clip(), f64::from(src.frames) / f64::from(src.fps));
-    assert_eq!(frames.len(), 87);
-    let expected: Vec<u32> = frames
+    let clip = steered_clip();
+    let compilation = compilation(&clip, f64::from(src.frames) / f64::from(src.fps));
+    assert_eq!(compilation.frames.len(), 87);
+    let expected: Vec<u32> = compilation
+        .frames
         .iter()
         .map(|f| oracle(f.source_time, src.fps, src.frames))
         .collect();
+    let recording =
+        fixtures::solid_video(&dir.path().join("rec.webm"), 320, 180, 30, 30, GREEN, true);
     let path = dir.path().join("out.mp4");
-    let done = export(job(src.path.clone(), frames, path.clone())).unwrap();
+    let done = export(ExportJob {
+        audio: audio_regions(&compilation, &Preferences::default()),
+        compilation,
+        sources: vec![src.path.clone()],
+        entries: vec![EntryMedia { recording, clip }],
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+    })
+    .unwrap();
     assert_eq!(done.path, path);
 
     counters_match(&decode_counters(&path), &expected);
@@ -371,6 +431,7 @@ fn a_two_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
                 clip: clip.clone(),
             })
             .collect(),
+        audio: Vec::new(),
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -628,6 +689,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             compilation: one_entry(&clip, frames, "1 / 2 | Demo"),
             sources: vec![source],
             entries: vec![EntryMedia { recording, clip }],
+            audio: Vec::new(),
             path: path.clone(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
@@ -746,6 +808,216 @@ fn show_pip_off_leaves_the_inset_empty_and_the_export_running() {
     assert_rgb(frame, "where the PiP would be", centre, 0x000000);
     // And the picture is untouched.
     assert_rgb(frame, "the picture", (300, 200), BLUE);
+}
+
+/// A one-clip export of `clip` from `source`, with its sound: the audio edit
+/// core derives from the same compilation, at the default volumes.
+fn sounded_job(
+    clip: Clip,
+    source: PathBuf,
+    recording: PathBuf,
+    source_duration: f64,
+    path: PathBuf,
+) -> ExportJob {
+    let compilation = compilation(&clip, source_duration);
+    ExportJob {
+        audio: audio_regions(&compilation, &Preferences::default()),
+        compilation,
+        sources: vec![source],
+        entries: vec![EntryMedia { recording, clip }],
+        path,
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+    }
+}
+
+/// The largest absolute value in `window`.
+fn peak(window: &[f32]) -> f64 {
+    window.iter().fold(0.0, |m, &v| f64::from(v).abs().max(m))
+}
+
+/// How much of `freq` is in `samples`: a single-bin DFT at the decode rate,
+/// scaled so a pure sine of amplitude `a` reads `a`.
+///
+/// Two tones at different frequencies is what makes the two tracks tellable
+/// apart once they have been mixed into one.
+fn tone_level(samples: &[f32], freq: f64) -> f64 {
+    let (mut re, mut im) = (0.0, 0.0);
+    for (i, &s) in samples.iter().enumerate() {
+        let angle = std::f64::consts::TAU * freq * i as f64 / 48_000.0;
+        re += f64::from(s) * angle.cos();
+        im -= f64::from(s) * angle.sin();
+    }
+    2.0 * re.hypot(im) / samples.len() as f64
+}
+
+/// A tone at a known time in the game video comes back out of the file at that
+/// time, to within a millisecond.
+///
+/// That is what dropping the first 1024 samples of the mixed stream buys.
+/// Shifting the timestamps instead measurably does nothing — `avenc_aac`
+/// re-derives its output times by counting samples from the first buffer — and
+/// leaves every sound 21.3 ms late (spec E3).
+#[test]
+fn a_tone_lands_where_the_picture_does() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // 2 s of video, silent but for a 50 ms burst starting at exactly 1.000 s.
+    let source = fixtures::tone_video(
+        &dir.path().join("src.mkv"),
+        640,
+        360,
+        30,
+        60,
+        fixtures::Tone {
+            freq: 1000.0,
+            amplitude: 0.5,
+            window: Some((1.0, 1.05)),
+        },
+    );
+    // Silent, and at 44.1 kHz: the commentary is resampled into the mix and
+    // contributes nothing to where the burst lands.
+    let recording =
+        fixtures::solid_video(&dir.path().join("rec.webm"), 320, 180, 30, 60, GREEN, true);
+    let path = dir.path().join("out.mp4");
+    export(sounded_job(
+        clip(0.0, 2.0, Vec::new()),
+        source,
+        recording,
+        2.0,
+        path.clone(),
+    ))
+    .unwrap();
+
+    let samples = fixtures::decode_audio(&path);
+    let onset = samples
+        .iter()
+        .position(|v| v.abs() > 0.1)
+        .expect("the burst is somewhere in the file");
+    let at = onset as f64 / 48_000.0;
+    assert!(
+        (at - 1.0).abs() < 0.001,
+        "the burst decodes back at {at:.4} s, not 1.000"
+    );
+}
+
+/// The game track is heard only while the source plays — a freeze is silent —
+/// while the commentary runs through the whole entry; and the mix opens on a
+/// fade rather than a click.
+#[test]
+fn the_game_track_is_gated_to_play_and_the_mix_fades_in() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // The two tracks are tellable apart by frequency, so "the game went quiet"
+    // is a statement about the game track and not about the total level.
+    const GAME: f64 = 1000.0;
+    const MIC: f64 = 300.0;
+    let tone = |freq, amplitude| fixtures::Tone {
+        freq,
+        amplitude,
+        window: None,
+    };
+    let source = fixtures::tone_video(
+        &dir.path().join("src.mkv"),
+        640,
+        360,
+        30,
+        60,
+        tone(GAME, 0.6),
+    );
+    let recording = fixtures::tone_video(
+        &dir.path().join("rec.mkv"),
+        320,
+        180,
+        30,
+        60,
+        tone(MIC, 0.2),
+    );
+    // Play 0–0.5 s, freeze 0.5–1.0 s on 0.5, play 1.0–1.5 s from 0.5.
+    let clip = clip(
+        0.0,
+        1.5,
+        vec![
+            CommentaryEvent::new(0.5, EventKind::Pause { source_time: 0.5 }),
+            CommentaryEvent::new(1.0, EventKind::Play { source_time: 0.5 }),
+        ],
+    );
+    let path = dir.path().join("out.mp4");
+    let job = sounded_job(clip, source, recording, 2.0, path.clone());
+    assert_eq!(job.compilation.frames.len(), 45);
+    export(job).unwrap();
+
+    let samples = fixtures::decode_audio(&path);
+    let window = |from: f64, to: f64| {
+        &samples[(from * 48_000.0) as usize..((to * 48_000.0) as usize).min(samples.len())]
+    };
+    let playing = window(0.15, 0.45);
+    let frozen = window(0.6, 0.9);
+    assert!(
+        tone_level(playing, GAME) > 0.4,
+        "the game is only {:.3} loud while it plays",
+        tone_level(playing, GAME)
+    );
+    assert!(
+        tone_level(frozen, GAME) < 0.05,
+        "the game is still {:.3} loud over a freeze",
+        tone_level(frozen, GAME)
+    );
+    for (what, samples) in [("play", playing), ("the freeze", frozen)] {
+        assert!(
+            tone_level(samples, MIC) > 0.1,
+            "the commentary is only {:.3} loud over {what}",
+            tone_level(samples, MIC)
+        );
+    }
+
+    // The 5 ms fade at the head of both regions: a millisecond in, the mix is
+    // a fraction of what it is once the ramp is past. Found from the first
+    // audible sample rather than a fixed index, so this says nothing about
+    // where the decoder puts the priming.
+    let start = samples
+        .iter()
+        .position(|v| v.abs() > 0.02)
+        .expect("the file has sound");
+    let early = peak(&samples[start..start + 48]);
+    let settled = peak(&samples[start + 240..start + 480]);
+    assert!(
+        early < 0.3 * settled,
+        "the mix opens at {early:.3} against {settled:.3} once settled: no fade"
+    );
+}
+
+/// A game video with no audio track exports a silent track rather than
+/// failing. Footage filmed without sound is still footage, and an audio pad
+/// that never sees a buffer leaves the muxer a track it cannot finish.
+#[test]
+fn a_source_with_no_audio_track_exports_silence() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let silent =
+        |name: &str| fixtures::solid_video(&dir.path().join(name), 640, 360, 30, 30, BLUE, false);
+    let path = dir.path().join("out.mp4");
+    export(sounded_job(
+        clip(0.0, 0.5, Vec::new()),
+        silent("src.webm"),
+        silent("rec.webm"),
+        1.0,
+        path.clone(),
+    ))
+    .unwrap();
+
+    duration_is_the_schedule_s(&path, 15);
+    let samples = fixtures::decode_audio(&path);
+    assert!(
+        samples.len() >= 15 * 1600,
+        "only {} samples for 15 frames of video",
+        samples.len()
+    );
+    assert!(
+        peak(&samples) < 0.01,
+        "the track peaks at {}",
+        peak(&samples)
+    );
 }
 
 /// Cancelling mid-export leaves no `.part`, and the file already at the path

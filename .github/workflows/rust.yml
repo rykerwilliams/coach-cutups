@@ -28,13 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `gstreamer1.0-libav` is there for `avenc_aac`, which is rank none and
+      # has no alternative; it also brings `avdec_h264` (rank 256), which
+      # outranks `openh264dec` and so moves this runner closer to the dev
+      # machine. `tests/openh264.rs` keeps openh264 covered by rank.
       - name: Install GStreamer and UI build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-gl \
-            gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad gstreamer1.0-libav \
             libfontconfig1-dev libfreetype-dev libxkbcommon-dev \
             libegl-dev libgl-dev
       - uses: dtolnay/rust-toolchain@1.92
