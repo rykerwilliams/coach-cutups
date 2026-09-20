@@ -235,8 +235,8 @@ This is a genuine improvement to bank. On macOS the two paths were *forced* apar
 | Scoreboard | bar | `0.36 × outW` × `0.08 × outH`, inset `0.015 × outH` | `ScoreboardDraw.swift:11-15` |
 | Scoreboard | accent strip | `0.08 × barH`, home and away cells only | `:17`, `:41-43` |
 | Scoreboard | columns | home `.30`, score `.20`, away `.30`, clock `.20` | `:20-23` |
-| Scoreboard | team font | `min(fit(home), fit(away))`, desired `0.55 × barH`, 6pt floor | `:48-54`, `:89-94` |
-| Scoreboard | score/clock font | `0.55 × barH`, bold | `:57`, `:60` |
+| Scoreboard | team font | `0.55 × scoreBarH` with ellipsis (**corrected 2026-09-20**: ratios are of `scoreBarH = barH − accentH`, and the port fixes the size rather than shrinking to fit) | `:48-54`, `:89-94` |
+| Scoreboard | score/clock font | `0.55 × scoreBarH`, bold; the stoppage tail is `0.45 × scoreBarH` and **not** bold (**corrected 2026-09-20**) | `:57`, `:60`, `:64` |
 
 **Base image fit — letterbox, not stretch.** Uniform scale `min(outW/srcW, outH/srcH)`, centered, black bars where aspects differ. macOS disagrees with itself: the mpv record/scan path letterboxes (`MPVSourcePlayer.swift:482-487`, `panscan=0`) while the export compositor stretches non-uniformly (`CompilationCompositor.swift:130-134`). They agree only for 16:9-into-16:9, and a non-16:9 source exported at a fixed 1920×1080 comes out **anamorphically distorted today**. `ContentView.swift:306-313` names the reason letterbox is right: the aspect-locked player exists so "recording and playback render pixel-identical at every zoom." (This is `min(sx, sy)`, not the crop-fill `max(sx, sy)` that `PreviewCompositor.swift:126-128` warns against. Letterbox never crops.)
 

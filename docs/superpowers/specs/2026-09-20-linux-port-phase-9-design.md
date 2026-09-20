@@ -1,10 +1,10 @@
 # Linux Port — Phase 9: Scoreboard
 
 **Date:** 2026-09-20
-**Status:** Draft, pre-review
-**Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` (Phasing → Phase 9; the scoreboard rows of the layout table; the `clipStartAbsSeconds` bug at lines 295 and 435)
+**Status:** Reviewed (simplify and correctness passes applied)
+**Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` (Phasing → Phase 9; the scoreboard rows of the layout table, **whose font ratios this spec corrects**; the `clipStartAbsSeconds` bug at lines 295 and 435)
 **Builds on:** Phase 8 (the overlay rasterizer and its font system), Phase 7 (preview), Phase 3 (undo)
-**Evidence:** the macOS inventory of `ScoreboardState.swift`, `MatchInterpret.swift`, `MatchFormat.swift`, `MatchEvent.swift`, `ScoreboardDraw.swift`, `MatchInspectorPanel.swift` and `KeyCommandView.swift`.
+**Evidence:** `apple/VideoCoachCore/Sources/VideoCoachCore/{ScoreboardState,MatchInterpret,MatchFormat,MatchEvent}.swift` and `Overlays/ScoreboardDraw.swift`; `apple/App/Views/Scoreboard/MatchInspectorPanel.swift`; `apple/App/Views/KeyCommandView.swift`.
 
 ---
 
@@ -14,31 +14,36 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 
 ## Done when
 
-1. **Tagging.** Pressing **E** enters event mode; **1**, **2** and **3** then tag a home goal, an away goal and a start/stop. Esc leaves event mode first.
-2. **The panel.** A Match panel shows the live score and clock as you scan, three buttons for the same three actions, the list of events with their roles ("1H start", "HT", …), and seek and delete on each.
-3. **Setup.** Team names, four colours each, and the match format (periods and their length) are editable and saved with the project.
-4. **Burned in.** Preview and export draw the scoreboard top-left: `0.36 × width` by `0.08 × height`, with the team cells' accent strips, and the `+M:SS` tail in stoppage time.
-5. **The clock is right inside a clip.** A clip that pauses for 20 s shows the same match time before and after the pause, because the clock follows the source frame, not the recording.
-6. **Undo.** Tagging and deleting events are undoable.
+1. **Tagging.** Three keys tag a home goal, an away goal and a start/stop while scanning. The Match panel has the same three as buttons.
+2. **The panel** shows the live score and clock, the event list with each event's role ("1H start", "HT", …), and seek and delete per row.
+3. **Setup.** Team names, their three colours each, and the match format are editable in a sheet and saved with the project.
+4. **Burned in.** Preview and export draw the scoreboard top-left, with the accent strip, and the `+M:SS` tail in stoppage time.
+5. **The clock is right inside a clip.** A clip that pauses for 20 s shows the same match time before and after the pause.
+6. **Undo.** Tagging and deleting are undoable.
 
 ---
 
 ## Decisions
 
-### S1. The clock and score live in core, as a pure function of absolute time
+### S1. The clock and score: one core module, a pure function of absolute time
 
-`video-coach-core/src/scoreboard.rs` ports `ScoreboardState.swift`, `MatchInterpret.swift` and the derived parts of `MatchFormat.swift`:
+`scoreboard_config.rs` **becomes** `scoreboard.rs` (its own header already says Phase 9 completes it), holding the on-disk types and the behaviour:
 
-- `PeriodRole`, `interpret(events, format)` and `start_stop_roles(project)`: start/stops sorted by absolute time with an input-order tie-break, truncated to `2 × total_periods`, even indices starting a period and odd ones ending it.
+- `PeriodRole`, `interpret(events, format) -> Vec<(Uuid, PeriodRole)>`: start/stops stably sorted by absolute time with an input-order tie-break, truncated to `2 × total_periods`, even indices starting a period and odd ones ending it. **It returns ids**, so the panel doesn't index two parallel filtered lists the way macOS did.
 - `ClockDisplay::{Running, Stoppage { base, plus }, OnBreak(label), Fulltime}` and `format_clock`.
-- `scoreboard_state(now_abs, config, events) -> Option<ScoreboardState>`, returning `None` before kick-off, with no config, **or with either team name empty** — the last one is what stops a half-configured scoreboard being burned into an export.
-- Stoppage and half-time are **derived**, not stored: past the period's length it is stoppage; past `.end` it is the break, or full time on the last period.
-- **The P1 back-anchor** is ported verbatim, including its deliberate lack of guards: it inserts a flagged start/stop at `(0, 0)` **at index 0** so it wins the tie-break, and shifts period 0's display so a recording that missed kick-off still reads 45:00 at the whistle. The UI gates it; the mutator does not. macOS's test pinning that, comment included, ports too.
-- **Goals count inside `[first start, last end]`,** where the end is infinite unless the interpreted start/stops exactly fill the format — so a part-tagged match still counts late goals.
+- `scoreboard_state(now_abs, config, events) -> Option<ScoreboardState>`, where **`ScoreboardState` is `{ home_score, away_score, clock }`** — it does not carry the team configs, which the caller already has. Cheap per frame, so no memo is needed for it.
+- **It returns `None`** when no start/stop has been tagged yet, or when the first tagged start is still ahead of `now`. Not being configured is `Option<ScoreboardConfig>` at the caller, and **empty team names are rejected by the command** (S5), so the render path has one guard.
+- Stoppage and half-time are **derived**: past the period's length it is stoppage; past `.end` it is the break, or full time on the last period.
+- **Goals count inside `[first start, last end]`,** the end being infinite unless the interpreted start/stops exactly fill the format, so a part-tagged match still counts late goals.
+- **`ScoreboardContext::state_at(source_index, source_time)`** lives here too, so the one piece of arithmetic in S2 exists once.
 
-`scoreboard_config.rs` keeps the on-disk types. The mutators (`append_home_goal`, `append_away_goal`, `append_start_stop`, `set_auto_back_anchor_p1`) join `project.rs` beside the other edits.
+**The P1 back-anchor is derived, not stored.** macOS inserted a flagged `(0, 0)` event at index 0, relied on `interpret`'s tie-break, bypassed its own cap, and then added an offset to the *displayed* number — which left the clock reading 50:00 while still counted as running, so stoppage never began. Instead:
+- `ScoreboardConfig` gains `auto_back_anchor_p1: bool`;
+- when set, `interpret` prepends a **derived** start at `p1_end_abs − period_seconds(0)`.
 
-### S2. Per frame, the drivers pass absolute time — and nothing else
+Then the first period's start is a real start, and stoppage, half-time and full time fall out unchanged. `MatchEventRecord::is_auto_back_anchor` is removed (nothing writes it yet; the format is unshipped v7). macOS's test pinning the old behaviour is **not** ported.
+
+### S2. Per frame, the drivers pass absolute time
 
 `ExportJob` and `PreviewJob` gain `scoreboard: Option<ScoreboardContext>`, built once by the bus:
 
@@ -46,46 +51,56 @@ The coach tags a match as they scan it — kick-off, half-time, full-time, and e
 pub struct ScoreboardContext { config: ScoreboardConfig, events: Vec<AbsoluteMatchEvent>, source_offsets: Vec<f64> }
 ```
 
-Each frame, the driver computes `abs = source_offsets[entry.source_index] + frame.source_time` and calls `scoreboard_state`.
+Each frame the driver calls `context.state_at(entry.source_index, frame.source_time)`.
 
-**This avoids BACKLOG #27's export bug by construction.** macOS computed the clock as a per-clip constant plus the commentary's wall clock, so every pause and skip pushed the clock ahead of the footage — and since every recording starts with a pause, that was nearly always. The port has no such constant: `frame.source_time` already comes from the clip's own playback segments. **No per-entry absolute constant is added to `PlanEntry`; that field is the bug.**
-
-`ScoreboardState` is `PartialEq`, so the renderer can reuse its layout while the state is unchanged, as the text bar's fitting already does.
+- **This is safe because a clip cannot span a source boundary:** a `Clip` has one `source_index` and every timeline mutation clamps within it.
+- **The absolute events are derived once per job** and must never be cached across a source add, move, remove or **relink** (a relink can change a source's duration, and so every later offset).
+- **It closes BACKLOG #27 by construction.** macOS computed the clock as a per-clip constant plus the commentary's wall clock, so every pause and skip pushed the clock ahead of the footage — and since every recording opens with a pause, that was nearly always. **No per-entry absolute constant is added to `PlanEntry`; that field is the bug.**
+- **The clock is the displayed frame's source time,** i.e. `FrameSpec::source_time` from `playback_segments`, not `timeline::source_time`. Those two differ by up to 50 ms at a freeze near the end of a source, deliberately. `timeline.rs`'s module doc currently names *itself* as the scoreboard's authority: **amend it** in this phase, keeping its 50 ms note and changing its consumer, rather than shipping a file that contradicts the code.
 
 ### S3. Drawing: the same overlay, on top
 
-The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes and the bar's glyphs (macOS draws it on top of everything). `OverlayFrame` gains `scoreboard: Option<&ScoreboardState>`, and `core/src/layout.rs` gains the ratios its header already promised:
+The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes and the text bar (macOS draws it on top of everything). `OverlayFrame` gains `scoreboard: Option<(&ScoreboardConfig, &ScoreboardState)>`, and `layout.rs` gains `SCOREBOARD_*` ratios — **named distinctly**, since the text bar already has a `BAR_HEIGHT_RATIO` that happens to be the same 0.08.
 
 | Element | Value |
 |---|---|
 | Bar | `0.36 × outW` by `0.08 × outH`, inset `0.015 × outH`, top-left |
-| Accent strip | `0.08 × barH`, over the home and away cells only |
+| Accent strip | `0.08 × barH`, **above** the cells, over the home and away columns only |
+| Cells | height `scoreBarH = barH − accentH`, at `top + accentH` |
 | Columns | home `0.30`, score `0.20`, away `0.30`, clock `0.20` |
-| Cells | score `#1a1a1a`, clock `#0d0d0d` at 0.95 alpha |
-| Team font | `min(fit(home), fit(away))`, desired `0.55 × barH`, floor 6 px |
-| Score and clock font | `0.55 × barH`, bold |
-| Stoppage tail | its own rect off the clock cell's right edge, `0.45 × barH` |
+| Cell fills | score `#1a1a1a`, clock `#0d0d0d` at 0.95 alpha |
+| Fonts | `0.55 × scoreBarH`, bold, in each team's `font_color` |
+| Stoppage tail | its own rect off the clock cell's right edge, `0.45 × scoreBarH`, **not bold** |
+| Team name pad | `0.05 × scoreBarH` (macOS used an absolute 4 pt, which changes meaning with resolution) |
 
-- **`DejaVuSans-Bold.ttf` is vendored** beside the regular face, with its licence: every scoreboard label is bold on macOS, and the overlay loads only embedded faces.
-- **Team-name sizing comes from measured text,** which `overlay.rs` already has (`fit`, `width`). A different font means different sizes than macOS, so the tests assert properties ("inside the bar rect", "the left margin is untouched"), not golden images — which is what macOS's own render tests do.
+**These are fractions of `scoreBarH`, not `barH`** — the parent spec's table says `barH` and is ~9% too large. Correct both.
 
-### S4. Entry: event mode plus a Match panel
+- **`DejaVuSans-Bold.ttf` is vendored** beside the regular face, with its licence: four of the five labels are bold.
+- **Team names use a fixed size and ellipsize** (`overlay.rs`'s existing `fit`), rather than macOS's shrink-to-fit with a 6 px floor: at a cell 10.8% of the width, a shrunk long name is illegible anyway.
+- **`draw_text` is generalized** with colour and horizontal alignment; today it hardcodes white and left-aligns. The scoreboard's fitting gets **its own memo slot**, since the existing one is a single slot that the bar's line already uses.
 
-- **Keys,** mirroring macOS: `E` enters event mode (a UI flag); `1`, `2` and `3` then tag home goal, away goal and start/stop instead of zooming; **Esc leaves event mode first** in the existing cascade.
+### S4. Entry: three direct keys, and a Match panel
+
+- **No event mode.** macOS needed `E` then `1/2/3` because it had no free keys; this port does. **`z` tags a home goal, `x` an away goal, `v` a start/stop**, directly. That removes a UI mode, a branch in the Esc cascade and a second gate on the zoom keys.
+  - They carry `!event.repeat` (a held key must not insert a goal per repeat), and they yield to text fields like every other shortcut.
+  - They are gated exactly as the panel's buttons are: while scanning or recording, never while previewing or during a recording's start-up.
 - **The Match panel** sits in the right-hand column beside the clip inspector and tag overview:
-  - the live score and clock as a line of text, updated from the scan position;
-  - three buttons for the same three tags, so the feature is discoverable without the keys;
+  - the live score and clock as text;
+  - the same three actions as buttons, so the feature is discoverable;
   - the auto-back-anchor toggle;
-  - the event list in match order, each row with its interpreted role, a seek button and a delete button;
-  - a settings mode for team names, the four colours each, and the format, with a warning when more start/stops are tagged than the format expects.
-- **No scoreboard is drawn over the scan picture** (user decision, 2026-09-20). The panel's line is the live readout; preview and export carry the bar itself. That keeps the scan view clean and avoids a second rasterizer in the UI toolkit.
+  - the event list in match order, each row with its role, a seek and a delete;
+  - **a warning when the format is shrunk below the number of start/stops already tagged.**
+- **The panel's clock comes from the scan anchor** (`source_index` and the last good position), computed in the existing tick — **not** from the shared position properties, which a preview repurposes to record time within one clip. **While a preview is open the panel's clock freezes**; the preview's own scoreboard is burned into its picture. No scoreboard clock is computed during an export: that is per-frame in the driver.
+- **No scoreboard is drawn over the scan picture** (user decision, 2026-09-20).
 
 ### S5. Commands, undo and storage
 
-- **Commands:** `TagMatchEvent { kind, source_index, source_seconds }` — with the position **captured on the UI thread**, per the bus contract — plus `DeleteMatchEvent(Uuid)`, `SetScoreboard(Option<ScoreboardConfig>)` and `SetAutoBackAnchorP1(bool)`.
-- **Undo:** one `UndoAction::EditMatchEvents { before, after }` holding the whole list, as macOS did. The lists are small, and per-event undo would buy nothing.
-- **Match events belong to the project, not to clips** — as the format already has them. A goal must appear on every clip spanning it, and the clock runs across all sources.
-- **Source moves and deletions already remap them,** and removing a source an event points at is already refused. **Nothing in Phase 9 needs to touch that**; it is easy to redo by accident.
+- **Commands:** `TagMatchEvent { kind, source_index, source_seconds }` — captured on the UI thread per the bus contract, with the same `last_secs` fallback the readout uses when a position query returns nothing — plus `DeleteMatchEvent(Uuid)`, `SetScoreboard(Option<ScoreboardConfig>)` and `SetAutoBackAnchorP1(bool)`.
+- **Validation lives at the command,** not in the render path: `SetScoreboard` rejects an empty team name with a message.
+- **One cap rule.** `interpret` truncates to the format's capacity — that must be total regardless. The UI **disables** the start/stop action at the cap and says why. The mutator does **not** silently no-op, as macOS's did: a command that quietly does nothing is worse than one that refuses out loud.
+- **Undo:** `UndoAction::EditMatchEvents { before, after }` holding the whole list, as macOS did.
+  - **A source add, move, remove or relink purges `EditMatchEvents` from both undo stacks,** in the same place delete entries are already evicted. The project's events are remapped by those operations, but a snapshot on the stack is not, so undo would otherwise restore events pointing at the wrong source — or resurrect one pointing at a source since removed.
+- **Match events belong to the project,** as the format already has them: a goal must appear on every clip spanning it, and the clock runs across all sources. Source moves and deletions already remap them, and removing a source an event points at is already refused. **Phase 9 changes none of that.**
 
 ---
 
@@ -93,28 +108,28 @@ The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes an
 
 | Crate | Phase 9 contents |
 |---|---|
-| `video-coach-core` | `scoreboard.rs` (interpret, roles, clock, state); `MatchFormat`'s derived accessors; the event mutators; the scoreboard's layout ratios. |
-| `video-coach-media` | The scoreboard in `overlay.rs`, drawn last; the vendored bold face; `ScoreboardContext` on both jobs. |
-| `video-coach-app` | Bus: the four commands, `EditMatchEvents` undo, building the context. UI: event mode, the Match panel and its settings mode. |
-| `video-coach-harness` | Tagging, deleting, undo, and the context reaching an export. |
+| `video-coach-core` | `scoreboard.rs`: the on-disk types plus `interpret`, roles, the clock, `scoreboard_state`, `ScoreboardContext::state_at`, the derived back-anchor, and `MatchFormat`'s accessors. The event mutators. `SCOREBOARD_*` ratios in `layout.rs`. The `timeline.rs` doc amendment. |
+| `video-coach-media` | The scoreboard drawn last in `overlay.rs`; a generalized `draw_text` (colour, alignment) and a second memo slot; the vendored bold face; `ScoreboardContext` on both jobs. |
+| `video-coach-app` | Bus: the four commands, `EditMatchEvents` undo and its purge on source edits, building the context. UI: the three keys, the Match panel, and the setup sheet. |
+| `video-coach-harness` | Tagging, deleting, undo across a source move, and the context reaching an export. |
 
 ## Testing
 
-- **Core:** port macOS's ~830 lines — stoppage in both halves, HT and FT, quarters, overtime, the goal window, `interpret`'s tie-break and truncation, the roles map, `MatchFormat`'s names and labels, and the back-anchor test **with its comment**.
+- **Core** (macOS has 651 lines to draw on): stoppage in both halves, HT and FT, quarters, overtime, the goal window, `interpret`'s tie-break and truncation, the roles map, `MatchFormat`'s names and labels, and **the derived back-anchor**, including that a back-anchored first period reaches stoppage correctly — which macOS's could not.
 - **Media:**
-  - property assertions on the drawing: inside the bar rect, the area left of it untouched, the accent strips only over the team cells, the stoppage tail present only in stoppage;
-  - **the pause test** (the spec's own): a clip with a mid-clip pause of N seconds shows the same clock at record time `p` and `p + N`. This is the test that pins BACKLOG #27 shut.
-- **Harness:** tag, delete, undo, and an export whose scoreboard context reaches the overlay.
+  - properties, not golden images: drawn inside the bar ∪ tail rect, the area left of the bar untouched, the accent strip only over the team columns, the tail present only in stoppage;
+  - **the pause test:** a clip with a mid-clip pause of N seconds shows the same clock at record time `p` and `p + N`. This is what pins BACKLOG #27 shut.
+- **Harness:** tag, delete, undo; **undo after a source move doesn't restore a stale index**; an export whose context reaches the overlay.
 - **Manual** (batched): tag a real match while scanning and check the clock against the footage.
 
 ## Risks
 
-1. **The clock's correctness inside a clip** is the whole point of the phase, and it is one line (`offset + source_time`). The pause test is what keeps it.
-2. **Half-configured scoreboards:** three distinct "draw nothing" cases (no config, an empty team name, before kick-off), all easy to miss.
-3. **Modal keys.** Event mode is the first real mode in this UI. Its place in the Esc cascade needs checking against the existing one rather than assumed.
+1. **The clock's correctness inside a clip** is the point of the phase, and it is one call. The pause test keeps it.
+2. **Undo across source edits** is the subtle one; the purge is the fix, and the harness test is the guard.
+3. **Two "draw nothing" cases** (not configured, nothing tagged yet) after validation moves to the command.
 
 ## Deferred
 
 - A scoreboard over the scan picture (user decision).
-- Manual clock offsets beyond the P1 back-anchor: macOS had none.
+- Manual clock offsets beyond the back-anchor.
 - Per-event undo.
