@@ -20,7 +20,8 @@
 //! **The bar is export's own** (spec E7). Preview runs the clip's one-entry
 //! compilation, so its overlay carries the same text bar the file gets, and
 //! the line reads `1 / 1 | <name> | tags` because the target is that one clip.
-//! What the coach checks here is what the export shows.
+//! The scoreboard comes off the same per-frame call the export makes. What the
+//! coach checks here is what the export shows.
 //!
 //! **One pump, both appsrcs, one PTS.** `glvideomixer` waits indefinitely on
 //! every pad, so frame `n`'s overlay goes out with frame `n` or the mixer
@@ -55,6 +56,7 @@ use gstreamer_video as gst_video;
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::Clip;
+use video_coach_core::scoreboard::{ScoreboardConfig, ScoreboardContext, ScoreboardState};
 
 use super::decode::Decoder;
 use super::{
@@ -95,6 +97,10 @@ pub struct PreviewJob {
     /// The commentary's volume, the project's `preview_commentary_volume`, in
     /// the volume slider's `0..=1` space.
     pub commentary_volume: f64,
+    /// The match clock and score to draw, or `None` when the project has no
+    /// scoreboard configured. Built once by the bus, and **never reused across
+    /// a source add, move, remove or relink** — see [`ScoreboardContext`].
+    pub scoreboard: Option<ScoreboardContext>,
 }
 
 /// What a running preview reports, on its own thread.
@@ -404,13 +410,34 @@ fn run(
         ended = false;
         let frame = &job.compilation.frames[n as usize];
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), watch)?;
+        // The scoreboard's clock is the **displayed** frame's source time, so
+        // a pause in the commentary leaves it where it was (BACKLOG #27).
+        let state = job.scoreboard.as_ref().and_then(|context| {
+            let entry = job.compilation.plan.entries.get(frame.entry)?;
+            context.state_at(entry.source_index, frame.source_time)
+        });
+        let scoreboard = job
+            .scoreboard
+            .as_ref()
+            .zip(state.as_ref())
+            .map(|(context, state)| (context.config(), state));
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
             composite = Some(Composite::start(sample, job, gl, mailbox, shared, watch)?);
         }
         let composite = composite.as_ref().expect("started above");
-        composite.push(n, generation, sample, &job.clip, &mut overlays, watch)?;
+        composite.push(
+            Frame {
+                n,
+                generation,
+                sample,
+                clip: &job.clip,
+                scoreboard,
+            },
+            &mut overlays,
+            watch,
+        )?;
     }
 }
 
@@ -454,6 +481,23 @@ impl Counters {
             dropped: self.dropped.load(Ordering::SeqCst),
         }
     }
+}
+
+/// One output frame's own inputs, as `export.rs`'s `Frame` is for the export.
+/// The renderer and the [`Watch`] belong to the run rather than the frame, so
+/// they stay arguments of their own.
+struct Frame<'a> {
+    /// The output frame index: its PTS is `n/30`.
+    n: u64,
+    /// The seek generation this frame was prepared under.
+    generation: u64,
+    /// The decoded source frame to show.
+    sample: &'a gst::Sample,
+    /// The clip, for the drawings the overlay replays.
+    clip: &'a Clip,
+    /// The board at this frame, from the job's context, or `None` when the
+    /// project has no scoreboard or nothing has been tagged yet.
+    scoreboard: Option<(&'a ScoreboardConfig, &'a ScoreboardState)>,
 }
 
 /// The composite pipeline: three mixer pads and the tail into the mailbox.
@@ -638,21 +682,25 @@ impl Composite {
         })
     }
 
-    /// Pushes output frame `n`: `sample`'s texture on the base pad and the
-    /// clip's overlay at `n/30` on the overlay pad, **both stamped `n/30`**.
-    /// A seek that landed since `generation` was read discards both.
+    /// Pushes output frame `frame.n`: its texture on the base pad and its
+    /// overlay at `n/30` on the overlay pad, **both stamped `n/30`**. A seek
+    /// that landed since `frame.generation` was read discards both.
     ///
     /// The base is a buffer reference, not a pixel copy: a freeze sends the
     /// same texture out many times.
     fn push(
         &self,
-        n: u64,
-        generation: u64,
-        sample: &gst::Sample,
-        clip: &Clip,
+        frame: Frame,
         overlays: &mut OverlayRenderer,
         watch: &Watch,
     ) -> Result<(), CompositeError> {
+        let Frame {
+            n,
+            generation,
+            sample,
+            clip,
+            scoreboard,
+        } = frame;
         let base = stamp(sample, n);
         // Record time is output time (see the module docs), so the overlay's
         // moment is the output frame's own, and its stamp the frame's own.
@@ -662,6 +710,7 @@ impl Composite {
                 record_time: n as f64 / f64::from(OUTPUT_FPS),
                 picture: self.picture,
                 text: &self.text,
+                scoreboard,
             },
             OUTPUT_WIDTH as u32,
             OUTPUT_HEIGHT as u32,

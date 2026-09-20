@@ -1,7 +1,8 @@
-DejaVuSans.ttf is the DejaVu Sans font, taken unmodified from the DejaVu
-fonts project (https://dejavu-fonts.github.io/). It is vendored here so the
-export's text bar looks the same on every machine, including CI runners with
-no fonts installed.
+DejaVuSans.ttf and DejaVuSans-Bold.ttf are the DejaVu Sans regular and bold
+faces, taken unmodified from the DejaVu fonts project
+(https://dejavu-fonts.github.io/). They are vendored here so the export's
+text bar and scoreboard look the same on every machine, including CI runners
+with no fonts installed. This licence covers both.
 
 Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
 Bitstream Vera is a trademark of Bitstream, Inc.

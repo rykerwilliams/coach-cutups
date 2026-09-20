@@ -500,6 +500,8 @@ fn job(
         path: exports.join(file_name(label, &open.project.name)),
         resolution,
         quality,
+        // Phase 9 Task 3a builds the context here.
+        scoreboard: None,
     };
     Ok(job)
 }

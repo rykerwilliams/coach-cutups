@@ -1,8 +1,8 @@
 //! The vector overlay layer, rasterized once per output frame (spec P4, E2).
 //!
-//! Phase 8 draws the strokes and the text bar; Phase 9's scoreboard joins this
-//! file. Geometry stays in core ([`video_coach_core::layout`]), pixels stay
-//! here.
+//! Phase 8 draws the strokes and the text bar; Phase 9's scoreboard joins them,
+//! **last, over everything** (spec S3). Geometry stays in core
+//! ([`video_coach_core::layout`]), pixels stay here.
 //!
 //! **The rect is the output frame; the strokes are mapped into the picture.**
 //! One layer carries both, because they belong to different spaces: the coach
@@ -13,10 +13,13 @@
 //! bar's background and its glyphs on different layers, which is exactly the
 //! macOS arrangement the raised PiP exists to remove.
 //!
-//! **The font is vendored** (`fonts/DejaVuSans.ttf`, with its licence beside
-//! it) and it is the only font loaded: `cosmic-text`'s system-font scanning is
-//! off, so an export's bar looks the same on this machine, on another coach's,
-//! and on a CI runner with no fonts installed at all.
+//! **The fonts are vendored** (`fonts/DejaVuSans*.ttf`, with their licence
+//! beside them) and they are the only fonts loaded, because [`font_system`]
+//! builds the database itself rather than letting `cosmic-text` scan the
+//! machine. So an export looks the same here, on another coach's laptop and on
+//! a CI runner with no fonts installed at all. Both faces load under the one
+//! family, so **every [`Attrs`] states its weight**: the default would draw the
+//! scoreboard's labels in whichever face the query happened to reach.
 //!
 //! **Premultiplied, which the mixer pad has to be told.** tiny-skia stores
 //! premultiplied pixels; GStreamer's `RGBA` means straight alpha. Nothing here
@@ -33,26 +36,40 @@ use std::sync::Arc;
 
 use cosmic_text::{
     fontdb, Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache,
-    Wrap,
+    Weight, Wrap,
 };
 use gstreamer as gst;
 use gstreamer_video as gst_video;
 use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, PixmapMut, Rect, Transform};
 use video_coach_core::layout::{
-    bar_rect, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO, BAR_INSET_RATIO,
+    bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
+    BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO, SCOREBOARD_TAIL_FONT_RATIO,
 };
 use video_coach_core::project::Clip;
+use video_coach_core::scoreboard::{format_clock, ScoreboardConfig, ScoreboardState};
+use video_coach_core::stroke::Rgba;
 use video_coach_core::stroke_replay::visible_strokes;
 
-/// The one font the bar is drawn in. Vendored so the picture doesn't depend on
-/// what the machine happens to have installed.
-const FONT: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
+/// The two faces everything here is drawn in. Vendored so the picture doesn't
+/// depend on what the machine happens to have installed.
+const FONT_REGULAR: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
+const FONT_BOLD: &[u8] = include_bytes!("../fonts/DejaVuSans-Bold.ttf");
 
-/// What a line too long for the bar ends in.
+/// The family both faces load under, and so the family every [`Attrs`] asks
+/// for: [`Family::SansSerif`] resolves to it (see [`font_system`]).
+const FONT_FAMILY: &str = "DejaVu Sans";
+
+/// What a line too long for its rect ends in.
 const ELLIPSIS: &str = "…";
 
 /// The bar's background, over the picture: macOS's black at 60%.
 const BAR_ALPHA: f32 = 0.6;
+
+/// The score cell's fill, and the clock cell's — the two that aren't a team's
+/// colour (spec S3). macOS's 0.1 and 0.05 grey, the clock's slightly darker
+/// and slightly translucent.
+const SCORE_FILL: [u8; 4] = [0x1a, 0x1a, 0x1a, 255];
+const CLOCK_FILL: [u8; 4] = [0x0d, 0x0d, 0x0d, 242];
 
 /// Line height as a multiple of the font size — cosmic-text has no default,
 /// and this is the usual one.
@@ -72,19 +89,41 @@ pub(crate) struct OverlayFrame<'a> {
     /// nor its glyphs: that is how a caller suppresses the bar. Neither
     /// shipping caller does; both draw the entry's own line (spec E7).
     pub text: &'a str,
+    /// The teams to draw and what the board reads at this frame, or `None`
+    /// when the project has no scoreboard configured or nothing has been
+    /// tagged yet (`core::scoreboard`'s two "draw nothing" cases). The state
+    /// is the driver's per-frame
+    /// [`ScoreboardContext::state_at`](video_coach_core::scoreboard::ScoreboardContext::state_at).
+    pub scoreboard: Option<(&'a ScoreboardConfig, &'a ScoreboardState)>,
 }
 
-/// Rasterizes overlay frames, holding the font between them.
+/// Rasterizes overlay frames, holding the fonts between them.
 ///
 /// One per pump thread: `FontSystem` and `SwashCache` are `&mut` to draw with,
-/// and building a `FontSystem` per frame would re-parse the TTF.
+/// and building a `FontSystem` per frame would re-parse both TTFs.
 pub(crate) struct OverlayRenderer {
     fonts: FontSystem,
     cache: SwashCache,
-    /// The last line fitted to the bar, so the search in [`Self::ellipsized`]
-    /// runs once an entry rather than once a frame: the line changes only at
-    /// an entry boundary.
-    fitted: Option<Fitted>,
+    /// The last line fitted in each [`TextSlot`], so the search in
+    /// [`Self::ellipsized`] runs once an entry rather than once a frame: none
+    /// of those lines changes inside one.
+    fitted: [Option<Fitted>; TextSlot::COUNT],
+}
+
+/// A line that gets ellipsized to fit, and so gets a memo slot of its own.
+///
+/// The two team names share a size and very nearly a width, so a single slot
+/// would thrash: each frame would evict the other name's fit and re-run the
+/// search.
+#[derive(Debug, Clone, Copy)]
+enum TextSlot {
+    Bar,
+    HomeName,
+    AwayName,
+}
+
+impl TextSlot {
+    const COUNT: usize = 3;
 }
 
 /// A remembered result of [`OverlayRenderer::ellipsized`], with what it was
@@ -96,12 +135,78 @@ struct Fitted {
     result: String,
 }
 
+/// How a run of text is shaped. **The weight is always stated**: both vendored
+/// faces load under [`FONT_FAMILY`], so it is what picks between them.
+#[derive(Debug, Clone, Copy)]
+struct Style {
+    metrics: Metrics,
+    weight: Weight,
+}
+
+impl Style {
+    /// A style at `font_size` pixels, with the usual line height.
+    fn new(font_size: f32, weight: Weight) -> Style {
+        Style {
+            metrics: Metrics::new(font_size, font_size * LINE_HEIGHT),
+            weight,
+        }
+    }
+
+    fn attrs(&self) -> Attrs<'static> {
+        Attrs::new().family(Family::SansSerif).weight(self.weight)
+    }
+}
+
+/// Where a label sits across its rect. It is always centred down it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Center,
+}
+
+/// One line of text to draw, and everything about how it lands.
+struct Label<'a> {
+    text: &'a str,
+    /// The rect the line is placed in, in output pixels.
+    rect: LayoutRect,
+    style: Style,
+    color: TextColor,
+    align: Align,
+    /// The gap kept off `rect`'s left and right edges, in pixels.
+    pad: f32,
+    /// Where the ellipsized result is remembered, or `None` to draw the line
+    /// as it is. The score, the clock and the stoppage tail are short by
+    /// construction and are drawn unfitted, as macOS drew them.
+    slot: Option<TextSlot>,
+}
+
+/// The font database the overlay draws from: the two vendored faces and
+/// nothing else.
+///
+/// **Built by hand rather than through `FontSystem::new_with_fonts`**, which
+/// calls `fontdb::Database::load_system_fonts` — 432 faces on the reference
+/// laptop, none on CI. That made the picture depend on the machine, and with a
+/// bold face to pick it would have decided which one the labels got. The
+/// sans-serif alias points at [`FONT_FAMILY`] so [`Family::SansSerif`] resolves
+/// to the vendored family instead of falling back.
+///
+/// The locale is fixed for the same reason: it steers `cosmic-text`'s
+/// script fallback, and there is nothing here to fall back to.
+fn font_system() -> FontSystem {
+    let mut db = fontdb::Database::new();
+    for face in [FONT_REGULAR, FONT_BOLD] {
+        db.load_font_source(fontdb::Source::Binary(Arc::new(face)));
+    }
+    db.set_sans_serif_family(FONT_FAMILY);
+    FontSystem::new_with_locale_and_db("en-US".to_owned(), db)
+}
+
 impl OverlayRenderer {
     pub(crate) fn new() -> OverlayRenderer {
         OverlayRenderer {
-            fonts: FontSystem::new_with_fonts([fontdb::Source::Binary(Arc::new(FONT))]),
+            fonts: font_system(),
             cache: SwashCache::new(),
-            fitted: None,
+            fitted: [const { None }; TextSlot::COUNT],
         }
     }
 
@@ -142,102 +247,221 @@ impl OverlayRenderer {
     /// Draws `frame` over `pixmap`, in output pixels.
     ///
     /// **The order is macOS's:** the bar's background, then the strokes, then
-    /// the glyphs. A drawing near the bottom of the picture stays visible over
-    /// the bar's tint, and the words stay legible over the drawing.
+    /// the glyphs, and the scoreboard over all of it. A drawing near the bottom
+    /// of the picture stays visible over the bar's tint, the words stay legible
+    /// over the drawing, and the board is never drawn through.
     fn draw(&mut self, pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         // The allocator hands back whatever was in that memory, and nothing
         // else clears it: `from_bytes` adopts the bytes as they are.
         pixmap.fill(Color::TRANSPARENT);
 
-        let bar = bar_rect(f64::from(pixmap.width()), f64::from(pixmap.height()));
+        let (out_w, out_h) = (f64::from(pixmap.width()), f64::from(pixmap.height()));
+        let bar = bar_rect(out_w, out_h);
         if !frame.text.is_empty() {
-            if let Some(rect) =
-                Rect::from_xywh(bar.x as f32, bar.y as f32, bar.w as f32, bar.h as f32)
-            {
-                let paint = Paint {
-                    shader: tiny_skia::Shader::SolidColor(
-                        Color::from_rgba(0.0, 0.0, 0.0, BAR_ALPHA).expect("a valid colour"),
-                    ),
-                    anti_alias: false,
-                    ..Paint::default()
-                };
-                pixmap.fill_rect(rect, &paint, Transform::identity(), None);
-            }
+            fill(
+                pixmap,
+                &bar,
+                Color::from_rgba(0.0, 0.0, 0.0, BAR_ALPHA).expect("a valid colour"),
+            );
         }
 
         draw_strokes(pixmap, frame);
 
         if !frame.text.is_empty() {
-            self.draw_text(pixmap, frame.text, &bar);
+            self.draw_label(
+                pixmap,
+                &Label {
+                    text: frame.text,
+                    rect: bar,
+                    style: Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL),
+                    color: TextColor::rgb(255, 255, 255),
+                    align: Align::Left,
+                    pad: (bar.h * BAR_INSET_RATIO) as f32,
+                    slot: Some(TextSlot::Bar),
+                },
+            );
+        }
+
+        if let Some((config, state)) = frame.scoreboard {
+            self.draw_scoreboard(pixmap, config, state, out_w, out_h);
         }
     }
 
-    /// Draws `line` inside `bar`, on one line, clipped with a tail ellipsis.
-    fn draw_text(&mut self, pixmap: &mut PixmapMut, line: &str, bar: &LayoutRect) {
-        let font_size = (bar.h * BAR_FONT_RATIO) as f32;
-        let inset = (bar.h * BAR_INSET_RATIO) as f32;
-        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT);
-        let max_width = bar.w as f32 - 2.0 * inset;
-        if max_width <= 0.0 || font_size <= 0.0 {
+    /// Draws the scoreboard top-left, over everything else (spec S3).
+    ///
+    /// The cells come from [`scoreboard_rects`]; the only geometry decided here
+    /// is the accent strip, which that function returns as one row across the
+    /// whole bar because the score cell sits between the two columns it
+    /// actually covers.
+    fn draw_scoreboard(
+        &mut self,
+        pixmap: &mut PixmapMut,
+        config: &ScoreboardConfig,
+        state: &ScoreboardState,
+        out_w: f64,
+        out_h: f64,
+    ) {
+        let rects = scoreboard_rects(out_w, out_h);
+        fill(pixmap, &rects.home, fill_color(config.home.primary_color));
+        fill(pixmap, &rects.score, rgba8(SCORE_FILL));
+        fill(pixmap, &rects.away, fill_color(config.away.primary_color));
+        fill(pixmap, &rects.clock, rgba8(CLOCK_FILL));
+        // The strip runs over the team columns only, in each team's own
+        // secondary colour, so it is drawn as the two of them.
+        for (cell, color) in [
+            (&rects.home, config.home.secondary_color),
+            (&rects.away, config.away.secondary_color),
+        ] {
+            let strip = LayoutRect {
+                x: cell.x,
+                w: cell.w,
+                ..rects.accent
+            };
+            fill(pixmap, &strip, fill_color(color));
+        }
+
+        // Every label's size is a fraction of the CELL height, not the bar's
+        // (the parent spec's table says the bar's and is ~9% too large).
+        let cell_h = rects.home.h;
+        let bold = Style::new((cell_h * SCOREBOARD_FONT_RATIO) as f32, Weight::BOLD);
+        let white = TextColor::rgb(255, 255, 255);
+        let pad = (cell_h * SCOREBOARD_NAME_PAD_RATIO) as f32;
+        let clock = format_clock(state.clock);
+        let score = format!("{} - {}", state.home_score, state.away_score);
+
+        let labels = [
+            Label {
+                text: &config.home.name,
+                rect: rects.home,
+                style: bold,
+                color: text_color(config.home.font_color),
+                align: Align::Center,
+                pad,
+                slot: Some(TextSlot::HomeName),
+            },
+            Label {
+                text: &score,
+                rect: rects.score,
+                style: bold,
+                color: white,
+                align: Align::Center,
+                pad: 0.0,
+                slot: None,
+            },
+            Label {
+                text: &config.away.name,
+                rect: rects.away,
+                style: bold,
+                color: text_color(config.away.font_color),
+                align: Align::Center,
+                pad,
+                slot: Some(TextSlot::AwayName),
+            },
+            Label {
+                text: &clock.main,
+                rect: rects.clock,
+                style: bold,
+                color: white,
+                align: Align::Center,
+                pad: 0.0,
+                slot: None,
+            },
+        ];
+        for label in &labels {
+            self.draw_label(pixmap, label);
+        }
+        // The `+M:SS` tail hangs outside the bar, and only in stoppage:
+        // `trailing` is empty otherwise.
+        if !clock.trailing.is_empty() {
+            self.draw_label(
+                pixmap,
+                &Label {
+                    text: &clock.trailing,
+                    rect: rects.tail,
+                    style: Style::new((cell_h * SCOREBOARD_TAIL_FONT_RATIO) as f32, Weight::NORMAL),
+                    color: white,
+                    align: Align::Center,
+                    pad: 0.0,
+                    slot: None,
+                },
+            );
+        }
+    }
+
+    /// Draws `label` on one row of its rect, centred down it and placed across
+    /// it by its [`Align`], ellipsized if it has a [`TextSlot`].
+    fn draw_label(&mut self, pixmap: &mut PixmapMut, label: &Label) {
+        let max_width = label.rect.w as f32 - 2.0 * label.pad;
+        if max_width <= 0.0 || label.style.metrics.font_size <= 0.0 || label.text.is_empty() {
             return;
         }
-        let line = self.ellipsized(line, metrics, max_width);
+        let line = match label.slot {
+            Some(slot) => self.ellipsized(slot, label.text, label.style, max_width),
+            None => label.text.to_owned(),
+        };
 
-        let mut buffer = self.shaped(&line, metrics, Some(max_width));
-        // Left at the inset, and vertically centred on the bar: the glyphs'
-        // own box is one line high, so centring it centres the ascender and
-        // descender together.
-        let left = (bar.x as f32 + inset).round() as i32;
-        let top = (bar.y as f32 + (bar.h as f32 - metrics.line_height) / 2.0).round() as i32;
+        let mut buffer = self.shaped(&line, label.style, Some(max_width));
+        // The shaped width comes off this same buffer rather than a second
+        // measuring pass: centring a label must not cost an extra shaping a
+        // frame.
+        let line_w = line_width(&buffer);
+        let left = match label.align {
+            Align::Left => label.rect.x as f32 + label.pad,
+            Align::Center => label.rect.x as f32 + (label.rect.w as f32 - line_w) / 2.0,
+        }
+        .round() as i32;
+        // Vertically centred on the rect: the glyphs' own box is one line
+        // high, so centring it centres the ascender and descender together.
+        let line_height = label.style.metrics.line_height;
+        let top = (label.rect.y as f32 + (label.rect.h as f32 - line_height) / 2.0).round() as i32;
 
         let (width, height) = (pixmap.width() as i32, pixmap.height() as i32);
         let data = pixmap.data_mut();
         let (fonts, cache) = (&mut self.fonts, &mut self.cache);
-        buffer.draw(
-            fonts,
-            cache,
-            TextColor::rgb(255, 255, 255),
-            |x, y, w, h, color| {
-                let a = u32::from(color.a());
-                if a == 0 {
-                    return;
-                }
-                // `color` is straight alpha; the pixmap is premultiplied.
-                let src =
-                    [color.r(), color.g(), color.b(), color.a()].map(|c| u32::from(c) * a / 255);
-                for dy in 0..h as i32 {
-                    for dx in 0..w as i32 {
-                        let (px, py) = (left + x + dx, top + y + dy);
-                        if px < 0 || py < 0 || px >= width || py >= height {
-                            continue;
-                        }
-                        let i = (py as usize * width as usize + px as usize) * 4;
-                        for c in 0..4 {
-                            let under = u32::from(data[i + c]) * (255 - a) / 255;
-                            data[i + c] = (src[c] + under).min(255) as u8;
-                        }
+        buffer.draw(fonts, cache, label.color, |x, y, w, h, color| {
+            let a = u32::from(color.a());
+            if a == 0 {
+                return;
+            }
+            // `color` is straight alpha; the pixmap is premultiplied.
+            let src = [color.r(), color.g(), color.b(), color.a()].map(|c| u32::from(c) * a / 255);
+            for dy in 0..h as i32 {
+                for dx in 0..w as i32 {
+                    let (px, py) = (left + x + dx, top + y + dy);
+                    if px < 0 || py < 0 || px >= width || py >= height {
+                        continue;
+                    }
+                    let i = (py as usize * width as usize + px as usize) * 4;
+                    for c in 0..4 {
+                        let under = u32::from(data[i + c]) * (255 - a) / 255;
+                        data[i + c] = (src[c] + under).min(255) as u8;
                     }
                 }
-            },
-        );
+            }
+        });
     }
 
     /// `line` cut to at most `max_width`, with a tail ellipsis if it didn't
-    /// fit.
+    /// fit, remembered in `slot`.
     ///
     /// [`Wrap::None`] puts the whole line on one row whatever its width, so
     /// without this a realistic clip line runs off the right of the frame
     /// (measured: 143 characters overflows at every resolution). macOS wrapped
-    /// it onto a second row, which landed over the picture.
-    fn ellipsized(&mut self, line: &str, metrics: Metrics, max_width: f32) -> String {
-        let size = metrics.font_size;
-        if let Some(f) = &self.fitted {
+    /// it onto a second row, which landed over the picture. A long team name
+    /// is cut the same way rather than shrunk to fit as macOS's was: in a cell
+    /// a tenth of the frame wide, a shrunk name is illegible anyway (spec S3).
+    ///
+    /// Each slot keeps one fit, and a slot always holds the same weight, so
+    /// the memo need not key on it.
+    fn ellipsized(&mut self, slot: TextSlot, line: &str, style: Style, max_width: f32) -> String {
+        let size = style.metrics.font_size;
+        if let Some(f) = &self.fitted[slot as usize] {
             if f.line == line && f.font_size == size && f.max_width == max_width {
                 return f.result.clone();
             }
         }
-        let result = self.fit(line, metrics, max_width);
-        self.fitted = Some(Fitted {
+        let result = self.fit(line, style, max_width);
+        self.fitted[slot as usize] = Some(Fitted {
             line: line.to_owned(),
             font_size: size,
             max_width,
@@ -247,8 +471,8 @@ impl OverlayRenderer {
     }
 
     /// [`Self::ellipsized`] without the memo.
-    fn fit(&mut self, line: &str, metrics: Metrics, max_width: f32) -> String {
-        if self.width(line, metrics) <= max_width {
+    fn fit(&mut self, line: &str, style: Style, max_width: f32) -> String {
+        if self.width(line, style) <= max_width {
             return line.to_owned();
         }
         // The longest prefix that still fits with an ellipsis after it.
@@ -263,7 +487,7 @@ impl OverlayRenderer {
         let (mut low, mut high) = (0, cuts.len() - 1);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
-            if self.width(&with_ellipsis(cuts[mid]), metrics) <= max_width {
+            if self.width(&with_ellipsis(cuts[mid]), style) <= max_width {
                 low = mid;
             } else {
                 high = mid - 1;
@@ -275,27 +499,62 @@ impl OverlayRenderer {
     }
 
     /// How wide `line` is, shaped on one unbounded row.
-    fn width(&mut self, line: &str, metrics: Metrics) -> f32 {
-        self.shaped(line, metrics, None)
-            .layout_runs()
-            .map(|run| run.line_w)
-            .fold(0.0, f32::max)
+    fn width(&mut self, line: &str, style: Style) -> f32 {
+        line_width(&self.shaped(line, style, None))
     }
 
     /// `line` shaped on one row, at most `max_width` wide if given.
-    fn shaped(&mut self, line: &str, metrics: Metrics, max_width: Option<f32>) -> Buffer {
-        let mut buffer = Buffer::new(&mut self.fonts, metrics);
+    fn shaped(&mut self, line: &str, style: Style, max_width: Option<f32>) -> Buffer {
+        let mut buffer = Buffer::new(&mut self.fonts, style.metrics);
         buffer.set_wrap(Wrap::None);
-        buffer.set_size(max_width, Some(metrics.line_height));
-        buffer.set_text(
-            line,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
+        buffer.set_size(max_width, Some(style.metrics.line_height));
+        buffer.set_text(line, &style.attrs(), Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.fonts, false);
         buffer
     }
+}
+
+/// How wide a shaped [`Buffer`]'s widest row is.
+fn line_width(buffer: &Buffer) -> f32 {
+    buffer
+        .layout_runs()
+        .map(|run| run.line_w)
+        .fold(0.0, f32::max)
+}
+
+/// Fills `rect` with `color`, doing nothing for a rect that is empty or
+/// non-finite (a corrupt layout, not something to paint a guess over).
+///
+/// Anti-aliasing off: these are axis-aligned blocks of chrome, and a soft
+/// edge on one would only leak the picture through it.
+fn fill(pixmap: &mut PixmapMut, rect: &LayoutRect, color: Color) {
+    let Some(rect) = Rect::from_xywh(rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32)
+    else {
+        return;
+    };
+    let paint = Paint {
+        shader: tiny_skia::Shader::SolidColor(color),
+        anti_alias: false,
+        ..Paint::default()
+    };
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+/// An 8-bit straight-alpha colour as tiny-skia's.
+fn rgba8([r, g, b, a]: [u8; 4]) -> Color {
+    Color::from_rgba8(r, g, b, a)
+}
+
+/// A stored colour as tiny-skia's. Out of range is transparent: a corrupt
+/// project, not something to paint a guess over (BACKLOG #28).
+fn fill_color(c: Rgba) -> Color {
+    Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32).unwrap_or(Color::TRANSPARENT)
+}
+
+/// A stored colour as cosmic-text's, which is 8-bit and straight-alpha.
+fn text_color(c: Rgba) -> TextColor {
+    let channel = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    TextColor::rgba(channel(c.r), channel(c.g), channel(c.b), channel(c.a))
 }
 
 /// Draws the visible strokes over `pixmap`, mapped into the picture rect.
@@ -358,9 +617,15 @@ mod tests {
     use uuid::Uuid;
     use video_coach_core::event::{CommentaryEvent, EventKind};
     use video_coach_core::layout::{BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO};
+    use video_coach_core::scoreboard::{ClockDisplay, MatchFormat, TeamConfig};
     use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 
     use super::*;
+
+    /// The export's own output size, which the scoreboard tests use so the
+    /// rects they reason about are the shipping ones.
+    const OUT_W: u32 = 1920;
+    const OUT_H: u32 = 1080;
 
     /// A clip whose only content is `events`.
     fn clip(events: Vec<CommentaryEvent>) -> Clip {
@@ -406,12 +671,14 @@ mod tests {
     }
 
     /// The rendered pixels, as `[r, g, b, a]` per pixel in row order, for a
-    /// `w`×`h` output whose picture is `picture` and whose bar reads `text`.
-    fn render_at(
+    /// `w`×`h` output whose picture is `picture`, whose bar reads `text` and
+    /// whose scoreboard is `scoreboard`.
+    fn render_frame(
         clip: &Clip,
         record_time: f64,
         text: &str,
         picture: (i32, i32, i32, i32),
+        scoreboard: Option<(&ScoreboardConfig, &ScoreboardState)>,
         w: u32,
         h: u32,
     ) -> Vec<[u8; 4]> {
@@ -422,6 +689,7 @@ mod tests {
                 record_time,
                 picture,
                 text,
+                scoreboard,
             },
             w,
             h,
@@ -434,6 +702,18 @@ mod tests {
         let map = buffer.map_readable().unwrap();
         assert_eq!(map.len(), (w * h * 4) as usize);
         map.as_chunks::<4>().0.to_vec()
+    }
+
+    /// [`render_frame`] with no scoreboard, which is Phase 8's overlay.
+    fn render_at(
+        clip: &Clip,
+        record_time: f64,
+        text: &str,
+        picture: (i32, i32, i32, i32),
+        w: u32,
+        h: u32,
+    ) -> Vec<[u8; 4]> {
+        render_frame(clip, record_time, text, picture, None, w, h)
     }
 
     /// [`render_at`] over a picture filling the whole output and no bar.
@@ -625,25 +905,25 @@ mod tests {
                     set-piece";
         let mut renderer = OverlayRenderer::new();
         let bar = bar_rect(1920.0, 1080.0);
-        let font_size = (bar.h * BAR_FONT_RATIO) as f32;
-        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT);
+        let style = Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL);
         let max_width = bar.w as f32 - 2.0 * (bar.h * BAR_INSET_RATIO) as f32;
+        let slot = TextSlot::Bar;
 
-        let fitted = renderer.ellipsized(long, metrics, max_width);
+        let fitted = renderer.ellipsized(slot, long, style, max_width);
         assert!(fitted.ends_with(ELLIPSIS), "{fitted:?} has no ellipsis");
         assert!(long.starts_with(fitted.trim_end_matches(ELLIPSIS)));
-        assert!(renderer.width(&fitted, metrics) <= max_width);
+        assert!(renderer.width(&fitted, style) <= max_width);
         // And it is the longest such cut: one more character overflows.
         let kept = fitted.trim_end_matches(ELLIPSIS).chars().count();
         let longer = format!(
             "{}{ELLIPSIS}",
             long.chars().take(kept + 1).collect::<String>()
         );
-        assert!(renderer.width(&longer, metrics) > max_width);
+        assert!(renderer.width(&longer, style) > max_width);
 
         // A line that fits is left exactly as it is.
         let short = "3 / 7 | Turnover";
-        assert_eq!(renderer.ellipsized(short, metrics, max_width), short);
+        assert_eq!(renderer.ellipsized(slot, short, style, max_width), short);
     }
 
     /// The cut line is drawn on one row: the overflow never reaches the
@@ -664,5 +944,264 @@ mod tests {
             .filter(|&y| at(&px, 1280, 1279, y)[0] > 128)
             .count();
         assert_eq!(right_edge, 0);
+    }
+
+    // ------------------------------------------------------- the scoreboard
+
+    fn rgba(r: f64, g: f64, b: f64) -> Rgba {
+        Rgba { r, g, b, a: 1.0 }
+    }
+
+    /// Two teams whose six colours are all different and all primary, so a
+    /// pixel says which of them painted it.
+    fn scoreboard_config() -> ScoreboardConfig {
+        ScoreboardConfig {
+            home: TeamConfig {
+                name: "HOME".into(),
+                primary_color: rgba(0.0, 0.0, 1.0),
+                secondary_color: rgba(1.0, 1.0, 0.0),
+                font_color: rgba(1.0, 0.0, 1.0),
+            },
+            away: TeamConfig {
+                name: "AWAY".into(),
+                primary_color: rgba(1.0, 0.0, 0.0),
+                secondary_color: rgba(0.0, 1.0, 1.0),
+                font_color: rgba(0.0, 1.0, 0.0),
+            },
+            format: MatchFormat::default(),
+            auto_back_anchor_p1: false,
+        }
+    }
+
+    fn state(clock: ClockDisplay) -> ScoreboardState {
+        ScoreboardState {
+            home_score: 2,
+            away_score: 1,
+            clock,
+        }
+    }
+
+    /// The scoreboard alone, over an empty clip and no text bar, at the
+    /// export's output size.
+    fn render_scoreboard(config: &ScoreboardConfig, state: &ScoreboardState) -> Vec<[u8; 4]> {
+        render_frame(
+            &clip(Vec::new()),
+            0.0,
+            "",
+            (0, 0, OUT_W as i32, OUT_H as i32),
+            Some((config, state)),
+            OUT_W,
+            OUT_H,
+        )
+    }
+
+    /// How many pixels of `rect` satisfy `matches`. The rect is taken a pixel
+    /// inside on every edge, so an anti-aliased boundary is never counted.
+    fn count_in(px: &[[u8; 4]], rect: &LayoutRect, matches: impl Fn([u8; 4]) -> bool) -> usize {
+        let rows = (rect.y.ceil() as u32 + 1)..(rect.y + rect.h) as u32;
+        let cols = (rect.x.ceil() as u32 + 1)..(rect.x + rect.w) as u32;
+        rows.flat_map(|y| cols.clone().map(move |x| (x, y)))
+            .filter(|&(x, y)| matches(at(px, OUT_W, x, y)))
+            .count()
+    }
+
+    /// The four cells take their fills, and nothing at all is painted outside
+    /// the bar and the stoppage tail — in particular not the strip left of the
+    /// bar or the rows above it, which the inset leaves clear.
+    #[test]
+    fn the_scoreboard_fills_its_cells_and_paints_nowhere_else() {
+        let config = scoreboard_config();
+        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 135.0 }));
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+
+        // The bottom-left corner of each cell: inside the fill, clear of the
+        // centred glyphs.
+        let corner =
+            |cell: &LayoutRect| at(&px, OUT_W, cell.x as u32 + 4, (cell.y + cell.h) as u32 - 4);
+        assert_eq!(corner(&r.home), [0, 0, 255, 255], "the home cell");
+        assert_eq!(corner(&r.away), [255, 0, 0, 255], "the away cell");
+        assert_eq!(corner(&r.score), [26, 26, 26, 255], "the score cell");
+        // The clock's fill is the one that isn't opaque (macOS's 0.95), and
+        // the pixmap is premultiplied, so its channels sit under its alpha.
+        let clock = corner(&r.clock);
+        assert_eq!(clock[3], 242, "the clock cell's alpha");
+        assert!(clock[0] < 16, "the clock cell is dark: {clock:?}");
+
+        // Nothing outside the bar or the tail, to within the rounding of a
+        // sub-pixel rect.
+        let touched: Vec<(u32, u32)> = (0..OUT_H)
+            .flat_map(|y| (0..OUT_W).map(move |x| (x, y)))
+            .filter(|&(x, y)| at(&px, OUT_W, x, y)[3] > 0)
+            .filter(|&(x, y)| {
+                let outside = |rect: &LayoutRect| {
+                    f64::from(x) < rect.x - 1.0
+                        || f64::from(x) > rect.x + rect.w + 1.0
+                        || f64::from(y) < rect.y - 1.0
+                        || f64::from(y) > rect.y + rect.h + 1.0
+                };
+                outside(&r.bar) && outside(&r.tail)
+            })
+            // A handful names the mistake; the whole frame would be two
+            // million pairs in the panic message.
+            .take(8)
+            .collect();
+        assert!(touched.is_empty(), "painted outside the board: {touched:?}");
+        // Named for what they are: the inset's own margins.
+        assert_eq!(at(&px, OUT_W, r.bar.x as u32 - 4, 60), [0, 0, 0, 0]);
+        assert_eq!(at(&px, OUT_W, 60, r.bar.y as u32 - 4), [0, 0, 0, 0]);
+    }
+
+    /// The accent strip is each team's secondary colour over that team's
+    /// column only. `scoreboard_rects` returns it as one row across the whole
+    /// bar because the score cell sits between the two columns it covers, so
+    /// this is the one piece of geometry the drawer decides.
+    #[test]
+    fn the_accent_strip_covers_the_team_columns_only() {
+        let config = scoreboard_config();
+        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 60.0 }));
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        let row = (r.accent.y + r.accent.h / 2.0) as u32;
+        let strip = |cell: &LayoutRect| at(&px, OUT_W, cell.x as u32 + 4, row);
+
+        assert_eq!(strip(&r.home), [255, 255, 0, 255], "the home accent");
+        assert_eq!(strip(&r.away), [0, 255, 255, 255], "the away accent");
+        // The score and clock columns get no strip: the board's top row is
+        // open above them.
+        assert_eq!(strip(&r.score), [0, 0, 0, 0], "above the score");
+        assert_eq!(strip(&r.clock), [0, 0, 0, 0], "above the clock");
+    }
+
+    /// The `+M:SS` tail is drawn only in stoppage, and outside the bar.
+    #[test]
+    fn the_stoppage_tail_is_drawn_only_in_stoppage() {
+        let config = scoreboard_config();
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        let lit = |px: &[[u8; 4]], rect: &LayoutRect| count_in(px, rect, |p| p[3] > 0);
+
+        let running = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 135.0 }));
+        assert_eq!(lit(&running, &r.tail), 0, "a tail with the clock running");
+        assert!(lit(&running, &r.clock) > 0, "no clock at all");
+
+        let stoppage = render_scoreboard(
+            &config,
+            &state(ClockDisplay::Stoppage {
+                base: 2700.0,
+                plus: 125.0,
+            }),
+        );
+        assert!(lit(&stoppage, &r.tail) > 0, "no tail in stoppage");
+        // And it hangs past the bar rather than inside it.
+        assert!(r.tail.x > r.bar.x + r.bar.w);
+    }
+
+    /// Each team's name is drawn in that team's `font_color` — the field the
+    /// setup sheet sets separately from the two cell colours.
+    #[test]
+    fn each_team_name_is_drawn_in_its_own_font_color() {
+        let config = scoreboard_config();
+        let px = render_scoreboard(&config, &state(ClockDisplay::Running { seconds: 1.0 }));
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        // Magenta and green over blue and red cells: a glyph pixel is the only
+        // place either can come from, and neither fill is close to either.
+        let magenta = |p: [u8; 4]| p[0] > 200 && p[1] < 64 && p[2] > 200;
+        let green = |p: [u8; 4]| p[0] < 64 && p[1] > 200 && p[2] < 64;
+
+        assert!(count_in(&px, &r.home, magenta) > 50, "no home name");
+        assert!(count_in(&px, &r.away, green) > 50, "no away name");
+        assert_eq!(count_in(&px, &r.home, green), 0, "the away colour at home");
+        assert_eq!(count_in(&px, &r.away, magenta), 0, "the home colour away");
+    }
+
+    /// The board is drawn last, so a drawing under it never shows through.
+    /// macOS drew it on top of everything and so does this.
+    #[test]
+    fn the_scoreboard_covers_a_stroke_under_it() {
+        let across = CommentaryEvent::new(
+            1.0,
+            EventKind::Stroke(Stroke {
+                id: Uuid::nil(),
+                color: Rgba::RED,
+                line_width: 0.05,
+                // Across the board's cells and out past them, a twentieth of
+                // the way down the picture.
+                points: [0.01, 0.5]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, x)| StrokePoint {
+                        x,
+                        y: 0.055,
+                        t: i as f64 * 0.1,
+                    })
+                    .collect(),
+                auto_clear_after_seconds: None,
+            }),
+        );
+        let config = scoreboard_config();
+        let px = render_frame(
+            &clip(vec![across]),
+            1.5,
+            "",
+            (0, 0, OUT_W as i32, OUT_H as i32),
+            Some((&config, &state(ClockDisplay::Running { seconds: 1.0 }))),
+            OUT_W,
+            OUT_H,
+        );
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        // The stroke crosses this row of the home cell; the cell's fill wins.
+        let y = (0.055 * f64::from(OUT_H)) as u32;
+        assert_eq!(at(&px, OUT_W, r.home.x as u32 + 4, y), [0, 0, 255, 255]);
+        // And it is still there past the board's right edge.
+        assert_eq!(at(&px, OUT_W, 900, y), [255, 51, 51, 255]);
+    }
+
+    /// A frame with no scoreboard leaves the board's rects alone: the two
+    /// "draw nothing" cases (not configured, nothing tagged yet) reach here as
+    /// one `None`.
+    #[test]
+    fn a_frame_without_a_scoreboard_draws_no_board() {
+        let px = render_at(
+            &clip(Vec::new()),
+            0.0,
+            "1 / 3 | Kick-off",
+            (0, 0, OUT_W as i32, OUT_H as i32),
+            OUT_W,
+            OUT_H,
+        );
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        assert_eq!(count_in(&px, &r.bar, |p| p[3] > 0), 0);
+        assert_eq!(count_in(&px, &r.tail, |p| p[3] > 0), 0);
+    }
+
+    /// Both faces are loaded under one family, so the weight is what picks
+    /// between them — and picking is silent when it goes wrong. Bold DejaVu is
+    /// wider than regular at the same size, which is the cheapest proof that
+    /// two different faces were actually reached.
+    #[test]
+    fn the_weight_picks_between_the_two_vendored_faces() {
+        let mut renderer = OverlayRenderer::new();
+        let line = "Hamburgefonstiv 12:34";
+        let regular = renderer.width(line, Style::new(40.0, Weight::NORMAL));
+        let bold = renderer.width(line, Style::new(40.0, Weight::BOLD));
+        assert!(bold > regular, "bold {bold} is not wider than {regular}");
+    }
+
+    /// The two vendored faces are the only fonts in the database. Without
+    /// this, `cosmic-text` scans the machine (432 faces on the reference
+    /// laptop, none on CI) and the picture stops being the same everywhere.
+    #[test]
+    fn only_the_vendored_faces_are_loaded() {
+        let fonts = font_system();
+        let faces: Vec<_> = fonts.db().faces().collect();
+        assert_eq!(faces.len(), 2, "{} faces loaded", faces.len());
+        for face in &faces {
+            assert!(
+                face.families.iter().any(|(name, _)| name == FONT_FAMILY),
+                "{:?} is not {FONT_FAMILY}",
+                face.families
+            );
+        }
+        let mut weights: Vec<_> = faces.iter().map(|f| f.weight).collect();
+        weights.sort_by_key(|w| w.0);
+        assert_eq!(weights, [Weight::NORMAL, Weight::BOLD]);
     }
 }

@@ -119,6 +119,7 @@ impl Running {
             clip,
             compilation,
             commentary_volume: 0.0,
+            scoreboard: None,
         };
         let mailbox = FrameMailbox::default();
         let position = PreviewPosition::default();

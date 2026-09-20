@@ -484,3 +484,31 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** if a long session ever hits `EMFILE`, or when GStreamer
   offers a way to release a display's imported buffers without terminating the
   `EGLDisplay`. Raising `RLIMIT_NOFILE` is the cheap stopgap.
+
+## Phase 9 deferrals (spec `docs/superpowers/specs/2026-09-20-linux-port-phase-9-design.md`)
+
+56. **The score label overflows its cell at double-digit scores.** Measured at
+  1080p: the score cell is 138.2 px wide; `"3 - 1"` is 109.4 px, but
+  `"12 - 9"` is 139.8 px and `"10 - 10"` is 170.3 px. The label is centred, so
+  it spills symmetrically into the home and away cells rather than clipping.
+- **Why deferred:** macOS behaved identically (it never fit the score), so
+  this is not a regression, and soccer — the format the spec is written
+  around — does not reach double digits. Fixing it means either a fourth memo
+  slot keyed on size or a narrower column, and neither earns its place until a
+  format that scores in double digits exists.
+- **When to revisit:** when a basketball or hockey format lands, or the first
+  time a real scoreboard reads `10 - 10`.
+
+57. **A realistic club name is ellipsized to ~7 characters.** Measured at
+  1080p: the padded home cell is 199.4 px; `"HOME"` is 147.1 px, but
+  `"Manchester United"` is 467.6 px and `"Riverside Rovers U14"` is 526.5 px,
+  so both render as roughly `"Manche…"`. The spec chose fixed-size-plus-
+  ellipsize deliberately, rejecting macOS's shrink-to-fit on the grounds that a
+  shrunk name in a cell 10.8% of the frame width is illegible anyway.
+- **Why deferred:** it is the spec's decision working as written, not a bug,
+  and the alternative (shrink to a legibility floor, then ellipsize) needs the
+  fitting memo to key on size as well as width. Worth a human's eye before
+  spending that complexity — "Manche…" may or may not be worse than a slightly
+  small "Manchester Utd".
+- **When to revisit:** the first hands-on pass with real team names, which is
+  in the batched checklist.

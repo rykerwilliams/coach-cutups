@@ -95,6 +95,8 @@ impl Bus {
             clip: clip.clone(),
             compilation,
             commentary_volume: open.project.preferences.preview_commentary_volume,
+            // Phase 9 Task 3a builds the context here.
+            scoreboard: None,
         };
 
         // Whatever was on screen stops first, and takes its frame with it.

@@ -5,7 +5,8 @@
 //! pad 0, z 0: the pumped source frame through `gltransformation` (zoom), at
 //!             that entry's fit rect
 //! pad 1, z 1: the entry's webcam recording, at the PiP rect
-//! pad 2, z 2: the overlay -- drawings and the text bar -- at the output size
+//! pad 2, z 2: the overlay -- drawings, the text bar and the scoreboard --
+//!             at the output size
 //! ```
 //!
 //! The sound goes into the same muxer, mixed per output frame by
@@ -39,6 +40,7 @@ use video_coach_core::audio::Region;
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::{Clip, Quality, Resolution};
+use video_coach_core::scoreboard::ScoreboardContext;
 
 use super::audio::Mixer;
 use super::decode::Decoder;
@@ -80,6 +82,10 @@ pub struct ExportJob {
     pub path: PathBuf,
     pub resolution: Resolution,
     pub quality: Quality,
+    /// The match clock and score to burn in, or `None` when the project has no
+    /// scoreboard configured. Built once by the bus, and **never reused across
+    /// a source add, move, remove or relink** — see [`ScoreboardContext`].
+    pub scoreboard: Option<ScoreboardContext>,
 }
 
 /// What one entry needs beside its `PlanEntry`, which carries the edit but
@@ -303,12 +309,24 @@ fn export(
         }
 
         let record_time = entry.record_time(n);
+        // **The displayed frame's source time**, not a per-clip constant plus
+        // the record time: that sum is exactly the macOS bug that put the
+        // match clock ahead of the footage after every pause (BACKLOG #27).
+        let state = job
+            .scoreboard
+            .as_ref()
+            .and_then(|context| context.state_at(entry.source_index, frame.source_time));
         let overlay = overlays.render(
             &OverlayFrame {
                 clip: &media.clip,
                 record_time,
                 picture,
                 text: &entry.text,
+                scoreboard: job
+                    .scoreboard
+                    .as_ref()
+                    .zip(state.as_ref())
+                    .map(|(context, state)| (context.config(), state)),
             },
             out_w as u32,
             out_h as u32,
@@ -881,6 +899,7 @@ mod tests {
             path: path.clone(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
+            scoreboard: None,
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();

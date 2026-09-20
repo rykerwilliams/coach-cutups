@@ -21,9 +21,12 @@ use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
-use video_coach_core::layout::{bar_rect, pip_rect};
+use video_coach_core::layout::{bar_rect, pip_rect, scoreboard_rects, Rect as LayoutRect};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::scoreboard::{
+    MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
+};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
@@ -131,6 +134,7 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         path,
         resolution: Resolution::R720,
         quality: Quality::Medium,
+        scoreboard: None,
     }
 }
 
@@ -336,6 +340,7 @@ fn fiducial(kind: CounterKind) {
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
+        scoreboard: None,
     })
     .unwrap();
     assert_eq!(done.path, path);
@@ -441,6 +446,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
+        scoreboard: None,
     })
     .unwrap();
 
@@ -729,6 +735,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             path: path.clone(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
+            scoreboard: None,
         },
         path,
     )
@@ -821,6 +828,86 @@ fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
     assert!(glyphs > 50, "only {glyphs} glyph pixels in the bar");
 }
 
+/// A pixel inside `cell`, clear of the label centred in it.
+fn cell_corner(cell: &LayoutRect) -> (usize, usize) {
+    ((cell.x + 4.0) as usize, (cell.y + cell.h - 4.0) as usize)
+}
+
+/// The `ScoreboardContext` the bus will build reaches the overlay through the
+/// export driver, and the board is burned into the file.
+///
+/// The clock it draws is the **displayed frame's** source time
+/// (`state_at(entry.source_index, frame.source_time)`), never a per-clip
+/// constant plus the record time — the macOS bug that put the match clock ahead
+/// of the footage after every pause (BACKLOG #27). The arithmetic itself is
+/// pinned in core; this pins the wiring.
+#[test]
+fn the_export_burns_in_the_scoreboard() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 60, BLUE, false);
+    let team = |name: &str, primary: u32, secondary: u32| {
+        let rgb = |c: u32| Rgba {
+            r: f64::from((c >> 16) as u8) / 255.0,
+            g: f64::from((c >> 8) as u8) / 255.0,
+            b: f64::from(c as u8) / 255.0,
+            a: 1.0,
+        };
+        TeamConfig::new(name, rgb(primary), rgb(secondary))
+    };
+    let mut project = Project::new("p");
+    project.source_videos.push(SourceRef {
+        relative_path: "src.webm".into(),
+        display_name: "src".into(),
+        duration_seconds: 2.0,
+        display_aspect: 16.0 / 9.0,
+    });
+    project.scoreboard = Some(ScoreboardConfig {
+        home: team("HOME", 0x0000ff, 0xffff00),
+        away: team("AWAY", 0xff0000, 0x00ffff),
+        format: MatchFormat::default(),
+        auto_back_anchor_p1: false,
+    });
+    // Kick-off at the top of the source, a home goal a quarter-second in, and
+    // every exported frame showing 0.5 s: the board reads 1 - 0, running.
+    project.append_match_event(MatchEventKind::StartStop, 0, 0.0);
+    project.append_match_event(MatchEventKind::HomeGoal, 0, 0.25);
+
+    let clip = clip(0.0, 0.2, Vec::new());
+    let frames = (0..6)
+        .map(|_| FrameSpec {
+            entry: 0,
+            source_time: 0.5,
+            zoom: Zoom::IDENTITY,
+        })
+        .collect();
+    let path = dir.path().join("out.mp4");
+    export(ExportJob {
+        compilation: one_entry(&clip, frames, ""),
+        sources: vec![source],
+        entries: vec![EntryMedia {
+            recording: PathBuf::new(),
+            clip,
+        }],
+        audio: Vec::new(),
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: ScoreboardContext::for_project(&project),
+    })
+    .unwrap();
+
+    let out = fixtures::decode_rgb(&path);
+    let frame = out.last().expect("frames out");
+    let rects = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+    assert_rgb(frame, "the home cell", cell_corner(&rects.home), 0x0000ff);
+    assert_rgb(frame, "the away cell", cell_corner(&rects.away), 0xff0000);
+    // The board is top-left and nothing else is: the picture below it, and the
+    // strip the inset leaves to its left, are the source's own blue.
+    assert_rgb(frame, "the picture", (640, 400), BLUE);
+    assert_rgb(frame, "left of the board", (2, 40), BLUE);
+}
+
 /// With `show_pip` off the pad takes a 1×1 transparent filler, which is
 /// invisible — and, being fed at all, is what keeps the mixer running: an
 /// unfed pad produces no output frames whatever (measured).
@@ -864,6 +951,7 @@ fn sounded_job(
         path,
         resolution: Resolution::R720,
         quality: Quality::Medium,
+        scoreboard: None,
     }
 }
 
