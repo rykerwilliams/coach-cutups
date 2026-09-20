@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! pump:  appsrc name=src -- the source frame, GL memory, PTS n/30
-//!        appsrc name=ov  -- its overlay, RGBA, the SAME PTS
+//!        appsrc name=ov  -- its overlay, output-size RGBA, the SAME PTS
 //! rec:   filesrc ! decodebin3 -- video to the PiP pad (only with show_pip),
 //!                                audio to volume ! autoaudiosink
 //! tail:  glvideomixer ! 1280x720 30/1 ! glcolorconvert ! RGBA GL ! appsink
@@ -54,10 +54,10 @@ use video_coach_core::project::Clip;
 use super::decode::Decoder;
 use super::{
     display_aspect, fit_rect, frame_index, frame_time, head, install_zoom, place, stamp,
-    stamp_buffer, wait_for_room, CompositeError, Gl, Stopper, Watch, POLL, QUEUED,
+    stamp_buffer, wait_for_room, CompositeError, Gl, Schedule, Stopper, Watch, POLL, QUEUED,
 };
 use crate::mailbox::FrameMailbox;
-use crate::overlay::render_overlay;
+use crate::overlay::{OverlayFrame, OverlayRenderer};
 use crate::player::{fill_mailbox, gain, gl_caps, seconds_to_clock};
 
 /// The preview's output size. Measured (spec P1): of the sizes tried, 720p
@@ -360,6 +360,7 @@ fn run(
 ) -> Result<(), CompositeError> {
     let total = job.frames.len() as u64;
     let mut decoder = Decoder::start(&job.source, gl, watch)?;
+    let mut overlays = OverlayRenderer::new();
     let mut composite: Option<Composite> = None;
     // Set once the schedule has run out and the tail has been flushed, and
     // cleared by a seek back into the schedule.
@@ -398,7 +399,7 @@ fn run(
             composite = Some(Composite::start(sample, job, gl, mailbox, shared, watch)?);
         }
         let composite = composite.as_ref().expect("started above");
-        composite.push(n, generation, sample, &job.clip, watch)?;
+        composite.push(n, generation, sample, &job.clip, &mut overlays, watch)?;
     }
 }
 
@@ -449,10 +450,11 @@ struct Composite {
     pipeline: Stopper,
     /// The pumped source frames.
     src: gst_app::AppSrc,
-    /// Their overlays, rasterized at the picture rect.
+    /// Their overlays, rasterized at the **output** size with the strokes
+    /// mapped into the picture rect (spec E2).
     overlay: gst_app::AppSrc,
-    /// That rect's size.
-    picture: (u32, u32),
+    /// The picture rect the strokes are mapped into, `(x, y, w, h)`.
+    picture: (i32, i32, i32, i32),
     shared: Arc<Shared>,
 }
 
@@ -477,7 +479,6 @@ impl Composite {
         let info = gst_video::VideoInfo::from_caps(caps)
             .map_err(|e| CompositeError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
         let picture = fit_rect(&info, OUTPUT_WIDTH, OUTPUT_HEIGHT);
-        let (pw, ph) = (picture.2, picture.3);
 
         // The PiP pad is requested only with `show_pip`, and the recording's
         // video pad is then left unlinked.
@@ -487,7 +488,7 @@ impl Composite {
             ""
         };
         // The overlay branch is RGBA end to end. GStreamer's `RGBA` means
-        // *straight* alpha and `render_overlay` hands over premultiplied
+        // *straight* alpha and `OverlayRenderer` hands over premultiplied
         // pixels; nothing here demultiplies them, because the mixer pad's
         // `blend-function-src-rgb=one` (set below) is premultiplied-over for
         // free on the GPU.
@@ -496,7 +497,8 @@ impl Composite {
              ! appsink name=out sync=true qos=true max-buffers=1 enable-last-sample=false \
              appsrc name=ov format=time is-live=false block=false \
                max-buffers={QUEUED} max-bytes=0 max-time=0 \
-               caps=video/x-raw,format=RGBA,width={pw},height={ph},framerate={OUTPUT_FPS}/1 \
+               caps=video/x-raw,format=RGBA,width={OUTPUT_WIDTH},height={OUTPUT_HEIGHT},\
+                 framerate={OUTPUT_FPS}/1 \
              ! glupload ! glcolorconvert \
              ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2 \
              {pip}\
@@ -547,13 +549,15 @@ impl Composite {
             mix.static_pad(name)
                 .expect("requested in the launch string")
         };
-        // Base and overlay share the picture rect, so a drawing lands on the
-        // picture and not across the letterbox bars (spec P4). The PiP is
+        // The base takes the picture rect; the overlay is the whole output
+        // frame, with the strokes mapped into that same rect inside it (spec
+        // E2), so a drawing lands on the picture and not across the letterbox
+        // bars while the bar and the scoreboard keep the frame. The PiP is
         // chrome in output space and waits for the camera's shape.
         let base_pad = mix_pad("sink_0");
         place(&base_pad, picture, 0);
         let overlay_pad = mix_pad("sink_2");
-        place(&overlay_pad, picture, 2);
+        place(&overlay_pad, (0, 0, OUTPUT_WIDTH, OUTPUT_HEIGHT), 2);
         overlay_pad.set_property_from_str("blend-function-src-rgb", "one");
         // The two pumped pads are sent EOS at the end of the schedule (see
         // `Composite::end`), and an EOS pad is otherwise not drawn at all:
@@ -565,7 +569,9 @@ impl Composite {
         if job.clip.show_pip {
             place_pip(&mix_pad("sink_1"));
         }
-        install_zoom(&by_name("zoom"), &job.frames);
+        // One entry, laid out once above rather than per entry, so the
+        // schedule here carries only the zoom.
+        install_zoom(&by_name("zoom"), &Schedule::new(job.frames.clone(), 1));
 
         let out = by_name("out")
             .downcast::<gst_app::AppSink>()
@@ -618,7 +624,7 @@ impl Composite {
             pipeline,
             src,
             overlay,
-            picture: (pw as u32, ph as u32),
+            picture,
             shared: shared.clone(),
         })
     }
@@ -635,13 +641,24 @@ impl Composite {
         generation: u64,
         sample: &gst::Sample,
         clip: &Clip,
+        overlays: &mut OverlayRenderer,
         watch: &Watch,
     ) -> Result<(), CompositeError> {
         let base = stamp(sample, n);
         // Record time is output time (see the module docs), so the overlay's
         // moment is the output frame's own, and its stamp the frame's own.
-        let (w, h) = self.picture;
-        let mut overlay = render_overlay(clip, n as f64 / f64::from(OUTPUT_FPS), w, h);
+        // The bar's line is empty until Phase 8's Task 5, which draws
+        // `1 / 1` here.
+        let mut overlay = overlays.render(
+            &OverlayFrame {
+                clip,
+                record_time: n as f64 / f64::from(OUTPUT_FPS),
+                picture: self.picture,
+                text: "",
+            },
+            OUTPUT_WIDTH as u32,
+            OUTPUT_HEIGHT as u32,
+        );
         stamp_buffer(&mut overlay, n);
 
         // Room for both first, so the cursor's lock is never held across a

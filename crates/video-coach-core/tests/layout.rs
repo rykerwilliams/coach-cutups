@@ -1,22 +1,47 @@
 //! The composite's layout ratios.
 
-use video_coach_core::layout::{pip_rect, stroke_line_width, Rect, PIP_WIDTH_RATIO};
+use video_coach_core::layout::{
+    bar_rect, pip_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
+};
 
 #[test]
-fn the_pip_sits_in_the_bottom_right_corner_at_the_ratio_table_s_size() {
-    // 1920×1080 with a 16:9 camera: 422.4 × 237.6, 23.76 from each edge.
+fn the_pip_sits_above_the_text_bar_at_the_ratio_table_s_size() {
+    // 1920×1080 with a 16:9 camera: 422.4 × 237.6, 23.76 from the right edge
+    // and the same again above the 86.4 px bar.
     let r = pip_rect(1920.0, 1080.0, 16.0 / 9.0);
     assert_eq!(
         r,
         Rect {
             x: 1920.0 - 23.76 - 422.4,
-            y: 1080.0 - 23.76 - 237.6,
+            y: 1080.0 - 86.4 - 23.76 - 237.6,
             w: 422.4,
             h: 237.6,
         }
     );
-    // Flush to both edges by the same margin.
-    assert!((1920.0 - (r.x + r.w) - (1080.0 - (r.y + r.h))).abs() < 1e-9);
+    // The same margin from the right edge as from the bar's top (spec E2):
+    // the inset sits on the bar rather than over it.
+    let bar = bar_rect(1920.0, 1080.0);
+    assert!((1920.0 - (r.x + r.w) - (bar.y - (r.y + r.h))).abs() < 1e-9);
+}
+
+#[test]
+fn the_text_bar_is_a_full_width_strip_along_the_bottom() {
+    let bar = bar_rect(1920.0, 1080.0);
+    assert_eq!(
+        bar,
+        Rect {
+            x: 0.0,
+            y: 1080.0 - BAR_HEIGHT_RATIO * 1080.0,
+            w: 1920.0,
+            h: BAR_HEIGHT_RATIO * 1080.0,
+        }
+    );
+    // It reaches the bottom edge exactly, at every output size.
+    for (w, h) in [(1280.0, 720.0), (1920.0, 1080.0), (3840.0, 2160.0)] {
+        let bar = bar_rect(w, h);
+        assert_eq!(bar.y + bar.h, h);
+        assert_eq!(bar.h / h, BAR_HEIGHT_RATIO);
+    }
 }
 
 #[test]

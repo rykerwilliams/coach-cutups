@@ -29,4 +29,9 @@ glutin_egl_sys = "0.7"
 # The vector overlay layer, in video-coach-media only: core stays media-free.
 # `png-format` would pull in a PNG codec no shipping path decodes.
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+# The text bar's shaping and rasterizing, in video-coach-media only. Default
+# features are off on purpose: `fontconfig` and `sys-locale` would scan the
+# machine's fonts, and the bar is rendered from the vendored TTF alone, so an
+# export looks the same on every machine (and on CI, which installs no fonts).
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 rfd = "0.17"

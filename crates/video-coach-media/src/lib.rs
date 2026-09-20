@@ -17,7 +17,9 @@ pub use capture::{
     list_devices, now_ns, resolve_camera, resolve_mic, Camera, CaptureSources, Devices, Mic,
     Recorder, RecorderMessage, StopOutcome,
 };
-pub use composite::export::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
+pub use composite::export::{
+    EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
+};
 pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
 pub use composite::Gl;
 pub use mailbox::{Frame, FrameMailbox};

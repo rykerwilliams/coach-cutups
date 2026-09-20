@@ -14,6 +14,7 @@ gstreamer-gl.workspace = true
 gstreamer-gl-egl.workspace = true
 gstreamer-pbutils.workspace = true
 gstreamer-video.workspace = true
+cosmic-text.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 

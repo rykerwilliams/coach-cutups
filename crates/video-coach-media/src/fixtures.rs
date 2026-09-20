@@ -1,4 +1,5 @@
-//! Synthetic media files for tests.
+//! Synthetic media files for tests, and the one-entry compilation that drives
+//! an export of them.
 //!
 //! Every function writes into a directory the caller supplies, so the caller
 //! owns cleanup (normally a `tempfile::TempDir`) and this crate carries no
@@ -17,12 +18,44 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
+use video_coach_core::export::{Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::plan::{CompilationPlan, PlanEntry};
+use video_coach_core::project::Clip;
 
 /// How long a fixture pipeline may run before it is declared hung.
 const TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(30);
 
 /// Audio sample rate for fixtures that carry audio.
 const AUDIO_RATE: u32 = 44_100;
+
+/// A one-entry compilation of `frames` for `clip`, with `text` on the bar: the
+/// plan `compilation_schedule` builds for a single-clip target.
+///
+/// The media tests drive the export from frame lists no project can express —
+/// a seek into a gap, a zoom held over three frames, a deliberate mid-stream
+/// error — so they assemble the entry rather than going through a project.
+/// `segments` is left empty: it is the audio edit's input (Phase 8 Task 4),
+/// not the picture's.
+pub fn one_entry(clip: &Clip, frames: Vec<FrameSpec>, text: &str) -> Compilation {
+    let count = frames.len();
+    Compilation {
+        plan: CompilationPlan {
+            total_duration_seconds: count as f64 / f64::from(OUTPUT_FPS),
+            entries: vec![PlanEntry {
+                clip_id: clip.id,
+                source_index: clip.source_index,
+                recording_filename: clip.recording_filename.clone(),
+                show_pip: clip.show_pip,
+                segments: Vec::new(),
+                recording_duration: clip.recording_duration,
+                start_frame: 0,
+                frames: count,
+                text: text.to_owned(),
+            }],
+        },
+        frames,
+    }
+}
 
 /// A VP8 + Vorbis WebM of `secs` seconds at `w`×`h`, `fps` frames per second,
 /// with a keyframe at least every `keyint` frames. Written to `dir/name`.
@@ -363,13 +396,64 @@ pub fn decode_gray(path: &Path) -> Vec<GrayFrame> {
     frames
 }
 
-/// Decodes `path` with whatever decoder the machine ranks first, and calls
-/// `visit` with each video frame's luma. The video stream is selected by caps,
-/// so an audio stream is left alone.
+/// A decoded frame's colour, tightly packed RGB.
+///
+/// The composite's own assertions need colour, not luma: a premultiplied
+/// blend and a straight-alpha one differ by which channel is halved twice.
+#[derive(Debug, Clone)]
+pub struct RgbFrame {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u8>,
+}
+
+impl RgbFrame {
+    pub fn at(&self, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * self.width + x) * 3;
+        self.data[i..i + 3].try_into().expect("three channels")
+    }
+}
+
+/// Every frame of `path`'s video stream, in order, as RGB. Holds them all:
+/// for short files.
+pub fn decode_rgb(path: &Path) -> Vec<RgbFrame> {
+    let mut frames = Vec::new();
+    for_each_frame(path, "RGB", 3, |width, height, data| {
+        frames.push(RgbFrame {
+            width,
+            height,
+            data,
+        })
+    });
+    frames
+}
+
+/// Decodes `path` and calls `visit` with each video frame's luma.
 fn for_each_gray(path: &Path, mut visit: impl FnMut(GrayFrame)) {
-    let description = "decodebin3 name=dec ! video/x-raw(ANY) ! videoconvert \
-                       ! video/x-raw,format=GRAY8 ! appsink name=sink sync=false";
-    let pipeline = gst::parse::launch(description)
+    for_each_frame(path, "GRAY8", 1, |width, height, data| {
+        visit(GrayFrame {
+            width,
+            height,
+            data,
+        })
+    })
+}
+
+/// Decodes `path` with whatever decoder the machine ranks first, and calls
+/// `visit` with each video frame as `format` (`bytes` bytes a pixel, one
+/// plane), tightly packed. The video stream is selected by caps, so an audio
+/// stream is left alone.
+fn for_each_frame(
+    path: &Path,
+    format: &str,
+    bytes: usize,
+    mut visit: impl FnMut(usize, usize, Vec<u8>),
+) {
+    let description = format!(
+        "decodebin3 name=dec ! video/x-raw(ANY) ! videoconvert \
+         ! video/x-raw,format={format} ! appsink name=sink sync=false"
+    );
+    let pipeline = gst::parse::launch(&description)
         .expect("decode pipeline parses")
         .downcast::<gst::Pipeline>()
         .expect("a multi-element launch string yields a pipeline");
@@ -398,20 +482,16 @@ fn for_each_gray(path: &Path, mut visit: impl FnMut(GrayFrame)) {
             .expect("decoded sample has video caps");
         let buffer = sample.buffer().expect("sample has a buffer");
         let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-            .expect("GRAY8 frame maps");
+            .expect("the decoded frame maps");
         let (width, height) = (info.width() as usize, info.height() as usize);
         let stride = frame.plane_stride()[0] as usize;
-        let plane = frame.plane_data(0).expect("GRAY8 has one plane");
+        let plane = frame.plane_data(0).expect("the format has one plane");
         let data = plane
             .chunks(stride)
             .take(height)
-            .flat_map(|row| row[..width].iter().copied())
+            .flat_map(|row| row[..width * bytes].iter().copied())
             .collect();
-        visit(GrayFrame {
-            width,
-            height,
-            data,
-        });
+        visit(width, height, data);
     }
     let error = bus.pop_filtered(&[gst::MessageType::Error]);
     let eos = sink.is_eos();

@@ -1,5 +1,9 @@
-//! Export (Phase 5 spec X4): one clip at a time, rendered by an [`Exporter`]
-//! on its own thread while the bus goes on.
+//! Export (Phase 5 spec X4, Phase 8 spec E1): one target at a time, rendered
+//! by an [`Exporter`] on its own thread while the bus goes on.
+//!
+//! A single clip is a **one-entry compilation**: one plan, one schedule, one
+//! progress model, one cancel. The rest of the target list — all clips, each
+//! tag — is Phase 8's Task 6.
 //!
 //! The exporter's messages arrive as their own input. It sends exactly one
 //! `Finished`, last, and there is one exporter at a time on a FIFO channel,
@@ -12,8 +16,10 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
-use video_coach_core::export::frame_schedule;
-use video_coach_media::{ExportError, ExportJob, ExportMessage, Exporter};
+use video_coach_core::export::compilation_schedule;
+use video_coach_core::plan::ExportTarget;
+use video_coach_core::store::RECORDINGS_DIRNAME;
+use video_coach_media::{EntryMedia, ExportError, ExportJob, ExportMessage, Exporter};
 
 use super::{Bus, Event, Input, UserError};
 
@@ -69,15 +75,40 @@ impl Bus {
         {
             return refused("that file is the clip's game video");
         }
-        let frames = frame_schedule(clip, video.duration_seconds);
-        if frames.is_empty() {
+        let compilation = compilation_schedule(&open.project, &ExportTarget::Clip(id));
+        if compilation.frames.is_empty() {
             return refused("the clip has nothing to export");
         }
-        // A snapshot: later edits to the project don't reach this export.
+        // A snapshot: later edits to the project don't reach this export. The
+        // whole source list goes with it because `PlanEntry::source_index`
+        // indexes it -- a compilation may walk several game videos.
+        let recordings = open.folder.join(RECORDINGS_DIRNAME);
         let job = ExportJob {
-            source,
-            frames,
+            entries: compilation
+                .plan
+                .entries
+                .iter()
+                .map(|entry| EntryMedia {
+                    recording: recordings.join(&entry.recording_filename),
+                    clip: open
+                        .project
+                        .clips
+                        .iter()
+                        .find(|c| c.id == entry.clip_id)
+                        .expect("the plan's entries are the project's clips")
+                        .clone(),
+                })
+                .collect(),
+            compilation,
+            sources: open
+                .project
+                .source_videos
+                .iter()
+                .map(|s| open.folder.join(&s.relative_path))
+                .collect(),
             path,
+            resolution: open.project.preferences.last_export_resolution,
+            quality: open.project.preferences.last_export_quality,
         };
         let tx = self.tx.clone();
         self.export = Some(Exporter::start(job, move |msg| {

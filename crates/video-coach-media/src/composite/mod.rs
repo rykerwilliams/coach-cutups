@@ -276,6 +276,90 @@ fn frame_index(t: gst::ClockTime) -> u64 {
         / gst::ClockTime::SECOND.nseconds()
 }
 
+/// One entry's mixer geometry, in output pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Layout {
+    /// The source's letterboxed picture rect: the base pad's.
+    picture: (i32, i32, i32, i32),
+    /// The webcam inset: the PiP pad's. A 1×1 rect while the entry has no
+    /// PiP, which is where its transparent filler lands, invisibly.
+    pip: (i32, i32, i32, i32),
+}
+
+/// What every PTS-keyed probe looks up: output frame `n`'s zoom, and the
+/// geometry of the entry it belongs to.
+///
+/// **Geometry is keyed to the buffer's PTS, never set from the pushing
+/// thread.** With [`QUEUED`] frames in flight a direct property set lands up
+/// to four frames early, so the last frames of an entry take the next entry's
+/// layout (measured). One table serves the zoom and both moving pads, so they
+/// cannot disagree about which frame belongs to which entry.
+///
+/// An entry's rects are not known until its first frame is decoded — the
+/// picture rect comes from the source's caps and the PiP's from the
+/// recording's — so the pump fills them in before it pushes that entry's first
+/// frame, which is strictly before any probe can ask for them.
+struct Schedule {
+    frames: Vec<FrameSpec>,
+    /// One per plan entry, written by the pump and read on GStreamer's
+    /// threads.
+    layouts: Mutex<Vec<Layout>>,
+}
+
+impl Schedule {
+    /// A schedule of `frames` over `entries` entries, with no geometry yet.
+    fn new(frames: Vec<FrameSpec>, entries: usize) -> Arc<Schedule> {
+        Arc::new(Schedule {
+            frames,
+            layouts: Mutex::new(vec![Layout::default(); entries]),
+        })
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<Layout>> {
+        self.layouts.lock().expect("the layouts aren't poisoned")
+    }
+
+    /// Lays entry `entry` out, before its first frame is pushed.
+    fn set_layout(&self, entry: usize, layout: Layout) {
+        if let Some(slot) = self.locked().get_mut(entry) {
+            *slot = layout;
+        }
+    }
+
+    /// The frame `pts` names, or `None` past the end of the schedule.
+    fn spec(&self, pts: gst::ClockTime) -> Option<&FrameSpec> {
+        self.frames.get(frame_index(pts) as usize)
+    }
+
+    /// The layout of the entry the frame at `pts` belongs to.
+    fn layout(&self, pts: gst::ClockTime) -> Option<Layout> {
+        let entry = self.spec(pts)?.entry;
+        self.locked().get(entry).copied()
+    }
+}
+
+/// Places `pad` where the frame's entry says as each buffer arrives, keyed on
+/// its PTS (see [`Schedule`]). `rect` picks which of the entry's rects is
+/// this pad's; `zorder` is fixed for the run.
+fn install_geometry(
+    pad: &gst::Pad,
+    schedule: &Arc<Schedule>,
+    zorder: u32,
+    rect: fn(&Layout) -> (i32, i32, i32, i32),
+) {
+    let schedule = schedule.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        if let Some(layout) = info
+            .buffer()
+            .and_then(|b| b.pts())
+            .and_then(|pts| schedule.layout(pts))
+        {
+            place(pad, rect(&layout), zorder);
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Sets each buffer's zoom on `transform` as it arrives, keyed on its PTS, so
 /// the value matches the frame whatever is queued.
 ///
@@ -284,8 +368,7 @@ fn frame_index(t: gst::ClockTime) -> u64 {
 /// transformation meta, and the mixer draws the transformed quad unclipped:
 /// a zoomed 4:3 source spills into its pillarbox bars (measured). Rendered
 /// into its own source-sized texture, the zoom is clipped to the picture.
-fn install_zoom(transform: &gst::Element, frames: &[FrameSpec]) {
-    let zooms: Vec<Zoom> = frames.iter().map(|f| f.zoom).collect();
+fn install_zoom(transform: &gst::Element, schedule: &Arc<Schedule>) {
     transform
         .static_pad("src")
         .expect("gltransformation has a src pad")
@@ -305,6 +388,7 @@ fn install_zoom(transform: &gst::Element, frames: &[FrameSpec]) {
             },
         );
     let weak = transform.downgrade();
+    let schedule = schedule.clone();
     transform
         .static_pad("sink")
         .expect("gltransformation has a sink pad")
@@ -314,8 +398,8 @@ fn install_zoom(transform: &gst::Element, frames: &[FrameSpec]) {
             else {
                 return gst::PadProbeReturn::Ok;
             };
-            if let Some(zoom) = zooms.get(frame_index(pts) as usize) {
-                let (s, tx, ty) = zoom_params(*zoom);
+            if let Some(spec) = schedule.spec(pts) {
+                let (s, tx, ty) = zoom_params(spec.zoom);
                 transform.set_property("scale-x", s);
                 transform.set_property("scale-y", s);
                 transform.set_property("translation-x", tx);

@@ -1,45 +1,84 @@
-//! The export tail (spec X2–X4): the composite read back as NV12, encoded to
-//! H.264 and muxed into an MP4, driven by the pump on a thread of its own.
+//! The export tail (spec X2–X4, E2): a compilation read back as NV12, encoded
+//! to H.264 and muxed into an MP4, driven by the pump on a thread of its own.
+//!
+//! ```text
+//! pad 0, z 0: the pumped source frame through `gltransformation` (zoom), at
+//!             that entry's fit rect
+//! pad 1, z 1: the entry's webcam recording, at the PiP rect
+//! pad 2, z 2: the overlay -- drawings and the text bar -- at the output size
+//! ```
+//!
+//! **Every pad gets a buffer for every frame.** A requested pad that never
+//! receives one produced no output at all and backed the base `appsrc` up,
+//! with no error (measured), so an entry with the PiP off, or with a recording
+//! that can't be read, pushes a 1×1 transparent pixel instead.
+//!
+//! **Caps may change from the pushing thread; geometry may not.** Every
+//! `appsrc` takes a mid-stream caps change and it lands on exactly the right
+//! frame, but a pad rect set the same way applied up to [`QUEUED`] frames
+//! early, so the last frames of an entry took the next entry's layout
+//! (measured). The rects live in the [`Schedule`] instead, keyed to each
+//! buffer's PTS in a pad probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{Compilation, OUTPUT_FPS};
+use video_coach_core::layout::pip_rect;
+use video_coach_core::plan::PlanEntry;
+use video_coach_core::project::{Clip, Quality, Resolution};
 
 use super::decode::Decoder;
 use super::{
-    fit_rect, frame_time, head, install_zoom, place, push_buffer, stamp, CompositeError, Gl,
-    Stopper, Watch, POLL,
+    fit_rect, frame_time, head, install_geometry, install_zoom, place, push_buffer, stamp,
+    stamp_buffer, CompositeError, Gl, Layout, Schedule, Stopper, Watch, POLL, QUEUED,
 };
+use crate::overlay::{OverlayFrame, OverlayRenderer};
 use crate::player::{seconds_to_clock, Diagnostics};
 
-/// The output frame size.
-const OUTPUT_WIDTH: i32 = 1920;
-const OUTPUT_HEIGHT: i32 = 1080;
-/// The one quality setting until Phase 8's picker: a quantizer, since the
-/// hardware encoder is CQP-only. QP 24 is ~11 Mbps on camera footage.
-const QP: u32 = 24;
+/// Where the PiP's filler lands: one transparent pixel, so the rect is only
+/// something for `glvideomixer` to scale nothing into.
+const FILLER_RECT: (i32, i32, i32, i32) = (0, 0, 1, 1);
 
 /// Why an export produced no file. The composite's error under export's name,
 /// which the bus and the UI have always used.
 pub type ExportError = CompositeError;
 
-/// What to export.
+/// What to export: one compilation, and the files its entries read.
 #[derive(Debug, Clone)]
 pub struct ExportJob {
-    /// The source video: a snapshot taken when the export starts.
-    pub source: PathBuf,
-    /// The clip's frame schedule (`video_coach_core::export::frame_schedule`).
-    pub frames: Vec<FrameSpec>,
+    /// Every output frame and the plan they came from
+    /// (`video_coach_core::export::compilation_schedule`).
+    pub compilation: Compilation,
+    /// The project's game videos, indexed by `PlanEntry::source_index`: one
+    /// decoder is opened per distinct index and lives for the whole run.
+    /// A snapshot taken when the export starts.
+    pub sources: Vec<PathBuf>,
+    /// One per `compilation.plan.entries`, in the same order.
+    pub entries: Vec<EntryMedia>,
     /// The output file. Written as `<path>.part` and renamed on success, so a
     /// failed export never touches a file already there.
     pub path: PathBuf,
+    pub resolution: Resolution,
+    pub quality: Quality,
+}
+
+/// What one entry needs beside its `PlanEntry`, which carries the edit but
+/// neither the files nor the drawings.
+#[derive(Debug, Clone)]
+pub struct EntryMedia {
+    /// The commentary recording, under the project's `recordings/`: the
+    /// picture-in-picture's video.
+    pub recording: PathBuf,
+    /// The clip, for the drawings the overlay replays.
+    pub clip: Clip,
 }
 
 /// What a running export reports, on its own thread.
@@ -57,7 +96,9 @@ pub struct ExportDone {
     pub path: PathBuf,
     /// Factory name of the H.264 encoder, e.g. `vah264lpenc`.
     pub encoder: String,
-    /// The decode side's path, as the player logs it.
+    /// The decode side's path for the first entry's source, as the player logs
+    /// it. Every source runs the same graph, so one of them says whether the
+    /// run was zero-copy.
     pub diagnostics: Diagnostics,
 }
 
@@ -72,7 +113,7 @@ impl Exporter {
     /// Starts exporting `job`. `on_message` is called on the export thread:
     /// [`ExportMessage::Progress`] as frames go out, then exactly one
     /// [`ExportMessage::Finished`]. `job` must have frames: the bus refuses
-    /// an empty clip.
+    /// an empty target.
     pub fn start(
         job: ExportJob,
         on_message: impl FnMut(ExportMessage) + Send + 'static,
@@ -87,7 +128,12 @@ impl Exporter {
         mut on_message: impl FnMut(ExportMessage) + Send + 'static,
         inject: Option<&'static str>,
     ) -> Exporter {
-        debug_assert!(!job.frames.is_empty(), "an export needs frames");
+        debug_assert!(!job.compilation.frames.is_empty(), "an export needs frames");
+        debug_assert_eq!(
+            job.entries.len(),
+            job.compilation.plan.entries.len(),
+            "every plan entry needs its files"
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("export".into())
@@ -119,6 +165,27 @@ impl Drop for Exporter {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// The output frame size for `resolution` (spec E4). 2160p stays in the
+/// project format but the sheet doesn't offer it: it runs at 0.56× realtime
+/// and only upscales the user's 1440p footage.
+fn output_size(resolution: Resolution) -> (i32, i32) {
+    match resolution {
+        Resolution::R720 => (1280, 720),
+        Resolution::R1080 => (1920, 1080),
+        Resolution::R2160 => (3840, 2160),
+    }
+}
+
+/// The quantizer for `quality` (spec E4). Quality **is** a quantizer: the
+/// hardware encoder is CQP-only, and macOS's bitrate table was a no-op.
+fn quantizer(quality: Quality) -> u32 {
+    match quality {
+        Quality::Low => 28,
+        Quality::Medium => 24,
+        Quality::High => 20,
     }
 }
 
@@ -162,55 +229,268 @@ fn export(
         cancel,
         error: Arc::default(),
     };
-    let mut decoder = Decoder::start(&job.source, &gl, &watch)?;
-    let mut encoder = None;
+    let (out_w, out_h) = output_size(job.resolution);
+    let plan = &job.compilation.plan;
+    let schedule = Schedule::new(job.compilation.frames.clone(), plan.entries.len());
 
-    let total = job.frames.len();
+    // One decoder per distinct source, alive for the whole compilation: a
+    // compilation normally walks one match video over and over, and reopening
+    // it per entry would cost a preroll each time.
+    let mut sources: HashMap<usize, Decoder> = HashMap::new();
+    let mut overlays = OverlayRenderer::new();
+    let mut encoder: Option<Encoder> = None;
+    // The entry the layout and the caps are currently for, and its PiP, which
+    // is opened and closed with it.
+    let mut laid_out: Option<usize> = None;
+    let mut pip = Pip::filler();
+    // The current entry's picture rect, which the overlay maps strokes into.
+    let mut picture = (0, 0, out_w, out_h);
+
+    let total = job.compilation.frames.len();
     let mut percent = 0;
-    for (n, frame) in job.frames.iter().enumerate() {
+    for (n, frame) in job.compilation.frames.iter().enumerate() {
+        let entry = &plan.entries[frame.entry];
+        let media = &job.entries[frame.entry];
+        if let std::collections::hash_map::Entry::Vacant(slot) = sources.entry(entry.source_index) {
+            let source = job
+                .sources
+                .get(entry.source_index)
+                .ok_or_else(|| ExportError::Failed(format!("{} has no game video", entry.text)))?;
+            slot.insert(Decoder::start(source, &gl, &watch)?);
+        }
+        let decoder = sources
+            .get_mut(&entry.source_index)
+            .expect("inserted just above");
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), &watch)?;
         // The first frame's caps shape the encode side: its size, PAR and
         // memory.
         if encoder.is_none() {
-            encoder = Some(Encoder::start(
-                sample,
-                part,
-                &job.frames,
-                &gl,
-                inject,
-                &watch,
-            )?);
+            encoder = Some(Encoder::start(part, &schedule, job, &gl, inject, &watch)?);
         }
         let encoder = encoder.as_ref().expect("started above");
-        encoder.push(n as u64, sample, &watch)?;
+        if laid_out != Some(frame.entry) {
+            let caps = source_caps(sample)?;
+            let info = gst_video::VideoInfo::from_caps(&caps)
+                .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
+            picture = fit_rect(&info, out_w, out_h);
+            pip = Pip::open(entry, &media.recording, &gl, cancel, (out_w, out_h));
+            // Before the push, so the pad probes find it (see `Schedule`).
+            schedule.set_layout(
+                frame.entry,
+                Layout {
+                    picture,
+                    pip: pip.rect,
+                },
+            );
+            set_caps(&encoder.src, &caps);
+            laid_out = Some(frame.entry);
+        }
+
+        let overlay = overlays.render(
+            &OverlayFrame {
+                clip: &media.clip,
+                record_time: entry.record_time(n),
+                picture,
+                text: &entry.text,
+            },
+            out_w as u32,
+            out_h as u32,
+        );
+        encoder.push(n as u64, sample, &mut pip, overlay, entry, &watch)?;
+
         let now = ((n + 1) * 100 / total) as u8;
         if now != percent {
             percent = now;
             on_message(ExportMessage::Progress(percent));
         }
     }
-    let encoder = encoder.ok_or_else(|| ExportError::Failed("the clip has no frames".into()))?;
+    let encoder = encoder.ok_or_else(|| ExportError::Failed("the target has no frames".into()))?;
     encoder.finish(&watch)?;
     Ok(ExportDone {
         path: job.path.clone(),
         encoder: encoder.name().to_owned(),
-        diagnostics: decoder.diagnostics(),
+        diagnostics: plan
+            .entries
+            .first()
+            .and_then(|e| sources.get(&e.source_index))
+            .map(Decoder::diagnostics)
+            .unwrap_or_default(),
     })
+}
+
+/// `sample`'s caps with the output frame rate on them, which is what the base
+/// `appsrc` is fed at.
+fn source_caps(sample: &gst::Sample) -> Result<gst::Caps, ExportError> {
+    let caps = sample
+        .caps()
+        .ok_or_else(|| ExportError::Failed("a decoded frame has no caps".into()))?;
+    let mut caps = caps.to_owned();
+    caps.make_mut()
+        .set("framerate", gst::Fraction::new(OUTPUT_FPS as i32, 1));
+    Ok(caps)
+}
+
+/// Sets `appsrc`'s caps unless they are already `caps`.
+///
+/// Caps are safe to set from the pushing thread: the change lands on exactly
+/// the frame pushed after it (measured). Geometry is not — see the module
+/// comment.
+fn set_caps(appsrc: &gst_app::AppSrc, caps: &gst::Caps) {
+    if appsrc.caps().as_ref() != Some(caps) {
+        appsrc.set_caps(Some(caps));
+    }
+}
+
+/// One entry's picture-in-picture: its recording's decoder and where it lands.
+///
+/// The pad is fed every frame whatever happens here, because an unfed pad
+/// stalls the whole export (measured). `show_pip` off, a recording that isn't
+/// there, one with no video, one that stops decoding mid-entry: each of them
+/// ends up pushing the 1×1 transparent filler, and the export goes on.
+struct Pip {
+    /// `None` means the filler.
+    decoder: Option<Decoder>,
+    /// The recording's own errors, kept off the export's [`Watch`]: a
+    /// recording that gives up costs the inset, not the run.
+    errors: Arc<Mutex<Option<String>>>,
+    /// The pad's rect, from the recording's **probed** display aspect — never
+    /// from the pushed caps, whose 1×1 filler would make the inset square.
+    rect: (i32, i32, i32, i32),
+}
+
+impl Pip {
+    /// No inset: the pad takes the filler for every frame of the entry.
+    fn filler() -> Pip {
+        Pip {
+            decoder: None,
+            errors: Arc::default(),
+            rect: FILLER_RECT,
+        }
+    }
+
+    /// Opens `recording` for `entry`, or falls back to the filler, saying on
+    /// stderr why. A missing PiP is a smaller loss than a failed export of an
+    /// hour of video.
+    fn open(
+        entry: &PlanEntry,
+        recording: &Path,
+        gl: &Gl,
+        cancel: &AtomicBool,
+        (out_w, out_h): (i32, i32),
+    ) -> Pip {
+        if !entry.show_pip {
+            return Pip::filler();
+        }
+        let refuse = |why: String| {
+            eprintln!(
+                "export: no picture-in-picture for {}: {why}",
+                recording.display()
+            );
+            Pip::filler()
+        };
+        // The probe is also the check that the file is there and has video,
+        // before a decoder is built on it.
+        let aspect = match crate::probe::probe(recording) {
+            Ok(probe) => probe.display_aspect,
+            Err(e) => return refuse(e.to_string()),
+        };
+        let errors: Arc<Mutex<Option<String>>> = Arc::default();
+        let watch = Watch {
+            cancel,
+            error: errors.clone(),
+        };
+        match Decoder::start(recording, gl, &watch) {
+            Ok(decoder) => {
+                let rect = pip_rect(f64::from(out_w), f64::from(out_h), aspect);
+                Pip {
+                    decoder: Some(decoder),
+                    errors,
+                    // The mixer pad is the one place the sub-pixel layout is
+                    // rounded.
+                    rect: (
+                        rect.x.round() as i32,
+                        rect.y.round() as i32,
+                        rect.w.round() as i32,
+                        rect.h.round() as i32,
+                    ),
+                }
+            }
+            Err(e) => refuse(e.to_string()),
+        }
+    }
+
+    /// The inset's buffer for output frame `n`, stamped, with the caps it must
+    /// be pushed under.
+    ///
+    /// `record_time` is where the frame sits in the **recording**, which is
+    /// the entry's own timeline. Past the recording's end `Decoder::frame_at`
+    /// holds its last frame, which is what `repeat-after-eos` would have done
+    /// on a pad that could EOS — a pumped one never does.
+    fn frame(&mut self, n: u64, record_time: f64, cancel: &AtomicBool) -> (gst::Buffer, gst::Caps) {
+        if let Some(decoded) = self.decode(n, record_time, cancel) {
+            return decoded;
+        }
+        // Whatever went wrong won't get better: the rest of the entry takes
+        // the filler rather than retrying the recording once a frame.
+        self.decoder = None;
+        let mut buffer = gst::Buffer::from_slice([0u8; 4]);
+        stamp_buffer(&mut buffer, n);
+        (buffer, filler_caps())
+    }
+
+    /// The recording's frame at `record_time`, or `None` once there is no
+    /// recording or it has given up.
+    fn decode(
+        &mut self,
+        n: u64,
+        record_time: f64,
+        cancel: &AtomicBool,
+    ) -> Option<(gst::Buffer, gst::Caps)> {
+        let errors = self.errors.clone();
+        let decoder = self.decoder.as_mut()?;
+        let watch = Watch {
+            cancel,
+            error: errors,
+        };
+        match decoder.frame_at(seconds_to_clock(record_time), &watch) {
+            Ok(sample) => sample
+                .caps()
+                .map(|caps| (stamp(sample, n), caps.to_owned())),
+            // Cancellation is the run ending, and the loop's own `Watch` is
+            // about to see it too.
+            Err(CompositeError::Cancelled) => None,
+            Err(CompositeError::Failed(e)) => {
+                eprintln!("export: the picture-in-picture stopped: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// One transparent RGBA pixel's caps. The pad scales it to whatever rect it
+/// has, and a transparent pixel is invisible however big (measured).
+fn filler_caps() -> gst::Caps {
+    gst_video::VideoCapsBuilder::new()
+        .format(gst_video::VideoFormat::Rgba)
+        .width(1)
+        .height(1)
+        .framerate(gst::Fraction::new(OUTPUT_FPS as i32, 1))
+        .build()
 }
 
 /// The H.264 encoders export can use, in preference order, with their
 /// launch-string settings. Only encoders someone has run are listed (spec X3).
-fn encoders() -> [(&'static str, String); 2] {
+fn encoders(qp: u32) -> [(&'static str, String); 2] {
     [
         (
             "vah264lpenc",
-            format!("rate-control=cqp qpi={QP} qpp={QP} key-int-max=60"),
+            format!("rate-control=cqp qpi={qp} qpp={qp} key-int-max=60"),
         ),
         // Constant quality: smaller than constant QP at the same quality.
         // `medium` runs at 0.39x realtime; `veryfast` keeps up.
         (
             "x264enc",
-            format!("pass=qual quantizer={QP} speed-preset=veryfast key-int-max=60"),
+            format!("pass=qual quantizer={qp} speed-preset=veryfast key-int-max=60"),
         ),
     ]
 }
@@ -218,29 +498,34 @@ fn encoders() -> [(&'static str, String); 2] {
 struct Encoder {
     /// Held to go to NULL with the encoder.
     _pipeline: Stopper,
-    appsrc: gst_app::AppSrc,
+    /// The pumped source frames: pad 0.
+    src: gst_app::AppSrc,
+    /// The picture-in-picture: pad 1.
+    pip: gst_app::AppSrc,
+    /// The drawings and the text bar, at the output size: pad 2.
+    overlay: gst_app::AppSrc,
     name: &'static str,
     /// Set when the file is complete.
     eos: Arc<AtomicBool>,
 }
 
 impl Encoder {
-    /// Builds the graph for frames shaped like `first` (the decoder's),
-    /// writing to `part`, and sets it PLAYING. Output frame `n` gets
-    /// `frames[n]`'s zoom. Its errors reach `watch`. `inject` is spliced in
-    /// before the encoder (tests).
+    /// Builds the three-pad graph writing to `part` and sets it PLAYING. The
+    /// zoom and the moving pads read `schedule`; its errors reach `watch`.
+    /// `inject` is spliced in before the encoder (tests).
     ///
     /// The encoder is the first of [`encoders`] installed. A presence check
     /// only: one that fails at start fails the export (BACKLOG #39).
     fn start(
-        first: &gst::Sample,
         part: &Path,
-        frames: &[FrameSpec],
+        schedule: &Arc<Schedule>,
+        job: &ExportJob,
         gl: &Gl,
         inject: Option<&str>,
         watch: &Watch,
     ) -> Result<Encoder, ExportError> {
-        let (name, settings) = encoders()
+        let (out_w, out_h) = output_size(job.resolution);
+        let (name, settings) = encoders(quantizer(job.quality))
             .into_iter()
             .find(|(name, _)| gst::ElementFactory::find(name).is_some())
             .ok_or_else(|| {
@@ -250,43 +535,58 @@ impl Encoder {
             })?;
         let inject = inject.map(|i| format!("{i} ! ")).unwrap_or_default();
         // The readback before the encoder is required, and so is the queue.
+        // The overlay branch is RGBA end to end; `OverlayRenderer` hands over
+        // premultiplied pixels and GStreamer's `RGBA` means straight alpha, so
+        // the pad's `blend-function-src-rgb=one` (set below) does the
+        // premultiplied-over on the GPU rather than anything demultiplying.
         let description = format!(
             "{head} \
              ! glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 \
              ! gldownload ! video/x-raw,format=NV12 ! queue \
              ! {inject}{name} {settings} \
              ! h264parse ! video/x-h264,profile=high,stream-format=avc,alignment=au \
-             ! mp4mux name=mux ! filesink name=out",
-            head = head(OUTPUT_WIDTH, OUTPUT_HEIGHT)
+             ! mp4mux name=mux ! filesink name=out \
+             appsrc name=pip format=time is-live=false block=false \
+               max-buffers={QUEUED} max-bytes=0 max-time=0 \
+             ! glupload ! glcolorconvert ! mix.sink_1 \
+             appsrc name=ov format=time is-live=false block=false \
+               max-buffers={QUEUED} max-bytes=0 max-time=0 \
+               caps=video/x-raw,format=RGBA,width={out_w},height={out_h},\
+                 framerate={OUTPUT_FPS}/1 \
+             ! glupload ! glcolorconvert \
+             ! video/x-raw(memory:GLMemory),format=RGBA ! mix.sink_2",
+            head = head(out_w, out_h)
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| ExportError::Failed(format!("could not build the export graph: {e}")))?
             .downcast::<gst::Pipeline>()
             .expect("a multi-element launch string yields a pipeline");
         let by_name = |n: &str| pipeline.by_name(n).expect("named in the launch string");
+        let appsrc = |name: &str| {
+            by_name(name)
+                .downcast::<gst_app::AppSrc>()
+                .expect("named as an appsrc in the launch string")
+        };
 
-        let caps = first
-            .caps()
-            .ok_or_else(|| ExportError::Failed("a decoded frame has no caps".into()))?;
-        let info = gst_video::VideoInfo::from_caps(caps)
-            .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
-        let mut caps = caps.to_owned();
-        caps.make_mut()
-            .set("framerate", gst::Fraction::new(OUTPUT_FPS as i32, 1));
-        let appsrc = by_name("src")
-            .downcast::<gst_app::AppSrc>()
-            .expect("`src` is an appsrc");
-        appsrc.set_caps(Some(&caps));
+        let mix = by_name("mix");
+        let mix_pad = |name: &str| {
+            mix.static_pad(name)
+                .expect("requested in the launch string")
+        };
+        // The base and the PiP move with the entry, so their rects come from
+        // the schedule keyed on each buffer's PTS. The overlay is the whole
+        // output frame for the whole run.
+        install_geometry(&mix_pad("sink_0"), schedule, 0, |l| l.picture);
+        install_geometry(&mix_pad("sink_1"), schedule, 1, |l| l.pip);
+        let overlay_pad = mix_pad("sink_2");
+        place(&overlay_pad, (0, 0, out_w, out_h), 2);
+        overlay_pad.set_property_from_str("blend-function-src-rgb", "one");
+        install_zoom(&by_name("zoom"), schedule);
 
-        let mix_pad = by_name("mix")
-            .static_pad("sink_0")
-            .expect("the mixer's first pad is linked");
-        place(&mix_pad, fit_rect(&info, OUTPUT_WIDTH, OUTPUT_HEIGHT), 0);
         // `moov` goes first, in space reserved up front, with no temp file
         // (`faststart` writes the whole `mdat` to `$TMPDIR`, which a crash
         // leaks). The reserve must cover the whole file, so it gets a margin.
-        let duration = frame_time(frames.len() as u64);
-        install_zoom(&by_name("zoom"), frames);
+        let duration = frame_time(job.compilation.frames.len() as u64);
         by_name("mux").set_property(
             "reserved-max-duration",
             (duration + duration / 10 + gst::ClockTime::SECOND).nseconds(),
@@ -294,13 +594,16 @@ impl Encoder {
         by_name("out").set_property("location", part);
 
         let eos = gl.install(&pipeline, watch, |_| {});
+        let (src, pip, overlay) = (appsrc("src"), appsrc("pip"), appsrc("ov"));
         let pipeline = Stopper(pipeline);
         if pipeline.set_state(gst::State::Playing).is_err() {
             return Err(watch.failure("could not start the encoder"));
         }
         Ok(Encoder {
             _pipeline: pipeline,
-            appsrc,
+            src,
+            pip,
+            overlay,
             name,
             eos,
         })
@@ -311,14 +614,38 @@ impl Encoder {
         self.name
     }
 
-    /// Pushes `sample`'s buffer as output frame `n`.
-    fn push(&self, n: u64, sample: &gst::Sample, watch: &Watch) -> Result<(), ExportError> {
-        push_buffer(&self.appsrc, stamp(sample, n), &format!("frame {n}"), watch)
+    /// Pushes output frame `n` onto all three pads, in z-order.
+    ///
+    /// The base is a buffer reference, not a pixel copy: a freeze (and every
+    /// held source frame) sends the same texture out again.
+    fn push(
+        &self,
+        n: u64,
+        sample: &gst::Sample,
+        pip: &mut Pip,
+        mut overlay: gst::Buffer,
+        entry: &PlanEntry,
+        watch: &Watch,
+    ) -> Result<(), ExportError> {
+        let (inset, caps) = pip.frame(n, entry.record_time(n as usize), watch.cancel);
+        set_caps(&self.pip, &caps);
+        stamp_buffer(&mut overlay, n);
+
+        push_buffer(&self.src, stamp(sample, n), &format!("frame {n}"), watch)?;
+        push_buffer(&self.pip, inset, &format!("the PiP of frame {n}"), watch)?;
+        push_buffer(
+            &self.overlay,
+            overlay,
+            &format!("the overlay of frame {n}"),
+            watch,
+        )
     }
 
-    /// Ends the stream and waits for the muxer to finish the file.
+    /// Ends the streams and waits for the muxer to finish the file.
     fn finish(&self, watch: &Watch) -> Result<(), ExportError> {
-        let _ = self.appsrc.end_of_stream();
+        for appsrc in [&self.src, &self.pip, &self.overlay] {
+            let _ = appsrc.end_of_stream();
+        }
         loop {
             // Read before the check: an error is recorded before any EOS.
             let done = self.eos.load(Ordering::SeqCst);
@@ -336,16 +663,48 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use video_coach_core::export::FrameSpec;
     use video_coach_core::zoom::Zoom;
+
+    use uuid::Uuid;
 
     use super::*;
     use crate::fixtures::{self, CounterKind};
+
+    /// A clip with no drawings, whose game video is source 0.
+    fn clip() -> Clip {
+        Clip {
+            id: Uuid::nil(),
+            name: "c".into(),
+            notes: String::new(),
+            tags: Vec::new(),
+            source_index: 0,
+            start_source_seconds: 0.0,
+            recording_duration: 2.0,
+            recording_filename: "c.mkv".into(),
+            events: Vec::new(),
+            show_pip: false,
+            sort_index: 0,
+            created_at: "2026-09-19T00:00:00Z".into(),
+            transcript: String::new(),
+        }
+    }
 
     #[test]
     fn part_path_appends_to_the_file_name() {
         assert_eq!(
             part_path(Path::new("/a/b c.mp4")),
             PathBuf::from("/a/b c.mp4.part")
+        );
+    }
+
+    #[test]
+    fn the_output_size_and_the_quantizer_follow_the_pickers() {
+        assert_eq!(output_size(Resolution::R720), (1280, 720));
+        assert_eq!(output_size(Resolution::R1080), (1920, 1080));
+        assert_eq!(
+            [Quality::Low, Quality::Medium, Quality::High].map(quantizer),
+            [28, 24, 20]
         );
     }
 
@@ -371,10 +730,17 @@ mod tests {
                 zoom: Zoom::IDENTITY,
             })
             .collect();
+        let clip = clip();
         let job = ExportJob {
-            source,
-            frames,
+            compilation: fixtures::one_entry(&clip, frames, ""),
+            sources: vec![source],
+            entries: vec![EntryMedia {
+                recording: dir.path().join("missing.mkv"),
+                clip,
+            }],
             path: path.clone(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
