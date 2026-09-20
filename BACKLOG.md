@@ -441,3 +441,18 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** if a preview is ever seen frozen with the transport
   still saying it is playing; the fix is to check the recording's streams when
   the job is built (a probe) and drop `show_pip` when there is no video.
+
+## Phase 8 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-8-design.md`)
+
+### 52. No UI for the source and commentary volumes
+- **Why deferred:** `preview_source_volume` / `preview_commentary_volume` are read
+  by preview and export and default to 1.0, which is what macOS shipped, but
+  nothing sets them. Adding two sliders is easy; the question is where they
+  belong (the export sheet, the preview transport, or preferences).
+- **When to revisit:** the first time a commentary is drowned out by crowd noise.
+
+### 53. 2160p export
+- **Why deferred:** measured 0.56× realtime and it only upscales the user's
+  1440p footage. `Resolution::R2160` stays in the project format.
+- **When to revisit:** a 4K camera, or a machine that encodes 4K faster than
+  realtime.

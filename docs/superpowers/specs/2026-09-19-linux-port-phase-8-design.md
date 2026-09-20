@@ -1,139 +1,114 @@
 # Linux Port — Phase 8: Full Export
 
 **Date:** 2026-09-19
-**Status:** Draft, pre-review
+**Status:** Reviewed (simplify and correctness passes applied; the mixer pads, caps changes, AAC alignment, text scaling and throughput were measured on the reference laptop)
 **Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` ("Media pipelines → Export", "Export audio", "The compositor decision", Phasing → Phase 8)
-**Builds on:** Phase 5 (the export tail, the pump, the schedule), Phase 7 (the composite, the overlay, the PiP and layout), Phase 3 (tags)
-**Evidence:** the macOS inventory of `CompilationExporter.swift`, `ExportSheet.swift`, `ExportProgress.swift` and `CompilationCompositor.swift`; the Phase 8 research measurements, recorded below.
+**Builds on:** Phase 5 (the export tail and pump), Phase 7 (the composite, overlay, PiP and layout), Phase 3 (tags)
+**Evidence:** the macOS inventory of `CompilationExporter.swift`, `ExportSheet.swift`, `ExportProgress.swift` and `CompilationCompositor.swift`; the Phase 8 research and review measurements below.
 
 ---
 
 ## Goal
 
-Export **compilations**: every clip, or every clip carrying a tag, as one MP4 each, with the webcam picture-in-picture, the drawings, the text bar and mixed audio burned in, at a chosen resolution and quality, with honest progress and an ETA.
-
-This is the last piece of the coach's loop: record, review, export, send.
+Export **compilations**: all clips, one tag's clips, or a single clip, each as one MP4, with the webcam picture-in-picture, the drawings, the text bar and mixed audio burned in, at a chosen resolution and quality, with honest progress and a working cancel.
 
 ## Done when
 
-1. **Targets.** An export sheet lists **All clips** plus one row per tag, all checked by default. Each selected target produces one MP4.
-2. **The picture.** Each output frame carries: the game video with zoom, the webcam PiP (when `show_pip`), the drawings, and the text bar `"<n> / <total> | <name> | tag1, tag2"`.
-3. **The audio.** The game's audio plays during play segments only, the commentary throughout, both at the preview volumes, with 5 ms fades at every region edge, so no boundary clicks.
-4. **Quality.** Resolution (720p / **1080p** / 2160p) and quality (Low / **Medium** / High) are chosen in the sheet and persist. Quality is a quantizer, not a bitrate.
-5. **Progress.** The sheet shows per-target progress, the current rate, time left and a finish time, and **Cancel works**.
-6. **Files.** `<project>/exports/<label> - <project>.mp4`, written through `.part` and renamed.
+1. **Targets.** An export sheet lists **All clips**, one row per tag, and the selected clip; all are ticked by default except the single clip. Each ticked target produces one MP4.
+2. **The picture.** Each frame carries the game video with zoom, the webcam PiP (when the clip's `show_pip` is on), the drawings, and the text bar `"<n> / <total> | <name> | tag1, tag2"`, where `<total>` is that target's clip count.
+3. **The audio.** Game audio during play segments only, commentary throughout, 5 ms fades at every region edge, and **no systematic offset** between picture and sound.
+4. **Quality.** Resolution (720p / **1080p**) and quality (Low / **Medium** / High) are chosen in the sheet and persist. Quality is a quantizer.
+5. **Progress.** Per-target progress in exact frames, a rate, time left and a finish time, and **Cancel works**.
+6. **Files.** `<project>/exports/<label> - <project>.mp4`, written as `.part` and renamed.
 
 ---
 
 ## Measured facts (reference laptop)
 
-**Composite throughput,** 600 frames from the user's HEVC 1440p source, QP 24, one pipeline:
-
-| Pads | 720p | 1080p | 2160p |
-|---|---|---|---|
-| Mixer, 1 pad + encode | 126 fps | 77 fps | 26 fps |
-| + overlay pad | 107 | 60 | 17 |
-| + PiP pad (3 pads) | 85 | **52 (1.74× realtime)** | **17 (0.56×)** |
-
-- **The mixer itself is free;** a full-frame RGBA overlay pad costs about 23% at 1080p, 35% at 4K.
-- **Audio costs about 6%** of the 1080p composite. Decoding audio runs at ~90× realtime, and AAC encoding at ~13.5×.
-- **`mp4mux` takes AAC beside the video** with `avenc_aac ! aacparse`.
-- **Text** (cosmic-text + tiny-skia, 68 characters): **1.64 ms** at 1080p, 6.46 ms at 4K. Re-shaping every frame costs 0.26 ms, so no caching is needed. Clearing the RGBA layer costs 0.67 ms at 1080p.
-- **Fonts:** scanning system fonts costs 309 ms and varies by distro; one embedded TTF costs 24 ms. `DejaVuSans.ttf` is 741 KiB.
-- **2160p is 0.56× realtime** and upscales the only footage the user has.
-- **Measurement trap:** `glvideomixer` ignores `identity eos-after=N` and keeps emitting to the demuxer's segment end (150 input frames produced a 4m23s file). Cut fixtures with a real trim, and assert the output's duration.
-- **macOS facts worth keeping:**
-  - Quality was a **no-op**: the preset ignored it and `ExportSettings.bitrate` had no production call site. Don't port the bitrate table.
-  - Ramps were only at interior boundaries within an entry, never at clip joins and never on the mic. No test pinned that.
-  - Freezes are silent by design.
-  - Volumes come from the **preview** preferences.
-  - Export was sequential with one reused exporter, and **had no cancel**.
-  - Filenames collide and overwrite.
+- **Throughput,** 600 frames of the user's HEVC 1440p source, QP 24, with a real trim and the output duration asserted: **3 pads 48.8–49.4 fps, 4 pads 47.7–49.7 fps at 1080p** — the extra pad is free, and the composite runs ~1.6× realtime. 2160p measured 0.56× realtime.
+- **Per-pad `zorder` is honoured,** and a small RGBA strip placed at the bar's rect composites correctly under a full-frame overlay.
+- **Mid-stream caps changes are accepted** by every appsrc; `gltransformation` and `glvideomixer` renegotiate cleanly. **Geometry is the race, not caps:** setting pad rects from the pushing thread applied them **up to `QUEUED` (4) frames early**, so the last frames of an entry took the next entry's layout. Keying geometry to the buffer's PTS in a pad probe fixed it (the pattern `install_zoom` already uses).
+- **An unfed mixer pad stalls everything:** a requested pad that never receives a buffer produced **0 output frames** and backed up the base appsrc, with no error (`wait_for_room` has no deadline). EOS on that pad mid-run is safe: without `repeat-after-eos` the PiP disappears, with it the last frame holds.
+- **AAC priming shifts the sound:** a tone at exactly 1.000 s came back at **1.0214 s** through `avenc_aac`, and the audio track is 1024 samples (21.3 ms) longer than the video, with `media_time = 0` in the edit list. `voaacenc` is worse (+33.4 ms, and it drops samples).
+- **`avenc_aac` is in `gstreamer1.0-libav`, which CI does not install.** `aacparse` is in plugins-good.
+- **`mp4mux` tolerates differing track durations** and `reserved-max-duration` alone puts `moov` before `mdat`.
+- **Text scales by ratio** (0.674 of the width at 720p, 1080p and 2160p), and `Family::SansSerif` resolves with only the embedded TTF loaded. But a realistic 143-character line **wraps to two lines at every resolution**, and the second line lands outside the bar, over the picture. macOS clipped to the bar rect. Cost: 1.64 ms at 1080p, including re-shaping every frame.
+- **Measurement trap:** `glvideomixer` ignores `identity eos-after=N` and runs to the demuxer's segment end (600 "frames" took 88.9 s and produced an unreadable file). Every number above comes from a real trim with the output duration asserted.
+- **macOS facts:** Quality was a no-op and `ExportSettings.bitrate` had no production caller; ramps were interior-only and never on the mic; freezes are silent; volumes come from the preview preferences; export was sequential and had **no cancel**; `<total>` counts that target's clips; macOS had no 2160p and exported HEVC.
 
 ---
 
 ## Decisions
 
-### E1. Core builds the compilation schedule
+### E1. One export path: a single clip is a target
 
-`frame_schedule` grows into a compilation:
+`ExportTarget` gains `Clip(Uuid)` beside `AllClips` and `Tag(String)`.
 
-```rust
-pub struct FrameSpec {
-    pub source_index: usize,
-    pub source_time: f64,
-    pub zoom: Zoom,
-    pub entry: usize,        // which clip in the compilation
-    pub record_time: f64,    // t − entry_out_start, for strokes and the PiP
-}
-pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compilation;
-// Compilation { frames: Vec<FrameSpec>, entries: Vec<Entry> }
-// Entry { clip_id, source_index, recording: String, out_start_frame: u64, text: String, show_pip: bool }
-```
+- **`compilation_schedule(project, target) -> Compilation` replaces `frame_schedule`,** which is deleted along with the single-source `ExportJob`. Phase 5's per-clip export becomes a one-entry compilation, so there is one job type, one progress model and one cancel.
+- **It is built on `compilation_plan`,** not a second walk over the clips, so the plan's duration and the frame count can't disagree.
+- **Entries are quantized to whole output frames:** each entry's schedule is `frame_schedule`'s walk, and the next entry starts at the next frame boundary. That keeps "record time is output time" exact.
+- **`FrameSpec { entry, source_time, zoom }`.** `source_index` and `record_time` are derived from the entry and the frame index at the one call site, rather than stored three times.
+- **`Entry { clip_id, source_index, recording, start_frame, frames, text, show_pip }`,** where `text` is `"<n> / <total> | <name> | tags"` with empty parts collapsed and `<total>` the target's clip count.
 
-- It walks `compilation_plan`'s entries in `sort_index` order, concatenating each clip's segments onto one output clock.
-- **`record_time` is output time minus the entry's start** (the parent spec's rule), which drives the strokes, the PiP frame and the zoom.
-- **The text line** is `"<n> / <total> | <name> | tag1, tag2"`, with empty parts collapsed (macOS parity).
-- Fully unit-tested in core: no media.
-
-### E2. The video graph gains three pads
-
-The export tail becomes the preview's shape, at full resolution and offline:
+### E2. Three pads, fixed geometry except the base
 
 | Pad | z | Content |
 |---|---|---|
-| 0 | 0 | the pumped source frame through `gltransformation` (zoom), placed at that **entry's** fit rect |
-| 1 | 1 | the text bar's **background** (a small RGBA strip, bar height only) |
-| 2 | 2 | the webcam PiP, pumped from the entry's recording |
-| 3 | 3 | the overlay: drawings **and** the bar's glyphs, full-frame RGBA |
+| 0 | 0 | the pumped source frame through `gltransformation` (zoom), at **that entry's** fit rect |
+| 1 | 1 | the webcam PiP |
+| 2 | 2 | the overlay: drawings, the bar's background and its glyphs, at the **output size** |
 
-- **Why two overlay layers.** macOS drew the bar's background below the PiP and its glyphs above it. With one layer either the bar tints the bottom quarter of the PiP, or the PiP hides drawings that fall under it. The background strip is cheap (bar height, not full frame), so both rules are kept.
-- **The PiP is pumped, not played natively.** Export is offline and each entry has its own recording, so a `Decoder` per entry's recording feeds the PiP appsrc, stamped with the output frame's PTS. Preview's native-playback trick only works for a single clip in real time.
-- **Per-entry geometry.** The fit rect, the appsrc caps and the overlay size are computed **per entry**, not from the first sample, since a compilation can span sources of different sizes. Pads are re-placed at entry boundaries.
-- **One `Decoder` per distinct source**, kept alive across the compilation, so a tag whose clips interleave two sources doesn't reopen files.
+- **One overlay layer, not two.** Strokes are mapped into the entry's fit rect **inside** the output-size overlay (line width still from the picture's height), and the bar is drawn in output space. That keeps Phase 7's rule (strokes belong to the picture, chrome to the frame) without splitting a layer across two z-levels.
+- **The PiP sits above the bar, not over it:** its bottom margin becomes `bar height + margin`, one constant in `layout.rs`. macOS split the bar's background and glyphs across two layers precisely because its PiP overlapped the bar; moving the PiP removes the need.
+- **The PiP pad is fed every frame, always.** A clip with `show_pip` off, or a recording that is missing or video-less, pushes a 1×1 transparent RGBA. An unfed pad stalls the export silently (measured). A recording that runs short **holds its last frame** (`repeat-after-eos`).
+- **Geometry is keyed to PTS in pad probes,** never set from the pushing thread: with `QUEUED = 4` a direct set lands up to four frames early (measured). Only pad 0's rect and caps change per entry; pads 1 and 2 are fixed for the run.
+- **One `Decoder` per distinct source**, alive for the whole compilation; one per entry's recording, opened and closed with the entry.
 
-### E3. Audio: one audio-only pipeline per file, mixed in Rust
+### E3. Audio
 
-- **Each source video and each recording gets its own audio-only pipeline** ending in an appsink at F32LE/48k/2ch.
-  - This sidesteps the Phase 7 deadlock (an audio appsink on the pumped video branch stalls) **by construction**, so the drain-first rule isn't needed. Audio decode is ~90× realtime, so the extra pipelines cost about 1%.
-- **Rust mixes** per output block: the game's audio only during `play` segments, the commentary for the whole of each entry, each at its preview volume (`preview_source_volume`, `preview_commentary_volume`).
-- **5 ms linear fades at the start and end of every contiguous region on either track** (the parent spec's uniform rule), clamped at t=0. macOS ramped only inside an entry, so clip joins and every mic start clicked. Nothing in its tests pinned that, so the better rule wins, and this phase writes the first real ramp test.
-- **The mixed stream** goes through one appsrc → `audioconvert` → `avenc_aac bitrate=192000` → `aacparse` → `mp4mux`.
-- **The splice and ramp maths are pure functions in core,** tested with no GStreamer.
+- **One audio-only pipeline per file** (each source video, each recording), ending in an appsink at F32LE/48k/2ch. This avoids Phase 7's measured deadlock by construction, so the drain-first rule isn't needed; audio decode runs ~90× realtime.
+- **Rust mixes per output block,** interleaved with the video pump: audio for frame range [n, n+k) is pushed alongside those frames, bounded a little ahead. It is **not** pushed after the last frame: `mp4mux` advances only when both pads have data, so a late audio track would wedge the pump.
+- **The game's audio plays only during `play` segments.** Each play segment seeks its source's audio pipeline to the segment's source time, rather than holding decoded audio (F32/48k/2ch is 384 KB/s, so an hour-long match would be ~1.4 GB).
+- **5 ms linear fades at the start and end of every contiguous region on either track,** clamped at t=0 — the parent spec's uniform rule. macOS clicked at every clip join and mic start, and no macOS test pinned that.
+- **AAC priming is compensated.** The encoder delays by 1024 samples (21.3 ms, measured), and nothing trims it, so the mixed stream is pushed with its timestamps shifted earlier by that delay (clamped at zero). A known-tone fixture pins it: a tone at 1.000 s must decode back within a millisecond.
+- **Volumes** come from `preview_source_volume` and `preview_commentary_volume`, both defaulting to 1.0. There is no UI for them yet (backlog).
+- **The splice, gain and ramp maths are pure functions in core.**
 
 ### E4. Quality and resolution
 
-- **Resolution:** 720p, **1080p** (default), 2160p. The output size parameterizes the composite, as Phase 7 made it.
-- **Quality is a quantizer:** Low/Medium/High → **QP 28/24/20** for `vah264lpenc`, and the same numbers as `x264enc pass=qual quantizer=`. `ExportSettings.bitrate` is **not** ported: it never reached an encoder on macOS.
-- **Both persist** in `Preferences`, whose `Resolution` and `Quality` fields already exist and have no consumers yet.
-- **2160p is allowed but slow** (0.56× realtime) and upscales the user's 1440p footage. The ETA tells the truth rather than the UI refusing.
+- **Resolution: 720p or 1080p (default).** **2160p is dropped:** it runs at 0.56× realtime and only upscales the user's 1440p footage. `Resolution::R2160` stays in the format for later.
+- **Quality is a quantizer:** Low/Medium/High → QP 28/24/20, for both `vah264lpenc` and `x264enc pass=qual`. The macOS bitrate table is not ported.
+- Both persist in the existing `Preferences` fields.
 
 ### E5. Progress, ETA and running
 
-- **Sequential**, one target at a time. A single export already saturates the GPU (GL and VA encode contend: 87 fps without the encoder, 52 with), so parallel targets would not help.
-- **`ExportProgress` ports** from macOS:
-  - `RollingRate` over a 30 s window, with its "no ETA until the rate is stable" rule (≥5 samples and ≥2 s);
-  - `RunProjection`'s `totalSecondsRemaining`, per-item remaining and finish time;
-  - **dropping** the clamp for AVFoundation's progress overshoot: the port's progress is exact frame counts.
-  - Its tests port too.
-- **Cancel works,** unlike macOS. It stops after the current frame, deletes the `.part` and leaves earlier targets' finished files alone.
+- **Sequential**, one target at a time: a single export already saturates the GPU.
+- **Progress is exact frames,** reported as `frames_done` of `frames_total` per target, not a percent (the UI derives the percent).
+- **`ExportRun`** holds the targets with their frame counts, plus a rate over a trailing window:
+  - remaining wall time = remaining frames ÷ rate, for the current and the pending targets alike (they share an output size, so one rate applies);
+  - **no ETA until the rate is stable** (macOS's ≥5 samples and ≥2 s, which is about rate stability, not progress accuracy);
+  - macOS's monotonic clamp is **not** ported: it existed for AVFoundation's overshoot.
+- **Cancel works.** It stops after the current frame, deletes the `.part`, and leaves already-finished targets alone.
+- **A missing source or recording is refused up front, naming the clip,** rather than failing a long run halfway.
 
 ### E6. Files
 
-- **`<project>/exports/`**, created on demand.
-- **`<label> - <project>.mp4`**, with `/` and `:` replaced (macOS parity). `All clips` is the label for the all-clips target.
-- **Written as `.part` and renamed,** so a cancelled or failed export leaves nothing and an overwrite is atomic.
-- Overwriting an existing file is expected: re-running an export replaces its output.
+`<project>/exports/`, created on demand; `<label> - <project>.mp4` with `/` and `:` replaced; `.part` then rename. Re-running replaces the file. **There is no folder picker**: the exports folder is fixed, and the finished state offers to open it.
 
-### E7. UI
+### E7. Preview keeps matching export
 
-An **Export…** button in the transport opens a sheet:
-- **Targets:** All clips, then each tag with its clip count and total length, all checked by default.
-- **Resolution** and **Quality** pickers, and the output folder with a Change… button.
-- **Run list:** one row per target with its state (pending, a progress bar, or done with its encode time and average fps).
-- **A run line:** "<M:SS> of video left · ETA <M:SS> (finishes at 3:42 PM)", suppressed until the rate is stable.
-- **Export** and **Cancel**.
-- Recording and preview are refused while an export runs, as now.
+Phase 7 deferred two things to here, and both land so the shared composite keeps its meaning:
+- **Preview draws the text bar** with `n / total = 1 / 1`.
+- **Preview plays the game audio** through the same Rust mixer, at the same volumes, with the same ramps.
+
+### E8. UI
+
+An **Export…** button opens a sheet:
+- **Targets:** All clips, each tag with its clip count and total length, and the selected clip; all ticked by default except the clip.
+- **Resolution** and **Quality** pickers.
+- **A run list:** one row per target — pending, a progress bar, or done with its encode time and average fps.
+- **A run line:** "<M:SS> of video left · ETA <M:SS> (finishes at 3:42 PM)", hidden until the rate is stable.
+- **Export** and **Cancel**. The old per-clip menu item opens the sheet with that clip ticked.
 
 ---
 
@@ -141,35 +116,33 @@ An **Export…** button in the transport opens a sheet:
 
 | Crate | Phase 8 contents |
 |---|---|
-| `video-coach-core` | `compilation_schedule` and `Compilation`; the text line; the audio splice, gain and ramp maths; `ExportProgress` (`RollingRate`, `RunProjection`); the bar's layout ratios. |
-| `video-coach-media` | The export tail's four pads with per-entry geometry; the PiP decoder; the bar background and glyph rendering (cosmic-text plus an embedded TTF); the audio pipelines, the mixer's plumbing and the AAC branch; quality and resolution parameters. |
-| `video-coach-app` | Bus: compilation exports, the target list, progress and ETA events, cancel. UI: the export sheet, the run list, the pickers. |
-| `video-coach-harness` | A compilation export end to end with fixtures. |
+| `video-coach-core` | `compilation_schedule` / `Compilation` / `Entry` on top of `compilation_plan`; the text line; the audio splice, gain and ramp maths; `ExportRun` (the rate window and projection); the bar's layout ratios and the PiP's raised margin. |
+| `video-coach-media` | The three-pad export tail with PTS-keyed geometry; the PiP decoder and its transparent filler; the bar and glyph rendering (cosmic-text plus a vendored TTF, `Wrap::None` with a tail ellipsis); the audio pipelines, the mixer plumbing, the AAC branch and its priming shift; resolution and quality parameters. |
+| `video-coach-app` | Bus: compilation exports, the target list, frame-count progress, cancel. UI: the export sheet and run list. |
+| `video-coach-harness` | A compilation export end to end. |
+| CI | Add **`gstreamer1.0-libav`** for `avenc_aac`. |
 
 ## Testing
 
-- **Core:**
-  - `compilation_schedule`: entry order, `record_time` per entry, the frame count, a tag target, an empty target;
-  - the text line, including collapsed empty parts;
-  - the audio splice: sample counts, the ramp envelope, a region shorter than a ramp, the clamp at t=0, and freezes being silent;
-  - `RollingRate` and `RunProjection`, ported.
+- **Core:** `compilation_schedule` (entry order, whole-frame quantization, derived record time, a tag target, an empty target); the text line; the audio splice (sample counts, the ramp envelope, a region shorter than a ramp, silence during freezes); `ExportRun`'s rate gate and projection.
 - **Media:**
-  - **A multi-clip fiducial:** two counter fixtures at different sizes and frame rates, exported as one compilation, with every output frame's counter checked against the schedule. This is the test that catches per-entry geometry and concatenation errors.
-  - The four-pad composite over a synthetic base: the PiP rect, the bar background under the PiP, glyphs and strokes above it, and premultiplied alpha.
-  - The audio: a mixed output where the two tracks are distinguishable (a tone against silence), checking the gate and the ramps.
-  - Output shape per resolution, and that the file's duration matches the schedule (the mixer trap above).
-- **Harness:** export two targets; progress rises and completes; cancel leaves the finished target alone and no `.part`; refusals.
+  - **A multi-clip fiducial:** two counter fixtures of different sizes and frame rates as one compilation, with every output frame's counter checked. This catches per-entry geometry and concatenation errors, including the four-frame-early race.
+  - The three-pad composite over a synthetic base: the PiP rect (above the bar), strokes mapped into the fit rect on a non-16:9 entry, the bar, and premultiplied alpha.
+  - **An A/V alignment test:** a tone at a known time decodes back within a millisecond (this is what catches AAC priming; a gate-and-ramp test passes while being 21 ms late).
+  - A long text line is clipped to one line with an ellipsis.
+  - `show_pip` off, and a recording shorter than its entry.
+  - The output's duration matches the schedule (the mixer trap).
+- **Harness:** export two targets; progress rises and completes; cancel leaves the finished target alone; a missing source is refused naming the clip.
 - **Manual** (batched): export a real compilation and watch it.
 
 ## Risks
 
-1. **2160p at 0.56× realtime.** Accepted; the ETA is honest.
-2. **Per-entry geometry** is the most likely source of a subtle bug, which is why the fiducial uses two differently-sized sources.
-3. **Text rendering** is new (cosmic-text plus an embedded font). Its cost is measured and small, but glyph placement needs a pixel test.
-4. **A long compilation** holds one decoder per source plus one per entry's recording. Recordings are opened and closed per entry, so only the source decoders accumulate.
+1. **Audio alignment** is the subtlest thing here: the priming shift is measured, but the tone test is what keeps it honest.
+2. **Per-entry geometry** on pad 0, which the fiducial's differently-sized sources exist to catch.
+3. **Text rendering** is new; glyph placement and clipping need pixel tests.
 
 ## Deferred
 
-- HEVC output.
-- A combined single-file export across targets (macOS wrote one file per target, and so does this).
-- Per-clip export settings.
+- HEVC output; a combined single-file export across targets; per-clip export settings.
+- **UI for the two volumes** (they are read from the preferences, which default to 1.0).
+- 2160p (kept in the format, not offered).
