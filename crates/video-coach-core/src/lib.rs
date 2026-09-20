@@ -6,6 +6,7 @@
 //! passing silently. If you need a media type here, you need a different
 //! design.
 
+pub mod audio;
 pub mod event;
 pub mod export;
 pub mod layout;

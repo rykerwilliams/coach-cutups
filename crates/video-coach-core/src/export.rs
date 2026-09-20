@@ -5,6 +5,11 @@
 //! **no play/freeze flag**: the pump answers "last decoded frame with PTS ≤
 //! `source_time`", so a repeated `source_time` re-pushes the same buffer. That
 //! one rule covers freezes, 25→30 fps duplication and 60→30 fps drops.
+//!
+//! [`RateWindow`] lives here too: it measures the same frames the schedule
+//! hands out, so a run's progress and its estimate count the same thing.
+
+use std::collections::VecDeque;
 
 use crate::event::CommentaryEvent;
 use crate::plan::{compilation_plan, selected_clips, CompilationPlan, ExportTarget};
@@ -33,6 +38,60 @@ pub(crate) fn frame_count(seconds: f64) -> usize {
     (seconds * f64::from(OUTPUT_FPS) - FRAME_EPSILON)
         .ceil()
         .max(0.0) as usize
+}
+
+/// How far back the rate window looks.
+const RATE_WINDOW_SECONDS: f64 = 30.0;
+
+/// Samples a rate needs before it is reported at all.
+///
+/// macOS's gate, kept: it is about **rate stability**, not progress accuracy.
+/// The first seconds of an export are the pipeline filling and the encoder
+/// settling, and a "4 minutes left" that becomes "40 seconds left" is worse
+/// than no estimate.
+const RATE_MIN_SAMPLES: usize = 5;
+const RATE_MIN_SPAN: f64 = 2.0;
+
+/// The export's rate over a trailing window, in **output frames per wall
+/// second**.
+///
+/// The caller divides its remaining frames by this; frames are what the pump
+/// counts, so nothing has to convert through a duration that per-entry
+/// quantization has already made approximate (see
+/// `CompilationPlan::total_duration_seconds`).
+///
+/// macOS's monotonic clamp is deliberately **not** ported: it existed to
+/// absorb `AVFoundation`'s `fractionCompleted` overshooting 1.0. A pushed-frame
+/// count only rises, and a clamp would hide it if it ever didn't.
+#[derive(Debug, Clone, Default)]
+pub struct RateWindow {
+    /// `(elapsed, frames_done)`, oldest first.
+    samples: VecDeque<(f64, usize)>,
+}
+
+impl RateWindow {
+    /// Record `frames_done` at `elapsed` seconds into the run and return the
+    /// rate, or `None` until the window is wide enough to trust.
+    pub fn sample(&mut self, frames_done: usize, elapsed: f64) -> Option<f64> {
+        self.samples.push_back((elapsed, frames_done));
+        let cutoff = elapsed - RATE_WINDOW_SECONDS;
+        while self.samples.front().is_some_and(|&(t, _)| t < cutoff) {
+            self.samples.pop_front();
+        }
+
+        if self.samples.len() < RATE_MIN_SAMPLES {
+            return None;
+        }
+        let (t0, f0) = self.samples[0];
+        let (t1, f1) = self.samples[self.samples.len() - 1];
+        let span = t1 - t0;
+        if span < RATE_MIN_SPAN {
+            return None;
+        }
+        // In f64: a frame count that went backwards is merely a wrong rate, not
+        // a `usize` that wrapped to the size of the address space.
+        Some((f1 as f64 - f0 as f64) / span)
+    }
 }
 
 /// One output frame.

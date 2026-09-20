@@ -2,12 +2,15 @@
 //! frame, and where one entry ends and the next begins.
 //!
 //! Target filtering and empty targets are `tests/plan.rs`'s; these tests take
-//! the selection as given and check the frames it produces.
+//! the selection as given and check the frames it produces. The rate window,
+//! which counts those same frames, is at the bottom.
 
 use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
+use video_coach_core::export::{
+    compilation_schedule, Compilation, FrameSpec, RateWindow, OUTPUT_FPS,
+};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::zoom::Zoom;
@@ -312,4 +315,63 @@ fn the_text_line_counts_only_the_targets_clips() {
     assert_eq!(one.plan.entries.len(), 1);
     assert_eq!(one.plan.entries[0].text, "1 / 1 | b");
     assert_eq!(one.frames.len(), 30);
+}
+
+// ── The rate window ────────────────────────────────────────────────────────
+//
+// Ported from macOS's `RollingRateTests`, in frames per wall second rather
+// than composition seconds per wall second, and without the monotonic clamp.
+
+#[test]
+fn the_rate_is_withheld_until_five_samples() {
+    let mut w = RateWindow::default();
+    for i in 0..4 {
+        assert_eq!(w.sample(i * 45, i as f64), None, "sample {i}");
+    }
+    assert_eq!(w.sample(4 * 45, 4.0), Some(45.0));
+}
+
+#[test]
+fn the_rate_is_withheld_until_two_seconds_have_passed() {
+    let mut w = RateWindow::default();
+    // Six samples crammed into 1 s: the count gate passes, the span gate does
+    // not.
+    for i in 0..6 {
+        assert_eq!(w.sample(i * 9, i as f64 * 0.2), None, "sample {i}");
+    }
+}
+
+#[test]
+fn a_steady_rate_is_reported() {
+    let mut w = RateWindow::default();
+    let mut rate = None;
+    for i in 0..10 {
+        rate = w.sample(i * 45, i as f64);
+    }
+    assert!(approx(rate.unwrap(), 45.0));
+}
+
+#[test]
+fn the_window_forgets_a_rate_it_has_left_behind() {
+    // 40 s at 30 fps, then 40 s at 90 fps. The 30 s window holds only the
+    // second half by the end.
+    let mut w = RateWindow::default();
+    let mut rate = None;
+    for i in 0..80 {
+        let done = if i < 40 { 30 * i } else { 1200 + 90 * (i - 40) };
+        rate = w.sample(done, i as f64);
+    }
+    assert!(approx(rate.unwrap(), 90.0));
+}
+
+#[test]
+fn a_stalled_export_reports_a_rate_of_zero() {
+    let mut w = RateWindow::default();
+    let mut rate = None;
+    for i in 0..10 {
+        rate = w.sample(100, i as f64);
+    }
+    // Zero, not `None`: the caller needs to tell "no estimate yet" from
+    // "nothing is moving".
+    assert_eq!(rate, Some(0.0));
 }
