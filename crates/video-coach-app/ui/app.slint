@@ -4,7 +4,7 @@
 // Everything here is presentation. `src/main.rs` turns the callbacks into bus
 // commands and feeds bus events back in through the `in` properties.
 
-import { Button, CheckBox, LineEdit, ListView, Palette, ProgressIndicator, Slider, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, Slider, TextEdit } from "std-widgets.slint";
 
 /// One row of the sidebar's Sources list.
 export struct SourceRow {
@@ -31,6 +31,27 @@ export struct TagRow {
     tag: string,
     /// "3 clips · 1:24", already formatted.
     detail: string,
+}
+
+/// One row of the export sheet's target list (Phase 8 E8): all the clips, one
+/// tag's, or the clip the sheet was opened on.
+export struct TargetRow {
+    label: string,
+    /// "4 clips · 3:12", already formatted.
+    detail: string,
+    /// Ticked to export. `src/main.rs` owns it — it holds the targets these
+    /// rows stand for — so the sheet only reports a click.
+    ticked: bool,
+}
+
+/// One row of the export sheet's run list: a target of the run in progress.
+export struct RunRow {
+    label: string,
+    /// How far it has got, 0..1; negative when it isn't rendering, and
+    /// `status` stands in for the bar.
+    progress: float,
+    /// "Pending", "45%", "Done", "Cancelled" or "Failed".
+    status: string,
 }
 
 /// The inspector's text fields, for `edit-clip`.
@@ -493,6 +514,210 @@ component StrokePath inherits Path {
     stroke-line-join: round;
 }
 
+/// A row of the export sheet's target list: its tick, what it covers and how
+/// long that runs. A click anywhere on the row ticks or unticks it.
+component TargetChoice inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> ticked;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 4px;
+    background: root.enabled && touch.has-hover ? Palette.selection-background : transparent;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 15px;
+                height: 15px;
+                border-radius: 3px;
+                border-width: 1px;
+                border-color: Palette.border;
+                background: root.ticked ? Palette.accent-background : transparent;
+
+                Text {
+                    text: root.ticked ? "✓" : "";
+                    color: Palette.accent-foreground;
+                    font-size: 11px;
+                }
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.enabled ? Palette.foreground : Palette.alternate-foreground;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.detail;
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// The export sheet (Phase 8 E8), the **only** export UI: what to render, at
+/// what size and quality, and how the run is going. The window opens it; it
+/// reports ticks, Export, Cancel and Close.
+///
+/// A run goes on behind a closed sheet, and reopening it shows where that run
+/// has got to: the rows come from the bus's events, not from the sheet.
+component ExportSheet inherits Rectangle {
+    in property <[TargetRow]> targets;
+    /// Something is ticked, so there is something to export.
+    in property <bool> any-ticked;
+    /// The run in progress, one row per target; empty before the first.
+    in property <[RunRow]> run;
+    /// "Finishes at 3:42 PM", empty until the rate is steady (spec E5).
+    in property <string> finish;
+    /// A run is going: the targets and the pickers are settled for it.
+    in property <bool> exporting;
+    /// 720p or 1080p, and Low / Medium / High: the pickers' indices.
+    in-out property <int> resolution;
+    in-out property <int> quality;
+    callback tick(int, bool);
+    callback start();
+    callback cancel();
+    callback close();
+
+    width: 480px;
+    height: sheet.preferred-height;
+    background: Palette.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    sheet := VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: "Export";
+            color: Palette.foreground;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        FieldLabel { text: "What to export"; }
+        // A height of its own: a project with many tags scrolls the list
+        // rather than growing the sheet past the window.
+        ListView {
+            height: min(210px, max(30px, root.targets.length * 30px));
+            for row[index] in root.targets: TargetChoice {
+                label: row.label;
+                detail: row.detail;
+                ticked: row.ticked;
+                enabled: !root.exporting;
+                clicked => { root.tick(index, !row.ticked); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+
+            VerticalLayout {
+                spacing: 4px;
+                FieldLabel { text: "Resolution"; }
+                ComboBox {
+                    // 2160p is in the project format but not offered (E8).
+                    model: ["720p", "1080p"];
+                    enabled: !root.exporting;
+                    current-index <=> root.resolution;
+                }
+            }
+            VerticalLayout {
+                spacing: 4px;
+                FieldLabel { text: "Quality"; }
+                ComboBox {
+                    model: ["Low", "Medium", "High"];
+                    enabled: !root.exporting;
+                    current-index <=> root.quality;
+                }
+            }
+        }
+
+        if root.run.length > 0: FieldLabel { text: "Run"; }
+        if root.run.length > 0: ListView {
+            height: min(140px, root.run.length * 28px);
+            for row in root.run: HorizontalLayout {
+                height: 28px;
+                padding-left: 6px;
+                padding-right: 6px;
+                spacing: 8px;
+
+                Text {
+                    text: row.label;
+                    color: Palette.foreground;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // Only while it renders; the status word stands in otherwise.
+                if row.progress >= 0: VerticalLayout {
+                    alignment: center;
+                    ProgressIndicator {
+                        width: 120px;
+                        progress: row.progress;
+                    }
+                }
+                Text {
+                    text: row.status;
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    min-width: 64px;
+                }
+            }
+        }
+        // The one rendering of the estimate (E5): when the run ends, not how
+        // much of it is left.
+        if root.finish != "": Text {
+            text: root.finish;
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+
+            if root.exporting: Button {
+                text: "Cancel export";
+                clicked => { root.cancel(); }
+
+                Tooltip {
+                    text: @markdown("Stop the run. The videos already written are kept.");
+                }
+            }
+            Button {
+                text: "Close";
+                clicked => { root.close(); }
+            }
+            if !root.exporting: Button {
+                text: "Export";
+                primary: true;
+                enabled: root.any-ticked;
+                clicked => { root.start(); }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     min-width: 1100px;
@@ -643,13 +868,27 @@ export component AppWindow inherits Window {
     /// The stroke under the pen, likewise; empty when nothing is being drawn.
     in property <string> drawing-path;
 
-    // --- Export (Phase 5 X5) ---
+    // --- Export (Phase 8 E8): the sheet is the only export UI ---
 
-    /// The running export's whole percent; negative with none running.
-    in property <int> export-progress: -1;
-    /// Greys out Record and "Export video…": the bus refuses both while an
-    /// export runs.
-    out property <bool> exporting: root.export-progress >= 0;
+    /// The sheet is up. UI state: the Export… button and the clip menu's
+    /// "Export video…" open it, its own buttons and Esc close it.
+    in-out property <bool> export-sheet-open;
+    /// Its target list, in the order it shows them: All clips, each tag, then
+    /// the clip the sheet was opened on. `src/main.rs` holds the targets these
+    /// rows stand for, and owns the ticks.
+    in property <[TargetRow]> export-targets;
+    in property <bool> export-any-ticked;
+    /// The pickers, seeded from the project's preferences when the sheet opens
+    /// and persisted by the bus when a run starts (spec E4).
+    in-out property <int> export-resolution;
+    in-out property <int> export-quality;
+    /// The run in progress, and when it finishes; both from the bus's events,
+    /// so a closed sheet reopens on the run it left.
+    in property <[RunRow]> export-run;
+    in property <string> export-finish;
+    /// A run is going. Greys out Record, a preview and "Export video…", all of
+    /// which the bus refuses while one is.
+    in property <bool> exporting;
 
     // --- Preview (Phase 7 P6) ---
 
@@ -698,8 +937,15 @@ export component AppWindow inherits Window {
     callback delete-clip(string);
     callback move-clip(int, int);
     callback sort-clips();
-    /// Ask where, then export the clip with this id.
+    /// Open the export sheet on the selection, with everything else ticked
+    /// (the Export… button) ...
+    callback open-export();
+    /// ... or on this clip alone, ticked (the clip menu's "Export video…").
     callback export-clip(string);
+    /// The target row at this index was ticked or unticked.
+    callback tick-target(int, bool);
+    /// Export what's ticked, at the pickers' resolution and quality.
+    callback start-export();
     callback cancel-export();
     /// Preview the clip with this id, in place of the game video, and close
     /// the one open (P5).
@@ -752,6 +998,14 @@ export component AppWindow inherits Window {
             // Modal: nothing reaches the window behind the dialog.
             if (pressed && (event.text == Key.Return || event.text == Key.Escape)) {
                 root.error-message = "";
+            }
+            return accept;
+        }
+        // The export sheet is modal over the window's shortcuts: Esc closes
+        // it, and a run it started goes on behind it.
+        if (root.export-sheet-open) {
+            if (pressed && event.text == Key.Escape) {
+                root.export-sheet-open = false;
             }
             return accept;
         }
@@ -1548,31 +1802,6 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        // Its own item, so a notice can't overwrite it.
-                        if root.exporting: HorizontalLayout {
-                            spacing: 6px;
-
-                            // Wide enough for 100%, so the row doesn't
-                            // shift as it counts.
-                            Text {
-                                text: "Exporting " + root.export-progress + "%";
-                                color: Palette.foreground;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                min-width: 84px;
-                            }
-                            VerticalLayout {
-                                alignment: center;
-                                ProgressIndicator {
-                                    width: 70px;
-                                    progress: root.export-progress / 100;
-                                }
-                            }
-                            Button {
-                                text: "Cancel";
-                                clicked => { root.cancel-export(); }
-                            }
-                        }
                         // The one stretch item: it takes the row's slack, and
                         // elides rather than squeeze the controls.
                         Text {
@@ -1603,6 +1832,20 @@ export component AppWindow inherits Window {
                             value <=> root.volume;
                             changed(value) => { root.volume-changed(value); }
                             released(value) => { root.volume-released(value); }
+                        }
+                        Button {
+                            text: "Export…";
+                            // Still on while a run is going: the sheet is
+                            // where one is watched and cancelled from.
+                            enabled: root.has-project && root.clip-count > 0 && !root.recording && !root.previewing;
+                            clicked => {
+                                keys.focus();
+                                root.open-export();
+                            }
+
+                            Tooltip {
+                                text: @markdown("Export clips as videos");
+                            }
                         }
                         Button {
                             text: "Devices…";
@@ -1643,6 +1886,31 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // --- Export sheet: modal over the whole window (E8) ---
+        if root.export-sheet-open: Rectangle {
+            background: #000000a0;
+
+            // Swallows clicks meant for the window behind.
+            TouchArea { }
+
+            ExportSheet {
+                targets: root.export-targets;
+                any-ticked: root.export-any-ticked;
+                run: root.export-run;
+                finish: root.export-finish;
+                exporting: root.exporting;
+                resolution <=> root.export-resolution;
+                quality <=> root.export-quality;
+                tick(index, ticked) => { root.tick-target(index, ticked); }
+                start => { root.start-export(); }
+                cancel => { root.cancel-export(); }
+                close => {
+                    root.export-sheet-open = false;
+                    keys.focus();
                 }
             }
         }

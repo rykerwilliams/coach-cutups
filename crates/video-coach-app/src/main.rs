@@ -17,17 +17,18 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, DataTransfer, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot, TargetState,
+    export_targets, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, ExportTargetRow,
+    ExportTargetRun, RecordingStatus, Snapshot, TargetState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
-use video_coach_app::format::{format_hms, sentence};
+use video_coach_app::format::{finish_at, format_hms, sentence};
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Project};
+use video_coach_core::project::{Clip, Project, Quality, Resolution};
 use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
@@ -85,6 +86,10 @@ struct UiState {
     /// The previewed clip's duration while a preview is open. The transport
     /// then runs over the clip rather than the concat timeline (spec P6).
     preview_duration: Option<f64>,
+    /// What the export sheet's rows stand for, in its order (Phase 8 E8).
+    /// The window holds the labels and the ticks; the targets are here, since
+    /// it has no type for one.
+    export_targets: Vec<ExportTargetRow>,
 }
 
 impl Default for UiState {
@@ -102,6 +107,7 @@ impl Default for UiState {
             paths_rect: (0.0, 0.0),
             notice_until: None,
             preview_duration: None,
+            export_targets: Vec::new(),
         }
     }
 }
@@ -344,26 +350,69 @@ fn wire_clips(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
 }
 
-/// Export (Phase 8 E1, E6): the clip menu's "Export video…" runs that one
-/// clip as a target, into the project's own `exports/` folder — there is no
-/// save picker any more, since the folder is fixed. The sheet with the rest
-/// of the target list is Task 7; the transport's Cancel stops a run.
+/// Export (Phase 8 E8): the sheet is the only export UI. The Export… button
+/// opens it over the whole target list, the clip menu's "Export video…" opens
+/// it on that one clip, and Export hands the bus what's ticked. Every target
+/// goes into the project's own `exports/` folder, so there is no save picker.
 fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_open_export({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                // The selected clip gets a row of its own, unticked: the
+                // sheet's default is everything else (spec E8).
+                open_export_sheet(&w, selected_id(&w), false);
+            }
+        }
+    });
     window.on_export_clip({
-        let bus = bus.clone();
+        let weak = window.as_weak();
         move |id| {
-            let Some(id) = parse_clip_id(&id) else { return };
-            // The pickers' last values, until the sheet offers them again.
-            let Some((resolution, quality)) = UI.with_borrow(|ui| {
-                let prefs = &ui.snapshot.as_ref()?.project.preferences;
-                Some((prefs.last_export_resolution, prefs.last_export_quality))
-            }) else {
+            let (Some(w), Some(id)) = (weak.upgrade(), parse_clip_id(&id)) else {
                 return;
             };
+            // This clip was asked for, so it is the only thing ticked.
+            open_export_sheet(&w, Some(id), true);
+        }
+    });
+    window.on_tick_target({
+        let weak = window.as_weak();
+        move |index, ticked| {
+            let (Some(w), Ok(index)) = (weak.upgrade(), usize::try_from(index)) else {
+                return;
+            };
+            let rows = w.get_export_targets();
+            let Some(row) = rows.row_data(index) else {
+                return;
+            };
+            rows.set_row_data(index, TargetRow { ticked, ..row });
+            w.set_export_any_ticked(rows.iter().any(|row| row.ticked));
+        }
+    });
+    window.on_start_export({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let ticked = w.get_export_targets();
+            let targets = UI.with_borrow(|ui| {
+                ui.export_targets
+                    .iter()
+                    .zip(ticked.iter())
+                    .filter(|(_, row)| row.ticked)
+                    .map(|(target, _)| target.target.clone())
+                    .collect()
+            });
             bus.borrow().send(Command::Export {
-                targets: vec![ExportTarget::Clip(id)],
-                resolution,
-                quality,
+                targets,
+                resolution: match w.get_export_resolution() {
+                    0 => Resolution::R720,
+                    _ => Resolution::R1080,
+                },
+                quality: match w.get_export_quality() {
+                    0 => Quality::Low,
+                    2 => Quality::High,
+                    _ => Quality::Medium,
+                },
             });
         }
     });
@@ -371,6 +420,52 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let bus = bus.clone();
         move || bus.borrow().send(Command::CancelExport)
     });
+}
+
+/// Opens the export sheet: every target the project offers, with `clip`'s own
+/// row ticked or everything but it (spec E8), and the pickers at the
+/// project's last choice (spec E4).
+fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
+    let Some((resolution, quality, rows)) = UI.with_borrow_mut(|ui| {
+        let project = &ui.snapshot.as_ref()?.project;
+        ui.export_targets = export_targets(project, clip);
+        let rows: Vec<TargetRow> = ui
+            .export_targets
+            .iter()
+            .map(|row| {
+                let clips = if row.clips == 1 { "clip" } else { "clips" };
+                TargetRow {
+                    label: row.label.as_str().into(),
+                    detail: format!("{} {clips} · {}", row.clips, format_hms(row.seconds)).into(),
+                    // The clip's row is the one that differs: it is ticked
+                    // when the sheet was opened on it, and only then.
+                    ticked: matches!(row.target, ExportTarget::Clip(_)) == only_clip,
+                }
+            })
+            .collect();
+        let prefs = &project.preferences;
+        Some((
+            prefs.last_export_resolution,
+            prefs.last_export_quality,
+            rows,
+        ))
+    }) else {
+        return;
+    };
+    w.set_export_resolution(match resolution {
+        Resolution::R720 => 0,
+        // 2160p is kept in the format but not offered (E8), so it shows as
+        // 1080p — and a run started here saves it as that.
+        _ => 1,
+    });
+    w.set_export_quality(match quality {
+        Quality::Low => 0,
+        Quality::Medium => 1,
+        Quality::High => 2,
+    });
+    w.set_export_any_ticked(rows.iter().any(|row| row.ticked));
+    w.set_export_targets(ModelRc::new(VecModel::from(rows)));
+    w.set_export_sheet_open(true);
 }
 
 /// Preview (Phase 7 P6): the inspector's button and the clip menu's "Preview
@@ -791,6 +886,9 @@ fn on_event(w: &AppWindow, event: Event) {
             set_zoom(w, Zoom::IDENTITY);
             w.set_selected_clip(SharedString::new());
             w.set_tag_filter(SharedString::new());
+            // Another project's run doesn't belong in this one's sheet.
+            w.set_export_run(ModelRc::default());
+            w.set_export_finish(SharedString::new());
             w.set_volume(snapshot.project.preferences.scan_volume as f32);
             w.set_project_name(snapshot.project.name.as_str().into());
             show_project(w, snapshot);
@@ -838,9 +936,8 @@ fn on_event(w: &AppWindow, event: Event) {
             w.set_level(fraction as f32);
             w.set_level_seen(true);
         }
-        // The run list is the export sheet's (Phase 8 Task 7). Until then the
-        // transport's inline row shows the whole run as one percentage, and
-        // the last event of a run -- the one with nothing left running --
+        // The whole run travels in every event, so the sheet renders what it
+        // is handed; the last one -- with nothing left running -- also
         // reports how it went.
         Event::Export(run) => show_export(w, &run),
         // After the operation's `ProjectChanged`, so the clip is in the
@@ -904,17 +1001,25 @@ fn show_notice(w: &AppWindow, text: String) {
     UI.with_borrow_mut(|ui| ui.notice_until = Some(Instant::now() + NOTICE));
 }
 
-/// The run in the transport's inline row, which Task 7's export sheet
-/// replaces: one percentage over every target's frames, and a word about how
-/// it went once nothing is left running.
+/// The run in the export sheet (spec E8): a row per target, and one line
+/// saying when the whole run finishes. The sheet may well be closed — a run
+/// goes on behind it — so the outcome is also reported in the window.
 fn show_export(w: &AppWindow, run: &ExportRun) {
-    let total: usize = run.targets.iter().map(|t| t.frames).sum();
-    if run.is_running() {
-        let done = total.saturating_sub(run.remaining_frames());
-        w.set_export_progress((done * 100 / total.max(1)) as i32);
+    let running = run.is_running();
+    let rows: Vec<RunRow> = run.targets.iter().map(run_row).collect();
+    w.set_export_run(ModelRc::new(VecModel::from(rows)));
+    w.set_exporting(running);
+    // While something is still rendering, and only once the rate is steady
+    // (E5). `remaining_frames` covers the targets not started yet, so this is
+    // the whole run's end, not the current target's.
+    let finish = running
+        .then(|| run.rate.filter(|rate| *rate > 0.0))
+        .flatten()
+        .and_then(|rate| finish_at(run.remaining_frames() as f64 / rate));
+    w.set_export_finish(finish.unwrap_or_default().into());
+    if running {
         return;
     }
-    w.set_export_progress(-1);
     // A run stops at nothing: the first failure is what to say, since a run
     // of one target is still the common case.
     if let Some(why) = run.targets.iter().find_map(|t| match &t.state {
@@ -934,6 +1039,27 @@ fn show_export(w: &AppWindow, run: &ExportRun) {
             w,
             format!("Exported {written} video{plural} to the project's exports folder"),
         );
+    }
+}
+
+/// One target as the sheet's run list shows it: a bar while it renders, and a
+/// word in its place otherwise. A failure says only that here — the dialog
+/// carries the reason.
+fn run_row(target: &ExportTargetRun) -> RunRow {
+    let frames = target.frames.max(1);
+    RunRow {
+        label: target.label.as_str().into(),
+        progress: match target.state {
+            TargetState::Running(done) => done as f32 / frames as f32,
+            _ => -1.0,
+        },
+        status: match target.state {
+            TargetState::Pending => "Pending".into(),
+            TargetState::Running(done) => format!("{}%", done * 100 / frames).into(),
+            TargetState::Done(_) => "Done".into(),
+            TargetState::Failed(_) => "Failed".into(),
+            TargetState::Cancelled => "Cancelled".into(),
+        },
     }
 }
 
