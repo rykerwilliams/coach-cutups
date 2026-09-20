@@ -499,20 +499,13 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** when a basketball or hockey format lands, or the first
   time a real scoreboard reads `10 - 10`.
 
-57. **A realistic club name is ellipsized to ~7 characters.** Measured at
-  1080p: the padded home cell is 199.4 px; `"HOME"` is 147.1 px, but
-  `"Manchester United"` is 467.6 px and `"Riverside Rovers U14"` is 526.5 px,
-  so both render as roughly `"Manche…"`. The spec chose fixed-size-plus-
-  ellipsize deliberately, rejecting macOS's shrink-to-fit on the grounds that a
-  shrunk name in a cell 10.8% of the frame width is illegible anyway.
-- **Why deferred:** it is the spec's decision working as written, not a bug,
-  and the alternative (shrink to a legibility floor, then ellipsize) needs the
-  fitting memo to key on size as well as width. Worth a human's eye before
-  spending that complexity — "Manche…" may or may not be worse than a slightly
-  small "Manchester Utd".
-- **When to revisit:** the first hands-on pass with real team names, which is
-  in the batched checklist.
-
+57. ~~**A realistic club name is ellipsized to ~7 characters.**~~ **Fixed in
+  `babdea6`.** The spec's premise was measurably wrong: fitting
+  `"Manchester United"` to the cell needs 16.7 px at 1080p, well above macOS's
+  6 px floor, so "illegible anyway" did not hold and essentially no real club
+  name rendered. Labels now shrink to a floor of a quarter of full size and
+  ellipsize only below it. Left here as the record of why the spec said
+  otherwise.
 58. **`scan_abs` can pair a new source's index with the old source's offset.**
   `scan_abs` (`crates/video-coach-app/src/main.rs`) falls back to
   `abs_seconds(ui.source_index, ui.last_secs)` when `ui.target_abs` is `None`.

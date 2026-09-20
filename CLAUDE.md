@@ -160,6 +160,23 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
 - **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
 
+**The match clock is the displayed frame's source time** (Phase 9).
+- **Never a per-clip constant.** `ScoreboardContext::state_at(entry.source_index,
+  frame.source_time)` is called per frame, with `source_time` coming from
+  `FrameSpec` — not `timeline::source_time`, and nothing cached on `PlanEntry`.
+  macOS computed the clock as a per-clip constant plus the commentary's wall
+  clock, so every pause and skip pushed the clock ahead of the footage; since
+  every recording opens with a pause, that was nearly always (BACKLOG #27).
+  A clip that pauses reads the same match time either side of the pause, and
+  `core`'s pause test pins it.
+- **The absolute events are derived per job** and must never be cached across a
+  source add, move, remove or relink — a relink can change a duration, and so
+  every later offset.
+- **Every scoreboard label is fitted** (shrunk to a floor, then ellipsized).
+  `draw_label` centres and does not clip, so an unfitted label spills out of
+  both ends of its cell. The columns are sized so nothing realistic shrinks;
+  fitting is what makes a spill impossible rather than unlikely.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not

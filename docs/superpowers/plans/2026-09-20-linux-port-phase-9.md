@@ -72,11 +72,23 @@ Commit: `feat(app): match event commands and undo`.
 
 Commit: `feat(app): the Match panel and scoreboard setup`.
 
-## Task 4 — Closeout
+## Task 4 — Closeout (done)
 
-1. Adversarial review of the Phase 9 diff; apply and backlog.
-2. `CLAUDE.md`: the clock rule (the displayed frame's source time; no per-clip constant) in a line or two.
-3. The hands-on checklist items, in the Task 4 notes.
+1. ~~Adversarial review of the Phase 9 diff~~ — done, applied in `babdea6`. Two real bugs (the clock cell overflowing its column for `BREAK` and past 99:59; the `v` key ungated at the cap raising a modal over a live recording), the back-anchor's cap/warning/tooltip disagreeing three ways, a false "reads 45:00" claim in both the spec and the code, and seven simplifications. Backlogged: #58 (`scan_abs`'s index/offset pairing window). #57 closed by the fix.
+2. ~~`CLAUDE.md`: the clock rule~~ — done, alongside the derived-events and label-fitting rules.
+3. Hands-on checklist — below.
+
+### Hands-on checklist (Phase 9)
+
+Batched with the other phases' items; none of this needs a camera.
+
+1. **Setup sheet.** Open Setup…, enter both teams, six hex colours, a format. Check the swatches track the fields, that Save disables on a blank name or a bad hex, and that Cancel leaves the saved config alone.
+2. **Tagging while scanning.** `z` / `x` / `v` during a scan; confirm the panel's score and clock track the playhead and the rows land at the position you were watching, not where the seek started.
+3. **Tagging while recording.** Tag during a commentary take: it must work, and must not raise a dialog over the recording. At the cap, `v` should do nothing (the button greys out) rather than interrupt.
+4. **The back-anchor.** Tick "my video starts after kick-off" on footage that starts mid-half. Before tagging half-time the clock runs from the footage's start; tagging half-time should snap it so that end reads the period length (the display turns over to `HT` there — it never shows `45:00` itself). Check the warning names the leftover start/stop.
+5. **A non-soccer format.** Set quarters and check the break label reads `BREAK` inside its cell — this is the overflow bug from the review; it should now sit clear of the team cells and the bar's edge.
+6. **Long team names.** Enter a real club name ("Wolverhampton Wanderers" is the tightest one measured). It should shrink to fit rather than cut to "Wolver…". **Judgement call for you:** the floor is a quarter of full size, and that name clears it by 6%. If it reads too small on your screen, say so and the floor moves.
+7. **Burned in.** Export a clip and watch the board at full size on the laptop: legible, correct score at that moment, clock matching the footage across a mid-clip pause.
 
 ## Deliberately not in this phase
 
