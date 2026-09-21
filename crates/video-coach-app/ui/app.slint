@@ -81,6 +81,17 @@ export enum ClipField {
     name,
     tags,
     notes,
+    transcript,
+}
+
+/// The selected clip's transcription, as the bus publishes it (Phase 10 S5).
+/// `idle` covers "never transcribed" and "ran and found nothing" alike:
+/// `transcript-status` is the line that tells those two apart.
+export enum TranscriptState {
+    idle,
+    queued,
+    running,
+    failed,
 }
 
 /// One row of the Devices popover's camera or microphone list.
@@ -303,8 +314,19 @@ component Inspector inherits Rectangle {
     in-out property <string> tags-text;
     in-out property <string> notes-text;
     in-out property <bool> show-pip;
-    /// A field has focus: the window's shortcuts yield to it.
-    out property <bool> editing: name.has-focus || tags.has-focus || notes.has-focus;
+    /// The commentary as words (Phase 10 S4), editable like any other field.
+    in-out property <string> transcript-text;
+    /// What the bus says about this clip's transcription (S5) ...
+    in property <TranscriptState> transcript-state;
+    /// ... and the line under the box that says it in words -- including the
+    /// "no speech found" that an `idle` clip with an empty transcript may
+    /// have earned. Empty when there is nothing to say.
+    in property <string> transcript-status;
+    /// A field has focus: the window's shortcuts yield to it. **Every** text
+    /// field belongs here: miss one and typing in it makes Space start
+    /// playback and `r` start a recording.
+    out property <bool> editing: name.has-focus || tags.has-focus || notes.has-focus
+        || transcript.has-focus;
     /// Preview is possible at all (Phase 7 P6): something to play, and
     /// neither recording nor exporting, both of which the bus refuses.
     in property <bool> can-preview;
@@ -322,6 +344,10 @@ component Inspector inherits Rectangle {
     /// ... or lost focus, which commits.
     callback end-edit(ClipField, string);
     callback pip-toggled(bool);
+    /// Queue this clip's commentary for transcription (Phase 10 S6).
+    callback transcribe-clicked();
+    /// Stop the transcription running **and drop the queue behind it**.
+    callback cancel-transcribe-clicked();
     /// Existing tags to suggest for the tag field's text (C8).
     pure callback suggest-tags(string) -> [string];
     /// The tag field's text with the suggestion taken.
@@ -406,8 +432,63 @@ component Inspector inherits Rectangle {
         notes := TextEdit {
             enabled: root.enabled;
             vertical-stretch: 1;
+            // Still the field that takes this layout's slack, but no longer
+            // the field that pays for all of it: with the transcript below
+            // it, an unbounded `notes` collapses to nothing in a 700px
+            // window and draws its text over its own caption. The Match
+            // panel's event list under this column gives way instead, and it
+            // scrolls.
+            min-height: 64px;
             text <=> root.notes-text;
             changed has-focus => { root.focus-changed(ClipField.notes, self.has-focus, self.text); }
+        }
+
+        // The caption carries the actions, as the Clips list's and the Match
+        // panel's do: this column is 280px of a window that may be only
+        // 700px tall, and a row of its own for the buttons comes straight
+        // out of the Notes box above.
+        HorizontalLayout {
+            spacing: 6px;
+            FieldLabel {
+                text: "Transcript";
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Transcribe";
+                enabled: root.enabled
+                    && root.transcript-state != TranscriptState.queued
+                    && root.transcript-state != TranscriptState.running;
+                clicked => { root.transcribe-clicked(); }
+
+                Tooltip { text: @markdown("Write out the commentary recorded over this clip"); }
+            }
+            // Beside a waiting clip as much as a running one: the command
+            // stops the job in flight *and* drops the queue behind it.
+            if root.transcript-state == TranscriptState.queued
+                || root.transcript-state == TranscriptState.running: Button {
+                text: "Cancel";
+                clicked => { root.cancel-transcribe-clicked(); }
+
+                Tooltip { text: @markdown("Stop transcribing, and drop what's waiting"); }
+            }
+        }
+        // A fixed height with its own scroll, deliberately: `notes` above
+        // already takes this layout's slack, and a second stretchy box would
+        // halve both of them.
+        transcript := TextEdit {
+            enabled: root.enabled;
+            height: 88px;
+            text <=> root.transcript-text;
+            changed has-focus => { root.focus-changed(ClipField.transcript, self.has-focus, self.text); }
+        }
+        if root.transcript-status != "": Text {
+            text: root.transcript-status;
+            font-size: 11px;
+            wrap: word-wrap;
+            color: root.transcript-state == TranscriptState.failed
+                ? #ff6b6b
+                : Palette.alternate-foreground;
         }
 
         Button {
@@ -1272,7 +1353,14 @@ export component AppWindow inherits Window {
     in-out property <string> clip-name;
     in-out property <string> clip-tags;
     in-out property <string> clip-notes;
+    in-out property <string> clip-transcript;
     in-out property <bool> clip-show-pip;
+    /// The selected clip's transcription and the line that describes it
+    /// (Phase 10 S5). Both are written by `src/main.rs` from
+    /// `Event::Transcription` -- and, unlike the fields above, they keep
+    /// following it while a field is being edited.
+    in property <TranscriptState> transcript-state;
+    in property <string> transcript-status;
     /// The clip an inspector field is editing, set when one gains focus and
     /// cleared when the last one loses it. Commits go to it, not to the
     /// selection, which a row click has already moved by the time a field's
@@ -1454,6 +1542,10 @@ export component AppWindow inherits Window {
     /// An inspector field's commit for clip `id`.
     callback edit-clip(string, ClipField, string);
     callback set-show-pip(string, bool);
+    /// Queue clip `id`'s commentary for transcription (Phase 10 S6).
+    callback transcribe(string);
+    /// Stop the transcription running and drop the queue behind it.
+    callback cancel-transcription();
     /// Render the inspector's fields from the selected clip, unless one is
     /// being edited.
     callback show-clip();
@@ -2147,6 +2239,9 @@ export component AppWindow inherits Window {
                                 name-text <=> root.clip-name;
                                 tags-text <=> root.clip-tags;
                                 notes-text <=> root.clip-notes;
+                                transcript-text <=> root.clip-transcript;
+                                transcript-state: root.transcript-state;
+                                transcript-status: root.transcript-status;
                                 show-pip <=> root.clip-show-pip;
                                 begin-edit => { root.editing-clip-id = root.selected-clip; }
                                 commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
@@ -2164,6 +2259,18 @@ export component AppWindow inherits Window {
                                 // The selection, since a click doesn't take focus
                                 // from a field.
                                 pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
+                                // Off the fields first, as the Preview button
+                                // does: a click doesn't move focus, and the
+                                // machine's write is refused a re-render while
+                                // a field holds one.
+                                transcribe-clicked => {
+                                    keys.focus();
+                                    root.transcribe(root.selected-clip);
+                                }
+                                cancel-transcribe-clicked => {
+                                    keys.focus();
+                                    root.cancel-transcription();
+                                }
                                 preview-clicked => {
                                     keys.focus();
                                     if (self.previewing) {

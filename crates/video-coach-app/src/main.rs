@@ -102,6 +102,35 @@ struct UiState {
     /// Rebuilt on every project change and **never carried across one**: a
     /// source add, move, remove or relink moves the offsets it froze.
     scoreboard: Option<ScoreboardContext>,
+    /// The transcription queue (Phase 10 S5).
+    transcription: Transcription,
+}
+
+/// The transcription as the UI knows it (Phase 10 spec S5): the three fields
+/// of [`Event::Transcription`], and the three things they don't say.
+#[derive(Default)]
+struct Transcription {
+    /// The clips waiting, in the order they will run.
+    queued: Vec<Uuid>,
+    /// The clip being transcribed and the whole percent it last reported.
+    running: Option<(Uuid, u8)>,
+    /// The last failure — one slot, as the bus keeps it.
+    failed: Option<(Uuid, String)>,
+    /// When this UI first saw `running`'s clip running.
+    ///
+    /// The inspector's readout is this clock, not the percent: whisper's
+    /// progress callback fires at the top of a loop advancing in ≤30 s
+    /// chunks and never reports 100, so a clip shorter than one chunk
+    /// reports 0 exactly once and nothing after.
+    since: Option<Instant>,
+    /// The clip whose last run ended having written nothing. whisper hands
+    /// back no segments at all over silence, and `""` is *also* how a clip
+    /// says it was never transcribed (spec S4) — so without this the coach
+    /// presses Transcribe, waits, and sees no change whatsoever.
+    silent: Option<Uuid>,
+    /// The clip whose cancel this window asked for: its run was abandoned,
+    /// which is not the same as having found nothing to say.
+    cancelled: Option<Uuid>,
 }
 
 impl Default for UiState {
@@ -121,6 +150,7 @@ impl Default for UiState {
             preview_duration: None,
             export_targets: Vec::new(),
             scoreboard: None,
+            transcription: Transcription::default(),
         }
     }
 }
@@ -709,6 +739,9 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                 ClipField::Name => ClipEdit::Name(text.into()),
                 ClipField::Tags => ClipEdit::Tags(normalize_tags(&text)),
                 ClipField::Notes => ClipEdit::Notes(text.into()),
+                // The coach's own edit of a transcript is an undo step like
+                // any other; the machine's write of one is not (spec S7).
+                ClipField::Transcript => ClipEdit::Transcript(text.into()),
             };
             let id = parse_id(&id);
             // Whether the bus will apply it: it skips an edit that sets the
@@ -747,6 +780,26 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             if let Some(w) = weak.upgrade() {
                 show_clip(&w);
             }
+        }
+    });
+    window.on_transcribe({
+        let bus = bus.clone();
+        move |id| {
+            if let Some(clip_id) = parse_id(&id) {
+                bus.borrow().send(Command::Transcribe { clip_id });
+            }
+        }
+    });
+    window.on_cancel_transcription({
+        let bus = bus.clone();
+        move || {
+            // What the job in flight was for. Its clip goes back to idle,
+            // and its row must not then read "no speech found": it was
+            // abandoned, not answered.
+            UI.with_borrow_mut(|ui| {
+                ui.transcription.cancelled = ui.transcription.running.map(|(id, _)| id);
+            });
+            bus.borrow().send(Command::CancelTranscription);
         }
     });
     window.on_suggest_tags(|text| {
@@ -1094,6 +1147,9 @@ fn on_event(w: &AppWindow, event: Event) {
                 ui.source_index = 0;
                 ui.target_abs = None;
                 ui.last_secs = 0.0;
+                // The bus cancels and clears its queue on an open, and its
+                // own event follows; these three are the window's own.
+                ui.transcription = Transcription::default();
             });
             set_zoom(w, Zoom::IDENTITY);
             w.set_selected_clip(SharedString::new());
@@ -1188,10 +1244,44 @@ fn on_event(w: &AppWindow, event: Event) {
             // `total-seconds`, and picks it up from here.
             ui.preview_duration = clip.map(|c| c.recording_duration);
         }),
-        // The clip inspector's transcript row is what reads this (spec S5);
-        // it lands with the rest of that panel. The words themselves arrive
-        // as the `ProjectChanged` before it, so nothing is lost meanwhile.
-        Event::Transcription { .. } => {}
+        // The whole queue, every time (spec S5). The words themselves arrive
+        // as the `ProjectChanged` before it, so a clip that stops running
+        // and has nothing to show for it really did find nothing to say.
+        Event::Transcription {
+            queued,
+            running,
+            failed,
+        } => UI.with_borrow_mut(|ui| {
+            let ended = ui
+                .transcription
+                .running
+                .map(|(id, _)| id)
+                .filter(|id| running.map(|(now, _)| now) != Some(*id));
+            // A run that ended with nothing written and no other explanation
+            // for it. Cancelled, preempted by a recording (which puts its
+            // clip back at the front of the queue) and failed each leave the
+            // row something else to say.
+            let silent = ended.filter(|id| {
+                ui.transcription.cancelled != Some(*id)
+                    && !queued.contains(id)
+                    && failed.as_ref().is_none_or(|(clip, _)| clip != id)
+                    && !has_transcript(ui, *id)
+            });
+            let t = &mut ui.transcription;
+            if ended.is_some() {
+                t.cancelled = None;
+                t.silent = silent.or(t.silent);
+            }
+            // A different clip restarts the clock; the same one reporting a
+            // new percent keeps it.
+            if t.running.map(|(id, _)| id) != running.map(|(id, _)| id) {
+                t.since = running.is_some().then(Instant::now);
+            }
+            t.queued = queued;
+            t.running = running;
+            t.failed = failed;
+            show_transcription(w, ui);
+        }),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {
@@ -1367,6 +1457,8 @@ fn clip_name(clip: &Clip) -> &str {
 /// The inspector's fields, from the selected clip (C7), and empty with none.
 /// Not while a field is being edited: that would overwrite what's typed.
 fn show_clip(w: &AppWindow) {
+    // Not a field, so it follows the selection even mid-edit.
+    UI.with_borrow(|ui| show_transcription(w, ui));
     if !w.get_editing_clip_id().is_empty() {
         return;
     }
@@ -1379,8 +1471,70 @@ fn show_clip(w: &AppWindow) {
         w.set_clip_name(clip.map_or("", |c| &c.name).into());
         w.set_clip_tags(clip.map_or_else(String::new, |c| c.tags.join(", ")).into());
         w.set_clip_notes(clip.map_or("", |c| &c.notes).into());
+        w.set_clip_transcript(clip.map_or("", |c| &c.transcript).into());
         w.set_clip_show_pip(clip.is_some_and(|c| c.show_pip));
     });
+}
+
+/// The transcript row's state and its line, for the selected clip (spec S5).
+fn show_transcription(w: &AppWindow, ui: &UiState) {
+    let selected = selected_id(w);
+    let (state, status) = ui
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.project.clips.iter().find(|c| Some(c.id) == selected))
+        .map_or_else(
+            || (TranscriptState::Idle, String::new()),
+            |clip| transcript_row(&ui.transcription, clip),
+        );
+    w.set_transcript_state(state);
+    w.set_transcript_status(status.into());
+}
+
+/// What the inspector says about `clip`'s transcription.
+///
+/// **The running line is a clock, not a bare percentage.** whisper's progress
+/// callback fires at the top of a loop that advances in ≤30 s chunks and
+/// never reports 100, so a 20 s clip reports 0 exactly once: a percentage on
+/// its own would sit at 0% for the whole run and look stuck. It joins the
+/// clock once it has moved off zero.
+///
+/// **And a run that wrote nothing says so.** `""` is how a clip says it was
+/// never transcribed (spec S4) and whisper returns no segments at all over
+/// silence, so an empty result would otherwise leave the inspector looking
+/// exactly as it did before the coach pressed the button.
+fn transcript_row(t: &Transcription, clip: &Clip) -> (TranscriptState, String) {
+    if let Some((_, percent)) = t.running.filter(|(id, _)| *id == clip.id) {
+        let elapsed = format_hms(t.since.map_or(0.0, |at| at.elapsed().as_secs_f64()));
+        let line = match percent {
+            0 => format!("Transcribing… {elapsed}"),
+            p => format!("Transcribing… {elapsed} · {p}%"),
+        };
+        return (TranscriptState::Running, line);
+    }
+    if t.queued.contains(&clip.id) {
+        return (TranscriptState::Queued, "Queued".into());
+    }
+    if let Some((_, why)) = t.failed.as_ref().filter(|(id, _)| *id == clip.id) {
+        return (
+            TranscriptState::Failed,
+            sentence(&format!("couldn't transcribe: {why}")),
+        );
+    }
+    if t.silent == Some(clip.id) && clip.transcript.is_empty() {
+        return (TranscriptState::Idle, "No speech found".into());
+    }
+    (TranscriptState::Idle, String::new())
+}
+
+/// Whether clip `id` has words on it in the snapshot the UI holds.
+fn has_transcript(ui: &UiState, id: Uuid) -> bool {
+    ui.snapshot.as_ref().is_some_and(|s| {
+        s.project
+            .clips
+            .iter()
+            .any(|c| c.id == id && !c.transcript.is_empty())
+    })
 }
 
 /// The selected clip's id; `None` for no selection.
@@ -1411,6 +1565,12 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         if let Some(t0_ns) = ui.recording_t0 {
             let elapsed = now_ns().saturating_sub(t0_ns) as f64 / 1e9;
             w.set_recording_elapsed(format_hms(elapsed).into());
+        }
+        // The transcript row's readout is a clock (see `transcript_row`), so
+        // it moves with this timer and not with the bus's events -- which,
+        // for a clip shorter than one of whisper's chunks, is once.
+        if ui.transcription.running.is_some() {
+            show_transcription(w, ui);
         }
         if ui.notice_until.is_some_and(|until| until <= Instant::now()) {
             ui.notice_until = None;
