@@ -174,6 +174,9 @@ Each entry: what, why deferred, when to revisit.
   see #19, the macOS app already downloads a speech model inside `transcribe()`.
 - **When to revisit:** Phase 10. Decide before the packaging phase, since it
   changes the artifact size.
+- **Resolved 2026-09-21:** download on first use, implemented in Phase 11
+  (spec `2026-09-21-linux-port-phase-11-design.md` S3). Note the "~140 MB"
+  above is `base.en`; the default `small.en` is 487.6 MB, 3.3x that.
 
 ### 23. README accuracy: "no network calls" and "No FFmpeg"
 - **Why deferred:** Both claims on README line 5 are or will be false. "No
@@ -195,6 +198,10 @@ Each entry: what, why deferred, when to revisit.
   host's VA drivers. A `.deb` depending on Ubuntu's GStreamer is the simplest
   option for the user's own laptop. Weigh both against that expectation.
 - **When to revisit:** Phase 11.
+- **Resolved 2026-09-21:** a `.deb`, after the evidence overturned AppImage.
+  The reasoning, and why Flatpak is a capture rewrite rather than a
+  packaging choice, is in the Phase 11 spec's S0. AppImage and Flatpak stay
+  open for a later phase if the app is ever handed to someone else.
 
 ### 25. Wayland vs X11 for the drawing overlay
 - **Why deferred:** Freehand telestration wants low input latency and the two

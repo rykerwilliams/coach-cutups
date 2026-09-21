@@ -18,8 +18,10 @@
 #
 # Install first if needed (Debian/Ubuntu):
 #   sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-{base,good,bad,ugly} \
-#                    gstreamer1.0-libav gstreamer1.0-vaapi gstreamer1.0-pipewire \
-#                    vainfo
+#                    gstreamer1.0-libav gstreamer1.0-pipewire vainfo
+# (The `va` plugin the app uses -- vah265dec, vah264lpenc -- ships in
+# gstreamer1.0-plugins-bad. gstreamer1.0-vaapi is the older, separate,
+# deprecated plugin and is not needed.)
 # Fedora:
 #   sudo dnf install gstreamer1-plugins-{base,good,bad-free,ugly} gstreamer1-libav \
 #                    gstreamer1-vaapi libva-utils
@@ -59,7 +61,7 @@ for e in avdec_h265 avdec_h264; do
 done
 
 hdr "2. H.264 encoders (export path)"
-for e in vah264enc vaapih264enc nvh264enc x264enc; do
+for e in vah264lpenc vah264enc vaapih264enc nvh264enc x264enc; do
   gst-inspect-1.0 --exists "$e" 2>/dev/null && ok "$e — rank: $(rank_of "$e")"
 done
 
@@ -78,9 +80,11 @@ else
   bad "GL chain FAILED — export would fall back to software compositor"
 fi
 
-hdr "4. PipeWire capture (recording path)"
-gst-inspect-1.0 --exists pipewiresrc 2>/dev/null && ok "pipewiresrc present" \
-  || warn "pipewiresrc missing — install gstreamer1.0-pipewire (v4l2src fallback exists)"
+hdr "4. Capture (camera: v4l2src; microphone: pipewiresrc)"
+gst-inspect-1.0 --exists v4l2src 2>/dev/null && ok "v4l2src present (camera)" \
+  || bad "v4l2src missing — install gstreamer1.0-plugins-good"
+gst-inspect-1.0 --exists pipewiresrc 2>/dev/null && ok "pipewiresrc present (microphone, device list)" \
+  || bad "pipewiresrc missing — install gstreamer1.0-pipewire"
 ls /dev/video* >/dev/null 2>&1 && ok "camera nodes: $(ls /dev/video* | tr '\n' ' ')" \
   || warn "no /dev/video* nodes visible"
 

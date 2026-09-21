@@ -6,7 +6,7 @@
 
 ## Machine
 
-Laptop: Intel Core i7-10610U (Comet Lake, 15 W), Intel UHD Graphics (GT2), Ubuntu 24.04, kernel 6.8, GStreamer 1.24.2, X11 session. A low-power 2020 iGPU — deliberately not a favourable test machine.
+Laptop: Intel Core i7-10610U (Comet Lake, 15 W), Intel UHD Graphics (GT2), Linux Mint 22.1 (Ubuntu 24.04 base), kernel 6.8, GStreamer 1.24.2, X11 session. A low-power 2020 iGPU — deliberately not a favourable test machine.
 
 ## Results — measured through the app's real display path
 
