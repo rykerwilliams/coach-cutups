@@ -312,7 +312,8 @@ impl Bus {
             self.emit(Event::Error(UserError::StopNotClean));
         }
         // The clip exists and is saved, so it can be transcribed (Phase 10
-        // spec S6) -- and whatever this recording preempted resumes.
+        // spec S6). Whatever this recording preempted resumes on its own:
+        // `Bus::run`'s tail starts the queue once nothing is in its way.
         self.transcribe_after_recording(clip_id);
     }
 
@@ -325,10 +326,6 @@ impl Bus {
         drop(active.recorder);
         remove_recording(&active.path);
         self.emit(Event::Recording(RecordingStatus::Idle));
-        // A recording that produced no clip still preempted a transcript,
-        // which resumes here: this path is the easy one to miss, and missing
-        // it stalls the queue until the next enqueue (Phase 10 spec S5).
-        self.run_next_if_idle();
     }
 }
 

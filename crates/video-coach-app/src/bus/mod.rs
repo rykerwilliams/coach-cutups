@@ -45,7 +45,7 @@ use video_coach_media::{
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
-pub use transcribe::whisper_model_path;
+pub use transcribe::{whisper_model_path, Finish, TranscriptionState};
 
 /// What the UI asks the bus to do.
 #[derive(Debug)]
@@ -254,17 +254,14 @@ pub enum Event {
     /// The clip being previewed, or `None` once the preview closed.
     Preview(Option<Uuid>),
     /// The whole transcription state (Phase 10 spec S5), so no view is left
-    /// holding something the bus has moved past: the clips waiting in order,
-    /// the one running with its percent, and the last failure. A clip in
-    /// neither is idle.
+    /// holding something the bus has moved past.
     ///
-    /// The words themselves arrive as a [`Event::ProjectChanged`], which
-    /// always precedes the event that stops saying the clip is running.
-    Transcription {
-        queued: Vec<Uuid>,
-        running: Option<(Uuid, u8)>,
-        failed: Option<(Uuid, String)>,
-    },
+    /// The words themselves arrive as an [`Event::ProjectChanged`] sent
+    /// before this one — when there are any. A run that wrote nothing sends
+    /// no `ProjectChanged` at all, which is exactly why the state carries
+    /// [`Finish::Silent`]: the view cannot tell "found nothing to say" from
+    /// "never ran" by watching the project.
+    Transcription(TranscriptionState),
     /// Select this clip: an undo restored or edited it, or a redo edited it.
     /// Always sent after that change's `ProjectChanged`, which drops a
     /// selection whose clip is gone.
@@ -462,12 +459,10 @@ pub struct Bus {
     /// stale: without this a cancelled job's `Finished` clears `running` and
     /// a second job starts beside the one already going.
     transcribe_generation: u64,
-    /// The last transcription failure, as macOS kept it: one slot, in memory,
-    /// cleared on that clip's next try, its next success and on project open.
-    transcribe_failed: Option<(Uuid, String)>,
-    /// A [`Command::Shutdown`] is being handled, so no new transcription
-    /// starts: the bus is about to drop, and the UI is waiting on it.
-    shutting_down: bool,
+    /// How the last transcription ended, when that is something to say —
+    /// as macOS kept its failure: one slot, in memory, cleared on that clip's
+    /// next try, its next success and on project open.
+    transcribe_finished: Option<(Uuid, Finish)>,
 }
 
 impl Bus {
@@ -547,8 +542,7 @@ impl Bus {
             transcribe_queue: VecDeque::new(),
             transcribing: None,
             transcribe_generation: 0,
-            transcribe_failed: None,
-            shutting_down: false,
+            transcribe_finished: None,
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -596,11 +590,11 @@ impl Bus {
                     self.transcription_message(generation, clip, msg)
                 }
                 Some(Input::Cmd(Command::Shutdown { ack })) => {
-                    // Nothing new is transcribed from here: stopping the
-                    // recording and closing the preview both look for a
-                    // queued job to start, and the one running is cancelled
-                    // and joined when the bus drops below.
-                    self.shutting_down = true;
+                    // This arm returns without reaching the loop's tail, so
+                    // nothing new is transcribed from here however the
+                    // teardown below moves the queue; the job in flight is
+                    // cancelled and joined when the bus drops.
+                    //
                     // A recording keeps its clip (or is aborted while still
                     // starting) before anything is torn down. The preview's
                     // pipelines use the UI's GL context, so they go to NULL
@@ -621,6 +615,16 @@ impl Bus {
             // (level messages at 10 Hz) can't starve them.
             self.dispatch_deadlines();
             self.publish_position();
+            // The one place a transcription starts (Phase 10 spec S5), which
+            // is enough because a recording, an export and a preview can only
+            // end while the bus is handling an input or a deadline -- so the
+            // machine can never come free with the thread parked in `recv`.
+            // The alternative was a call at each of the eight places one of
+            // the three ends, which was both easy to miss and, through
+            // `load`'s close of the preview, wrong: it started a job
+            // underneath a preview that was about to open. After
+            // `dispatch_deadlines`, since one of those aborts a recording.
+            self.run_next_if_idle();
         }
     }
 

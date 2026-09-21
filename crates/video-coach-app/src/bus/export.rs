@@ -403,11 +403,9 @@ impl Bus {
             }
         };
         self.emit(Event::Export(active.run.clone()));
-        if over {
-            // The run is over, so a transcript may have the machine back
-            // (Phase 10 spec S5).
-            self.run_next_if_idle();
-        } else {
+        // The run being over is what lets a queued transcript have the
+        // machine back; `Bus::run`'s tail picks that up (Phase 10 spec S5).
+        if !over {
             self.export = Some(active);
         }
     }

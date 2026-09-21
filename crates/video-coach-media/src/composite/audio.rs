@@ -44,29 +44,29 @@ use super::{CompositeError, Stopper, Watch, POLL, QUEUED};
 use crate::player::seconds_to_clock;
 
 /// The mix is stereo: every sample position is a pair of floats.
-const CHANNELS: usize = 2;
+pub(super) const CHANNELS: usize = 2;
 
-/// How long [`Reader::start`] waits for `decodebin3`'s stream collection. A
-/// file that posts neither a collection nor an `ERROR` — a directory, a named
-/// pipe with nothing behind it — would otherwise wait forever.
-const COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long [`Reader::start`] will wait to have a playing pipeline — the
+/// stream collection and then the preroll that follows the stream selection,
+/// on one budget. A file that posts neither a collection nor an `ERROR` — a
+/// directory, a named pipe with nothing behind it — would otherwise wait
+/// forever, and so would one that posts a collection and then never prerolls.
+/// A hang here is worse than a failure: it strands the transcription queue for
+/// the session (spec S5).
+const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The format the readers decode to, the mixer produces and the encode side
-/// takes — one description so the three can't disagree.
-pub(super) fn caps_description() -> String {
-    description(AUDIO_SAMPLE_RATE, CHANNELS)
+/// The format a reader decodes to. The export's mix — what the mixer produces
+/// and the encode side takes — is [`AUDIO_SAMPLE_RATE`] stereo, described here
+/// too so the three can't disagree; transcription reads the same files at
+/// whisper's 16 kHz mono (spec S2).
+pub(super) fn caps_description(rate: u32, channels: usize) -> String {
+    format!("audio/x-raw,format=F32LE,rate={rate},channels={channels},layout=interleaved")
 }
 
-/// A reader's own caps. The export's are [`caps_description`]'s; transcription
-/// reads the same files at whisper's 16 kHz mono (spec S2).
 fn caps(rate: u32, channels: usize) -> gst::Caps {
-    description(rate, channels)
+    caps_description(rate, channels)
         .parse()
         .expect("a constant caps description parses")
-}
-
-fn description(rate: u32, channels: usize) -> String {
-    format!("audio/x-raw,format=F32LE,rate={rate},channels={channels},layout=interleaved")
 }
 
 /// The audio edit, played out one output frame at a time.
@@ -228,6 +228,17 @@ fn reader<'a>(
         .as_mut()
 }
 
+/// Why a [`Reader`] will produce no more samples.
+enum End {
+    /// The end of the file, which is not a failure.
+    OfFile,
+    /// A cancel, or a decode error. [`Reader::read`] pads over it and the
+    /// export goes quiet; [`Reader::rest`] must not, since a clip cut short by
+    /// a cancel is indistinguishable from a whole one once it is a buffer of
+    /// samples.
+    Stopped(CompositeError),
+}
+
 /// One file's sound: an audio-only pipeline with a cursor, read forward from
 /// wherever the last seek put it, at the rate and channel count
 /// [`Reader::start`] was asked for.
@@ -245,13 +256,10 @@ pub(crate) struct Reader {
     /// The last pulled buffer, and how much of it is spent.
     held: Vec<f32>,
     spent: usize,
-    /// Nothing more will come: the end of the file, an error, or a cancel.
-    done: bool,
-    /// Why, when it was not the end of the file. [`Reader::read`] pads over it
-    /// and the export goes quiet; [`Reader::rest`] must not, since a clip cut
-    /// short by a cancel is indistinguishable from a whole one once it is a
-    /// buffer of samples.
-    stopped: Option<CompositeError>,
+    /// Set once nothing more will come, and saying why. One field rather than
+    /// a flag beside a reason: a reason without the flag would let a second
+    /// read carry on past a cancel.
+    end: Option<End>,
     /// Where [`Reader::read`] hands its samples back.
     out: Vec<f32>,
 }
@@ -334,7 +342,7 @@ impl Reader {
         // and it does **not** post `no-more-pads` (measured), so the collection
         // is also how a file with no audio track is recognised — waiting for
         // the appsink to preroll would wait forever.
-        let deadline = Instant::now() + COLLECTION_TIMEOUT;
+        let deadline = Instant::now() + START_TIMEOUT;
         let audio = loop {
             watch.check()?;
             if let Some(collection) = &*streams.lock().expect("the stream slot isn't poisoned") {
@@ -355,6 +363,9 @@ impl Reader {
         // decoder and still decodes every frame (measured: 2.2 s against
         // 46 ms for 10 s of 1080p, and the export decodes that video already).
         decodebin.send_event(gst::event::SelectStreams::new([audio.as_str()]));
+        // On the same deadline: a file that prerolls neither way — no
+        // `ASYNC_DONE`, no `ERROR` — hangs here otherwise, and a hang is what
+        // strands the queue.
         loop {
             watch.check()?;
             match pipeline.state(POLL) {
@@ -364,6 +375,9 @@ impl Reader {
                     return Err(CompositeError::Failed("could not read the sound".into()));
                 }
                 _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(watch.failure("the sound never opened"));
             }
         }
         if pipeline.set_state(gst::State::Playing).is_err() {
@@ -376,8 +390,7 @@ impl Reader {
             errors,
             held: Vec::new(),
             spent: 0,
-            done: false,
-            stopped: None,
+            end: None,
             out: Vec::new(),
         }))
     }
@@ -391,8 +404,7 @@ impl Reader {
     fn seek(&mut self, seconds: f64) {
         self.held.clear();
         self.spent = 0;
-        self.done = false;
-        self.stopped = None;
+        self.end = None;
         if self
             .pipeline
             .seek_simple(
@@ -401,15 +413,13 @@ impl Reader {
             )
             .is_err()
         {
-            eprintln!(
-                "export: {} refused a seek to {seconds} s",
-                self.path.display()
-            );
-            self.done = true;
-            self.stopped = Some(CompositeError::Failed(format!(
-                "{} refused a seek to {seconds} s",
-                self.path.display()
-            )));
+            let why = format!("{} refused a seek to {seconds} s", self.path.display());
+            eprintln!("{why}");
+            // Defence in depth only: nothing reads the reason today, because
+            // only the export seeks and only [`Reader::rest`] reads it. The
+            // line above is what a coach sees; this is what a future `rest`
+            // after a `seek` would.
+            self.end = Some(End::Stopped(CompositeError::Failed(why)));
         }
     }
 
@@ -440,37 +450,36 @@ impl Reader {
     /// than a short buffer, which a caller cannot tell from a whole one
     /// (spec S2).
     pub(crate) fn rest(&mut self, cancel: &AtomicBool) -> Result<Vec<f32>, CompositeError> {
-        let watch = Watch {
-            cancel,
-            error: self.errors.clone(),
-        };
         let mut all = self.held[self.spent..].to_vec();
         self.spent = self.held.len();
-        loop {
-            // The cancel flag between pulls as well as inside one: `pull` only
-            // reaches its own check when the sink starves, and a file decoding
-            // faster than it is read never starves.
-            watch.check()?;
-            if !self.pull(cancel) {
-                break;
-            }
+        while self.pull(cancel) {
             all.extend_from_slice(&self.held[self.spent..]);
             self.spent = self.held.len();
         }
-        match &self.stopped {
-            Some(why) => Err(why.clone()),
-            None => Ok(all),
+        match &self.end {
+            Some(End::Stopped(why)) => Err(why.clone()),
+            Some(End::OfFile) | None => Ok(all),
         }
     }
 
     /// Pulls the next non-empty buffer into `held`. `false` once nothing more
-    /// will come, with `stopped` saying why unless it was the end of the file.
+    /// will come, with `end` saying why.
     fn pull(&mut self, cancel: &AtomicBool) -> bool {
         let watch = Watch {
             cancel,
             error: self.errors.clone(),
         };
-        while !self.done {
+        while self.end.is_none() {
+            // Before every pull, not only when the sink starves: a file
+            // decoding faster than it is read never starves, so a cancel would
+            // otherwise go unseen until the end of the file.
+            if let Err(e) = watch.check() {
+                if let CompositeError::Failed(e) = &e {
+                    eprintln!("the sound of {} stopped: {e}", self.path.display());
+                }
+                self.end = Some(End::Stopped(e));
+                break;
+            }
             if let Some(sample) = self.appsink.try_pull_sample(POLL) {
                 if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
                     let samples: Vec<f32> = map
@@ -489,13 +498,7 @@ impl Reader {
                 continue;
             }
             if self.appsink.is_eos() {
-                self.done = true;
-            } else if let Err(e) = watch.check() {
-                if let CompositeError::Failed(e) = &e {
-                    eprintln!("export: the sound of {} stopped: {e}", self.path.display());
-                }
-                self.done = true;
-                self.stopped = Some(e);
+                self.end = Some(End::OfFile);
             }
         }
         false

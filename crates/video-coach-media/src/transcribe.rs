@@ -211,7 +211,7 @@ fn transcribe(
 /// errors, and both are errors: export folds them into silence and runs on,
 /// but an empty transcript is how a clip says it has never been transcribed
 /// (spec S4), so a swallowed failure here would be invisible.
-pub fn read_all(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>, CompositeError> {
+fn read_all(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>, CompositeError> {
     match Reader::start(path, TRANSCRIBE_SAMPLE_RATE, TRANSCRIBE_CHANNELS, cancel) {
         Ok(Some(mut reader)) => reader.rest(cancel),
         Ok(None) => Err(CompositeError::Failed(format!(

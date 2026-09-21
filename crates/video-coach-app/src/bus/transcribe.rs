@@ -9,9 +9,10 @@
 //! **Recording always wins** (spec S5). A transcript never refuses a
 //! recording: starting one cancels the job in flight and puts its clip back
 //! at the **front** of the queue, and [`Bus::run_next_if_idle`] refuses to
-//! start while a recording, an export or a preview is going. So every place
-//! one of those three ends has to call it, or a preempted transcript sits
-//! there until the next enqueue.
+//! start while a recording, an export or a preview is going. Nothing here
+//! has to remember to resume the queue afterwards: `Bus::run` calls
+//! [`Bus::run_next_if_idle`] at the bottom of every turn, so the queue picks
+//! up on the first input after the machine is free.
 //!
 //! **A cancel is never a failure.** The clip goes back to idle, and a job
 //! that finished before the cancel reached it keeps its words — the same
@@ -69,6 +70,43 @@ pub fn whisper_model_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(MODEL_FILE))
 }
 
+/// How a job ended, when the ending is something the inspector has to say
+/// out loud. A run that wrote words says it with the words, and a cancel says
+/// nothing at all (spec S5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finish {
+    /// The run wrote nothing. whisper returns no segments at all over
+    /// silence, and `""` is *also* how a clip says it was never transcribed
+    /// (spec S4), so without this the coach presses Transcribe, waits, and
+    /// sees no change whatsoever.
+    Silent,
+    /// The run failed, with the message to show.
+    Failed(String),
+}
+
+/// The whole transcription state (spec S5), as [`Event::Transcription`]
+/// carries it: the clips waiting in order, the one running with its percent,
+/// and how the last run ended if it ended with something to say. A clip in
+/// none of the three is idle with nothing to report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptionState {
+    pub queued: Vec<Uuid>,
+    pub running: Option<(Uuid, u8)>,
+    pub finished: Option<(Uuid, Finish)>,
+}
+
+impl TranscriptionState {
+    /// Nothing running and nothing waiting.
+    pub fn is_idle(&self) -> bool {
+        self.queued.is_empty() && self.running.is_none()
+    }
+
+    /// The clip running, whatever percent it reports.
+    pub fn running_clip(&self) -> Option<Uuid> {
+        self.running.map(|(id, _)| id)
+    }
+}
+
 /// The job in flight: the clip it is about, the thread doing it, and the
 /// percent it last reported.
 pub(super) struct Active {
@@ -92,14 +130,12 @@ impl Bus {
         if self.recording_path(id).is_none() {
             return eprintln!("bus: Transcribe on a clip that isn't there: {id}");
         }
-        // A retry clears the message the last one left: it is otherwise the
-        // only thing the inspector says about this clip, including after the
-        // retry succeeds.
-        self.clear_transcribe_failure(id);
+        // A retry clears what the last one left: it is otherwise the only
+        // thing the inspector says about this clip, including after the retry
+        // succeeds.
+        self.clear_transcribe_finished(id);
         self.transcribe_queue.push_back(id);
-        if !self.run_next_if_idle() {
-            self.publish_transcription();
-        }
+        self.publish_transcription();
     }
 
     /// [`Command::CancelTranscription`](super::Command::CancelTranscription):
@@ -108,9 +144,7 @@ impl Bus {
     pub(super) fn cancel_transcription(&mut self) {
         self.transcribe_queue.clear();
         self.stop_transcription();
-        if !self.run_next_if_idle() {
-            self.publish_transcription();
-        }
+        self.publish_transcription();
     }
 
     /// A recording has just started, so the transcript in flight gives way to
@@ -133,20 +167,12 @@ impl Bus {
     /// that is now in `.trash/` and leaves a failure naming a clip that no
     /// longer exists.
     pub(super) fn cancel_transcription_of(&mut self, id: Uuid) {
-        let running = self.transcribing.as_ref().is_some_and(|a| a.clip == id);
-        let queued = self.transcribe_queue.contains(&id);
-        let failed = self.transcribe_failure_of(id);
-        if !(running || queued || failed) {
-            return;
-        }
-        if running {
+        if self.transcribing.as_ref().is_some_and(|a| a.clip == id) {
             self.stop_transcription();
         }
         self.transcribe_queue.retain(|&q| q != id);
-        self.clear_transcribe_failure(id);
-        if !self.run_next_if_idle() {
-            self.publish_transcription();
-        }
+        self.clear_transcribe_finished(id);
+        self.publish_transcription();
     }
 
     /// A project is being opened: nothing of the last one's queue survives,
@@ -155,40 +181,35 @@ impl Bus {
     pub(super) fn reset_transcription(&mut self) {
         self.transcribe_queue.clear();
         self.stop_transcription();
-        self.transcribe_failed = None;
+        self.transcribe_finished = None;
         self.publish_transcription();
     }
 
-    /// A recording just produced clip `id` (spec S6). Also the point where a
-    /// job the recording preempted resumes — with [`AUTO_TRANSCRIBE`] off as
-    /// much as on, which is why the resume is not inside the `if`.
+    /// A recording just produced clip `id` (spec S6).
     pub(super) fn transcribe_after_recording(&mut self, id: Uuid) {
         if AUTO_TRANSCRIBE {
             self.transcribe(id);
         }
-        self.run_next_if_idle();
     }
 
-    /// Starts the queue's first job unless something is in the way. Returns
-    /// whether it published the state, so a caller that changed it knows
-    /// whether it still has to.
+    /// Starts the queue's first job unless something is in the way.
     ///
-    /// **Every place one of the exclusive jobs ends calls this** — a
-    /// recording finishing *or aborting*, an export's last target, a preview
-    /// closing — as well as every place the queue changes. Miss one and the
-    /// queue stalls silently until the next enqueue.
-    pub(super) fn run_next_if_idle(&mut self) -> bool {
-        // Shutting down: the bus is about to drop, and a job started now
-        // would only be cancelled and joined again, delaying the teardown the
-        // UI waits on.
-        if self.shutting_down || self.transcribing.is_some() {
-            return false;
+    /// **[`Bus::run`](super::Bus::run) calls this at the bottom of every
+    /// turn**, beside the deadlines and the position, so nothing else has to
+    /// remember to. The alternative was a call at each of the eight places a
+    /// recording, an export or a preview ends and each place the queue
+    /// changes — a discipline that stalls the queue silently when one is
+    /// missed, and started a job *underneath* an opening preview when one was
+    /// wrong.
+    pub(super) fn run_next_if_idle(&mut self) {
+        if self.transcribing.is_some() {
+            return;
         }
         // One condition for all three, rather than a rule per pair: the
         // recording owns the machine (spec S5), the export owns the encoder,
         // and the preview owns the picture and the audio sink.
         if self.recording.is_some() || self.export.is_some() || self.preview.is_some() {
-            return false;
+            return;
         }
         let mut changed = false;
         while let Some(id) = self.transcribe_queue.pop_front() {
@@ -210,10 +231,11 @@ impl Bus {
             });
             break;
         }
+        // Only when it moved something: this runs after every input, and an
+        // empty queue must not emit an event per GStreamer message.
         if changed {
             self.publish_transcription();
         }
-        changed
     }
 
     pub(super) fn transcription_message(
@@ -240,46 +262,47 @@ impl Bus {
                 // The words are kept whatever became of the queue meanwhile:
                 // a cancel too late to stop the job doesn't throw its work
                 // away, and a clip deleted since simply has nowhere to put
-                // them. A stale *failure*, though, belongs to a job nobody is
+                // them. A stale *outcome*, though, belongs to a job nobody is
                 // waiting for, and saying so would be noise.
                 let current = generation == self.transcribe_generation;
-                let mut changed = match result {
-                    Ok(text) => self.write_transcript(clip, text),
-                    Err(TranscribeError::Cancelled) => false,
+                match result {
+                    Ok(text) => {
+                        let silent = text.is_empty();
+                        self.write_transcript(clip, text);
+                        if silent && current {
+                            self.transcribe_finished = Some((clip, Finish::Silent));
+                        }
+                    }
+                    // Abandoned, not answered: the clip goes back to idle
+                    // with nothing to say about it (spec S5).
+                    Err(TranscribeError::Cancelled) => self.clear_transcribe_finished(clip),
                     Err(TranscribeError::Failed(e)) => {
                         eprintln!("bus: transcribing {clip} failed: {e}");
                         if current {
-                            self.transcribe_failed = Some((clip, e));
+                            self.transcribe_finished = Some((clip, Finish::Failed(e)));
                         }
-                        current
                     }
-                };
+                }
                 if current {
                     self.transcribing = None;
-                    changed = true;
                 }
-                if !self.run_next_if_idle() && changed {
-                    self.publish_transcription();
-                }
+                self.publish_transcription();
             }
         }
     }
 
     /// The machine's write (spec S7): apply, save and publish, and **never**
-    /// push undo — an out-of-band undo entry is bundled into the coach's next
-    /// focus-loss flush, so Ctrl+Z on a notes edit would silently revert the
-    /// transcript.
-    ///
-    /// Returns whether the queue state changed with it.
-    fn write_transcript(&mut self, clip: Uuid, text: String) -> bool {
+    /// push undo — [`UndoController::push`](video_coach_core::undo::UndoController::push)
+    /// clears the redo stack, so a transcript landing mid-session would
+    /// silently destroy whatever the coach still had to redo.
+    fn write_transcript(&mut self, clip: Uuid, text: String) {
         // Work already done is never redone: a job the recording preempted
         // may still have finished, and its clip is back on the queue.
-        let changed = self.transcribe_queue.contains(&clip) || self.transcribe_failure_of(clip);
         self.transcribe_queue.retain(|&q| q != clip);
-        self.clear_transcribe_failure(clip);
+        self.clear_transcribe_finished(clip);
 
         let Some(open) = &mut self.open else {
-            return changed;
+            return;
         };
         match open
             .project
@@ -295,7 +318,6 @@ impl Bus {
             Some(before) if before == ClipEdit::Transcript(text) => {}
             Some(_) => self.project_changed(),
         }
-        changed
     }
 
     /// Cancels the job in flight, if any, and joins its thread. The
@@ -310,18 +332,16 @@ impl Bus {
         drop(active.transcriber);
     }
 
-    fn transcribe_failure_of(&self, id: Uuid) -> bool {
-        self.transcribe_failed
+    /// Drops the last outcome if it is this clip's. One slot, in memory: a
+    /// relaunch starts every clip idle, and a failed transcript is cheap to
+    /// retry (spec S5).
+    fn clear_transcribe_finished(&mut self, id: Uuid) {
+        if self
+            .transcribe_finished
             .as_ref()
             .is_some_and(|(c, _)| *c == id)
-    }
-
-    /// Drops the failure message if it is this clip's. One slot, in memory:
-    /// a relaunch starts every clip idle, and a failed transcript is cheap to
-    /// retry (spec S5).
-    fn clear_transcribe_failure(&mut self, id: Uuid) {
-        if self.transcribe_failure_of(id) {
-            self.transcribe_failed = None;
+        {
+            self.transcribe_finished = None;
         }
     }
 
@@ -340,10 +360,10 @@ impl Bus {
     /// The whole state, every time (spec S5): three fields, so no view is
     /// left holding something the bus has moved past.
     fn publish_transcription(&self) {
-        self.emit(Event::Transcription {
+        self.emit(Event::Transcription(TranscriptionState {
             queued: self.transcribe_queue.iter().copied().collect(),
             running: self.transcribing.as_ref().map(|a| (a.clip, a.percent)),
-            failed: self.transcribe_failed.clone(),
-        });
+            finished: self.transcribe_finished.clone(),
+        }));
     }
 }

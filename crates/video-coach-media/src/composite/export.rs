@@ -36,7 +36,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use video_coach_core::audio::Region;
+use video_coach_core::audio::{Region, AUDIO_SAMPLE_RATE};
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::{Clip, Quality, Resolution};
@@ -693,7 +693,7 @@ impl Encoder {
              {overlay}",
             head = head(out_w, out_h),
             overlay = overlay_branch(out_w, out_h),
-            audio_caps = audio::caps_description()
+            audio_caps = audio::caps_description(AUDIO_SAMPLE_RATE, audio::CHANNELS)
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| ExportError::Failed(format!("could not build the export graph: {e}")))?

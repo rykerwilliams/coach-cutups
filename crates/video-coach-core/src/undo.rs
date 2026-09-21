@@ -41,9 +41,10 @@ pub enum ClipEdit {
     ShowPip(bool),
     /// The commentary as words (Phase 10 spec S4, S7). The coach's own edit
     /// of it is an undo step like any other; the **machine's** write of one
-    /// is not — it applies the edit and skips [`UndoController::push`], or an
-    /// out-of-band entry would be bundled into the coach's next focus-loss
-    /// flush and Ctrl+Z on a notes edit would silently revert the transcript.
+    /// is not — it applies the edit and skips [`UndoController::push`],
+    /// which **clears the redo stack**. A transcript landing mid-session
+    /// would otherwise destroy whatever the coach still had to redo, at a
+    /// moment they had nothing to do with.
     Transcript(String),
 }
 

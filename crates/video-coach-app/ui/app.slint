@@ -468,6 +468,10 @@ component Inspector inherits Rectangle {
             if root.transcript-state == TranscriptState.queued
                 || root.transcript-state == TranscriptState.running: Button {
                 text: "Cancel";
+                // As its sibling: `CancelTranscription` is not on the
+                // recording allow-list, so a click through would be dropped
+                // with nothing to show for it.
+                enabled: root.enabled;
                 clicked => { root.cancel-transcribe-clicked(); }
 
                 Tooltip { text: @markdown("Stop transcribing, and drop what's waiting"); }

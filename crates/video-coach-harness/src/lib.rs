@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use video_coach_app::bus::{
     Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot, StateFile,
-    UserError,
+    TranscriptionState, UserError,
 };
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
@@ -21,26 +21,6 @@ use video_coach_media::{fixtures, now_ns, probe, SinkKind, TranscribeKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
-
-/// One `Event::Transcription`: the whole queue state as the bus published it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Transcription {
-    pub queued: Vec<Uuid>,
-    pub running: Option<(Uuid, u8)>,
-    pub failed: Option<(Uuid, String)>,
-}
-
-impl Transcription {
-    /// Nothing running and nothing waiting.
-    pub fn is_idle(&self) -> bool {
-        self.queued.is_empty() && self.running.is_none()
-    }
-
-    /// The clip running, whatever percent it reports.
-    pub fn running_clip(&self) -> Option<Uuid> {
-        self.running.map(|(id, _)| id)
-    }
-}
 
 pub struct Harness {
     bus: BusHandle,
@@ -214,21 +194,10 @@ impl Harness {
     pub fn wait_transcription(
         &mut self,
         what: &str,
-        f: impl Fn(&Transcription) -> bool,
-    ) -> Transcription {
+        f: impl Fn(&TranscriptionState) -> bool,
+    ) -> TranscriptionState {
         self.wait_map(what, |e| match e {
-            Event::Transcription {
-                queued,
-                running,
-                failed,
-            } => {
-                let state = Transcription {
-                    queued: queued.clone(),
-                    running: *running,
-                    failed: failed.clone(),
-                };
-                f(&state).then_some(state)
-            }
+            Event::Transcription(state) => f(state).then(|| state.clone()),
             _ => None,
         })
     }

@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use uuid::Uuid;
-use video_coach_app::bus::{CaptureKind, Command, Event, RecordingStatus};
+use video_coach_app::bus::{
+    CaptureKind, Command, Event, Finish, RecordingStatus, TranscriptionState,
+};
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::Zoom;
-use video_coach_harness::{clip, write_project, Harness, Transcription};
+use video_coach_harness::{clip, write_project, Harness};
 use video_coach_media::{fixtures, TranscribeKind};
 
 /// What the test transcriber says.
@@ -66,7 +68,10 @@ impl Rig {
         h.send(Command::OpenProject(folder.clone()));
         h.wait_opened();
         // The queue the open cleared, so a later wait can't match it.
-        h.wait_transcription("the opened project's empty queue", Transcription::is_idle);
+        h.wait_transcription(
+            "the opened project's empty queue",
+            TranscriptionState::is_idle,
+        );
         Rig {
             h,
             folder,
@@ -82,7 +87,11 @@ impl Rig {
     /// Waits for a transcription state that `f` accepts, handing it the clip
     /// ids: the harness is borrowed for the wait, so a closure can't reach
     /// back into the rig for them.
-    fn wait(&mut self, what: &str, f: impl Fn(&Transcription, &[Uuid]) -> bool) -> Transcription {
+    fn wait(
+        &mut self,
+        what: &str,
+        f: impl Fn(&TranscriptionState, &[Uuid]) -> bool,
+    ) -> TranscriptionState {
         let ids: Vec<Uuid> = self.clips.iter().map(|c| c.id).collect();
         self.h.wait_transcription(what, |t| f(t, &ids))
     }
@@ -106,9 +115,9 @@ impl Rig {
     }
 
     /// Waits until the queue has emptied and nothing is running.
-    fn wait_idle(&mut self) -> Transcription {
+    fn wait_idle(&mut self) -> TranscriptionState {
         self.h
-            .wait_transcription("an idle queue", Transcription::is_idle)
+            .wait_transcription("an idle queue", TranscriptionState::is_idle)
     }
 }
 
@@ -221,23 +230,41 @@ fn re_enqueueing_a_running_or_queued_clip_does_nothing() {
     rig.transcribe(1);
     rig.wait_idle();
 
-    // Two runs, not four: every state the bus published had at most one
-    // entry in the queue, and clip 0 never went back into it.
-    let first = rig.id(0);
-    let states: Vec<&Event> = rig
-        .h
-        .log()
-        .iter()
-        .filter(|e| matches!(e, Event::Transcription { .. }))
-        .collect();
-    for state in &states {
-        let Event::Transcription { queued, .. } = state else {
-            unreachable!()
-        };
-        assert!(queued.len() <= 1, "{states:#?}");
-        assert!(!queued.contains(&first), "{states:#?}");
+    // Two runs, not four -- which is what "does nothing" means, and what a
+    // queue assertion alone would miss.
+    assert_eq!(runs(rig.h.log()), [rig.id(0), rig.id(1)]);
+    // And nothing was ever waiting twice. A clip is in the queue from its
+    // enqueue until it starts, so the second ask for each would show up here
+    // as a queue of two.
+    for t in states(rig.h.log()) {
+        assert!(t.queued.len() <= 1, "{t:#?}");
     }
     rig.h.shutdown();
+}
+
+/// Every transcription state in `log`, in order.
+fn states(log: &[Event]) -> Vec<&TranscriptionState> {
+    log.iter()
+        .filter_map(|e| match e {
+            Event::Transcription(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The clips that ran, in order: each stretch of states naming the same
+/// running clip is one run of it.
+fn runs(log: &[Event]) -> Vec<Uuid> {
+    let mut runs: Vec<Uuid> = Vec::new();
+    let mut last = None;
+    for t in states(log) {
+        let running = t.running_clip();
+        if running != last {
+            runs.extend(running);
+            last = running;
+        }
+    }
+    runs
 }
 
 /// Spec S5: recording always wins. The job in flight is cancelled and its
@@ -322,19 +349,10 @@ fn a_cancel_clears_the_queue_and_leaves_no_failure() {
 
     rig.h.send(Command::CancelTranscription);
     let idle = rig.wait_idle();
-    assert_eq!(idle.failed, None, "a cancel is not a failure");
+    assert_eq!(idle.finished, None, "a cancel is not a failure");
 
     let rest = rig.h.shutdown();
-    assert!(
-        !rest.iter().any(|e| matches!(
-            e,
-            Event::Transcription {
-                running: Some(_),
-                ..
-            }
-        )),
-        "nothing started after the cancel: {rest:#?}"
-    );
+    assert!(runs(&rest).is_empty(), "nothing started after the cancel");
 }
 
 /// A failure names the clip and stays until that clip is tried again — and
@@ -350,9 +368,12 @@ fn a_failure_is_reported_and_cleared_on_the_next_try() {
     std::fs::write(&recording, b"this is not a recording").unwrap();
 
     rig.transcribe(0);
-    let failed = rig.wait("the failure", |t, _| t.failed.is_some());
-    let (id, message) = failed.failed.expect("just checked");
+    let failed = rig.wait("the failure", |t, _| t.finished.is_some());
+    let (id, how) = failed.finished.expect("just checked");
     assert_eq!(id, rig.id(0));
+    let Finish::Failed(message) = how else {
+        panic!("a failure, not {how:?}")
+    };
     assert!(message.contains("could not read the sound"), "{message}");
     assert_eq!(rig.saved_transcript(0), "", "no words were written");
 
@@ -367,7 +388,7 @@ fn a_failure_is_reported_and_cleared_on_the_next_try() {
         25,
     );
     rig.transcribe(0);
-    rig.wait("the failure cleared", |t, _| t.failed.is_none());
+    rig.wait("the failure cleared", |t, _| t.finished.is_none());
     rig.wait_idle();
     assert_eq!(rig.saved_transcript(0), WORDS);
     rig.h.shutdown();
@@ -392,20 +413,13 @@ fn opening_a_project_clears_the_queue() {
     let cleared = rig.wait_idle();
     assert!(cleared.queued.is_empty() && cleared.running.is_none());
 
-    // Nothing was written into the project that was closed.
-    let untouched = rig.saved_transcript(1);
+    // Nothing was written into the project that was closed -- not the clip
+    // that was only waiting, and not the one that was **running**, whose job
+    // the open had to cancel for this to hold.
+    let untouched = [rig.saved_transcript(0), rig.saved_transcript(1)];
     let rest = rig.h.shutdown();
-    assert!(
-        !rest.iter().any(|e| matches!(
-            e,
-            Event::Transcription {
-                running: Some(_),
-                ..
-            }
-        )),
-        "nothing of the old project started: {rest:#?}"
-    );
-    assert_eq!(untouched, "");
+    assert!(runs(&rest).is_empty(), "nothing of the old project started");
+    assert_eq!(untouched, ["", ""]);
 }
 
 /// Deleting a clip stops its job and takes it out of the queue: its recording
@@ -427,19 +441,13 @@ fn deleting_a_clip_stops_and_dequeues_its_job() {
     });
     rig.h.send(Command::DeleteClip(rig.id(0)));
     let idle = rig.wait_idle();
-    assert_eq!(idle.failed, None, "a deleted clip leaves no message");
+    assert_eq!(idle.finished, None, "a deleted clip leaves no message");
     // The queue is told first, then the project is saved without the clip.
     let empty = rig.h.wait_changed().project.clips.is_empty();
 
     let rest = rig.h.shutdown();
     assert!(
-        !rest.iter().any(|e| matches!(
-            e,
-            Event::Transcription {
-                failed: Some(_),
-                ..
-            }
-        )),
+        states(&rest).iter().all(|t| t.finished.is_none()),
         "{rest:#?}"
     );
     assert!(empty);
@@ -468,4 +476,63 @@ fn the_transcript_write_is_not_undoable() {
     let clip = &saved.clips[0];
     assert_eq!(clip.transcript, WORDS, "the transcript is not undone");
     assert_eq!(clip.name, "clip 0", "the coach's own edit is");
+}
+
+/// Spec S5: a preview owns the picture and the audio sink, so a clip queued
+/// while one is open waits — and starts as soon as it closes, with nobody
+/// having had to remember to say so.
+#[test]
+fn a_preview_holds_the_queue_until_it_closes() {
+    let mut rig = Rig::open(2, Duration::ZERO);
+    rig.h.send(Command::OpenPreview(rig.id(0)));
+    assert_eq!(rig.h.wait_preview(), Some(rig.id(0)));
+
+    rig.transcribe(1);
+    rig.wait("clip 1 waiting", |t, id| {
+        t.running.is_none() && t.queued == [id[1]]
+    });
+
+    rig.h.send(Command::ClosePreview);
+    assert_eq!(rig.h.wait_preview(), None);
+    rig.wait("clip 1 running", |t, id| t.running_clip() == Some(id[1]));
+    rig.wait_idle();
+    assert_eq!(rig.saved_transcript(1), WORDS);
+
+    // And it started *after* the close, not before it.
+    let log = rig.h.log();
+    let closed = log
+        .iter()
+        .position(|e| matches!(e, Event::Preview(None)))
+        .expect("the preview closed");
+    let started = log
+        .iter()
+        .position(|e| matches!(e, Event::Transcription(t) if t.running.is_some()))
+        .expect("the job started");
+    assert!(started > closed, "{log:#?}");
+    rig.h.shutdown();
+}
+
+/// Replacing one preview with another tears the first down on the way, and a
+/// queued clip must **not** slip in underneath the one opening: it would hold
+/// the audio sink against the preview that is about to want it.
+#[test]
+fn replacing_a_preview_does_not_start_the_queue() {
+    let mut rig = Rig::open(2, Duration::ZERO);
+    rig.h.send(Command::OpenPreview(rig.id(0)));
+    assert_eq!(rig.h.wait_preview(), Some(rig.id(0)));
+
+    rig.transcribe(1);
+    rig.wait("clip 1 waiting", |t, id| {
+        t.running.is_none() && t.queued == [id[1]]
+    });
+
+    rig.h.send(Command::OpenPreview(rig.id(1)));
+    assert_eq!(rig.h.wait_preview(), None, "the first one closed");
+    assert_eq!(rig.h.wait_preview(), Some(rig.id(1)));
+
+    let ran = runs(rig.h.log());
+    // The shutdown is the barrier: every command sent before it has been
+    // handled, and every event it produced delivered.
+    let rest = rig.h.shutdown();
+    assert!(ran.is_empty() && runs(&rest).is_empty(), "{ran:?}");
 }

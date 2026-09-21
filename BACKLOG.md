@@ -572,3 +572,24 @@ Each entry: what, why deferred, when to revisit.
   worker that drops the context whenever the queue empties *or* a blocker
   starts, which is what makes it more than a one-line change.
 
+
+63. **A truncated recording that EOSes cleanly still transcribes as complete.**
+  `Reader::rest` tells a cancel and a posted `ERROR` apart from EOF, but a
+  Matroska/WebM file cut mid-stream — which `finish_recording` already knows it
+  produces, since it emits `UserError::StopNotClean` — commonly EOSes with no
+  bus error at all. `rest` then returns `Ok(partial)` and whisper transcribes
+  ten seconds of a ninety-second take as the whole thing. S4's `""`-means-never
+  -transcribed makes a short transcript indistinguishable from a right one, so
+  nothing tells the coach.
+- **Why deferred:** the check itself is cheap — `Clip::recording_duration` is
+  already on the clip, and a run that read materially less than that is
+  partial — but it means threading an expected duration down into media's
+  `read_all`, which is a real interface change on a path shared with export,
+  for a case that needs a crash or a kill mid-recording to reach.
+- **When to revisit:** when the extraction interface is next opened anyway
+  (Phase 11's model download touches neither, but a streaming or partial-
+  transcript feature would), or if `StopNotClean` turns out to be common on
+  real hardware rather than the backstop it is meant to be. The honest fix is
+  for `read_all` to report how much sound it got and for the bus to mark a
+  short read as `Finish::Failed("the recording is incomplete")`, which reuses
+  the slot Phase 10 already has.
