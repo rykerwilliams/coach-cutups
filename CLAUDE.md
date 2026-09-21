@@ -208,8 +208,12 @@ packaging/smoke-test.sh target/debian/coach-cuts_<version>_amd64.deb
   `.github/workflows/release.yml` fails a tag that isn't `v` + that version, gates
   on fmt/clippy/tests, builds on `ubuntu-24.04` (the libc floor), asserts whisper's
   `-mavx2`, smoke-tests, and attaches the `.deb` to a GitHub Release. To check the
-  pipeline without releasing, `gh workflow run release.yml --ref <branch>`: it runs
-  everything and publishes nothing but a workflow artifact. It uses no build cache
+  pipeline without releasing, `gh workflow run release.yml --ref <branch>` runs
+  everything and publishes nothing but a workflow artifact — **but only once
+  `release.yml` exists on the default branch**; GitHub refuses to dispatch it
+  otherwise (`HTTP 404: workflow … not found on the default branch`). Until then,
+  a temporary `push: branches: [<branch>]` trigger does the same job; the release
+  job requires a tag ref, so a branch run cannot publish. It uses no build cache
   on purpose (a cached whisper build can outlive an `[env]` change).
 
 **Crate layout:**

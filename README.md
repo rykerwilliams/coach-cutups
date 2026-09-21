@@ -1,113 +1,121 @@
 # Coach Cuts
 
-Native macOS app for breaking down sports match film. Watch the game, tag the moments you care about, narrate over them with webcam + voice and freehand drawings, and export per-tag YouTube-ready clips.
+A desktop app for breaking down game film, for Linux. Open the game video,
+record your commentary over it with a webcam and microphone while you play,
+pause, scrub, zoom and draw on the picture, and export each clip as a video
+with your voice, your drawings and a picture-in-picture of you burned in.
 
-Built on Swift + SwiftUI + AVFoundation. No FFmpeg, no third-party encoders, no network calls — transcription and summaries run on-device via Apple's `SpeechAnalyzer` and `FoundationModels`.
+## What it does
 
-## Features
+- **Commentary clips.** Each clip is a recording of you talking over the game
+  video: the webcam and microphone, plus everything you did to the picture
+  while recording — play, pause, seek, zoom and pan, and freehand drawings. It
+  all replays in step, in the preview and in the export.
+- **Clips you can find again.** Name them, tag them, add notes, and filter the
+  clip list by tag. Undo and redo with Ctrl+Z and Ctrl+Shift+Z.
+- **Scoreboard and match clock.** Set up the two teams, their colours and the
+  match format, then tag goals and the start and end of each period (Z, X and
+  V). The clock and score are drawn into previews and exports. If your video
+  starts after kick-off, the clock can still read correctly.
+- **Transcripts.** Transcribe a clip's commentary on your own computer, with
+  [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
+- **Export.** One H.264 `.mp4` per target — every clip, the clips with one tag,
+  or a single clip — at 720p or 1080p, into the project's `exports/` folder.
+  Each clip carries a caption bar with its number, name and tags, and the
+  webcam inset can be turned off per clip.
 
-**Tagging & navigation**
-- Scrub any source video, tag a moment with a name and free-form tags, mark a duration around it.
-- Tag overview and filter — pivot a session by tag to find every "transition" or "set piece" across all sources.
-- Jump-to-clip shortcuts. Per-clip key commands for fast navigation.
-- Per-clip transcript and 1–2 sentence summary, auto-generated from your commentary (editable).
+A project is a folder: `project.json`, your commentary in `recordings/`, and
+your exports in `exports/`. The game video stays where it is.
 
-**Commentary recording**
-- Webcam + microphone capture overlaid onto each clip as a picture-in-picture.
-- Freehand drawing layer recorded in sync with playback for telestration-style analysis.
-- Picture-in-picture visibility togglable per clip.
-- Drawings replay over the source video on export — no flattened raster.
+## Install
 
-**Scoreboard + match clock**
-- Configurable two-team scoreboard with team colors, primary/secondary, and font color.
-- Match formats: any number of regulation periods of any length, plus optional overtime.
-- Tag start/stop, home goal, away goal during a match. The clock derives period transitions, halftime breaks, stoppage, and fulltime automatically.
-- **Back-anchor P1 clock from end-of-period-1**: if your recording missed the actual kickoff, tick a checkbox and tag end of P1 — the clock back-computes the displayed minute so it reads correctly across the recording.
-- Scoreboard overlay rendered onto exports.
-
-**Export**
-- One HEVC `.mp4` per checked tag, sized for direct YouTube upload (1080p or 720p, low/medium/high quality).
-- Custom AVFoundation compositor handles webcam PiP, drawings, scoreboard, and zoom in a single render pass.
-- Headless export pipeline — no hidden window required.
-
-**Project format**
-- Each project is a folder: `project.json` + `recordings/` of `.mov` files (your commentary tracks).
-- Format-versioned schema with at-decode migration. v6 (current).
-
-## Requirements
-
-- macOS 26 (Tahoe) or later
-- Apple Silicon
-- Xcode with the macOS 26 SDK installed (only needed if building from source)
-
-## Run from source
+Coach Cuts ships as a `.deb` for **Ubuntu 24.04 and Linux Mint 22** on
+x86-64. Releases are built from version tags by CI; there are none published
+yet, so for now build the package yourself ([below](#build-from-source)). Then:
 
 ```bash
-# One-shot build + launch (Debug)
-apple/scripts/run.sh
-
-# Release build
-apple/scripts/run.sh Release
+sudo apt install ./coach-cuts_<version>_amd64.deb
 ```
 
-The script regenerates the Xcode project from `apple/project.yml` if needed, stamps the current git SHA into the build, kills any running instance, and launches the freshly built `CoachCuts.app` from DerivedData.
+It appears in the applications menu as **Coach Cuts**. From a terminal it is
+`coach-cuts`, or `coach-cuts <folder>` to open (or create) a project there;
+with no argument it reopens the last project.
 
-If you'd rather drive Xcode yourself:
+### Requirements
+
+- **GStreamer 1.24 or newer**, as Ubuntu 24.04 ships it. The package pulls in
+  the plugin sets it needs.
+- **An x86-64-v3 CPU** — Haswell (2013) or newer, with AVX2, FMA, F16C and
+  BMI2. The speech recognizer is built for that instruction set.
+- **A VA-API driver for hardware video decode and encode.** The package
+  recommends `intel-media-va-driver` (or `va-driver-all`), and apt installs
+  it by default. Without one, playback falls back to software decode, and
+  recording and export to the `x264enc` software encoder, which is much
+  slower.
+- **An OpenGL (EGL) capable display**, X11 or Wayland.
+- **A webcam and microphone** for recording: the camera is captured through
+  V4L2 and the microphone through PipeWire.
+
+### Transcription and the network
+
+Transcription runs entirely on your computer. The first time you transcribe,
+the app downloads the speech model you chose in the clip inspector —
+`small.en` (488 MB, the default, more accurate) or `base.en` (148 MB, faster)
+— into `~/.cache/coach-cuts/models/`, and keeps it. The Transcribe button
+names the download before you press it. After that, nothing leaves your
+machine.
+
+### When something goes wrong
+
+The app writes its diagnostics to stderr. Started from the applications menu
+on an X11 session (Linux Mint's default), that lands in `~/.xsession-errors`;
+or start it from a terminal as `coach-cuts` to see it directly.
+
+## Build from source
+
+On Ubuntu 24.04 / Linux Mint 22, with Rust 1.92 or newer from
+[rustup](https://rustup.rs):
 
 ```bash
-brew install xcodegen
-cd apple && xcodegen generate
-open VideoCoach.xcodeproj
+sudo apt install \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-pipewire \
+  libfontconfig1-dev libfreetype-dev libxkbcommon-dev libegl-dev libgl-dev \
+  cmake libclang-dev
+
+cargo run --release -p video-coach-app        # run it
+cargo test --workspace                        # test it
 ```
 
-## Install into /Applications
+The first build compiles whisper.cpp and takes a few minutes.
+
+To build the `.deb` (into `target/debian/`), also install `dpkg-dev`,
+`cargo-deb` and `cargo-about`, then run the packaging script:
 
 ```bash
-# Build Release, install to /Applications, sign, strip quarantine
-apple/scripts/install.sh
-
-# Same, but also launch after install
-apple/scripts/install.sh --launch
+sudo apt install dpkg-dev
+cargo install --locked cargo-deb
+cargo install --locked cargo-about --features cli
+packaging/build-deb.sh
 ```
 
-Override the code-signing identity with `VIDEO_COACH_IDENTITY=...` (defaults to `Apple Development`).
+The code is a Cargo workspace under `crates/`: `video-coach-core` (pure logic,
+no media dependencies), `video-coach-media` (GStreamer), `video-coach-app` (the
+Slint UI) and `video-coach-harness` (headless integration tests). The
+developer conventions — the zero-copy decode path, the capture clock, the
+export graph, how to run CI's GPU-less path locally — are in
+[`CLAUDE.md`](CLAUDE.md), and the design is in
+[`docs/superpowers/specs/`](docs/superpowers/specs/).
 
-## Pre-built downloads
+## The macOS original
 
-See the [Releases page](../../releases) for signed `CoachCuts.app` builds.
+[`apple/`](apple/) holds the original macOS app (Swift, SwiftUI and
+AVFoundation), which this port replaces. It is kept as the reference for how
+things should behave and is not maintained or built by CI.
 
-## Repo layout
+## Licence
 
-```
-apple/
-├── App/                       # SwiftUI + AppKit interop, ContentView, capture, recording
-├── VideoCoachCore/            # Swift Package — pure logic, headless-testable
-│   ├── Sources/VideoCoachCore # data model, clock, compositor, export pipeline
-│   └── Tests/VideoCoachCoreTests
-├── scripts/
-│   ├── run.sh                 # build + launch
-│   ├── install.sh             # build Release + install to /Applications
-│   └── sign.sh                # codesign helper
-└── project.yml                # XcodeGen source for VideoCoach.xcodeproj
-docs/superpowers/
-├── specs/                     # Design specs per feature
-└── plans/                     # Implementation plans per feature
-CLAUDE.md                      # Project conventions for AI-assisted development
-```
-
-The `.xcodeproj` is gitignored — regenerate it from `apple/project.yml` with `xcodegen generate` (or let `run.sh`/`install.sh` do it for you).
-
-## Tests
-
-```bash
-# Pure-logic core (fast, headless)
-swift test --package-path apple/VideoCoachCore
-
-# App build
-cd apple && xcodegen generate && cd ..
-xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach -destination 'platform=macOS' build
-```
-
-## License
-
-AGPL-3.0 — see [LICENSE](./LICENSE). If you ship a modified version (including as a network service), you must release the source under the same license.
+AGPL-3.0-or-later — see [`LICENSE`](LICENSE). The package installs the
+licence notices for the third-party code built into the binary under
+`/usr/share/doc/coach-cuts/`.

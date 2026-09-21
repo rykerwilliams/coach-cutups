@@ -52,7 +52,10 @@ Coach Cuts is for breaking down game film. Record commentary over the \
 game video with a webcam and microphone, draw on the picture as it plays, \
 and export each clip as a video with the commentary, the drawings and a \
 picture-in-picture of the coach burned in. Commentary can be transcribed on \
-the device; the speech model downloads once, on first use."""
+the device; the speech model downloads once, on first use.
+
+Requires an x86-64-v3 CPU (Haswell or newer: AVX2, FMA, F16C, BMI2), \
+which the speech recognizer is built for."""
 section = "video"
 # A native package: its version is the workspace version, with no Debian
 # revision, so the file is coach-cuts_<version>_amd64.deb and matches the tag.

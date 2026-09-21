@@ -178,7 +178,7 @@ Each entry: what, why deferred, when to revisit.
   (spec `2026-09-21-linux-port-phase-11-design.md` S3). Note the "~140 MB"
   above is `base.en`; the default `small.en` is 487.6 MB, 3.3x that.
 
-### 23. README accuracy: "no network calls" and "No FFmpeg"
+### 23. README accuracy: "no network calls" and "No FFmpeg" — RESOLVED
 - **Why deferred:** Both claims on README line 5 are or will be false. "No
   network calls" is already inaccurate on macOS (#19). "No FFmpeg" becomes false
   the moment `gst-libav` ships, which it must for software decode of arbitrary
@@ -186,6 +186,10 @@ Each entry: what, why deferred, when to revisit.
   still ships.
 - **When to revisit:** When the Linux build becomes the primary artifact
   (Phase 11), or sooner if the macOS README is touched for any other reason.
+- **Resolved 2026-09-21:** the README is rewritten for the Linux port (Phase
+  11 spec S7). It no longer makes either claim: it says the speech model
+  downloads once, on first use, and that nothing leaves the machine after
+  that; FFmpeg isn't mentioned (the package does depend on `gst-libav`).
 
 ### 24. Linux packaging: AppImage vs Flatpak
 - **Why deferred:** Flatpak sandboxing complicates camera, microphone and
