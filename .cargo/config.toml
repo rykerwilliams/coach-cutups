@@ -1,0 +1,20 @@
+# Environment for every cargo invocation in this workspace — dev, test, CI and
+# cargo-deb alike — so they all build the same whisper.cpp.
+#
+# Changing any of these does NOT rebuild whisper: `whisper-rs-sys`'s build
+# script doesn't declare them, so cargo reuses the old library. After an edit,
+# run `cargo clean -p whisper-rs-sys`.
+[env]
+# Stop `-march=native`. Left on, a CI runner with AVX-512 builds a binary that
+# dies with SIGILL on the coach's laptop.
+GGML_NATIVE = "OFF"
+# Name the instruction set explicitly: x86-64-v3, the Haswell-class floor.
+# `NATIVE=OFF` alone gives these only by default, and that default is switched
+# off by `SOURCE_DATE_EPOCH` (which Debian tooling and reproducible builds
+# export) — leaving no SIMD at all, a scalar whisper. Set here, they survive it.
+GGML_SSE42 = "ON"
+GGML_AVX = "ON"
+GGML_AVX2 = "ON"
+GGML_FMA = "ON"
+GGML_F16C = "ON"
+GGML_BMI2 = "ON"

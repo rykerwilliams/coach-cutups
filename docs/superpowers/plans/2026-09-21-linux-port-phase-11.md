@@ -10,7 +10,7 @@
 
 **Known facts. Don't re-derive these — each was reproduced during review.**
 - **whisper's SIMD:** `GGML_NATIVE=OFF` alone gives x86-64-v3; with `SOURCE_DATE_EPOCH` set it gives **no SIMD at all**; the explicit `GGML_SSE42/AVX/AVX2/FMA/F16C/BMI2=ON` flags survive it. The names are right for whisper.cpp 1.8.3 (`ggml/CMakeLists.txt:151-163`).
-- **`.cargo/config.toml`'s `[env]` reaches build scripts**, and cargo-deb honours it — **but changing `[env]` does not rerun the build script.** `cargo clean -p whisper-rs-sys` is genuinely required, and removes every profile's copy.
+- **`.cargo/config.toml`'s `[env]` reaches build scripts**, and cargo-deb honours it — **but changing `[env]` does not rerun the build script.** `cargo clean -p whisper-rs-sys` is genuinely required — **and cleans only the dev profile** (cargo 1.98.1). The release copy survives until `cargo clean -p whisper-rs-sys --release`. *(An earlier draft said it removed every profile's copy; Task 1 found otherwise. It matters most for the `.deb`, which is built from `target/release`.)*
 - **The build output line** is in `target/release/build/whisper-rs-sys-<hash>/output`: `-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mfma;-mbmi2;-mavx;-mavx2 …` — `;`-joined. **The repo's `target/` holds six such files today, all `-march=native`.**
 - **`Swatinem/rust-cache` would preserve a stale native build**: it hashes `.cargo/config.toml` into its key, but on a miss it restores the prefix key and keeps dependency build dirs younger than a week — and cargo then doesn't rerun the script.
 - **`[[bin]] name = "coach-cuts"` needs `path = "src/main.rs"`**, or the manifest fails to parse and the whole workspace breaks. With it, `cargo run -p video-coach-app` runs `target/debug/coach-cuts` and nothing else names the binary.
@@ -29,7 +29,7 @@
 ## Task 1 — Pin whisper's instruction set
 
 1. **`.cargo/config.toml`**, committed, `[env]`: `GGML_NATIVE = "OFF"` and `GGML_SSE42`, `GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_BMI2` all `"ON"`. Comment both halves: the explicit flags are what survive `SOURCE_DATE_EPOCH`.
-2. **`cargo clean -p whisper-rs-sys`**, rebuild, and confirm `-mavx2` and no `-march=native` in the output — then again with `SOURCE_DATE_EPOCH=0`.
+2. **`cargo clean -p whisper-rs-sys` and again with `--release`**, rebuild, and confirm `-mavx2` and no `-march=native` in the output — then again with `SOURCE_DATE_EPOCH=0`.
 3. **Re-run the whisper `#[ignore]`d throughput test** and confirm no regression against the spike's 0.73×. A regression means the SIMD didn't take.
 4. **`CLAUDE.md`:** the x86-64-v3 floor, and that a changed `GGML_*` needs `cargo clean -p whisper-rs-sys` because cargo won't notice.
 

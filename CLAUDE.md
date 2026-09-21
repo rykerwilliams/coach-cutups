@@ -82,6 +82,18 @@ nothing builds but `video-coach-core`. With them, the first build spends
 **about three minutes** compiling the vendored whisper.cpp, and nothing
 afterwards.
 
+**whisper.cpp's instruction set is pinned to x86-64-v3** — Haswell-class:
+AVX2, FMA, F16C, BMI2 — by `.cargo/config.toml`'s `[env]`, so dev, test, CI
+and the `.deb` all build the same library. `GGML_NATIVE=OFF` stops
+`-march=native` (a CI runner with AVX-512 would build a binary that `SIGILL`s
+on the laptop); the explicit `GGML_*=ON` flags are what survive
+`SOURCE_DATE_EPOCH`, which otherwise switches off *all* SIMD. **After changing
+any `GGML_*`, run `cargo clean -p whisper-rs-sys` and again with `--release`**
+— cargo does not rerun the build script when `[env]` changes, and each clean
+removes one profile's copy only. Check it took: every
+`target/*/build/whisper-rs-sys-*/output` should read `ggml-cpu: -msse4.2;…;-mavx2`,
+never `-march=native`.
+
 **Which model runs is the coach's, machine-wide.** The inspector's transcript
 row has a picker (`base.en` / `small.en`, default `small.en`), remembered in
 `state.json` and never in `project.json` — a `Preferences` field would be a
