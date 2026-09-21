@@ -523,3 +523,37 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** if a tag or the readout is ever seen a whole source's
   duration out, or when `Event::Position` gains a payload for another reason —
   add the source seconds to it then and the fallback becomes exact for free.
+
+## Phase 10 deferrals (spec `docs/superpowers/specs/2026-09-20-linux-port-phase-10-design.md`)
+
+59. **Segment timestamps and click-a-line-to-seek.** whisper returns per-segment
+  `start_timestamp()`/`end_timestamp()` (centiseconds) for free, and storing them
+  would let the coach click a transcript line to jump there — something the
+  macOS app could never do.
+- **Why deferred:** the transcript is editable. The moment the coach fixes a
+  mangled player name, stored timings describe text that no longer exists, and
+  every consumer needs a reconciliation story. Editable-plus-timestamped is a
+  real design; editable-plus-timestamped with no reconciliation is a bug
+  waiting to be found. It is also a format change (v7 → v8).
+- **When to revisit:** if transcript search lands (which wants anchors anyway),
+  or if the coach asks to navigate by what they said.
+
+60. **whisper-rs's `set_abort_callback_safe` is unsound in 0.16.0.** It boxes the
+  closure into a `Box<Box<dyn FnMut() -> bool>>` then installs
+  `trampoline::<F>` with `F` the concrete closure type, so the trampoline
+  reinterprets the fat pointer's data half. `set_progress_callback_safe`
+  twelve lines above does it correctly. We work around it by passing an
+  already-boxed trait object, so `F` is the boxed type and the cast is right.
+- **Why deferred:** the workaround is free and local. Upstreaming it means a
+  patch to a slow-moving crate (last commit 2026-03-14, now on Codeberg).
+- **When to revisit:** when bumping whisper-rs — check whether the workaround
+  is still needed, and whether it is still *safe*, since a fixed upstream would
+  make the double box wrong in the other direction.
+
+61. **All three whisper-rs `*_safe` callback setters leak their box.**
+  `Box::into_raw` with no matching free; three small boxes per transcription
+  job.
+- **Why deferred:** a few dozen bytes per job on a job that allocates hundreds
+  of megabytes. Recorded only so nobody spends an afternoon hunting it.
+- **When to revisit:** never, unless a future caller sets callbacks in a loop.
+

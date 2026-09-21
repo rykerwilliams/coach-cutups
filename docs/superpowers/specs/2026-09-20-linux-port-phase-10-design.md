@@ -1,10 +1,10 @@
 # Linux Port — Phase 10: Transcription
 
 **Date:** 2026-09-20
-**Status:** Draft, pre-review. **Two decisions are gated on the spike** (S3's default model, S6's auto-enqueue) — see "The spike, first".
+**Status:** Reviewed (simplify and correctness passes applied)
 **Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` (Phasing → Phase 10; the locked decision at line 22; open question 3 and risk 6)
-**Builds on:** Phase 3 (clip editing and undo), Phase 4 (capture, which writes the audio this reads), Phase 8 (the audio-only decode pipeline this generalizes)
-**Evidence:** `apple/App/Intelligence/AppleClipIntelligence.swift`; `apple/VideoCoachCore/Sources/VideoCoachCore/Intelligence/TranscriptionCoordinator.swift`; `apple/App/Models/Workspace.swift:815-832`; `apple/App/Views/ClipInspector.swift:271-360`; `docs/superpowers/specs/2026-05-21-clip-transcript-and-summary-design.md`.
+**Builds on:** Phase 3 (clip editing and undo), Phase 4 (capture, which writes the audio this reads, and whose `CaptureKind::Test` seam this copies), Phase 8 (the audio-only decode pipeline this reuses)
+**Evidence:** `apple/App/Intelligence/AppleClipIntelligence.swift`; `apple/VideoCoachCore/Sources/VideoCoachCore/Intelligence/{TranscriptionCoordinator,ClipIntelligence}.swift`; `apple/App/Models/Workspace.swift:815-832`; `apple/App/Views/ClipInspector.swift:271-360`; `docs/superpowers/specs/2026-05-21-clip-transcript-and-summary-design.md`. **whisper-rs 0.16.0 and whisper.cpp 1.8.3 were vendored and read** for every claim in S1.
 
 ---
 
@@ -16,117 +16,152 @@ The coach records commentary over a clip. Afterwards the words are there as text
 
 1. **A clip transcribes.** Stopping a recording queues its clip; the transcript appears when it lands.
 2. **The queue is honest.** One job at a time, FIFO behind it, and a clip that is waiting *says* it is waiting.
-3. **The model arrives on its own.** First use explains what it's about to download, downloads it with visible progress, verifies it, and caches it for every project afterwards.
+3. **Recording always wins.** Hitting record never gets refused because a transcript is running.
 4. **The transcript is editable** and survives a reload.
 5. **Editing a transcript is undoable; the machine writing one is not.**
-6. **It runs with no network** once the model is cached, and the README says something true.
+6. **The queue is tested without a model**, on CI, with no whisper build.
 
 ---
 
 ## Decisions
 
-### S0. The spike, first
+### S0. What gets measured, and when
 
-Nothing about whisper has been measured in this project, and there is no spike under `docs/superpowers/spikes/`. This project's rule is "measured, not preferred" — three GStreamer spikes exist because guessing was not good enough — and two decisions below are **gated on one number**: transcription wall-time per minute of commentary audio, CPU-only, on the reference laptop (i7-10610U, 8 threads, 15 W).
+**The risk worth retiring first is the build, not the throughput.** Before committing to the phase, confirm `whisper-rs 0.16` compiles on the reference laptop and on the CI runner — cmake, libclang, whisper.cpp's own CMake build. That is a hello-world, not a study.
 
-Measure `small.en` and `base.en`, with and without the `openmp` feature (`build.rs` disables it by default), on a real commentary recording of a few minutes. Record it as `docs/superpowers/spikes/2026-09-20-whisper-throughput.md`.
+**The throughput number is taken at the end of the phase, not as a gate.** An earlier draft made the default model and the auto-enqueue default conditional on a spike. That was ceremony: the spike cannot run without the build dependencies *and* the 16 kHz extraction, so it is the first two tasks with a stopwatch attached, and nothing structural branches on the answer — both "gated" decisions are a constant and a bool that flip in a one-line commit. The three GStreamer spikes exist because they decided whether an *approach* was viable, which is a different thing.
 
-**What the number decides:**
-- **Slower than ~1× realtime:** `base.en` becomes the default (S3), and auto-enqueue on recording stop is off by default (S6) — a coach who records six clips in a row should not hand the laptop over to a queue that takes longer than the session did.
-- **Comfortably faster than realtime:** `small.en` stays the default and auto-enqueue stays on.
+So: the transcribe task prints its wall-clock ratio, in the style the codebase already uses (`bus: exported …: N frames in X s (Y fps)`), and the closeout records it in `docs/superpowers/spikes/2026-09-20-whisper-throughput.md` along with the two defaults chosen from it.
 
-**Build requirement, and it is new.** `whisper-rs-sys`'s build-dependencies are `cmake`, `bindgen` and `fs_extra`; it drives whisper.cpp's own CMake build. The workspace already compiles C++ — but through skia-safe, which **downloads prebuilt binaries**, so neither `cmake` nor `libclang` is installed on the reference laptop today. Both must be added to the dev machine, to `.github/workflows/rust.yml`'s `workspace` job, and to Phase 11's packaging story. **Do not repeat the claim that this costs no new build dependency; it does.**
+**Pin what you measure, or the number is worthless.** `whisper_full_default_params` sets `n_threads = min(4, hardware_concurrency())` — **4 on an 8-thread laptop**, which halves the figure — and the default sampling strategy is `Greedy { best_of: -1 }`. Record `n_threads`, the strategy, the model, whether `openmp` was on (`build.rs` disables it by default), the clip length, and **whether the machine was on AC**: a 15 W mobile i7 throttles over a multi-minute run, so a 2-minute and a 10-minute take give different answers. `CLAUDE.md`'s `measure-media` skill exists for exactly this failure mode.
 
-### S1. It lives in `video-coach-media`, behind `feature = "whisper"`
+**Build dependencies are genuinely new.** `whisper-rs-sys`'s build-deps are `cmake`, `bindgen`, `fs_extra`, `cfg-if` and `semver`; it drives whisper.cpp's CMake build. The workspace already compiles C++ — but through skia-safe, which **downloads prebuilt binaries**, so neither `cmake` nor `libclang` is installed on the reference laptop (verified: both absent, and `target/debug/build/skia-bindings-*` exists). Both go on the dev machine, in CI, and into Phase 11's packaging story.
 
-Forced, and confirmed three ways: `video-coach-core` declares no media dependency (its `Cargo.toml`, a dedicated CI job on a runner with no GStreamer, and the `verify` skill's exact four-dependency audit), and the job needs GStreamer to decode the recording anyway. The feature follows the existing `feature = "fixtures"` pattern.
+### S1. `whisper-rs 0.16.0` in `video-coach-media`, no feature gate
 
-`whisper-rs 0.16.0` (Unlicense, MSRV 1.88, vendoring whisper.cpp 1.8.3). `default = []` is a plain CPU build with no GPU SDK — keep it that way; a GPU feature is a packaging problem for a laptop that has no discrete GPU.
+The crate placement is forced: `video-coach-core` declares no media dependency (its `Cargo.toml`, a dedicated CI job on a runner with no GStreamer, and the `verify` skill's exact four-dependency audit), and the job needs GStreamer to decode the recording anyway.
 
-**The API changed under the ecosystem's feet.** `full_n_segments`, `full_get_segment_t0/t1` and `full_get_segment_text` were removed in 0.15.x. Current shape is `get_segment(i) -> Option<WhisperSegment>` / `as_iter()`, with `start_timestamp()`/`end_timestamp()`/`to_str()`, and `full()` returning `Result<(), WhisperError>`. Nearly every tutorial online predates this. **Read the 0.16 docs, not a blog post.**
+**No `feature = "whisper"`.** The `fixtures` precedent is not analogous — `fixtures` is test-only and adds no API the app compiles against. A `whisper` feature would gate a `Transcriber` the app needs, so either the app enables it unconditionally (and `cargo test --workspace` builds it anyway, making the gate worthless) or the command, the event, the bus field and the Slint wiring all become `#[cfg]`-conditional and a second, never-exercised compilation of the UI rots. Transcription is part of the product; it is a plain dependency. The honest cost — cmake and libclang for every contributor and every CI run, plus a multi-minute first build — is stated once here rather than hidden behind a flag. S8's test seam is what keeps the *queue* testable without any of it.
 
-**Timestamps are centiseconds** (divide by 100.0). Named here because it is exactly the kind of detail that ships a silent 100× error — though see S4: Phase 10 does not store them.
+`whisper-rs 0.16.0` (newest on crates.io, Unlicense, MSRV 1.88 against the workspace's 1.92, vendoring whisper.cpp 1.8.3). `default = []` is a plain CPU build with no GPU SDK — keep it; the reference laptop has no discrete GPU. Licences are compatible: repo AGPL-3.0-or-later, whisper-rs Unlicense, whisper.cpp/ggml MIT, weights MIT.
 
-### S2. Audio extraction generalizes `composite::Reader`
+**`set_abort_callback_safe` is unsound in 0.16.0. Do not call it naively.** Verified by reading the source: it boxes the closure into a `Box<Box<dyn FnMut() -> bool>>` and then installs `trampoline::<F>` with `F` the *concrete closure type*, so the trampoline reinterprets the fat pointer's data half as the closure. The correct sibling twelve lines above (`set_progress_callback_safe`) instantiates `trampoline::<Box<dyn FnMut(i32)>>`; `set_segment_callback_safe` is also correct. Only abort is wrong.
 
-whisper.cpp requires **16 kHz mono f32 in [-1, 1]** and does not resample internally (`whisper_full` takes no rate argument). The recording is 48 kHz stereo Opus in Matroska.
+The fix costs nothing — hand it an already-boxed trait object so `F` *is* `Box<dyn FnMut() -> bool>` and the cast is correct:
 
-`crates/video-coach-media/src/composite/audio.rs`'s `Reader` is already `filesrc ! decodebin3 (audio only) ! audioconvert ! audioresample ! appsink`, and it already solves the hard parts: detecting a missing audio track from the `StreamCollection` rather than prerolling (`decodebin3` never posts `no-more-pads` here — measured), selecting only the audio stream (an unselected video stream still decodes every frame: 2.2 s vs 46 ms for 10 s of 1080p), cancellation, and zero-padding past EOF.
+```rust
+let abort: Box<dyn FnMut() -> bool> = Box::new(move || cancel.load(Ordering::SeqCst));
+params.set_abort_callback_safe(abort);
+```
 
-**Only its caps are wrong.** `caps_description()` hardcodes F32LE/48000/2ch, and `AUDIO_SAMPLE_RATE` is a core `const` with a compile-time assertion hanging off it, because it is the export mix rate. So:
+Comment it with the upstream bug. Cancellation is the whole of `Drop`-cancels-and-joins, so getting this wrong hangs or crashes the app on shutdown.
 
-- **Parameterize `Reader` with its own rate and channel count** rather than touching `AUDIO_SAMPLE_RATE`. `audioconvert` and `audioresample` are already in the chain, so mono at 16 kHz is a caps change, not new elements.
-- **Promote it out of `composite`.** It is `mod audio;` private today, with `Reader` private and `Mixer` `pub(super)`. Transcription is a second consumer, so the reader becomes a `video-coach-media` helper. Its plumbing dependencies (`POLL`, `QUEUED`, `Stopper`, `Watch`, `CompositeError`) move or are shared with it.
-- **Transcription reads the whole file**, not a cursor: a thin `read_all` over `read()` in a loop. A minute of 16 kHz mono f32 is 3.8 MB, so a long take is tens of megabytes — acceptable, and whisper wants one contiguous slice anyway.
+**An aborted run returns an error, not a cancellation.** whisper.cpp returns −6/−8 when the abort callback fires, and whisper-rs maps anything unrecognised to `WhisperError::GenericError(-6)`. So the worker must check **its own cancel flag before interpreting the return code** and yield a distinct `Cancelled` outcome. Export already does exactly this (`ExportError::Cancelled`); transcription follows it rather than shipping `Failed("Generic error: -6")` when the coach hits record.
 
-**It reads the commentary recording only**, never the source video — same as macOS, and the parent spec lists source-video audio as a non-goal. The recording's first audio track is the mic.
+**Params to set explicitly**, because the defaults are wrong for us: `n_threads` (4 by default on an 8-thread machine), `print_progress = false` and `print_timestamps = false` (otherwise whisper spams stderr and buries `bus: loaded …`, the zero-copy diagnostic `CLAUDE.md` relies on — use `install_logging_hooks`). **Silence hallucination is whisper's characteristic failure and is likely here:** a coach who records ten seconds of nothing gets "Thank you." or "[BLANK_AUDIO]" written onto the clip. `no_speech_thold` and `suppress_nst` are the levers. This phase **names the failure and accepts it**; a transcript is one button away from being cleared.
 
-### S3. The model: `small.en`, downloaded on first use
+**Corrections to the earlier draft, from reading the crate:** `full_n_segments` was **not** removed — it is public on `WhisperState` in 0.16.0. What moved is `full_get_segment_t0/t1/text`, now `WhisperSegment::start_timestamp()/end_timestamp()/to_str()` via `get_segment(i)`/`as_iter()`. Timestamps really are centiseconds. And abort granularity is **per graph node** (the CPU backend checks inside its compute loop), not "one compute step" — sub-millisecond in practice, so the UI needn't hedge. All three `*_safe` setters leak their box (`into_raw` with no matching free); three small boxes per job, negligible, noted so nobody hunts it later.
 
-**User decision (2026-09-20):** download on first use; `small.en`. Both were open question 3 / BACKLOG #22.
+### S2. Audio extraction reuses `composite::audio::Reader` where it is
 
-- **Default `ggml-small.en.bin`, 466 MB**, sha256 `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d` (downloaded and verified while writing this spec). **Gated on S0:** if the spike shows `small.en` is slower than realtime, `base.en` (148 MB) becomes the default instead. The spec's old "~140 MB" figure was pricing `base`.
-- **From** `huggingface.co/ggerganov/whisper.cpp` (weights MIT). Don't hardcode a quantization suffix in any model table: tiny/base/small ship `q5_1` but medium/large ship `q5_0`, and there is no `.en` variant of large.
-- **Cached at `$XDG_CACHE_HOME/coach-cuts/models/<name>.bin`** — a cache, not config: it is large, re-downloadable, and machine-scoped. The *path in use* is recorded in the app's `StateFile` (`$XDG_CONFIG_HOME/coach-cuts/state.json`, which today holds only `last_project`), so a coach who supplies their own model keeps it across launches.
-- **First use asks before it downloads**, names the size, and shows progress. This is the one thing macOS got wrong (BACKLOG #19: the download blocked transparently inside `transcribe()` with no progress), and it is why the parent spec recommended this option.
-- **Verify the sha256 before use**, and write to `.part` then rename — the same discipline the export path already uses. A truncated model is otherwise a confusing whisper error much later.
-- **A missing model is not an error at rest.** Nothing downloads until the coach transcribes something.
+whisper.cpp requires **16 kHz mono f32 in [-1, 1]** and does not resample internally (`whisper_full` takes no rate argument; `WHISPER_SAMPLE_RATE 16000`). The recording is 48 kHz stereo Opus in Matroska.
+
+`Reader` is already `filesrc ! decodebin3 (audio only) ! audioconvert ! audioresample ! appsink`. The reuse is worth it for one reason above all: **it detects a missing audio track from the `StreamCollection` rather than by prerolling.** `decodebin3` never posts `no-more-pads` here, so a recording with no audio track would otherwise hang forever. (The stream-selection optimisation — 2.2 s vs 46 ms for an unselected video stream — is real but irrelevant next to a whisper run measured in minutes. Don't lead with it.)
+
+**It does not move out of `composite`.** An earlier draft proposed promoting it and relocating `POLL`, `QUEUED`, `Stopper`, `Watch` and `CompositeError`. Unnecessary: `CompositeError` is already `pub`, and the rest are used only inside `Reader`'s own implementation. Two visibility keywords (`pub(crate) mod audio`, `pub(crate) struct Reader`) let a sibling `transcribe.rs` call it, with zero churn in the export path. Give `Reader` its **own caps** rather than changing `caps_description()`, which the export tail uses; `AUDIO_SAMPLE_RATE` stays untouched, since it is the export mix rate with a compile-time assertion on it. Note the channel count is a module-level `const CHANNELS: usize = 2` that `read` and `Mixer` both use, so parameterizing is slightly more than a caps change.
+
+Two corrections that matter before this reaches a plan:
+
+- **`read_all` cannot be "a thin loop over `read()`".** `read` always returns exactly `frames * CHANNELS` samples, **zero-padded past EOF**, and gives the caller no EOF signal — a loop over it reads silence forever. Have `read` also return the count of *real* samples (export ignores it; it wants the zeros), so EOF is in the type rather than a second entry point.
+- **Transcription must use `start`, not `open`.** `open` collapses "no audio track" and "couldn't be read" into `None` with an `eprintln!("export: no sound from …")`. For export that collapse is correct — silence, run continues. For transcription the two are different failures the coach must see, and both must reach `Failed(msg)`: an empty transcript is indistinguishable from never-having-run, because S4 defines `""` as exactly that. Have the promoted `open` return `Result<Option<Reader>, _>` and let export keep its collapse at the call site. `CompositeError::Cancelled`'s `"the export was cancelled"` message and the `"export:"` log prefixes need renaming once a second caller exists.
+
+**It reads the commentary recording only**, never the source video — as macOS did, and as the parent spec's non-goals require.
+
+### S3. The model path is found, not fetched — the downloader is Phase 11
+
+**User decision (2026-09-20), recorded and unchanged:** download on first use; `small.en`. That is the *decision*. **The implementation moves to Phase 11**, and the reasoning is a dependency the earlier draft priced at zero: the workspace has **no network dependency of any kind** — no `reqwest`, `ureq`, `hyper`, `rustls`, `native-tls`, `openssl`, `curl`, `ring` or `sha2`. Adding "download 466 MB over HTTPS with progress and a sha256 check" means a TLS tree larger than everything Phases 5–9 added combined, in a project whose `Cargo.toml` agonizes over one `cosmic-text` feature. BACKLOG #22 already parks the artifact-size question in the packaging phase, and that is where the cost belongs — **alongside the option of bundling, which would make the dependency moot**.
+
+Phase 10 therefore:
+- takes the model from **`$COACH_CUTS_WHISPER_MODEL`**, else `$XDG_CACHE_HOME/coach-cuts/models/ggml-<name>.bin` (with the `~/.cache` fallback — generalize `state.rs`'s existing `config_dir(xdg, home)`, which already implements this shape with three tests, rather than writing a second copy);
+- treats a **missing model as `Failed`, with a message naming the exact path and the exact URL** to put there. Two lines and a good error message;
+- **stores nothing.** An earlier draft put the path in `StateFile`, which has exactly one field and a doc contract that says losing it costs a re-open — losing a model path would cost a 466 MB re-download. And nothing in this phase lets the coach *supply* a model, so the field would only ever hold a derivable default.
+
+This also buys the thing the earlier draft had no answer for: **an env var makes the whole path testable**, with a small model locally and none at all in CI.
+
+For Phase 11, two notes so they aren't rediscovered: the download needs **per-model** sha256 (the earlier draft pinned one constant while leaving the model choice open), and `souphttpsrc ! filesink` is the GStreamer-native option — verified present, rank primary, already in CI's plugin set, follows the Hugging Face redirect, gives byte progress off the sink pad, and adds **zero** Rust dependencies.
+
+**Model facts, so a table isn't written wrong:** `ggml-small.en.bin` is 466 MB, sha256 `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d` (downloaded and verified byte-for-byte). `base.en` is 148 MB — the "~140 MB" the parent spec quoted. tiny/base/small ship `q5_1` but medium/large ship `q5_0`, so never hardcode a quantization suffix; there is no `.en` variant of large.
 
 ### S4. The transcript is a plain `String`, and that is a decision
 
-`Clip.transcript: String` already exists in the Rust format (v7, `#[serde(default)]`, written empty, read by nothing). Keep it exactly as it is. **The format does not change; there is no v8 in this phase.**
+`Clip.transcript: String` already exists (v7, `#[serde(default)]`, written empty, read by nothing). Keep it exactly. **The format does not change; there is no v8 in this phase.**
 
-whisper hands back per-segment timestamps for free, and storing them would allow click-a-line-to-seek, which macOS could never do. **Phase 10 does not do this,** for one reason that outweighs the feature: *the transcript is editable.* The moment the coach fixes a mangled player name, stored segment timings describe text that no longer exists, and every consumer of them needs a reconciliation story. Editable-plus-timestamped is a real design; editable-plus-timestamped-with-no-reconciliation is a bug waiting to be found. Segments are backlogged with that reasoning, not dismissed.
+whisper hands back per-segment timestamps for free, and storing them would allow click-a-line-to-seek, which macOS could never do. **Phase 10 does not**, for one reason that outweighs the feature: *the transcript is editable.* The moment the coach fixes a mangled player name, stored timings describe text that no longer exists, and every consumer needs a reconciliation story. Editable-plus-timestamped is a real design; editable-plus-timestamped with no reconciliation is a bug waiting to be found. Backlogged with that reasoning, not dismissed.
 
-Segments are still **joined with a space**, matching the macOS implementation (its protocol doc claims newlines; the code at `AppleClipIntelligence.swift:60` joins with a space — the doc is wrong).
+**Join by concatenating the raw segment texts and trimming once.** Do *not* inherit macOS's space-join: whisper's BPE tokens carry their leading space, so every segment already begins `" Hello there."` and joining with a space yields a double space at every boundary plus a leading one. whisper's own spacing is already correct.
 
-`""` means "not transcribed yet", deliberately, not `Option<String>` — the macOS spec's reasoning holds: one empty string for both the user-facing and the encoded state.
+`""` means "not transcribed yet", deliberately, not `Option<String>` — one empty string for both the user-facing and the encoded state. This is also why S2's `open`-vs-`start` distinction matters: a swallowed extraction failure would be invisible.
 
-### S5. The queue: serial, FIFO, idempotent, and it admits when it is waiting
+### S5. The queue: serial, FIFO, idempotent, preemptible
 
-Keep `TranscriptionCoordinator`'s semantics, drop its structure. One job in flight, a FIFO queue behind it, and enqueueing a clip that is already queued or running does nothing. macOS serialized with `@MainActor`; here the **bus thread owns the queue**, which is the same guarantee and needs no new machinery.
+Keep `TranscriptionCoordinator`'s semantics, drop its structure. One job in flight, FIFO behind it, and enqueueing a clip already queued or running does nothing. macOS serialized with `@MainActor`; here the **bus thread owns the queue**, which is the same guarantee with no new machinery. The queue earns its place because S6 auto-enqueues: six recordings produce six enqueues.
 
-The worker follows the **export precedent exactly**: a `Transcriber` owning a named `std::thread`, an `Arc<AtomicBool>` cancel, `on_message` called on the worker thread and forwarded into the bus's single `mpsc::Receiver<Input>`, and a `Drop` that cancels and joins.
+**One worker thread for the whole queue, not one per job.** Loading `ggml-small.en.bin` is a 466 MB read and takes seconds; one `Transcriber` per job would load the model once per clip and spend minutes of pure overhead on a six-clip session. The context is created when the queue goes non-empty and dropped when it drains. This is the one place transcription deliberately *departs* from the export precedent — export is one `Exporter` per target because each target has its own pipeline.
 
-- `Command::Transcribe { clip_id }` and `Command::CancelTranscription`.
-- `Event::Transcription(TranscriptionRun)` carrying **the whole queue state**, not a delta — the same reason export sends whole-run snapshots: a view can't be left holding a state the bus has moved past.
-- **State is `Idle | Queued | Running | Failed(String)`.** `Queued` is the fix for BACKLOG #18, which macOS still has: a queued clip reported `.idle`, so it looked never-transcribed and its button stayed enabled.
-- **Progress is a percentage**, from `set_progress_callback_safe`. Unlike export, there is no frame count to report, and unlike macOS there is no excuse for a spinner with no number.
-- **Failure is in-memory and per-clip**, as macOS had it: a relaunch starts every clip `Idle`. A failed transcript is cheap to retry and not worth a format change.
-- **Cancellation cannot promise export's ~10 ms.** `set_abort_callback_safe` fires between ggml graph computations, so the latency is one compute step. Say so in the UI's wording rather than implying instant.
-- **Mutual exclusion:** transcription must not run during a recording or an export. Both are already explicit, hand-rolled rules in the bus; this is a third.
+Otherwise the worker follows export exactly: a named `std::thread`, an `Arc<AtomicBool>` cancel, `on_message` called on the worker thread and forwarded into the bus's single `mpsc::Receiver<Input>`, and a `Drop` that cancels and joins.
+
+- `Command::Transcribe { clip_id }` and `Command::CancelTranscription` — **the latter cancels the running job only and clears the queue**; say so, because "cancel" is otherwise ambiguous with a queue present.
+- `Event::Transcription { queued: Vec<Uuid>, running: Option<(Uuid, u8)>, failed: Option<(Uuid, String)> }` — whole state, so no view is left holding something the bus has moved past, but **not** `ExportRun`'s struct-of-rows shape: that exists because the export sheet renders a list of targets with per-target progress and a time estimate. Transcription's UI is one inspector row. These three fields are exactly macOS's `queue` / `inFlightClipID` / `lastFailure`.
+- **State is `Idle | Queued | Running(percent) | Failed(String)`**, with `Queued` *derived* from `queue.contains(id)` rather than stored — as macOS derived `state(for:)` from three scalars. `Queued` is the fix for BACKLOG #18, which macOS still has.
+- **A cancel returns the clip to `Idle`**, never `Failed` (see S1).
+- **Progress is a percentage** from `set_progress_callback_safe`. Unlike export there is no frame count, and unlike macOS there is no excuse for a spinner with no number.
+- **Failure is one slot, in memory.** macOS had a single `lastFailure: (clipID, message)?`, not a per-clip map — "per-clip" read literally would build a `HashMap` macOS never had. A relaunch starts every clip `Idle`; a failed transcript is cheap to retry and not worth a format change.
+- **Opening a project cancels the running job and clears the queue**, the same way the undo history is cleared. Otherwise the queue holds ids from the previous project and a dead job writes into nothing.
+
+**Transcription is preemptible, not exclusive — and this is load-bearing.** The earlier draft said "transcription must not run during a recording or an export," which composes with S6 into a trap: stop clip 1 → transcription starts → hit record for clip 2 → *refused*. On a laptop where `small.en` may run near realtime, a coach recording six takes would be locked out of their own app for most of the session. Instead:
+
+- **`run_next_if_idle` refuses to start** while `recording.is_some() || export.is_some() || preview.is_some()`. One condition, no new pairwise rule. (Preview belongs in it: `can_record` already treats preview as a third exclusive party, and it holds the audio sink.)
+- **Starting a recording cancels the in-flight job and pushes its clip back to the front of the queue.** Three lines, and `cancel` must exist for `Drop` anyway.
+- **`can_record` gains nothing**, and neither does the export path. Refusing an export because a transcript is running is the wrong trade.
+- Half of what the earlier draft asked for **already exists**: `Bus::command` is a deny-by-default allow-list while recording, so `Command::Transcribe` is refused there by construction.
+
+One note for whoever adds the fifth such rule: this is now a fourth pairwise `is_some()` guard. A single "exclusive job" concept would replace the chain — but adding that abstraction for a fourth would not earn its place today.
 
 ### S6. Triggers
 
-- **Automatically on recording stop**, as macOS did — the clip is enqueued right after it is added. **Gated on S0:** if the spike shows transcription is slower than realtime, this defaults off, because a coach recording six takes in a row would leave with a queue longer than the session.
-- **A "Transcribe" button** on the clip inspector, for backfill and re-run. Re-running overwrites without a confirmation, as macOS did — the transcript is derived data and the coach asked.
+- **Automatically on recording stop**, as macOS did. Whether this stays the default is decided at the closeout from S0's number: if transcription runs slower than realtime, a coach recording six takes in a row leaves with a queue longer than the session, and manual becomes the default.
+- **A "Transcribe" button** on the clip inspector, for backfill and re-run. Re-running overwrites without confirmation, as macOS did — the transcript is derived data and the coach asked.
 - **No "transcribe all"** in this phase.
 
 ### S7. The undo carve-out, unchanged from macOS
 
 `Workspace.applyAIWrite` saves and **never** pushes undo, and its rationale carries over intact: an undo entry from an out-of-band write gets bundled into the user's next focus-loss flush, so Ctrl+Z on a notes edit would silently revert the transcript.
 
-In Rust the two paths are already distinct, and this is the whole of the contract:
-- **The coach edits a transcript:** `ClipEdit::Transcript(String)` — a new variant on the existing enum, which `Clip::set` matches exhaustively, so the compiler finds the two places to change. Undoable like any other field edit.
+- **The coach edits a transcript:** `ClipEdit::Transcript(String)` — a new variant on the existing enum. `Clip::set` matches exhaustively so the compiler finds *that* site; the Slint `ClipField` enum and its match in `main.rs` are a second site the compiler only finds **after** the `ClipField` case is added. Don't claim the compiler finds both.
 - **The machine writes a transcript:** mutate, `save()`, `publish_project()`, and **skip `record`**.
 
-BACKLOG #17 (Ctrl+Z clobbering an AI write) is **already fixed by construction** here — `ClipEdit` snapshots one field, not the whole clip — so it does not need re-litigating, only noting.
+**BACKLOG #17 is fixed by construction for the cross-field case only.** `ClipEdit` snapshots one field, so a transcript write can't be bundled into a *notes* edit. But `show_clip` refuses to re-render while any clip field has focus, so a machine write landing while the coach has the **transcript field itself** focused is silently overwritten by their stale text on focus loss, as one undoable edit. Rare, one click to recover, and the same trade #17 already accepted — **accepted, not fixed**, and #17 stays open with that narrowed scope.
 
-### S8. The README stops lying
+### S8. A one-method seam, so the queue is tested without whisper
 
-`README.md:5` still claims "no network calls — transcription and summaries run on-device via Apple's `SpeechAnalyzer` and `FoundationModels`." Every clause is wrong for the port: there are no summaries, there is no Apple framework, and there is now a one-time download. Reword to "runs entirely on your machine; one-time model download on first transcription." The "No FFmpeg" line is separately false once `gst-libav` ships. Closes BACKLOG #23.
+macOS's `ClipIntelligence` had **two** reasons to exist, and the parent spec only retires one. Yes, the real implementation lived in the App target because `Speech` and `FoundationModels` don't link headless — a Cargo feature (or here, crate placement) replaces that. But its docstring also says: *"The test fake in this package returns canned strings so coordinator tests are deterministic and run headlessly."* Nothing replaces that, and without it Phase 10 ships with the FIFO queue, idempotent enqueue, one-in-flight, `Queued` derivation, preemption, cancel and failure mapping — *"the part worth keeping"* — untested.
+
+So: **transcription goes through a one-method seam** (`fn(&[f32], progress, abort) -> Result<String, _>`, injected), with a test implementation that returns canned text after a controllable delay. This is not re-adding `ClipIntelligence`; it is the same trick `CaptureKind::Test` already uses for the recorder, which `CLAUDE.md` codifies.
+
+**Then `video-coach-harness` tests the queue on CI with no model and no whisper run:** enqueue while running, idempotent re-enqueue, FIFO order, preemption by a recording and requeue at the front, cancel → `Idle`, failure → `Failed`, project-open clearing. The real whisper call is exercised by one local test behind the env-var model path, and by the closeout's measurement.
 
 ---
 
 ## Deliberately not in this phase
 
-- **Summarization.** Deleted, not stubbed — the locked decision in the parent spec. `ClipIntelligence` and `TranscriptionWorkspace` do not survive: the former exists only because Apple's frameworks don't link in headless `swift test`, which in Rust is a Cargo feature.
-- **Segment timestamps and click-to-seek** (S4). Backlogged with the editability reasoning.
-- **Searching clips by transcript.** The sidebar filters by tag; transcript search is its own design.
-- **Streaming partial transcripts.** `set_segment_callback_safe` exists, so this is now possible where macOS listed it as a non-goal — but a transcript that rewrites itself while the coach reads it is worse, not better.
-- **Speaker diarization, translation, non-English models, source-video audio.**
-- **GPU acceleration.** CPU-only; the reference laptop has no discrete GPU.
+- **Summarization.** Deleted, not stubbed — the locked decision in the parent spec. `TranscriptionWorkspace` does not survive either.
+- **The model downloader** (S3) — Phase 11, with the artifact-size and bundling decision BACKLOG #22 already parks there.
+- **The README rewrite.** `README.md` is 113 lines describing a macOS app: line 4 is "Native macOS app…", line 5 opens "Built on Swift + SwiftUI + AVFoundation", and the Tests section is `swift test` and `xcodegen`. Rewording one clause of line 5 would leave it false in a dozen places and internally contradictory besides. BACKLOG #23 already defers the rewrite to Phase 11, "when the Linux build becomes the primary artifact"; leave it whole until then. (With the downloader gone, Phase 10 adds no network call anyway.)
+- **Segment timestamps and click-to-seek** (S4).
+- **Searching clips by transcript.**
+- **Streaming partial transcripts.** `set_segment_callback_safe` exists and is sound, so this is now possible where macOS listed it as a non-goal — but a transcript that rewrites itself while the coach reads it is worse, not better.
+- **Speaker diarization, translation, non-English models, source-video audio, GPU acceleration.**
 
 ## Noted for later
 
-**GStreamer 1.28 ships a `whispertranscriber` element** (gst-plugin-whisper, MPL-2.0) that wraps this same `whisper-rs 0.16`, with sink caps fixed at exactly 16 kHz/mono/F32LE. For a codebase that is already GStreamer-native that would turn this from a build problem into a packaging problem — no cmake, no bindgen, no C++ in the workspace. It is **unusable today**: the workspace pins `features = ["v1_24"]` and the reference laptop runs 1.24.2 on Ubuntu 24.04. Record it as the Phase 11+ migration path. That GStreamer upstream chose this binding is independent confirmation it is the right one.
+**GStreamer 1.28 ships a `whispertranscriber` element** (gst-plugin-whisper, MPL-2.0) wrapping this same `whisper-rs 0.16`, with sink caps fixed at exactly 16 kHz/mono/F32LE. For a codebase already GStreamer-native that would turn this from a build problem into a packaging problem — no cmake, no bindgen, no C++ in the workspace. **Unusable today:** the workspace pins `features = ["v1_24"]` and the reference laptop runs 1.24.2 on Ubuntu 24.04. Record as the Phase 11+ migration path. That GStreamer upstream chose this binding is independent confirmation it is the right one.
