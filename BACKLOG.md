@@ -638,8 +638,14 @@ Each entry: what, why deferred, when to revisit.
 
 ## Phase 11 deferrals (spec `docs/superpowers/specs/2026-09-21-linux-port-phase-11-design.md`)
 
-66. **`a_file_with_no_audio_track_is_a_failure` flaked once under a parallel
-  run.** In `video-coach-media`'s transcribe tests, matroskademux raised
+66. ~~**`a_file_with_no_audio_track_is_a_failure` flaked once under a parallel
+  run.**~~ **Fixed — and it was not a flake.** GitHub's runner failed it every
+  time, which turned a "rare" failure into a reproducible one. The cause was
+  the ordering the entry guessed at: `Reader::start` checked its error slot
+  before its stream-collection slot, so the demuxer's follow-on `not-linked`
+  error could beat the "no audio track" answer it follows. Reading the
+  collection first makes a video-only file always report "no sound".
+  Original entry kept below as the record. In `video-coach-media`'s transcribe tests, matroskademux raised
   "Internal data stream error" before the no-sound check ran, so the test saw a
   different failure than the one it asserts. It passed three times alone and on
   a full rerun, and nothing in its code path changed in the task that saw it.

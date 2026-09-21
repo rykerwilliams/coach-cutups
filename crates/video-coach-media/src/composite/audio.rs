@@ -342,15 +342,26 @@ impl Reader {
         // and it does **not** post `no-more-pads` (measured), so the collection
         // is also how a file with no audio track is recognised — waiting for
         // the appsink to preroll would wait forever.
+        //
+        // The collection is read **before** the error slot, and that order is
+        // load-bearing. With no audio stream selected, the demuxer pushes its
+        // video at a pad nobody linked and posts `not-linked` — always *after*
+        // the collection, since the selection comes from it, but both land in
+        // their slots out of band. Checking the error first let that follow-on
+        // error win the race, turning "this file has no sound" into a cryptic
+        // "Internal data stream error": rarely on the reference laptop, every
+        // time on a GitHub runner (BACKLOG #66).
         let deadline = Instant::now() + START_TIMEOUT;
         let audio = loop {
-            watch.check()?;
             if let Some(collection) = &*streams.lock().expect("the stream slot isn't poisoned") {
                 break collection
                     .iter()
                     .find(|s| s.stream_type().contains(gst::StreamType::AUDIO))
                     .and_then(|s| s.stream_id());
             }
+            // Still every turn: a cancel, or a file that fails before it has a
+            // collection at all, must not sit out the whole deadline.
+            watch.check()?;
             if Instant::now() >= deadline {
                 return Err(watch.failure("the sound's streams never appeared"));
             }
