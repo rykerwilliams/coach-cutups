@@ -13,6 +13,8 @@ name: release
 on:
   push:
     tags: ['v*']
+    # TEMPORARY: one validation run of the restructured pipeline. Remove after.
+    branches: [claude/intelligent-lamport-m2indd]
   workflow_dispatch:
 
 permissions:
