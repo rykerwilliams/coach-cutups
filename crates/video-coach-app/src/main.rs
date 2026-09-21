@@ -13,7 +13,7 @@ mod pickers;
 mod video;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -21,8 +21,9 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    export_targets, whisper_model_path, Bus, BusHandle, CaptureKind, Command, Event, ExportRun,
-    ExportTargetRun, Finish, RecordingStatus, Snapshot, TargetState, TranscriptionState,
+    export_targets, whisper_model_override, whisper_model_path, Bus, BusHandle, CaptureKind,
+    Command, Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, StateFile,
+    TargetState, TranscriptionState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
@@ -41,6 +42,7 @@ use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{
     list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, TranscribeKind,
+    WhisperModel,
 };
 
 use pickers::{Pick, Pickers};
@@ -162,15 +164,24 @@ fn main() {
 
     let window = AppWindow::new().expect("create the window");
 
+    // The last project and the chosen speech model, both this machine's and
+    // neither the project's.
+    let state = StateFile::default_location();
+    let model = state.whisper_model();
+    show_transcribe_model(&window, model);
+
     let weak = window.as_weak();
     let bus = Bus::spawn(
         SinkKind::Gl,
         CaptureKind::Devices,
         // The model is found, never fetched (Phase 10 spec S3): a missing one
-        // fails the job with a message naming this path.
+        // fails the job with a message naming this path and the URL to put
+        // there. Which model the coach picked is remembered in `state`, and
+        // the bus rewrites this when they pick another.
         TranscribeKind::Whisper {
-            model: whisper_model_path(),
+            model: whisper_model_path(model),
         },
+        state,
         Box::new(move |event| {
             let _ = weak.upgrade_in_event_loop(move |w| on_event(&w, event));
         }),
@@ -782,6 +793,22 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_cancel_transcription({
         let bus = bus.clone();
         move || bus.borrow().send(Command::CancelTranscription)
+    });
+    window.on_set_transcribe_model({
+        let bus = bus.clone();
+        move |index| {
+            // The picker's rows are `WhisperModel::ALL`, in its order; under
+            // `$COACH_CUTS_WHISPER_MODEL` it is disabled and holds one row
+            // that stands for no choice, so an index it yields is dropped.
+            let Some(&model) = usize::try_from(index)
+                .ok()
+                .filter(|_| whisper_model_override().is_none())
+                .and_then(|i| WhisperModel::ALL.get(i))
+            else {
+                return;
+            };
+            bus.borrow().send(Command::SetTranscribeModel(model));
+        }
     });
     window.on_suggest_tags(|text| {
         let tags = UI.with_borrow(|ui| {
@@ -1434,6 +1461,44 @@ fn show_clip(w: &AppWindow) {
         w.set_clip_transcript(clip.map_or("", |c| &c.transcript).into());
         w.set_clip_show_pip(clip.is_some_and(|c| c.show_pip));
     });
+}
+
+/// Fills the transcript row's model picker (Phase 10 S3).
+///
+/// **Written once, at start-up.** The choice is machine-wide — `state.json`,
+/// not the project — and nothing but this picker ever changes it, so unlike
+/// the rest of the row it follows no event: the bus's job is to remember it
+/// and to run it, not to own it.
+///
+/// Under `$COACH_CUTS_WHISPER_MODEL` the control is **disabled and shows what
+/// that variable points at**, rather than a choice that isn't what runs.
+fn show_transcribe_model(w: &AppWindow, model: WhisperModel) {
+    let override_path = whisper_model_override();
+    let (rows, chosen) = match &override_path {
+        Some(path) => (vec![override_name(path)], 0),
+        None => (
+            WhisperModel::ALL.iter().map(|m| m.label().into()).collect(),
+            WhisperModel::ALL
+                .iter()
+                .position(|m| *m == model)
+                .unwrap_or(0),
+        ),
+    };
+    w.set_transcript_models(ModelRc::new(VecModel::from(rows)));
+    w.set_transcript_model(chosen as i32);
+    w.set_transcript_model_enabled(override_path.is_none());
+}
+
+/// What the picker shows for `$COACH_CUTS_WHISPER_MODEL`: the label when it
+/// points at a model we ship, else the file's own name — all we can honestly
+/// say about it. The control has a fixed width and elides what doesn't fit,
+/// so a long name costs the row nothing.
+fn override_name(path: &Path) -> SharedString {
+    let file = path.file_name().unwrap_or_default().to_string_lossy();
+    match WhisperModel::from_file_name(&file) {
+        Some(model) => model.label().into(),
+        None => file.as_ref().into(),
+    }
 }
 
 /// The transcript row's state and its line, for the selected clip (spec S5).

@@ -40,14 +40,88 @@ const TEST_TICK: Duration = Duration::from_millis(5);
 /// Phase 11's, with the bundling decision.
 const MODEL_URL_PREFIX: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
-/// The model the app looks for (spec S3), and **the only file name
-/// [`MODEL_URL_PREFIX`] is known to resolve.** It lives here, beside the URL
-/// it pairs with, rather than beside the path that is built from it: a name
-/// suggested for download and a name that isn't must not drift apart.
+/// Which model whisper runs, and so the speed the coach waits at.
 ///
-/// Never a quantization suffix: tiny/base/small ship `q5_1` and medium/large
-/// `q5_0`.
-pub const DEFAULT_MODEL_FILE: &str = "ggml-small.en.bin";
+/// **Two, both English-only, and that is the whole choice.** `small.en` was
+/// measured at **0.73× realtime** on the reference laptop (65 s of audio in
+/// 89.2 s, 8 threads, on AC), which is slow enough that the trade is real;
+/// `base.en` is the faster, less accurate half of it. Nothing above `medium`
+/// has an `.en` variant, and none of them would be worth the wait here.
+///
+/// The names live **beside [`MODEL_URL_PREFIX`]**, rather than beside the
+/// path built from them: a name suggested for download and a name that isn't
+/// must not drift apart, and [`WhisperModel::from_file_name`] is the one
+/// place that answers "is this file ours".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum WhisperModel {
+    /// 147,964,211 bytes, sha256
+    /// `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`.
+    Base,
+    /// 487,614,201 bytes, sha256
+    /// `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d`.
+    #[default]
+    Small,
+}
+
+impl WhisperModel {
+    /// Both, in the order the picker offers them: fastest first.
+    pub const ALL: [WhisperModel; 2] = [WhisperModel::Base, WhisperModel::Small];
+
+    /// The file name under the models directory — which is also the name
+    /// [`MODEL_URL_PREFIX`] resolves.
+    ///
+    /// **Never a quantization suffix:** tiny/base/small ship `q5_1` and
+    /// medium/large `q5_0`, so a suffix written here would be wrong the first
+    /// time the list grows.
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            WhisperModel::Base => "ggml-base.en.bin",
+            WhisperModel::Small => "ggml-small.en.bin",
+        }
+    }
+
+    /// What the picker shows, and what `state.json` remembers.
+    pub const fn label(self) -> &'static str {
+        match self {
+            WhisperModel::Base => "base.en",
+            WhisperModel::Small => "small.en",
+        }
+    }
+
+    /// The sha256 of [`WhisperModel::file_name`] as published, **measured on
+    /// a downloaded copy, not read off a web page.**
+    ///
+    /// Nothing in this phase verifies it: the model is found, never fetched
+    /// (spec S3). It is here because Phase 11's downloader needs a hash **per
+    /// model** — an earlier draft of the spec pinned one constant while
+    /// leaving the choice of model open — and because rediscovering it means
+    /// downloading 600 MB again.
+    pub const fn sha256(self) -> &'static str {
+        match self {
+            WhisperModel::Base => {
+                "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+            }
+            WhisperModel::Small => {
+                "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d"
+            }
+        }
+    }
+
+    /// The model `name` is the file name of, if it is one we ship — which is
+    /// the same question as "does [`MODEL_URL_PREFIX`] resolve it".
+    pub fn from_file_name(name: &str) -> Option<WhisperModel> {
+        WhisperModel::ALL
+            .into_iter()
+            .find(|m| m.file_name() == name)
+    }
+
+    /// The model [`WhisperModel::label`] names, for what `state.json` last
+    /// remembered. `None` for a label this version doesn't know, which is how
+    /// a choice made by a later version reads.
+    pub fn from_label(label: &str) -> Option<WhisperModel> {
+        WhisperModel::ALL.into_iter().find(|m| m.label() == label)
+    }
+}
 
 /// `best_of` for the greedy sampler — whisper.cpp's own default for greedy,
 /// written down rather than inherited so the closeout's throughput number
@@ -128,19 +202,21 @@ fn whisper_run(
 ) -> Result<String, TranscribeError> {
     let name = model.file_name().unwrap_or_default().to_string_lossy();
     if !model.is_file() {
-        // **Only the model we ship has a URL.** The path is an escape hatch
+        // **Only a model we ship has a URL.** The path is an escape hatch
         // (`$COACH_CUTS_WHISPER_MODEL`), so interpolating whatever file name
         // it ends in would hand the coach a fabricated Hugging Face URL — a
         // 404 for a typo, a bare directory listing for a folder — and send
         // them looking for a download instead of at their own path.
-        return Err(TranscribeError::Failed(if name == DEFAULT_MODEL_FILE {
-            format!(
-                "no speech model at {}: download {MODEL_URL_PREFIX}{name} and save it there",
-                model.display(),
-            )
-        } else {
-            format!("no speech model at {}", model.display())
-        }));
+        return Err(TranscribeError::Failed(
+            if WhisperModel::from_file_name(&name).is_some() {
+                format!(
+                    "no speech model at {}: download {MODEL_URL_PREFIX}{name} and save it there",
+                    model.display(),
+                )
+            } else {
+                format!("no speech model at {}", model.display())
+            },
+        ));
     }
     // `full` refuses an empty buffer, and its refusal reads like a bug in us.
     // A recording with an audio track and no samples in it has no words in
@@ -208,8 +284,9 @@ fn recognise(
             // of the file — goes to the logging hooks installed above and
             // therefore nowhere at all. The one fact still worth having is
             // how big the file the coach has actually is: a download that
-            // stopped early is self-evident beside the 466 MB `small.en`
-            // weighs, and Phase 11 makes that the likeliest failure here.
+            // stopped early is self-evident beside the 148 MB (`base.en`) or
+            // 488 MB (`small.en`) a whole one prints, and Phase 11 makes that
+            // the likeliest failure here.
             TranscribeError::Failed(format!(
                 "could not load the speech model at {} ({}): {e}",
                 model.display(),
@@ -601,28 +678,47 @@ mod tests {
     /// A missing model is a failure the coach can act on: it names the path
     /// it looked at and the URL of the file to put there. Needs no model, and
     /// so is not `#[ignore]`d.
+    ///
+    /// **Both models we offer count as ours**, which is what makes the picker
+    /// safe: choosing the one that isn't downloaded yet has to land on this
+    /// message and not on a bare path.
     #[test]
     fn a_missing_model_names_the_path_and_the_url() {
         let dir = dir();
-        let model = dir.path().join("ggml-small.en.bin");
-        let error = TranscribeKind::Whisper {
-            model: model.clone(),
+        for model in WhisperModel::ALL {
+            let path = dir.path().join(model.file_name());
+            let error = TranscribeKind::Whisper {
+                model: path.clone(),
+            }
+            .run(&[0.0], &mut |_| {}, &running())
+            .expect_err("there is no model there");
+            let TranscribeError::Failed(message) = error else {
+                panic!("expected a failure, got {error:?}");
+            };
+            assert!(
+                message.contains(&path.display().to_string()),
+                "the message names no path: {message}"
+            );
+            assert!(
+                message.contains(&format!("{MODEL_URL_PREFIX}{}", model.file_name())),
+                "the message names no URL: {message}"
+            );
         }
-        .run(&[0.0], &mut |_| {}, &running())
-        .expect_err("there is no model there");
-        let TranscribeError::Failed(message) = error else {
-            panic!("expected a failure, got {error:?}");
-        };
-        assert!(
-            message.contains(&model.display().to_string()),
-            "the message names no path: {message}"
-        );
-        assert!(
-            message.contains(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
-            ),
-            "the message names no URL: {message}"
-        );
+    }
+
+    /// The names are the two halves of one fact — the file to fetch and the
+    /// label that stands for it — and nothing else may collide with them.
+    #[test]
+    fn every_model_round_trips_through_its_names() {
+        for model in WhisperModel::ALL {
+            assert_eq!(WhisperModel::from_file_name(model.file_name()), Some(model));
+            assert_eq!(WhisperModel::from_label(model.label()), Some(model));
+            assert_eq!(model.sha256().len(), 64, "{model:?}");
+        }
+        // A file the coach pointed us at, and a choice made by a version that
+        // knows more models than this one: neither is ours.
+        assert_eq!(WhisperModel::from_file_name("my-tuned-model.bin"), None);
+        assert_eq!(WhisperModel::from_label("medium"), None);
     }
 
     /// And a model path that is *not* the one we ship gets **no** URL: the

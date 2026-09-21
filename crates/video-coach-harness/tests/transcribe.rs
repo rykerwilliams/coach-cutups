@@ -15,14 +15,14 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{
-    CaptureKind, Command, Event, Finish, RecordingStatus, TranscriptionState,
+    CaptureKind, Command, Event, Finish, RecordingStatus, StateFile, TranscriptionState,
 };
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{clip, write_project, Harness};
-use video_coach_media::{fixtures, TranscribeKind};
+use video_coach_media::{fixtures, TranscribeKind, WhisperModel};
 
 /// What the test transcriber says.
 const WORDS: &str = "he has to shoot there";
@@ -42,6 +42,9 @@ const SLOW_CAMERA: CaptureKind = CaptureKind::Test {
 struct Rig {
     h: Harness,
     folder: PathBuf,
+    /// Where the bus's `state.json` is, so a test can read back what the bus
+    /// remembered without touching the real one.
+    config: PathBuf,
     clips: Vec<Clip>,
     #[expect(dead_code, reason = "kept alive: dropping it deletes the project")]
     tmp: TempDir,
@@ -64,7 +67,8 @@ impl Rig {
         let mut project = write_project(&folder, &media, &[("a.webm", 4)]);
         let added = add_clips_with_sound(&folder, &mut project, clips);
 
-        let mut h = Harness::with_transcribe(&tmp.path().join("config"), capture, transcribe);
+        let config = tmp.path().join("config");
+        let mut h = Harness::with_transcribe(&config, capture, transcribe);
         h.send(Command::OpenProject(folder.clone()));
         h.wait_opened();
         // The queue the open cleared, so a later wait can't match it.
@@ -75,6 +79,7 @@ impl Rig {
         Rig {
             h,
             folder,
+            config,
             clips: added,
             tmp,
         }
@@ -535,4 +540,102 @@ fn replacing_a_preview_does_not_start_the_queue() {
     // handled, and every event it produced delivered.
     let rest = rig.h.shutdown();
     assert!(ran.is_empty() && runs(&rest).is_empty(), "{ran:?}");
+}
+
+/// The model picker is **machine-wide** (spec S3's model path): it describes
+/// how fast this laptop is, not the match, so it is remembered in
+/// `state.json` beside the last project — never in `project.json`, where a
+/// new field is a format change every existing project would fail
+/// `store::read`'s exact-version guard on.
+#[test]
+fn the_chosen_model_is_remembered_for_the_machine() {
+    let rig = Rig::open(1, Duration::ZERO);
+    let state = StateFile::in_config_dir(&rig.config);
+    assert_eq!(
+        state.whisper_model(),
+        WhisperModel::Small,
+        "the default, until the coach picks otherwise"
+    );
+
+    rig.h.send(Command::SetTranscribeModel(WhisperModel::Base));
+    // Handles every command sent before it, so this is the write's barrier.
+    rig.h.shutdown();
+    assert_eq!(state.whisper_model(), WhisperModel::Base);
+    // And the last project survived the write, which rewrites the file whole.
+    assert_eq!(state.last_project().as_deref(), Some(rig.folder.as_path()));
+}
+
+/// **Switching mid-queue never touches the job in flight.** Cancelling a
+/// whisper run costs about twelve seconds of CPU for nothing — it reads its
+/// abort flag once per encode and once per decode pass — and the coach asked
+/// for a different model *next*, not for this run to be thrown away.
+#[test]
+fn changing_the_model_leaves_the_running_job_alone() {
+    let mut rig = Rig::open(2, SLOW);
+    rig.transcribe(0);
+    rig.transcribe(1);
+    rig.wait("both known", |t, id| {
+        t.running_clip() == Some(id[0]) && t.queued == [id[1]]
+    });
+
+    rig.h.send(Command::SetTranscribeModel(WhisperModel::Base));
+
+    rig.wait("clip 1 running", |t, id| t.running_clip() == Some(id[1]));
+    rig.wait_idle();
+    // A cancel would have left clip 0 idle with nothing written, and a
+    // preemption would have run it twice.
+    assert_eq!(rig.saved_transcript(0), WORDS);
+    assert_eq!(rig.saved_transcript(1), WORDS);
+    assert_eq!(runs(rig.h.log()), [rig.id(0), rig.id(1)]);
+    rig.h.shutdown();
+}
+
+/// ... and the job **started after** the change runs the model just picked.
+///
+/// On the whisper transcriber, with no model file anywhere near it: a model
+/// that isn't downloaded is the ordinary `Failed`, and that message names the
+/// exact file it looked for. Which is the point — the failure has to name the
+/// model the coach has just chosen, and offer the URL for it.
+#[test]
+fn a_new_job_runs_the_model_just_picked() {
+    let models = tempfile::tempdir().unwrap();
+    let mut rig = Rig::open_with(
+        1,
+        SLOW_CAMERA,
+        TranscribeKind::Whisper {
+            model: models.path().join(WhisperModel::Small.file_name()),
+        },
+    );
+
+    rig.transcribe(0);
+    let first = rig.wait("the first failure", |t, _| t.finished.is_some());
+    assert!(
+        failure(&first).contains(WhisperModel::Small.file_name()),
+        "{:?}",
+        first.finished
+    );
+
+    rig.h.send(Command::SetTranscribeModel(WhisperModel::Base));
+    rig.transcribe(0);
+    let second = rig.wait("the second failure", |t, _| {
+        matches!(&t.finished, Some((_, Finish::Failed(m)))
+            if m.contains(WhisperModel::Base.file_name()))
+    });
+    let message = failure(&second);
+    // The other model, beside the first: the directory is the one the app
+    // resolved at start-up, and only the file name follows the picker.
+    let wanted = models.path().join(WhisperModel::Base.file_name());
+    assert!(message.contains(&wanted.display().to_string()), "{message}");
+    // And it is one of ours, so it comes with somewhere to get it.
+    assert!(message.contains("https://huggingface.co/"), "{message}");
+    assert_eq!(rig.saved_transcript(0), "", "no words were written");
+    rig.h.shutdown();
+}
+
+/// The message of the last failure.
+fn failure(t: &TranscriptionState) -> String {
+    match &t.finished {
+        Some((_, Finish::Failed(message))) => message.clone(),
+        other => panic!("a failure, not {other:?}"),
+    }
 }

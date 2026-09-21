@@ -39,13 +39,13 @@ use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
     ExportMessage, FrameMailbox, Gl, PositionHandle, PreviewMessage, PreviewPosition, ProbeError,
-    RecorderMessage, SinkKind, SourcePlayer, TranscribeKind, TranscribeMessage,
+    RecorderMessage, SinkKind, SourcePlayer, TranscribeKind, TranscribeMessage, WhisperModel,
 };
 
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
-pub use transcribe::{whisper_model_path, Finish, TranscriptionState};
+pub use transcribe::{whisper_model_override, whisper_model_path, Finish, TranscriptionState};
 
 /// What the UI asks the bus to do.
 #[derive(Debug)]
@@ -190,6 +190,11 @@ pub enum Command {
     /// clip goes back to idle, not to a failure; one that had already
     /// finished keeps its words.
     CancelTranscription,
+    /// Which speech model to run, from the inspector's picker. Remembered for
+    /// every project on this machine (`state.json`), since it describes how
+    /// fast the machine is and not the match. **The job running keeps the
+    /// model it started with**; everything queued picks this one up.
+    SetTranscribeModel(WhisperModel),
 
     // Preview (Phase 7 spec P5).
     /// Show the clip's composite -- its source edited by the coach's plays,
@@ -448,8 +453,16 @@ pub struct Bus {
     preview_position: PreviewPosition,
     /// The latest preview's generation. Messages from any other are stale.
     preview_generation: u64,
-    /// Where transcripts come from (spec S8), chosen at [`Bus::spawn`].
+    /// Where transcripts come from (spec S8), chosen at [`Bus::spawn`]. For
+    /// whisper it carries the model **a job starting now would run**:
+    /// [`Bus::set_transcribe_model`] rewrites it, and the job in flight keeps
+    /// the copy it was started with.
     transcribe: TranscribeKind,
+    /// The coach's machine-wide choice of speech model, as `state.json`
+    /// remembers it. Not always what `transcribe` points at:
+    /// `$COACH_CUTS_WHISPER_MODEL` overrides the file without changing what
+    /// was picked.
+    transcribe_model: WhisperModel,
     /// The clips waiting to be transcribed, in order. The clip running is
     /// **not** in here, which is why enqueueing checks both.
     transcribe_queue: VecDeque<Uuid>,
@@ -466,8 +479,7 @@ pub struct Bus {
 }
 
 impl Bus {
-    /// Starts the bus thread with the player's video sink built from `sinks`,
-    /// and the last-project state file in the user's config directory.
+    /// Starts the bus thread with the player's video sink built from `sinks`.
     ///
     /// `sinks` picks the audio sink too: `Gl` is production, with
     /// `autoaudiosink`; `System` is headless tests, with `fakesink sync=true`,
@@ -477,24 +489,12 @@ impl Bus {
     /// or test sources. `transcribe` picks where transcripts come from the
     /// same way: whisper with a model, or canned text (spec S8).
     ///
+    /// `state` is the app's own state file — the last project and the chosen
+    /// speech model. Production passes [`StateFile::default_location`]; tests
+    /// pass a scratch directory, so the user's own is never touched.
+    ///
     /// `events` is called on the bus thread.
     pub fn spawn(
-        sinks: SinkKind,
-        capture: CaptureKind,
-        transcribe: TranscribeKind,
-        events: Box<dyn Fn(Event) + Send>,
-    ) -> BusHandle {
-        Self::spawn_with_state(
-            sinks,
-            capture,
-            transcribe,
-            StateFile::default_location(),
-            events,
-        )
-    }
-
-    /// [`Bus::spawn`] with an explicit state file, for tests.
-    pub fn spawn_with_state(
         sinks: SinkKind,
         capture: CaptureKind,
         transcribe: TranscribeKind,
@@ -513,6 +513,7 @@ impl Bus {
             }
         });
         let position = player.position_handle();
+        let transcribe_model = state.whisper_model();
         let bus = Bus {
             events,
             tx: tx.clone(),
@@ -539,6 +540,7 @@ impl Bus {
             preview_position: preview_position.clone(),
             preview_generation: 0,
             transcribe,
+            transcribe_model,
             transcribe_queue: VecDeque::new(),
             transcribing: None,
             transcribe_generation: 0,
@@ -716,6 +718,7 @@ impl Bus {
             Command::CancelExport => self.cancel_export(),
             Command::Transcribe { clip_id } => self.transcribe(clip_id),
             Command::CancelTranscription => self.cancel_transcription(),
+            Command::SetTranscribeModel(model) => self.set_transcribe_model(model),
             Command::OpenPreview(id) => self.open_preview(id),
             Command::ClosePreview => self.close_preview(),
             Command::GlReady { display, context } => {

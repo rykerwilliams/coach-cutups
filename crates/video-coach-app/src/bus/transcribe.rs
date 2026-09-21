@@ -23,12 +23,15 @@
 //! cancelled job's `Finished` can still be in the channel when the next one
 //! starts, and taking it for the new job's would leave two running at once.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use uuid::Uuid;
 use video_coach_core::store::RECORDINGS_DIRNAME;
 use video_coach_core::undo::ClipEdit;
-use video_coach_media::{TranscribeError, TranscribeMessage, Transcriber, DEFAULT_MODEL_FILE};
+use video_coach_media::{
+    TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, WhisperModel,
+};
 
 use super::state::{cache_dir, APP_DIR};
 use super::{Bus, Event, Input};
@@ -40,34 +43,62 @@ use super::{Bus, Event, Input};
 /// there is a throughput number to flip it with.
 const AUTO_TRANSCRIBE: bool = true;
 
-/// Under the cache directory, beside nothing else: a 466 MB download is a
-/// cache, not configuration, and nothing in this phase puts it there.
+/// Under the cache directory, beside nothing else: downloaded weights are a
+/// cache, not configuration, and nothing in this phase puts them there.
 const MODELS_DIRNAME: &str = "models";
 
 /// Points the app at a model somewhere else — which is also what makes the
 /// whole path testable, with a small model locally and none at all on CI.
 const MODEL_ENV: &str = "COACH_CUTS_WHISPER_MODEL";
 
-/// Where the whisper model is read from (spec S3): `$COACH_CUTS_WHISPER_MODEL`
-/// if set, else `$XDG_CACHE_HOME/coach-cuts/models/ggml-small.en.bin` (with
-/// the `~/.cache` fallback).
+/// Where `model` is read from (spec S3): `$COACH_CUTS_WHISPER_MODEL` if set,
+/// else `$XDG_CACHE_HOME/coach-cuts/models/<its file name>` (with the
+/// `~/.cache` fallback).
 ///
 /// **Found, never fetched.** Downloading it is Phase 11's, with the bundling
 /// decision; a model that isn't there fails the job with a message naming
-/// this path.
-pub fn whisper_model_path() -> PathBuf {
-    if let Some(path) = std::env::var_os(MODEL_ENV).filter(|p| !p.is_empty()) {
+/// this path and the URL to put there.
+pub fn whisper_model_path(model: WhisperModel) -> PathBuf {
+    model_path(
+        std::env::var_os(MODEL_ENV),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        model,
+    )
+}
+
+/// The model `$COACH_CUTS_WHISPER_MODEL` names, when it names one.
+///
+/// **The picker says so rather than lying:** with this set, the coach's
+/// choice is remembered but not what runs, so the control is disabled and
+/// shows what the variable points at instead.
+pub fn whisper_model_override() -> Option<PathBuf> {
+    std::env::var_os(MODEL_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// [`whisper_model_path`] with the environment passed in, as
+/// [`config_dir`](super::state) takes it: the rule is worth a test, and
+/// `set_var` in one is a race with every other test in the binary.
+fn model_path(
+    env: Option<OsString>,
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+    model: WhisperModel,
+) -> PathBuf {
+    if let Some(path) = env.filter(|p| !p.is_empty()) {
         return PathBuf::from(path);
     }
-    cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+    cache_dir(xdg, home)
         .map(|dir| {
             dir.join(APP_DIR)
                 .join(MODELS_DIRNAME)
-                .join(DEFAULT_MODEL_FILE)
+                .join(model.file_name())
         })
         // No `$HOME` and no `$XDG_CACHE_HOME`: a bare file name is still a path
         // for the failure to name, which is better than no failure at all.
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_FILE))
+        .unwrap_or_else(|| PathBuf::from(model.file_name()))
 }
 
 /// How a job ended, when the ending is something the inspector has to say
@@ -184,6 +215,39 @@ impl Bus {
         self.stop_transcription();
         self.transcribe_finished = None;
         self.publish_transcription();
+    }
+
+    /// [`Command::SetTranscribeModel`](super::Command::SetTranscribeModel):
+    /// the coach picked a model. It is remembered for every project on this
+    /// machine (`state.json`, never `project.json`), and **the job running
+    /// keeps the model it started with.**
+    ///
+    /// Cancelling it would cost about twelve seconds of CPU for nothing —
+    /// whisper reads its abort flag once per encode and once per decode pass
+    /// (see [`Bus::stop_transcription`]) — and the coach asked for a
+    /// different model *next*, not for this one to be thrown away. Everything
+    /// still queued picks the new one up.
+    pub(super) fn set_transcribe_model(&mut self, model: WhisperModel) {
+        if self.transcribe_model == model {
+            return;
+        }
+        self.transcribe_model = model;
+        self.state.set_whisper_model(model);
+        if let TranscribeKind::Whisper { model: path } = &mut self.transcribe {
+            // **Beside the model in use, and only when that is one of ours.**
+            // `$COACH_CUTS_WHISPER_MODEL` points at a file the coach chose,
+            // in a directory that is theirs; the picker is disabled under it,
+            // and a command that arrived anyway must not rewrite it into a
+            // sibling that was never downloaded.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(WhisperModel::from_file_name)
+                .is_some()
+            {
+                path.set_file_name(model.file_name());
+            }
+        }
     }
 
     /// A recording just produced clip `id` (spec S6).
@@ -376,5 +440,63 @@ impl Bus {
             running: self.transcribing.as_ref().map(|a| (a.clip, a.percent)),
             finished: self.transcribe_finished.clone(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chosen model's file under the cache directory, by the same XDG
+    /// rule everything else in `state.rs` follows.
+    #[test]
+    fn the_chosen_model_is_looked_for_under_the_cache_directory() {
+        for (model, file) in [
+            (WhisperModel::Base, "ggml-base.en.bin"),
+            (WhisperModel::Small, "ggml-small.en.bin"),
+        ] {
+            assert_eq!(
+                model_path(None, Some("/x/cache".into()), Some("/home/u".into()), model),
+                PathBuf::from(format!("/x/cache/coach-cuts/models/{file}")),
+            );
+            assert_eq!(
+                model_path(None, None, Some("/home/u".into()), model),
+                PathBuf::from(format!("/home/u/.cache/coach-cuts/models/{file}")),
+            );
+            // No `$HOME` and no `$XDG_CACHE_HOME`: a bare name is still a
+            // path for the failure to name.
+            assert_eq!(
+                model_path(None, None, None, model),
+                PathBuf::from(file),
+                "{model:?}"
+            );
+        }
+    }
+
+    /// **`$COACH_CUTS_WHISPER_MODEL` beats the choice, every time** — it is
+    /// how the `#[ignore]`d whisper tests find a model, and how a coach runs
+    /// one we don't ship. An empty value is not a path, and is ignored.
+    #[test]
+    fn the_environment_overrides_whatever_was_picked() {
+        for model in WhisperModel::ALL {
+            assert_eq!(
+                model_path(
+                    Some("/opt/models/my-tuned.bin".into()),
+                    Some("/x/cache".into()),
+                    Some("/home/u".into()),
+                    model,
+                ),
+                PathBuf::from("/opt/models/my-tuned.bin"),
+                "{model:?}"
+            );
+            assert_eq!(
+                model_path(Some("".into()), None, Some("/home/u".into()), model),
+                PathBuf::from(format!(
+                    "/home/u/.cache/coach-cuts/models/{}",
+                    model.file_name()
+                )),
+                "{model:?}"
+            );
+        }
     }
 }

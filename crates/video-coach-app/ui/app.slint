@@ -322,6 +322,19 @@ component Inspector inherits Rectangle {
     /// "no speech found" that an `idle` clip with an empty transcript may
     /// have earned. Empty when there is nothing to say.
     in property <string> transcript-status;
+    /// The speech models on offer, in `transcript-model`'s order (Phase 10
+    /// S3). `src/main.rs` owns the list: under
+    /// `$COACH_CUTS_WHISPER_MODEL` it is the one model that variable names,
+    /// and the picker is disabled.
+    in property <[string]> transcript-models;
+    /// Which one is chosen, as an index into `transcript-models`. **Two-way:**
+    /// a one-way binding onto a ComboBox's `current-index` is overwritten the
+    /// first time the coach opens it, and the readout then lies.
+    in-out property <int> transcript-model;
+    /// Whether the choice is the coach's to make -- false under
+    /// `$COACH_CUTS_WHISPER_MODEL`, which runs what it points at whatever is
+    /// picked.
+    in property <bool> transcript-model-enabled;
     /// A field has focus: the window's shortcuts yield to it. **Every** text
     /// field belongs here: miss one and typing in it makes Space start
     /// playback and `r` start a recording.
@@ -348,6 +361,8 @@ component Inspector inherits Rectangle {
     callback transcribe-clicked();
     /// Stop the transcription running **and drop the queue behind it**.
     callback cancel-transcribe-clicked();
+    /// A speech model was picked, by index into `transcript-models`.
+    callback transcript-model-chosen(int);
     /// Existing tags to suggest for the tag field's text (C8).
     pure callback suggest-tags(string) -> [string];
     /// The tag field's text with the suggestion taken.
@@ -454,27 +469,57 @@ component Inspector inherits Rectangle {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button {
-                text: "Transcribe";
-                enabled: root.enabled
-                    && root.transcript-state != TranscriptState.queued
-                    && root.transcript-state != TranscriptState.running;
-                clicked => { root.transcribe-clicked(); }
+            // Which model runs (Phase 10 S3): `small.en` was measured at
+            // 0.73x realtime on the reference laptop, so the speed it buys
+            // is worth a control. A fixed width, because the row is the
+            // tightest in the app and a long name from
+            // `$COACH_CUTS_WHISPER_MODEL` must not push the button out of
+            // a 1100px window.
+            ComboBox {
+                width: 96px;
+                model: root.transcript-models;
+                // Two-way, so the coach's pick stays on screen (a one-way
+                // binding is dropped the first time the popup opens), and
+                // `selected` is what tells Rust.
+                current-index <=> root.transcript-model;
+                enabled: root.enabled && root.transcript-model-enabled;
+                selected => { root.transcript-model-chosen(self.current-index); }
 
-                Tooltip { text: @markdown("Write out the commentary recorded over this clip"); }
+                Tooltip {
+                    text: root.transcript-model-enabled
+                        ? @markdown("Which speech model transcribes: `base.en` is faster, `small.en` more accurate. The clip being transcribed keeps the model it started with.")
+                        : @markdown("`$COACH_CUTS_WHISPER_MODEL` is set, so it is what runs.");
+                }
             }
-            // Beside a waiting clip as much as a running one: the command
-            // stops the job in flight *and* drops the queue behind it.
+            // **One action, not two.** With the picker beside them, a
+            // caption row of [Transcript] [model] [Transcribe] [Cancel] runs
+            // 76px past this 280px column at the window's 1100x700 minimum,
+            // and Cancel falls off the edge. They are never both live —
+            // Transcribe is disabled exactly when Cancel is offered — so the
+            // row shows the one that does something, and the line under the
+            // box says which state that is.
+            //
+            // Cancel is beside a waiting clip as much as a running one: the
+            // command stops the job in flight *and* drops the queue behind
+            // it.
             if root.transcript-state == TranscriptState.queued
                 || root.transcript-state == TranscriptState.running: Button {
                 text: "Cancel";
-                // As its sibling: `CancelTranscription` is not on the
-                // recording allow-list, so a click through would be dropped
-                // with nothing to show for it.
+                // `CancelTranscription` is not on the recording allow-list,
+                // so a click through would be dropped with nothing to show
+                // for it.
                 enabled: root.enabled;
                 clicked => { root.cancel-transcribe-clicked(); }
 
                 Tooltip { text: @markdown("Stop transcribing, and drop what's waiting"); }
+            }
+            if root.transcript-state != TranscriptState.queued
+                && root.transcript-state != TranscriptState.running: Button {
+                text: "Transcribe";
+                enabled: root.enabled;
+                clicked => { root.transcribe-clicked(); }
+
+                Tooltip { text: @markdown("Write out the commentary recorded over this clip"); }
             }
         }
         // A fixed height with its own scroll, deliberately: `notes` above
@@ -1365,6 +1410,12 @@ export component AppWindow inherits Window {
     /// following it while a field is being edited.
     in property <TranscriptState> transcript-state;
     in property <string> transcript-status;
+    /// The speech models on offer and which is chosen (Phase 10 S3): a
+    /// machine-wide setting, written once at start-up from `state.json` and
+    /// thereafter only by the picker, so it follows no event.
+    in property <[string]> transcript-models;
+    in-out property <int> transcript-model;
+    in property <bool> transcript-model-enabled;
     /// The clip an inspector field is editing, set when one gains focus and
     /// cleared when the last one loses it. Commits go to it, not to the
     /// selection, which a row click has already moved by the time a field's
@@ -1550,6 +1601,8 @@ export component AppWindow inherits Window {
     callback transcribe(string);
     /// Stop the transcription running and drop the queue behind it.
     callback cancel-transcription();
+    /// Run this speech model from now on, by index into `transcript-models`.
+    callback set-transcribe-model(int);
     /// Render the inspector's fields from the selected clip, unless one is
     /// being edited.
     callback show-clip();
@@ -2246,6 +2299,9 @@ export component AppWindow inherits Window {
                                 transcript-text <=> root.clip-transcript;
                                 transcript-state: root.transcript-state;
                                 transcript-status: root.transcript-status;
+                                transcript-models: root.transcript-models;
+                                transcript-model <=> root.transcript-model;
+                                transcript-model-enabled: root.transcript-model-enabled;
                                 show-pip <=> root.clip-show-pip;
                                 begin-edit => { root.editing-clip-id = root.selected-clip; }
                                 commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
@@ -2274,6 +2330,14 @@ export component AppWindow inherits Window {
                                 cancel-transcribe-clicked => {
                                     keys.focus();
                                     root.cancel-transcription();
+                                }
+                                // Off the fields as its siblings are: the
+                                // popup takes focus from a field being
+                                // edited, and the window's shortcuts must
+                                // come back afterwards.
+                                transcript-model-chosen(index) => {
+                                    keys.focus();
+                                    root.set-transcribe-model(index);
                                 }
                                 preview-clicked => {
                                     keys.focus();

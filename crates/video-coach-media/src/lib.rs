@@ -27,7 +27,7 @@ pub use mailbox::{Frame, FrameMailbox};
 pub use player::{Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer};
 pub use probe::{probe, Probe, ProbeError};
 pub use transcribe::{
-    TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, DEFAULT_MODEL_FILE,
+    TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, WhisperModel,
     TRANSCRIBE_SAMPLE_RATE,
 };
 

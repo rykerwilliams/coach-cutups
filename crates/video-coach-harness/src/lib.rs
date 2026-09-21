@@ -66,7 +66,7 @@ impl Harness {
         transcribe: TranscribeKind,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let bus = Bus::spawn_with_state(
+        let bus = Bus::spawn(
             SinkKind::System,
             capture,
             transcribe,

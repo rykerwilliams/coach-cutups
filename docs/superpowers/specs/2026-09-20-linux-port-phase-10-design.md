@@ -86,13 +86,25 @@ Two corrections that matter before this reaches a plan:
 Phase 10 therefore:
 - takes the model from **`$COACH_CUTS_WHISPER_MODEL`**, else `$XDG_CACHE_HOME/coach-cuts/models/ggml-<name>.bin` (with the `~/.cache` fallback — generalize `state.rs`'s existing `config_dir(xdg, home)`, which already implements this shape with three tests, rather than writing a second copy);
 - treats a **missing model as `Failed`, with a message naming the exact path and the exact URL** to put there. Two lines and a good error message;
-- **stores nothing.** An earlier draft put the path in `StateFile`, which has exactly one field and a doc contract that says losing it costs a re-open — losing a model path would cost a 466 MB re-download. And nothing in this phase lets the coach *supply* a model, so the field would only ever hold a derivable default.
+- **stores no path.** An earlier draft put the *path* in `StateFile`, which has exactly one field and a doc contract that says losing it costs a re-open — losing a model path would cost a 466 MB re-download. And nothing in this phase lets the coach *supply* a model, so the field would only ever hold a derivable default.
+
+**Amended 2026-09-21, at the user's request: `StateFile` stores *which model*, and the inspector picks it.** Not the path — the enum, as its label. The measurement is what changed the answer: `small.en` runs at **0.73× realtime** on the reference laptop (65 s of audio in 89.2 s, 8 threads, on AC), so the speed `base.en` buys is a real trade and not a derivable default. It belongs in `state.json` rather than `project.json` for the same reason the last project does — it describes how fast this machine is, not the match — and because `Preferences` is in the project format, where a new field is a schema change `store::read`'s exact-version guard would make every existing project unreadable for.
+- **Default stays `small.en`**, and `$COACH_CUTS_WHISPER_MODEL` still beats both. The picker is **disabled** under it and shows the file that variable names, rather than a choice that isn't what runs.
+- **Switching mid-queue never touches the job in flight**: it keeps the model it started with, and the queue behind it picks the new one up. Cancelling would cost ~12 s of CPU for nothing (S1: whisper reads its abort flag once per encode and once per decode pass), for a coach who asked for a different model *next*.
+- **A model that isn't downloaded is the ordinary `Failed`** — the message already names the path and the URL, and now **both** file names count as ours, so the URL is offered for either.
 
 This also buys the thing the earlier draft had no answer for: **an env var makes the whole path testable**, with a small model locally and none at all in CI.
 
 For Phase 11, two notes so they aren't rediscovered: the download needs **per-model** sha256 (the earlier draft pinned one constant while leaving the model choice open), and `souphttpsrc ! filesink` is the GStreamer-native option — verified present, rank primary, already in CI's plugin set, follows the Hugging Face redirect, gives byte progress off the sink pad, and adds **zero** Rust dependencies.
 
-**Model facts, so a table isn't written wrong:** `ggml-small.en.bin` is 466 MB, sha256 `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d` (downloaded and verified byte-for-byte). `base.en` is 148 MB — the "~140 MB" the parent spec quoted. tiny/base/small ship `q5_1` but medium/large ship `q5_0`, so never hardcode a quantization suffix; there is no `.en` variant of large.
+**Model facts, so a table isn't written wrong.** Both files were downloaded and hashed here, not quoted from a page; the same two numbers live on `WhisperModel` in `video-coach-media/src/transcribe.rs`, which is where Phase 11's downloader should read them from.
+
+| File | Bytes | `file_size` prints | sha256 |
+|---|---|---|---|
+| `ggml-base.en.bin` | 147,964,211 | 148.0 MB | `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002` |
+| `ggml-small.en.bin` | 487,614,201 | 487.6 MB | `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d` |
+
+**The "466 MB" this spec says elsewhere is MiB**; 487.6 MB decimal is the same file, and decimal is what the failure message prints, so don't put the two beside each other in one sentence. tiny/base/small ship `q5_1` but medium/large ship `q5_0`, so never hardcode a quantization suffix; there is no `.en` variant of large.
 
 ### S4. The transcript is a plain `String`, and that is a decision
 

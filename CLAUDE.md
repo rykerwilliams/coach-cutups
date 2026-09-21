@@ -82,7 +82,20 @@ nothing builds but `video-coach-core`. With them, the first build spends
 **about three minutes** compiling the vendored whisper.cpp, and nothing
 afterwards.
 
-The whisper tests are **`#[ignore]`d**, because they need a 466 MB model CI has
+**Which model runs is the coach's, machine-wide.** The inspector's transcript
+row has a picker (`base.en` / `small.en`, default `small.en`), remembered in
+`state.json` and never in `project.json` — a `Preferences` field would be a
+format change every existing project fails `store::read`'s version guard on.
+The model files are looked for in `$XDG_CACHE_HOME/coach-cuts/models/`, found
+and never fetched; a missing one fails the job with a message naming the path
+and the Hugging Face URL. Switching models leaves the job in flight alone (a
+whisper cancel costs ~12 s of CPU); the queue behind it picks the new one up.
+`$COACH_CUTS_WHISPER_MODEL` still beats the picker, which says so by going
+grey and showing the file that variable names. `WhisperModel` in
+`video-coach-media/src/transcribe.rs` carries each model's file name and its
+**measured** sha256, for Phase 11's downloader.
+
+The whisper tests are **`#[ignore]`d**, because they need a model CI has
 no copy of. Run them by pointing `$COACH_CUTS_WHISPER_MODEL` — the same
 variable the app finds its model with — at one, and read the throughput line
 off `--nocapture`:
@@ -111,9 +124,10 @@ lets GStreamer import decoded frames without a CPU copy. It logs the decoder,
 the caps entering `glupload` and the GL platform on every source load (`bus:
 loaded …` on stderr); that line is the zero-copy diagnostic, and on the
 reference laptop it reads `vah265dec` / `memory:DMABuf` / `egl`.
-`scripts/linux-gate-check.sh` measures decode throughput. Last-project
-state lives in `$XDG_CONFIG_HOME/coach-cuts/state.json`; point
-`XDG_CONFIG_HOME` elsewhere when testing so the real one isn't touched. With
+`scripts/linux-gate-check.sh` measures decode throughput. The last project
+and the chosen speech model live in `$XDG_CONFIG_HOME/coach-cuts/state.json`;
+point `XDG_CONFIG_HOME` elsewhere when testing so the real one isn't
+touched. With
 the monitor off (DPMS), playback slows unless run with `vblank_mode=0`
 (BACKLOG #36).
 
