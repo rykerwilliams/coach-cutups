@@ -27,7 +27,8 @@ pub use mailbox::{Frame, FrameMailbox};
 pub use player::{Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer};
 pub use probe::{probe, Probe, ProbeError};
 pub use transcribe::{
-    TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, TRANSCRIBE_SAMPLE_RATE,
+    TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, DEFAULT_MODEL_FILE,
+    TRANSCRIBE_SAMPLE_RATE,
 };
 
 use gstreamer as gst;

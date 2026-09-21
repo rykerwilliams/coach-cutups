@@ -89,8 +89,13 @@ off `--nocapture`:
 
 ```bash
 COACH_CUTS_WHISPER_MODEL=~/.cache/coach-cuts/models/ggml-small.en.bin \
-  cargo test -p video-coach-media transcribe -- --ignored --nocapture
+  cargo test -p video-coach-media transcribe -- --ignored --nocapture --test-threads=1
 ```
+
+`--test-threads=1` is **not optional**: `--ignored` runs *only* the ignored
+tests, and libtest would run them in parallel — two whisper contexts, ~1 GB
+resident and sixteen threads on eight cores, which is not the machine the
+throughput line describes.
 
 **Running the app** (needs a display and GStreamer's runtime plugins incl.
 `gstreamer1.0-gl`):

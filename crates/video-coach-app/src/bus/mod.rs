@@ -593,7 +593,10 @@ impl Bus {
                     // This arm returns without reaching the loop's tail, so
                     // nothing new is transcribed from here however the
                     // teardown below moves the queue; the job in flight is
-                    // cancelled and joined when the bus drops.
+                    // cancelled — and not waited for — when the bus drops,
+                    // because a whisper abort takes seconds and the ack
+                    // below is what the UI's GL teardown is waiting on
+                    // (`Bus::stop_transcription`).
                     //
                     // A recording keeps its clip (or is aborted while still
                     // starting) before anything is torn down. The preview's

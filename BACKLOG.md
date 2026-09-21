@@ -593,3 +593,38 @@ Each entry: what, why deferred, when to revisit.
   for `read_all` to report how much sound it got and for the bus to mark a
   short read as `Finish::Failed("the recording is incomplete")`, which reuses
   the slot Phase 10 already has.
+
+64. **A panic inside a transcription job would wedge the queue for the
+  session.** `Transcriber::start`'s thread calls `on_message(Finished(..))`
+  after `transcribe` returns, so a panic on the way there sends no `Finished`
+  at all — and `whisper_run`'s scoped `run.join().expect(…)` re-panics rather
+  than returning an `Err`. `Bus::transcribing` then stays `Some` forever,
+  `run_next_if_idle` returns at its first line, and every later clip sits in
+  the queue silently. `Command::CancelTranscription` is the one way out.
+- **Why deferred:** there is no likely panic. Every fallible path in
+  `recognise` and `read_all` returns `Err`, and ggml aborts the process rather
+  than unwinding. The honest fix — `catch_unwind` around the job, or sending
+  `Finished` from a guard that runs on unwind — is machinery for a case that
+  has never happened, and the cancel already recovers it. (Since the job
+  thread is no longer joined, a panic at least reaches stderr now instead of
+  being swallowed by `Drop`'s `let _ = join()`.)
+- **When to revisit:** if a panic is ever *seen* here, or if the job thread
+  grows a path that can panic on data — a slice index, an `unwrap` on
+  something whisper returned — rather than only on programmer error.
+
+65. **A cancelled whisper run keeps eight threads busy for ~12 s after the
+  coach has moved on.** The abort callback is consulted once per encode and
+  once per decode pass, so `Transcriber::drop` cancels and lets the thread go
+  (spec S5). When a recording is what preempted it, that abandoned run
+  overlaps the capture encoder at the start of the take; when the queue starts
+  the *next* job immediately afterwards, two whisper contexts can be resident
+  at once.
+- **Why deferred:** the obvious guard — hold the `JoinHandle` and refuse to
+  start a job while a cancelled one is still dying — stalls the queue
+  silently, because `run_next_if_idle` only runs at the bottom of a bus turn
+  and nothing wakes the bus when that thread finally exits. Making it correct
+  needs a deadline, which is more machinery than a CPU spike deserves.
+- **When to revisit:** if the closeout's throughput measurement shows the
+  overlap costing real time on a take, or when a cheaper stop exists — a
+  whisper.cpp whose abort is honoured per graph node would make the whole
+  question go away, so check it when bumping whisper-rs (BACKLOG #60).

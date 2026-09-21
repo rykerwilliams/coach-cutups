@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use video_coach_core::store::RECORDINGS_DIRNAME;
 use video_coach_core::undo::ClipEdit;
-use video_coach_media::{TranscribeError, TranscribeMessage, Transcriber};
+use video_coach_media::{TranscribeError, TranscribeMessage, Transcriber, DEFAULT_MODEL_FILE};
 
 use super::state::{cache_dir, APP_DIR};
 use super::{Bus, Event, Input};
@@ -43,10 +43,6 @@ const AUTO_TRANSCRIBE: bool = true;
 /// Under the cache directory, beside nothing else: a 466 MB download is a
 /// cache, not configuration, and nothing in this phase puts it there.
 const MODELS_DIRNAME: &str = "models";
-
-/// The model this phase looks for (spec S3). Never a quantization suffix:
-/// tiny/base/small ship `q5_1` and medium/large `q5_0`.
-const MODEL_FILE: &str = "ggml-small.en.bin";
 
 /// Points the app at a model somewhere else — which is also what makes the
 /// whole path testable, with a small model locally and none at all on CI.
@@ -64,10 +60,14 @@ pub fn whisper_model_path() -> PathBuf {
         return PathBuf::from(path);
     }
     cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
-        .map(|dir| dir.join(APP_DIR).join(MODELS_DIRNAME).join(MODEL_FILE))
+        .map(|dir| {
+            dir.join(APP_DIR)
+                .join(MODELS_DIRNAME)
+                .join(DEFAULT_MODEL_FILE)
+        })
         // No `$HOME` and no `$XDG_CACHE_HOME`: a bare file name is still a path
         // for the failure to name, which is better than no failure at all.
-        .unwrap_or_else(|| PathBuf::from(MODEL_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_FILE))
 }
 
 /// How a job ended, when the ending is something the inspector has to say
@@ -111,7 +111,8 @@ impl TranscriptionState {
 /// percent it last reported.
 pub(super) struct Active {
     clip: Uuid,
-    /// Dropping it cancels and joins.
+    /// Dropping it cancels the run and returns at once — see
+    /// [`Bus::stop_transcription`].
     transcriber: Transcriber,
     percent: u8,
 }
@@ -320,15 +321,25 @@ impl Bus {
         }
     }
 
-    /// Cancels the job in flight, if any, and joins its thread. The
-    /// generation goes up with it, so nothing it had already queued is taken
-    /// for the next job's.
+    /// Cancels the job in flight, if any, and **does not wait for it**. The
+    /// generation goes up with it, so nothing it had already queued — nor
+    /// anything it sends on its way out — is taken for the next job's.
+    ///
+    /// **Waiting here would freeze the app.** whisper.cpp reads its abort
+    /// callback once per encode and once per decode pass, not per graph node:
+    /// a cancelled `small.en` run was measured taking 12.4 s to return. Every
+    /// caller of this is on the bus thread, so a join would mean Stop
+    /// Recording doing nothing for twelve seconds, no recorder message
+    /// handled and no deadline dispatched in the meantime, and a quit holding
+    /// the UI's GL teardown for the same twelve seconds. The abandoned run
+    /// writes nothing: [`Bus::write_transcript`] already tolerates a job
+    /// nobody is waiting for, and a stale `Finished` is discarded by
+    /// generation.
     fn stop_transcription(&mut self) {
         let Some(active) = self.transcribing.take() else {
             return;
         };
         self.transcribe_generation += 1;
-        // Cancels and joins. It notices within about 10 ms.
         drop(active.transcriber);
     }
 

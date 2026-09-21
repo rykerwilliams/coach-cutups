@@ -18,7 +18,6 @@ use std::ffi::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -41,14 +40,23 @@ const TEST_TICK: Duration = Duration::from_millis(5);
 /// Phase 11's, with the bundling decision.
 const MODEL_URL_PREFIX: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 
+/// The model the app looks for (spec S3), and **the only file name
+/// [`MODEL_URL_PREFIX`] is known to resolve.** It lives here, beside the URL
+/// it pairs with, rather than beside the path that is built from it: a name
+/// suggested for download and a name that isn't must not drift apart.
+///
+/// Never a quantization suffix: tiny/base/small ship `q5_1` and medium/large
+/// `q5_0`.
+pub const DEFAULT_MODEL_FILE: &str = "ggml-small.en.bin";
+
 /// `best_of` for the greedy sampler — whisper.cpp's own default for greedy,
 /// written down rather than inherited so the closeout's throughput number
 /// describes a run somebody can reproduce. At temperature 0 the extra
 /// decoders are never sampled; they exist for the temperature fallback.
 const GREEDY_BEST_OF: c_int = 5;
 
-/// How often the whisper run's percent and the cancel flag are looked at.
-/// Also the worst case a cancel waits before whisper is told about it.
+/// How often the whisper run's percent is looked at. Nothing else waits on
+/// it: the abort callback reads the caller's own flag.
 const WHISPER_POLL: Duration = Duration::from_millis(100);
 
 /// Why a transcription produced no words. The composite's error under
@@ -82,13 +90,18 @@ impl TranscribeKind {
     /// [`TranscribeError::Cancelled`] and never a failure, so the clip goes
     /// back to idle rather than wearing a message about a return code.
     ///
+    /// `cancel` is an `&Arc` and not an `&AtomicBool` so that whisper's
+    /// `'static` abort callback can hold *the caller's own flag* rather than
+    /// a mirror something has to copy into. Everything that wants the plain
+    /// reference still gets it by deref.
+    ///
     /// The test arm leaves the samples unread and answers from `text`: the
     /// sound it was handed only has to have been readable.
     fn run(
         &self,
         samples: &[f32],
         progress: &mut dyn FnMut(u8),
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<String, TranscribeError> {
         match self {
             TranscribeKind::Whisper { model } => whisper_run(model, samples, progress, cancel),
@@ -101,22 +114,33 @@ impl TranscribeKind {
 /// the closeout's spike is written from.
 ///
 /// **The percent comes back through an atomic, and a second thread does the
-/// recognising.** whisper's callbacks have to be `'static`, so neither of
-/// them can hold `progress`; and [`WhisperState::full`](whisper_rs::WhisperState::full)
+/// recognising.** whisper's progress callback has to be `'static`, so it
+/// cannot hold `progress`; and [`WhisperState::full`](whisper_rs::WhisperState::full)
 /// blocks for the whole job, so there is no moment afterwards worth reporting
-/// in. The run goes beside this thread, which watches the two atomics.
+/// in. The run goes beside this thread, which watches the atomic. (The
+/// *abort* callback needs no such dance — `cancel` is already an `Arc`, so it
+/// clones it.)
 fn whisper_run(
     model: &Path,
     samples: &[f32],
     progress: &mut dyn FnMut(u8),
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<String, TranscribeError> {
     let name = model.file_name().unwrap_or_default().to_string_lossy();
     if !model.is_file() {
-        return Err(TranscribeError::Failed(format!(
-            "no speech model at {}: download {MODEL_URL_PREFIX}{name} and save it there",
-            model.display(),
-        )));
+        // **Only the model we ship has a URL.** The path is an escape hatch
+        // (`$COACH_CUTS_WHISPER_MODEL`), so interpolating whatever file name
+        // it ends in would hand the coach a fabricated Hugging Face URL — a
+        // 404 for a typo, a bare directory listing for a folder — and send
+        // them looking for a download instead of at their own path.
+        return Err(TranscribeError::Failed(if name == DEFAULT_MODEL_FILE {
+            format!(
+                "no speech model at {}: download {MODEL_URL_PREFIX}{name} and save it there",
+                model.display(),
+            )
+        } else {
+            format!("no speech model at {}", model.display())
+        }));
     }
     // `full` refuses an empty buffer, and its refusal reads like a bug in us.
     // A recording with an audio track and no samples in it has no words in
@@ -139,19 +163,12 @@ fn whisper_run(
         // which leaves half of an eight-thread laptop idle for minutes.
         .unwrap_or(4);
     let percent = Arc::new(AtomicU8::new(0));
-    // The cancel the abort callback reads. It cannot be the caller's — the
-    // callback must be `'static` and the caller's flag is a borrow — so this
-    // thread mirrors one into the other, within [`WHISPER_POLL`].
-    let abort = Arc::new(AtomicBool::new(false));
 
     let started = Instant::now();
     let text = std::thread::scope(|scope| {
-        let run = scope.spawn(|| recognise(model, samples, threads, cancel, &percent, &abort));
+        let run = scope.spawn(|| recognise(model, samples, threads, cancel, &percent));
         let mut reported = 0;
         while !run.is_finished() {
-            if cancel.load(Ordering::SeqCst) {
-                abort.store(true, Ordering::SeqCst);
-            }
             let now = percent.load(Ordering::Relaxed);
             if now != reported {
                 reported = now;
@@ -180,15 +197,23 @@ fn recognise(
     model: &Path,
     samples: &[f32],
     threads: c_int,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     percent: &Arc<AtomicU8>,
-    abort: &Arc<AtomicBool>,
 ) -> Result<String, TranscribeError> {
     let context = WhisperContext::new_with_params(model, WhisperContextParameters::default())
         .map_err(|e| {
+            // **The size is the diagnosis.** whisper-rs turns every loading
+            // failure into a bare `InitError`, and whisper.cpp's own reason
+            // for it — the magic, the version, which tensor ran off the end
+            // of the file — goes to the logging hooks installed above and
+            // therefore nowhere at all. The one fact still worth having is
+            // how big the file the coach has actually is: a download that
+            // stopped early is self-evident beside the 466 MB `small.en`
+            // weighs, and Phase 11 makes that the likeliest failure here.
             TranscribeError::Failed(format!(
-                "could not load the speech model at {}: {e}",
-                model.display()
+                "could not load the speech model at {} ({}): {e}",
+                model.display(),
+                file_size(model),
             ))
         })?;
     let mut state = context.create_state().map_err(|e| {
@@ -205,7 +230,13 @@ fn recognise(
         best_of: GREEDY_BEST_OF,
     });
     params.set_n_threads(threads);
-    // Both of these default to **true**, and both write to stderr.
+    // **Belt and braces, and not the mechanism.** Both default to `true`,
+    // but in whisper.cpp 1.8.3 neither reaches stderr on its own:
+    // `print_progress` is read by the CLI examples and never by the library,
+    // and `print_timestamps` is read only inside `if (params.print_realtime)`,
+    // which is off. `install_logging_hooks` above is what actually keeps the
+    // 37-line model dump off the stream `bus: loaded …` is read from — do not
+    // drop it on the strength of these two lines.
     params.set_print_progress(false);
     params.set_print_timestamps(false);
 
@@ -222,35 +253,76 @@ fn recognise(
     // with `F` the *concrete closure type*, so the trampoline reinterprets
     // the fat pointer's data half — undefined behaviour for a bare closure.
     // Handing it a trait object makes `F` the boxed type and the cast right
-    // (BACKLOG #60). Cancellation is the whole of `Drop`-cancels-and-joins,
-    // so this is not a detail to get wrong.
-    let stop = abort.clone();
+    // (BACKLOG #60). Cancellation is the whole of what `Drop` can do about a
+    // run, so this is not a detail to get wrong.
+    //
+    // **And it is consulted twice a job, not per graph node.** whisper.cpp's
+    // encoder and decoder both go through the `ggml_backend_sched_t` overload
+    // of `ggml_graph_compute_helper`, which never calls
+    // `ggml_backend_set_abort_callback`; only the per-node overload does, and
+    // nothing on this path uses it. Measured on the reference laptop with
+    // `small.en`: a run whose flag was set before `full` even started still
+    // took 31 s to return, against 29 s for the same run left alone — one
+    // 30-second chunk is one encode, and the abort is not looked at inside
+    // it. That is why nothing waits on a cancel — see [`Transcriber`].
+    let stop = cancel.clone();
     let abort_callback: Box<dyn FnMut() -> bool> = Box::new(move || stop.load(Ordering::SeqCst));
     params.set_abort_callback_safe(abort_callback);
 
     let outcome = state.full(params, samples);
-    // **Our flag, not the return code.** An abort surfaces as -6, -8 or -9
-    // depending on where it caught the run, all of them as
-    // `WhisperError::GenericError(n)`; the code says where it stopped, never
-    // why. We are the ones who asked it to stop, so we are the ones who know
-    // (spec S1): a cancel is `Cancelled` and the clip goes back to idle.
-    if cancel.load(Ordering::SeqCst) {
+    // **Our flag says *why*; the return code says *whether*.** An abort
+    // surfaces as -6, -8 or -9 depending on where it caught the run, all of
+    // them as `WhisperError::GenericError(n)`: the code can say the run
+    // stopped, never that we are the ones who stopped it (spec S1). So a
+    // refusal with our flag set is `Cancelled`, and the clip goes back to
+    // idle rather than wearing a message about a return code.
+    //
+    // A run that *finished* keeps its words even though the cancel arrived —
+    // the same trade the bus makes for a `Finished` that beat the cancel, and
+    // the same one export makes when a cancel loses the race to a written
+    // file. It also makes the cancel testable: with the flag set before the
+    // run, `Cancelled` can only come back if the abort callback really
+    // reached whisper.
+    if cancel.load(Ordering::SeqCst) && outcome.is_err() {
         return Err(TranscribeError::Cancelled);
     }
     outcome.map_err(|e| TranscribeError::Failed(format!("the speech recogniser stopped: {e}")))?;
 
-    // **Concatenated, then trimmed once.** Whisper's BPE tokens carry their
-    // own leading space, so every segment already reads " like this": joining
-    // with a space would double every boundary. Lossy on purpose — one
-    // invalid byte is not worth throwing a whole transcript away.
-    let mut text = String::new();
+    // Lossy on purpose — one invalid byte is not worth throwing a whole
+    // transcript away.
+    let mut segments = Vec::new();
     for segment in state.as_iter() {
         let words = segment.to_str_lossy().map_err(|e| {
             TranscribeError::Failed(format!("the speech recogniser returned no text: {e}"))
         })?;
-        text.push_str(&words);
+        segments.push(words.into_owned());
     }
-    Ok(text.trim().to_owned())
+    Ok(join_segments(&segments))
+}
+
+/// The transcript whisper's segments make: **concatenated, then trimmed
+/// once.** Whisper's BPE tokens carry their own leading space, so every
+/// segment already reads `" like this"`; joining with a space would double
+/// every boundary and joining without trimming would leave the first one.
+///
+/// Its own function because it is the only subtle thing in this file that a
+/// test can reach without a 466 MB model — the whole-run tests are
+/// `#[ignore]`d, and a rule this easy to get backwards should not be pinned
+/// only by a test nobody runs on CI.
+fn join_segments<S: AsRef<str>>(segments: impl IntoIterator<Item = S>) -> String {
+    let mut text = String::new();
+    for segment in segments {
+        text.push_str(segment.as_ref());
+    }
+    text.trim().to_owned()
+}
+
+/// How big the file at `path` is, in the form an error message wants it.
+fn file_size(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => format!("{:.1} MB", meta.len() as f64 / 1e6),
+        Err(e) => format!("its size is unreadable: {e}"),
+    }
 }
 
 /// The test transcriber: `delay` spent watching the cancel flag, one progress
@@ -296,8 +368,22 @@ pub enum TranscribeMessage {
 }
 
 /// A running transcription: the sound of one recording read, then recognised.
-/// It owns its thread, and dropping it cancels and joins, as
-/// [`Exporter`](crate::Exporter) does.
+/// Dropping it cancels the run — and, unlike [`Exporter`](crate::Exporter),
+/// **does not wait for it**.
+///
+/// **Nothing may block on a whisper cancel.** whisper.cpp looks at the abort
+/// callback once per encode and once per decode pass (see `recognise`), so a
+/// cancelled `small.en` run was measured returning 12.4 s later — and, on a
+/// recording short enough to be a single 30-second chunk, no sooner than an
+/// uncancelled one at all. Every cancel comes from the bus thread: a record
+/// starting, a clip going to the trash, a project opening, a quit. A bus
+/// thread parked for that long is a dead Stop Recording button, a frozen
+/// deadline and a quit that holds the UI's GL teardown. So the thread is let
+/// go instead: it holds nothing but its own model and samples, its last
+/// message is tagged with a generation the bus has already moved past, and
+/// the exiting process reclaims it. The cost is real and accepted: for those
+/// seconds the abandoned run is still on the CPU, and a quit during one ends
+/// the process with it still computing.
 ///
 /// **One thread per job, not one worker for the queue.** A worker holding its
 /// whisper context between jobs would save re-reading the model, and keep its
@@ -305,7 +391,6 @@ pub enum TranscribeMessage {
 /// queue lives on the bus, where it is a `VecDeque` and nothing else.
 pub struct Transcriber {
     cancel: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl Transcriber {
@@ -322,7 +407,10 @@ impl Transcriber {
         mut on_message: impl FnMut(TranscribeMessage) + Send + 'static,
     ) -> Transcriber {
         let cancel = Arc::new(AtomicBool::new(false));
-        let thread = std::thread::Builder::new()
+        // The handle is dropped on purpose: nothing here ever joins (see the
+        // type's own docs), and the last `Finished` is what says the job is
+        // over, on every path including a cancelled one.
+        std::thread::Builder::new()
             .name("transcribe".into())
             .spawn({
                 let cancel = cancel.clone();
@@ -332,15 +420,13 @@ impl Transcriber {
                 }
             })
             .expect("spawn the transcription thread");
-        Transcriber {
-            cancel,
-            thread: Some(thread),
-        }
+        Transcriber { cancel }
     }
 
-    /// Asks the transcription to stop. It finishes with
-    /// [`TranscribeError::Cancelled`] — unless it had already finished, in
-    /// which case its own result stands and the words are kept.
+    /// Asks the transcription to stop, and **returns at once**. It finishes
+    /// with [`TranscribeError::Cancelled`] whenever it gets round to noticing
+    /// — unless it had already finished, in which case its own result stands
+    /// and the words are kept.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
@@ -349,9 +435,6 @@ impl Transcriber {
 impl Drop for Transcriber {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }
 
@@ -359,7 +442,7 @@ impl Drop for Transcriber {
 fn transcribe(
     recording: &Path,
     kind: &TranscribeKind,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     on_message: &mut impl FnMut(TranscribeMessage),
 ) -> Result<String, TranscribeError> {
     let samples = read_all(recording, cancel)?;
@@ -403,9 +486,11 @@ mod tests {
     use super::*;
     use crate::fixtures;
 
-    /// A flag nothing sets: the uncancelled case.
-    fn running() -> AtomicBool {
-        AtomicBool::new(false)
+    /// A flag nothing sets: the uncancelled case. An `Arc`, because that is
+    /// what a run takes; `read_all` and `Reader` take the `&AtomicBool` out
+    /// of it by deref.
+    fn running() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     fn dir() -> tempfile::TempDir {
@@ -492,6 +577,27 @@ mod tests {
         assert_eq!(read_all(&path, &cancel), Err(CompositeError::Cancelled));
     }
 
+    /// **Whisper's own spacing is already right.** Every segment arrives with
+    /// its leading space, so the join is a concatenation and the trim happens
+    /// once, at the end. Space-joining (which macOS did) doubles every
+    /// boundary; trimming each segment welds the last word of one to the
+    /// first of the next.
+    ///
+    /// Needs no model, which is the point of [`join_segments`] being its own
+    /// function: this rule is the only subtle thing in the file, and it now
+    /// has a test that runs on CI.
+    #[test]
+    fn segments_are_concatenated_and_trimmed_once() {
+        assert_eq!(join_segments([" nice", " ball"]), "nice ball");
+        assert_eq!(join_segments([" Thank you.", " Bye."]), "Thank you. Bye.");
+        // One segment, and none at all.
+        assert_eq!(join_segments([" over the top"]), "over the top");
+        assert_eq!(join_segments([] as [&str; 0]), "");
+        // Trailing whitespace goes with the leading kind, and only there:
+        // whisper's spaces *inside* the transcript are its own.
+        assert_eq!(join_segments([" a", "  b ", " "]), "a  b");
+    }
+
     /// A missing model is a failure the coach can act on: it names the path
     /// it looked at and the URL of the file to put there. Needs no model, and
     /// so is not `#[ignore]`d.
@@ -519,6 +625,51 @@ mod tests {
         );
     }
 
+    /// And a model path that is *not* the one we ship gets **no** URL: the
+    /// path comes from `$COACH_CUTS_WHISPER_MODEL`, so a name pasted into
+    /// the Hugging Face URL would send the coach to a 404 for their own typo.
+    #[test]
+    fn a_missing_model_of_our_own_choosing_is_not_given_a_url() {
+        let dir = dir();
+        let error = TranscribeKind::Whisper {
+            model: dir.path().join("my-tuned-model.bin"),
+        }
+        .run(&[0.0], &mut |_| {}, &running())
+        .expect_err("there is no model there");
+        let TranscribeError::Failed(message) = error else {
+            panic!("expected a failure, got {error:?}");
+        };
+        assert!(
+            message.contains("my-tuned-model.bin") && !message.contains("http"),
+            "a URL was invented for it: {message}"
+        );
+    }
+
+    /// A file that is not a model at all — which is what a download cut off
+    /// half way through leaves behind, and Phase 11's likeliest failure.
+    /// whisper-rs reports every loading failure as a bare `InitError`, and
+    /// whisper.cpp's own reason for it is in the logging hooks and therefore
+    /// nowhere, so **the size is the diagnosis**: 0.0 MB where 466 MB should
+    /// be says what no error text here would. Needs no model.
+    #[test]
+    fn a_model_that_will_not_load_is_a_failure_that_names_its_size() {
+        let dir = dir();
+        let model = dir.path().join("ggml-small.en.bin");
+        std::fs::write(&model, vec![0x5a; 20_000]).unwrap();
+        let error = TranscribeKind::Whisper {
+            model: model.clone(),
+        }
+        .run(&[0.0], &mut |_| {}, &running())
+        .expect_err("that is not a model");
+        let TranscribeError::Failed(message) = error else {
+            panic!("expected a failure, got {error:?}");
+        };
+        assert!(
+            message.contains(&model.display().to_string()) && message.contains("0.0 MB"),
+            "the message does not give the coach the size: {message}"
+        );
+    }
+
     /// The model the whisper tests run against.
     ///
     /// They are **`#[ignore]`d, never skipped**: a test that reads an
@@ -537,26 +688,39 @@ mod tests {
     ///
     /// **Nothing is asserted about the words.** The fixture is a tone, and
     /// what whisper hears in a tone is the silence hallucination spec S1
-    /// names and accepts. What this pins is that a real run comes back with
-    /// text rather than an error — and, under `--nocapture`, it prints the
-    /// throughput line the closeout's spike is written from.
+    /// names and accepts. What this pins is that a real run comes back
+    /// rather than erroring — the *shape* of what comes back is
+    /// [`segments_are_concatenated_and_trimmed_once`]'s, which needs no
+    /// model. Under `--nocapture` this also prints the throughput line the
+    /// closeout's spike is written from, and that is half its job.
     #[test]
     #[ignore = "needs a whisper model in COACH_CUTS_WHISPER_MODEL"]
     fn a_recording_transcribes() {
         let dir = dir();
         let path = fixtures::webm(dir.path(), "commentary.webm", 3, 160, 90, 25, 25);
         let samples = read_all(&path, &running()).expect("the recording has sound");
-        let text = TranscribeKind::Whisper { model: model() }
-            .run(&samples, &mut |_| {}, &running())
+        let mut percents = Vec::new();
+        TranscribeKind::Whisper { model: model() }
+            .run(&samples, &mut |p| percents.push(p), &running())
             .expect("the model recognises the recording");
-        eprintln!("transcribed: {text:?}");
-        assert_eq!(text, text.trim(), "the transcript is trimmed once");
+        eprintln!("transcribed, progress: {percents:?}");
     }
 
     /// A cancelled run is [`TranscribeError::Cancelled`] — **and the test
     /// asserts no return code.** An abort surfaces as -6, -8 or -9 depending
     /// on where it caught the run, so a test that pinned one would be
     /// testing whisper's internals rather than our answer to them.
+    ///
+    /// **And it only says so if the abort really fired.** `Cancelled` is
+    /// reported for a run that *refused*, never for one that finished, so a
+    /// build where the abort callback never reached whisper — the one
+    /// unsound-by-default API this phase touches (BACKLOG #60) — comes back
+    /// here as `Ok(words)` and fails the test.
+    ///
+    /// A *clock* would not do it. Whisper pads anything shorter than its
+    /// 30-second chunk and looks at the abort once per pass, so aborting this
+    /// three-second fixture saves nothing measurable: 31 s cancelled against
+    /// 29 s left alone on the reference laptop.
     #[test]
     #[ignore = "needs a whisper model in COACH_CUTS_WHISPER_MODEL"]
     fn a_cancelled_run_says_cancelled() {
@@ -565,12 +729,16 @@ mod tests {
         let samples = read_all(&path, &running()).expect("the recording has sound");
         // Set before the run rather than raced against it: the model still
         // loads and `full` still starts, so the abort callback still fires —
-        // at its first graph node instead of somewhere unrepeatable.
-        let cancel = AtomicBool::new(true);
-        let error = TranscribeKind::Whisper { model: model() }
-            .run(&samples, &mut |_| {}, &cancel)
-            .expect_err("the run was cancelled");
-        assert_eq!(error, TranscribeError::Cancelled);
+        // at the end of the first pass instead of somewhere unrepeatable.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let outcome =
+            TranscribeKind::Whisper { model: model() }.run(&samples, &mut |_| {}, &cancel);
+        assert_eq!(
+            outcome,
+            Err(TranscribeError::Cancelled),
+            "the run was not refused, so the abort callback never reached \
+             whisper"
+        );
     }
 
     /// Everything the [`Transcriber`] sent, in order. The channel ends when
