@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Coach Cuts
+Comment=Record commentary and drawings over game video, and export the cut
+Exec=coach-cuts
+Icon=coach-cuts
+StartupWMClass=coach-cuts
+Categories=AudioVideo;Video;
+Terminal=false

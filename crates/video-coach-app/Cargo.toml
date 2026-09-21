@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The binary is named for the application ID (`coach-cuts`, also the config
+# directory and the desktop entry); the package keeps its crate name.
+[[bin]]
+name = "coach-cuts"
+path = "src/main.rs"
+
 # The library (the bus) uses none of the UI dependencies, so it builds and
 # tests without a display. Slint, the EGL wrapping and `rfd` are for the
 # binary (`src/main.rs`, `src/video.rs`, `src/pickers.rs`), which Cargo can't

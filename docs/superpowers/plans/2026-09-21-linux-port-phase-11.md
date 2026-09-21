@@ -42,7 +42,7 @@ Commit: `build: pin whisper.cpp's instruction set`.
 1. **The ID is `coach-cuts`**, matching the config directory. `[[bin]] name = "coach-cuts", path = "src/main.rs"` in the app crate; the package stays `video-coach-app`, so every documented `cargo … -p video-coach-app` command still works. Update `main.rs:4`'s doc comment.
 2. **`slint::set_xdg_app_id("coach-cuts").expect(…)`** immediately after `BackendSelector::select()`, before `AppWindow::new()`.
 3. **`packaging/coach-cuts.desktop`**: `Exec=coach-cuts` with **no `%f`/`%U`**, `Icon=coach-cuts`, `StartupWMClass=coach-cuts`, `Categories=AudioVideo;Video;`. `desktop-file-validate` it if available.
-4. **Icons**: the six distinct sizes 16/32/64/128/256/512 from the `.appiconset`, into `packaging/icons/<size>/coach-cuts.png`. Skip 1024; scaling covers 48.
+4. **Icons**: the six distinct sizes 16/32/64/128/256/512 from the `.appiconset`, into `packaging/icons/<size>x<size>/coach-cuts.png` (hicolor's own naming, so Task 4 maps each directory straight across). Skip 1024; scaling covers 48.
 5. **Verify on the laptop (X11):** `xprop WM_CLASS` on the running window reads `"", "coach-cuts"`.
 6. **`CLAUDE.md`:** the app ID and where it is set.
 
@@ -78,7 +78,7 @@ Commit: `feat(transcribe): download the model on first use`.
 2. **`[package.metadata.deb]`**: `name = "coach-cuts"`, a `maintainer`, an `extended-description`, and
    - `depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gstreamer1.0-gl, gstreamer1.0-pipewire, libxcursor1, libxi6, libxkbcommon-x11-0, libgstreamer1.0-0 (>= 1.24)"`. Comment the three X11 libraries (winit dlopens them) and the floor (tested behaviour, not API need — it sits beside `$auto`'s `>= 1.20` as a legal duplicate constraint, and apt resolves it correctly).
    - `recommends = "intel-media-va-driver | va-driver-all, zenity"`.
-   - assets: `target/release/coach-cuts` → `/usr/bin/`, the `.desktop` → `/usr/share/applications/`, icons → `/usr/share/icons/hicolor/<size>x<size>/apps/`.
+   - assets: `target/release/coach-cuts` → `/usr/bin/`, the `.desktop` → `/usr/share/applications/`, `packaging/icons/<size>x<size>/` → `/usr/share/icons/hicolor/<size>x<size>/apps/`.
 3. **Licence notices (S6):**
    - `license-file` → a hand-written `packaging/copyright`: the AGPL notice plus the statically-linked C/C++ that crate-licence tools cannot see — whisper.cpp (MIT, inside `whisper-rs-sys`), Skia (BSD, inside `skia-bindings`), the DejaVu fonts.
    - **`cargo-about` generates the crate notices at package time**, with its `accepted` licence list doubling as the **GPL-2.0-only tripwire** spec S0 names — a crate that would make the combination incompatible then fails the build rather than being found later. Not committed, so it can't drift from `Cargo.lock`.

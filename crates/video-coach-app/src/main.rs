@@ -4,6 +4,8 @@
 //! cargo run -p video-coach-app [-- <project folder>]
 //! ```
 //!
+//! The binary is `coach-cuts`, the application ID.
+//!
 //! With a folder, opens (or creates) the project there; otherwise reopens the
 //! last project. The UI thread owns only the window: the bus thread owns the
 //! project and the player, takes [`Command`]s and answers with [`Event`]s,
@@ -161,6 +163,9 @@ fn main() {
         .require_opengl_es()
         .select()
         .expect("unable to select Slint's winit backend with the skia-opengl renderer");
+    // The window's Wayland `app_id` and X11 `WM_CLASS`, matching the desktop
+    // entry's `StartupWMClass`. Only valid once a backend is selected.
+    slint::set_xdg_app_id("coach-cuts").expect("set the application ID");
 
     let window = AppWindow::new().expect("create the window");
 

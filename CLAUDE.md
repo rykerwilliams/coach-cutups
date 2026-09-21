@@ -148,6 +148,12 @@ cargo run --release -p video-coach-app               # restores the last project
 cargo run --release -p video-coach-app -- <folder>   # opens (or creates) a project there
 ```
 
+The application ID is **`coach-cuts`** everywhere: the binary
+(`target/*/coach-cuts`, via `[[bin]]` — the package is still
+`video-coach-app`), the config directory, `packaging/coach-cuts.desktop` and
+its icons, and the window's `WM_CLASS` / Wayland `app_id`, set by
+`slint::set_xdg_app_id` in `main.rs` (only valid after `BackendSelector::select()`).
+
 The app must run on Slint's **Skia OpenGL** renderer (it selects it and fails
 loudly otherwise): that renderer is EGL on X11 and Wayland, and EGL is what
 lets GStreamer import decoded frames without a CPU copy. It logs the decoder,
