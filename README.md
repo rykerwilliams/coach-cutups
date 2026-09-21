@@ -74,15 +74,12 @@ or start it from a terminal as `coach-cuts` to see it directly.
 ## Build from source
 
 On Ubuntu 24.04 / Linux Mint 22, with Rust 1.92 or newer from
-[rustup](https://rustup.rs):
+[rustup](https://rustup.rs), install the packages listed (and explained) in
+[`packaging/build-deps.txt`](packaging/build-deps.txt) — the same list CI
+installs:
 
 ```bash
-sudo apt install \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-pipewire \
-  libfontconfig1-dev libfreetype-dev libxkbcommon-dev libegl-dev libgl-dev \
-  cmake libclang-dev
+sudo apt install $(grep -o '^[^#]*' packaging/build-deps.txt)
 
 cargo run --release -p video-coach-app        # run it
 cargo test --workspace                        # test it
@@ -90,11 +87,10 @@ cargo test --workspace                        # test it
 
 The first build compiles whisper.cpp and takes a few minutes.
 
-To build the `.deb` (into `target/debian/`), also install `dpkg-dev`,
-`cargo-deb` and `cargo-about`, then run the packaging script:
+To build the `.deb` (into `target/debian/`), also install `cargo-deb` and
+`cargo-about`, then run the packaging script:
 
 ```bash
-sudo apt install dpkg-dev
 cargo install --locked cargo-deb
 cargo install --locked cargo-about --features cli
 packaging/build-deb.sh

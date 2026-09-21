@@ -565,6 +565,9 @@ mod tests {
 
     #[test]
     fn a_block_is_stamped_where_its_samples_sit() {
+        // A buffer is a GStreamer object: without this, the test passes only
+        // when another in the binary happened to initialise it first.
+        gst::init().unwrap();
         let buffer = stamp(&[0.0; 4], 48_000, 48_002);
         assert_eq!(buffer.pts(), Some(gst::ClockTime::SECOND));
         assert_eq!(buffer.size(), 16);

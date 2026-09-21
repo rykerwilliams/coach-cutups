@@ -14,6 +14,13 @@
 # GPL-2.0-only tripwire, so a crate whose licence isn't on it fails here,
 # before the three-minute build. Then cargo-deb, which ships the notices from
 # the path the asset list names.
+#
+# Last, whisper.cpp's instruction set is asserted on the release build that
+# was packaged. `.cargo/config.toml` pins it, but cargo does not rerun
+# whisper-rs-sys's build script when that [env] changes, so a warm target/
+# can still hold a library built before the pin: `-march=native` dies with
+# SIGILL on an older CPU, and one without `-mavx2` is scalar and unusably
+# slow.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,3 +33,18 @@ cargo about generate --fail --frozen \
     --output-file "$release_dir/crate-licenses.txt" \
     packaging/about.hbs
 cargo deb --locked -p video-coach-app "$@"
+
+build_outputs=("$release_dir"/build/whisper-rs-sys-*/output)
+[[ -f ${build_outputs[0]} ]] || {
+    echo "no whisper-rs-sys build output under $release_dir/build" >&2
+    exit 1
+}
+for output in "${build_outputs[@]}"; do
+    variant=$(grep -m1 'CPU backend variant' "$output" || true)
+    if [[ $variant != *-mavx2* ]] || grep -q -- '-march=native' "$output"; then
+        echo "$output: whisper.cpp was not built for x86-64-v3 (${variant:-no CPU backend line})." >&2
+        echo "Run 'cargo clean -p whisper-rs-sys --release' and build again." >&2
+        exit 1
+    fi
+done
+echo "whisper.cpp: ${variant#*-- }"

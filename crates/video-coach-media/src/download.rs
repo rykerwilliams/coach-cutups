@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use gstreamer as gst;
 use gstreamer::glib;
@@ -37,14 +38,19 @@ const POLL: gst::ClockTime = gst::ClockTime::from_mseconds(100);
 /// beside the hash.
 const HASH_CHUNK: usize = 1 << 20;
 
-/// Where a file comes from and how to know it arrived whole.
+/// Held for the whole of a [`download`]: one at a time, process-wide.
 ///
-/// **Its presence is the permission.** A [`TranscribeKind::Whisper`](crate::TranscribeKind::Whisper)
-/// with no `Fetch` never downloads, whatever its path is named: the app sets
-/// one only for a model under its own cache directory, never under
-/// `$COACH_CUTS_WHISPER_MODEL`, and the tests that point the transcriber at a
-/// missing file carrying our own name would otherwise pull 488 MB from
-/// Hugging Face on CI.
+/// **What it prevents:** the transcriber is never joined, so a cancelled job
+/// can still be between its last cancel check and its rename when the next
+/// job opens — and truncates — the same `.part`, and the rename would then
+/// move a half-written file to the model's path. Rare (it takes a clip
+/// trashed with another queued behind it), but the fix costs nothing: a
+/// cancelled download lets go within [`POLL`], so a successor waits at most
+/// that long.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Where a file comes from and how to know it arrived whole: its URL, its
+/// sha256 and its length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetch {
     pub url: String,
@@ -58,17 +64,21 @@ pub struct Fetch {
 /// Downloads `fetch` to `dest`, reporting whole percents to `progress` from
 /// this thread, and returns once `dest` is the verified file.
 ///
-/// `progress(0)` comes first, before anything can fail, so a caller showing
-/// a download has something to show even for one that fails at once.
+/// `progress(0)` comes first, before anything can fail or wait, so a caller
+/// showing a download has something to show even for one that fails at once
+/// or waits its turn behind a cancelled one.
 ///
-/// **A cancel touches no file.** It leaves the `.part` where it is: the
-/// transcriber is never joined, so the next job may already have opened the
-/// same `.part` by the time this one notices, and a delete then would send
-/// its whole download into an unlinked inode. The next attempt truncates it
-/// anyway, as does quitting mid-download.
+/// **Every failure deletes the `.part`, a cancel included** — a refused
+/// request, a dropped connection, a full disk, a file that fails its check —
+/// so nothing is left taking up the room the next recording needs. Only
+/// quitting mid-download leaves one, and the next attempt truncates it.
 ///
-/// **A file that fails its check is deleted**, and the failure names where
-/// it was going. No retry here: pressing Transcribe again is the retry.
+/// A cancel used to leave its `.part` alone, because the transcriber is never
+/// joined and a delete could land after the *next* job's `filesink` had opened
+/// the same path. [`ONE_AT_A_TIME`] rules that out: the cancelled job still
+/// holds it while it cleans up, so the next job can't open the file until it
+/// is gone. The failure says what went wrong. No retry here: pressing
+/// Transcribe again is the retry.
 pub fn download(
     fetch: &Fetch,
     dest: &Path,
@@ -76,35 +86,40 @@ pub fn download(
     cancel: &AtomicBool,
 ) -> Result<(), CompositeError> {
     progress(0);
+    // A download that panicked leaves nothing this guards to repair.
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // `filesink` opens its file and nothing else, so a first run on a
     // machine with no cache directory yet would fail here without this.
-    if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
+    if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| {
             CompositeError::Failed(format!("could not create {}: {e}", dir.display()))
         })?;
     }
     let part = part_path(dest);
-    fetch_to(fetch, &part, progress, cancel)?;
-    let verdict = check(fetch, &part, cancel)?;
-    // Past here nothing reads the flag, so this is where a cancel that came
-    // in during the hash stops it from touching the files.
-    if cancel.load(Ordering::SeqCst) {
-        return Err(CompositeError::Cancelled);
+    let outcome =
+        fetch_to(fetch, &part, progress, cancel).and_then(|()| check(fetch, &part, dest, cancel));
+    match outcome {
+        // Whatever else happened, including a hash that passed just as the
+        // cancel came in: a cancelled job never renames. Safe to delete under
+        // `_turn`, which the next job is waiting on.
+        _ if cancel.load(Ordering::SeqCst) => {
+            let _ = std::fs::remove_file(&part);
+            Err(CompositeError::Cancelled)
+        }
+        Err(failed) => {
+            let _ = std::fs::remove_file(&part);
+            Err(failed)
+        }
+        Ok(()) => std::fs::rename(&part, dest).map_err(|e| {
+            CompositeError::Failed(format!(
+                "could not move {} to {}: {e}",
+                part.display(),
+                dest.display()
+            ))
+        }),
     }
-    if let Err(why) = verdict {
-        let _ = std::fs::remove_file(&part);
-        return Err(CompositeError::Failed(format!(
-            "the download of {} failed its check ({why}), and was deleted",
-            dest.display()
-        )));
-    }
-    std::fs::rename(&part, dest).map_err(|e| {
-        CompositeError::Failed(format!(
-            "could not move {} to {}: {e}",
-            part.display(),
-            dest.display()
-        ))
-    })
 }
 
 /// `dest` with `.part` on the end of its whole name, as export writes its
@@ -146,18 +161,19 @@ fn fetch_to(
     let pipeline = Stopper(pipeline);
     let bus = pipeline.bus().expect("a pipeline has a bus");
 
-    let failed =
-        |what: String| CompositeError::Failed(format!("could not download {}: {what}", fetch.url));
+    let failed = |err: Option<&gst::message::Error>| {
+        CompositeError::Failed(match err {
+            Some(err) => unreachable_or(fetch, err),
+            None => format!("could not download {}: it would not start", fetch.url),
+        })
+    };
     if pipeline.set_state(gst::State::Playing).is_err() {
         // The element's own reason, if it posted one before refusing.
-        return Err(failed(
-            bus.pop_filtered(&[gst::MessageType::Error])
-                .and_then(|msg| match msg.view() {
-                    gst::MessageView::Error(err) => Some(crate::error_text(err)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "it would not start".into()),
-        ));
+        let msg = bus.pop_filtered(&[gst::MessageType::Error]);
+        return Err(failed(msg.as_ref().and_then(|msg| match msg.view() {
+            gst::MessageView::Error(err) => Some(err),
+            _ => None,
+        })));
     }
     let mut reported = 0;
     loop {
@@ -168,7 +184,7 @@ fn fetch_to(
             bus.timed_pop_filtered(POLL, &[gst::MessageType::Eos, gst::MessageType::Error])
         {
             match msg.view() {
-                gst::MessageView::Error(err) => return Err(failed(crate::error_text(err))),
+                gst::MessageView::Error(err) => return Err(failed(Some(err))),
                 _ => {
                     // All of it, which a fast transfer can reach between
                     // two polls.
@@ -189,8 +205,32 @@ fn fetch_to(
     }
 }
 
-/// Whether `part` is the file `fetch` describes: `Ok(Err(why))` when it
-/// isn't, `Err` when it couldn't be read or the check was cancelled.
+/// What to tell the coach about a transfer that failed with `err`.
+///
+/// **Offline is the likeliest failure at a field, and GStreamer's words for it
+/// are the worst.** A refused connection or a name that won't resolve gets no
+/// error of `souphttpsrc`'s own: `basesrc` posts its generic "Internal data
+/// stream error" instead, which says nothing a coach can act on. Every error
+/// the server or the disk causes — a 404, a 403, a full disk — is posted
+/// first, with a reason of its own, and is passed through. The raw error goes
+/// to stderr either way.
+fn unreachable_or(fetch: &Fetch, err: &gst::message::Error) -> String {
+    let raw = crate::error_text(err);
+    if !err.error().matches(gst::StreamError::Failed) {
+        return format!("could not download {}: {raw}", fetch.url);
+    }
+    eprintln!("download: {}: {raw}", fetch.url);
+    let host = fetch
+        .url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', ':']).next())
+        .unwrap_or(&fetch.url);
+    format!("could not reach {host} — check the internet connection")
+}
+
+/// Whether `part` is the file `fetch` describes, as it will be at `dest`:
+/// `Failed` naming `dest` when it isn't, `Cancelled` if the cancel came in
+/// while it was being hashed.
 ///
 /// **The file is hashed, not the stream.** What is checked is then exactly
 /// what gets renamed, whatever `filesink` did or didn't write. The cost is
@@ -200,17 +240,24 @@ fn fetch_to(
 fn check(
     fetch: &Fetch,
     part: &Path,
+    dest: &Path,
     cancel: &AtomicBool,
-) -> Result<Result<(), String>, CompositeError> {
+) -> Result<(), CompositeError> {
     let unreadable = |e: std::io::Error| {
         CompositeError::Failed(format!("could not read {}: {e}", part.display()))
+    };
+    let mismatch = |why: String| {
+        CompositeError::Failed(format!(
+            "the download of {} failed its check ({why}), and was deleted",
+            dest.display()
+        ))
     };
     let mut file = File::open(part).map_err(unreadable)?;
     // The cheap check first, and the one that says the most when it fails:
     // a transfer that stopped early.
     let len = file.metadata().map_err(unreadable)?.len();
     if len != fetch.bytes {
-        return Ok(Err(format!("{len} bytes of {}", fetch.bytes)));
+        return Err(mismatch(format!("{len} bytes of {}", fetch.bytes)));
     }
     let mut sum = glib::Checksum::new(glib::ChecksumType::Sha256).expect("glib has sha256");
     let mut chunk = vec![0; HASH_CHUNK];
@@ -225,96 +272,32 @@ fn check(
         sum.update(&chunk[..n]);
     }
     let got = sum.string().expect("a sha256 has a hex form");
-    Ok(if got == fetch.sha256 {
+    if got == fetch.sha256 {
         Ok(())
     } else {
-        Err(format!("sha256 {got}, expected {}", fetch.sha256))
-    })
+        Err(mismatch(format!("sha256 {got}, expected {}", fetch.sha256)))
+    }
 }
 
-/// A local HTTP server for the tests here and the transcriber's: **no test
-/// touches Hugging Face.**
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
+mod tests {
+    use std::net::TcpListener;
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     use super::*;
+    use crate::fixtures::{serve, served_body, Answer, SERVED_SHA256};
 
-    /// A body with no repeating pattern a short read could hide in.
-    pub(crate) fn body() -> Vec<u8> {
-        (0..1_000_000u32).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// [`body`]'s sha256, from `hashlib` and not from `glib`, so a hash the
-    /// download computes wrongly can't agree with itself here.
-    pub(crate) const BODY_SHA256: &str =
-        "2c030d49ec131bfbbb446ad21e7a2f12cdb4f2f4f3fda3ac709dd2e68a4646c7";
-
-    /// What the test server does with each request.
-    #[derive(Clone, Copy)]
-    pub(crate) enum Answer {
-        /// `200 OK` and the whole body.
-        Whole,
-        /// `200 OK`, the headers and half the body — then nothing, with the
-        /// connection held open, as a transfer stalled mid-way.
-        Stall,
-        /// This status line and no body.
-        Status(&'static str),
-    }
-
-    /// An HTTP server on a port of its own answering every request with
-    /// `answer`, and the URL to ask it. It lives as long as the test binary:
-    /// nothing joins it, and a stalled connection's thread just sleeps.
-    pub(crate) fn serve(answer: Answer) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/ggml-test.bin", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                std::thread::spawn(move || respond(stream, answer));
-            }
-        });
-        url
-    }
-
-    fn respond(mut stream: TcpStream, answer: Answer) {
-        // The request's headers, whole, before any answer: a reply to half a
-        // request is a reset libsoup reports as something else entirely.
-        let mut request = Vec::new();
-        let mut byte = [0; 1];
-        while !request.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte) {
-                Ok(1) => request.push(byte[0]),
-                _ => return,
-            }
-        }
-        let body = body();
-        let head = |status: &str, len: usize| {
-            format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
-        };
-        let _ = match answer {
-            Answer::Whole => stream
-                .write_all(head("200 OK", body.len()).as_bytes())
-                .and_then(|()| stream.write_all(&body)),
-            Answer::Stall => {
-                let _ = stream
-                    .write_all(head("200 OK", body.len()).as_bytes())
-                    .and_then(|()| stream.write_all(&body[..body.len() / 2]))
-                    .and_then(|()| stream.flush());
-                std::thread::sleep(Duration::from_secs(600));
-                Ok(())
-            }
-            Answer::Status(status) => stream.write_all(head(status, 0).as_bytes()),
-        };
+    /// [`serve`], answering at once.
+    fn server(answer: Answer) -> String {
+        serve(answer, Duration::ZERO)
     }
 
     fn fetch(url: String, sha256: &str) -> Fetch {
         Fetch {
             url,
             sha256: sha256.into(),
-            bytes: body().len() as u64,
+            bytes: served_body().len() as u64,
         }
     }
 
@@ -332,14 +315,14 @@ pub(crate) mod tests {
         let dest = dir.path().join("models").join("ggml-test.bin");
         let mut percents = Vec::new();
         download(
-            &fetch(serve(Answer::Whole), BODY_SHA256),
+            &fetch(server(Answer::Whole), SERVED_SHA256),
             &dest,
             &mut |p| percents.push(p),
             &AtomicBool::new(false),
         )
         .expect("the download succeeds");
         assert!(
-            std::fs::read(&dest).unwrap() == body(),
+            std::fs::read(&dest).unwrap() == served_body(),
             "the file is not the body"
         );
         assert!(!part_path(&dest).exists(), "the .part was left behind");
@@ -356,7 +339,7 @@ pub(crate) mod tests {
         let dest = dir.path().join("ggml-test.bin");
         let wrong = "0".repeat(64);
         let error = download(
-            &fetch(serve(Answer::Whole), &wrong),
+            &fetch(server(Answer::Whole), &wrong),
             &dest,
             &mut |_| {},
             &AtomicBool::new(false),
@@ -366,7 +349,7 @@ pub(crate) mod tests {
             panic!("expected a failure, got {error:?}");
         };
         assert!(
-            message.contains(&dest.display().to_string()) && message.contains(BODY_SHA256),
+            message.contains(&dest.display().to_string()) && message.contains(SERVED_SHA256),
             "the message names neither the path nor what arrived: {message}"
         );
         assert!(!part_path(&dest).exists(), "the .part survived");
@@ -380,14 +363,14 @@ pub(crate) mod tests {
     fn a_cancel_leaves_no_final_file() {
         let dir = dir();
         let dest = dir.path().join("ggml-test.bin");
-        let url = serve(Answer::Stall);
+        let url = server(Answer::Stall);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let run = std::thread::spawn({
             let (dest, cancel) = (dest.clone(), cancel.clone());
             move || {
                 download(
-                    &fetch(url, BODY_SHA256),
+                    &fetch(url, SERVED_SHA256),
                     &dest,
                     &mut |p| {
                         let _ = tx.send(p);
@@ -405,6 +388,10 @@ pub(crate) mod tests {
         cancel.store(true, Ordering::SeqCst);
         assert_eq!(run.join().unwrap(), Err(CompositeError::Cancelled));
         assert!(!dest.exists(), "a cancelled download landed");
+        assert!(
+            !part_path(&dest).exists(),
+            "a cancelled download left its .part taking up room"
+        );
     }
 
     /// A server that refuses fails the download with the server's reason and
@@ -413,9 +400,9 @@ pub(crate) mod tests {
     fn a_server_error_fails() {
         let dir = dir();
         let dest = dir.path().join("ggml-test.bin");
-        let url = serve(Answer::Status("404 Not Found"));
+        let url = server(Answer::Status("404 Not Found"));
         let error = download(
-            &fetch(url.clone(), BODY_SHA256),
+            &fetch(url.clone(), SERVED_SHA256),
             &dest,
             &mut |_| {},
             &AtomicBool::new(false),
@@ -429,5 +416,105 @@ pub(crate) mod tests {
             "{message}"
         );
         assert!(!dest.exists());
+    }
+
+    /// **A transfer that fails deletes its `.part`**, as a failed check
+    /// does: a refused request once left 2 MB behind, and a disk that fills
+    /// mid-download would leave nearly 488 MB where the next recording needs
+    /// the room, with the coach unaware the file exists.
+    #[test]
+    fn a_failed_transfer_deletes_the_part() {
+        let dir = dir();
+        let dest = dir.path().join("ggml-test.bin");
+        download(
+            &fetch(server(Answer::Status("403 Forbidden")), SERVED_SHA256),
+            &dest,
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .expect_err("the server refuses");
+        assert!(!part_path(&dest).exists(), "the .part survived");
+    }
+
+    /// **Offline says so.** A refused connection gets nothing of
+    /// `souphttpsrc`'s own, only `basesrc`'s generic "Internal data stream
+    /// error" — which is what the coach used to read, at the field, where
+    /// being offline is the likeliest failure there is.
+    #[test]
+    fn an_unreachable_server_says_so() {
+        let dir = dir();
+        let dest = dir.path().join("ggml-test.bin");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = download(
+            &fetch(
+                format!("http://127.0.0.1:{port}/ggml-test.bin"),
+                SERVED_SHA256,
+            ),
+            &dest,
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .expect_err("nothing is listening");
+        let CompositeError::Failed(message) = error else {
+            panic!("expected a failure, got {error:?}");
+        };
+        assert!(
+            message.contains("could not reach 127.0.0.1")
+                && message.contains("internet connection")
+                && !message.contains("Internal data stream error"),
+            "{message}"
+        );
+        assert!(!part_path(&dest).exists(), "the .part survived");
+    }
+
+    /// **Downloads take turns, process-wide.** The second waits while the
+    /// first holds the `.part` it would otherwise truncate, and lands once
+    /// the first is cancelled — see [`ONE_AT_A_TIME`].
+    #[test]
+    fn downloads_take_turns() {
+        let dir = dir();
+        let dest = dir.path().join("ggml-test.bin");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let first = std::thread::spawn({
+            let (dest, cancel, url) = (dest.clone(), cancel.clone(), server(Answer::Stall));
+            move || {
+                download(
+                    &fetch(url, SERVED_SHA256),
+                    &dest,
+                    &mut |p| {
+                        let _ = tx.send(p);
+                    },
+                    &cancel,
+                )
+            }
+        });
+        while rx.recv_timeout(Duration::from_secs(15)).expect("progress") < 40 {}
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn({
+            let (dest, url) = (dest.clone(), server(Answer::Whole));
+            move || {
+                let result = download(
+                    &fetch(url, SERVED_SHA256),
+                    &dest,
+                    &mut |_| {},
+                    &AtomicBool::new(false),
+                );
+                let _ = done_tx.send(());
+                result
+            }
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(1_000)).is_err(),
+            "the second download ran while the first held the .part"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(first.join().unwrap(), Err(CompositeError::Cancelled));
+        second.join().unwrap().expect("the second download lands");
+        assert!(std::fs::read(&dest).unwrap() == served_body());
     }
 }

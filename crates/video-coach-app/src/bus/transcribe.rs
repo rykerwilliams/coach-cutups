@@ -20,7 +20,7 @@
 //!
 //! **The job may download its model first** (Phase 11 spec S3), when the
 //! model is absent and [`whisper`] gave it somewhere to fetch it from. That
-//! is its own state on screen, and a download that fails drops the queue
+//! is its own [`Stage`] on screen, and a download that fails drops the queue
 //! behind it: otherwise every waiting clip tries again in turn — each one
 //! offline at the field, or each one another 488 MB after a bad hash.
 //!
@@ -70,10 +70,8 @@ const MODEL_ENV: &str = "COACH_CUTS_WHISPER_MODEL";
 /// fallback), **downloaded there on first use** — or the file
 /// `$COACH_CUTS_WHISPER_MODEL` names, which is never fetched.
 ///
-/// **This is the one place that decides whether a job may download.** The
-/// path alone can't say: the variable can name a file called
-/// `ggml-small.en.bin` in a directory that is the coach's, and the tests
-/// point the transcriber at a missing file of that name on purpose.
+/// **This is the one place that decides whether a job may download** — see
+/// [`TranscribeKind::Whisper`] for why the path can't.
 pub fn whisper(model: WhisperModel) -> TranscribeKind {
     whisper_kind(
         std::env::var_os(MODEL_ENV),
@@ -128,6 +126,27 @@ fn whisper_kind(
     }
 }
 
+/// `kind` pointed at `model` instead, when the coach picks it.
+///
+/// **Only a job that may download has a path of ours** (see [`whisper`]), so
+/// `fetch` is what says the path may move — never its file name, which under
+/// `$COACH_CUTS_WHISPER_MODEL` can be ours in a directory that is the
+/// coach's. **And a `fetch` follows the model only when it is one of ours:**
+/// anything else is a test's local server, which switching models must never
+/// turn into a download from Hugging Face.
+fn retarget(kind: &mut TranscribeKind, model: WhisperModel) {
+    if let TranscribeKind::Whisper {
+        model: path,
+        fetch: Some(fetch),
+    } = kind
+    {
+        path.set_file_name(model.file_name());
+        if WhisperModel::ALL.iter().any(|m| m.fetch() == *fetch) {
+            *fetch = model.fetch();
+        }
+    }
+}
+
 /// How a job ended, when the ending is something the inspector has to say
 /// out loud. A run that wrote words says it with the words, and a cancel says
 /// nothing at all (spec S5).
@@ -142,19 +161,24 @@ pub enum Finish {
     Failed(String),
 }
 
+/// Where the running job is, and how far along, in whole percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Downloading its model first (Phase 11 spec S3). Its own stage, so a
+    /// screen can't read "Transcribing… 63%" while 488 MB arrives.
+    Downloading(u8),
+    /// whisper's percent: a floor, which on a short clip never leaves 0.
+    Transcribing(u8),
+}
+
 /// The whole transcription state (spec S5), as [`Event::Transcription`]
-/// carries it: the clips waiting in order, the one running with its percent,
+/// carries it: the clips waiting in order, the one running and its stage,
 /// and how the last run ended if it ended with something to say. A clip in
 /// none of the three is idle with nothing to report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranscriptionState {
     pub queued: Vec<Uuid>,
-    pub running: Option<(Uuid, u8)>,
-    /// The running job is downloading its model, this far along (Phase 11
-    /// spec S3). `running`'s percent is whisper's, and stays 0 until this is
-    /// `None` again: a screen reading "Transcribing… 63%" while 488 MB
-    /// arrives would be telling the coach the wrong thing.
-    pub downloading: Option<u8>,
+    pub running: Option<(Uuid, Stage)>,
     pub finished: Option<(Uuid, Finish)>,
 }
 
@@ -164,23 +188,21 @@ impl TranscriptionState {
         self.queued.is_empty() && self.running.is_none()
     }
 
-    /// The clip running, whatever percent it reports.
+    /// The clip running, whatever stage it is at.
     pub fn running_clip(&self) -> Option<Uuid> {
         self.running.map(|(id, _)| id)
     }
 }
 
 /// The job in flight: the clip it is about, the thread doing it, and the
-/// percents it last reported.
+/// stage it last reported.
 pub(super) struct Active {
     clip: Uuid,
     /// Dropping it cancels the run and returns at once — see
     /// [`Bus::stop_transcription`].
     transcriber: Transcriber,
-    percent: u8,
-    /// Set by `Downloading`, cleared by the `Progress` that follows the
-    /// download — so a failure while it is set is a failed download.
-    downloading: Option<u8>,
+    /// A failure while this is `Downloading` is a failed download.
+    stage: Stage,
 }
 
 impl Bus {
@@ -214,8 +236,9 @@ impl Bus {
         self.publish_transcription();
     }
 
-    /// A recording has just started, so the transcript in flight gives way to
-    /// it and its clip goes back to the **front** of the queue (spec S5).
+    /// A recording has just started (or the model a download was fetching was
+    /// just turned down), so the transcript in flight gives way to it and its
+    /// clip goes back to the **front** of the queue (spec S5).
     ///
     /// Called the moment the recording exists, never from the top of
     /// `toggle_recording`: that bails at five points, and a refused record
@@ -254,40 +277,32 @@ impl Bus {
 
     /// [`Command::SetTranscribeModel`](super::Command::SetTranscribeModel):
     /// the coach picked a model. It is remembered for every project on this
-    /// machine (`state.json`, never `project.json`), and **the job running
-    /// keeps the model it started with.**
+    /// machine (`state.json`, never `project.json`), and everything still
+    /// queued picks it up.
     ///
-    /// Cancelling it would cost about twelve seconds of CPU for nothing —
-    /// whisper reads its abort flag once per encode and once per decode pass
-    /// (see [`Bus::stop_transcription`]) — and the coach asked for a
-    /// different model *next*, not for this one to be thrown away. Everything
-    /// still queued picks the new one up.
+    /// **A job transcribing keeps the model it started with.** Cancelling it
+    /// would cost about twelve seconds of CPU for nothing — whisper reads its
+    /// abort flag once per encode and once per decode pass (see
+    /// [`Bus::stop_transcription`]) — and the coach asked for a different
+    /// model *next*, not for this one to be thrown away.
+    ///
+    /// **A job downloading is preempted**, as a recording preempts it, and
+    /// restarts on the new model. A download stops within a tenth of a
+    /// second, and left alone it would carry on fetching up to 488 MB of a
+    /// model the coach has just turned down — on a slow link, for minutes.
     pub(super) fn set_transcribe_model(&mut self, model: WhisperModel) {
         if self.transcribe_model == model {
             return;
         }
         self.transcribe_model = model;
         self.state.set_whisper_model(model);
-        if let TranscribeKind::Whisper { model: path, fetch } = &mut self.transcribe {
-            // **Beside the model in use, and only when that is one of ours.**
-            // `$COACH_CUTS_WHISPER_MODEL` points at a file the coach chose,
-            // in a directory that is theirs; the picker is disabled under it,
-            // and a command that arrived anyway must not rewrite it into a
-            // sibling that was never downloaded.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(WhisperModel::from_file_name)
-                .is_some()
-            {
-                path.set_file_name(model.file_name());
-                // And fetched from the new model's URL only if the old one
-                // was fetchable at all: a name of ours is not permission to
-                // download (see [`whisper`]).
-                if let Some(fetch) = fetch {
-                    *fetch = model.fetch();
-                }
-            }
+        retarget(&mut self.transcribe, model);
+        if self
+            .transcribing
+            .as_ref()
+            .is_some_and(|a| matches!(a.stage, Stage::Downloading(_)))
+        {
+            self.preempt_transcription();
         }
     }
 
@@ -333,8 +348,7 @@ impl Bus {
             self.transcribing = Some(Active {
                 clip: id,
                 transcriber,
-                percent: 0,
-                downloading: None,
+                stage: Stage::Transcribing(0),
             });
             break;
         }
@@ -353,32 +367,10 @@ impl Bus {
     ) {
         match msg {
             TranscribeMessage::Downloading(percent) => {
-                if generation != self.transcribe_generation {
-                    return;
-                }
-                let Some(active) = &mut self.transcribing else {
-                    return;
-                };
-                if active.downloading == Some(percent) {
-                    return;
-                }
-                active.downloading = Some(percent);
-                self.publish_transcription();
+                self.advance(generation, Stage::Downloading(percent))
             }
             TranscribeMessage::Progress(percent) => {
-                if generation != self.transcribe_generation {
-                    return;
-                }
-                let Some(active) = &mut self.transcribing else {
-                    return;
-                };
-                // The first one after a download ends it, even at the same 0.
-                if active.percent == percent && active.downloading.is_none() {
-                    return;
-                }
-                active.percent = percent;
-                active.downloading = None;
-                self.publish_transcription();
+                self.advance(generation, Stage::Transcribing(percent))
             }
             TranscribeMessage::Finished(result) => {
                 // The words are kept whatever became of the queue meanwhile:
@@ -409,7 +401,7 @@ impl Bus {
                             if self
                                 .transcribing
                                 .as_ref()
-                                .is_some_and(|a| a.downloading.is_some())
+                                .is_some_and(|a| matches!(a.stage, Stage::Downloading(_)))
                             {
                                 self.transcribe_queue.clear();
                             }
@@ -423,6 +415,22 @@ impl Bus {
                 self.publish_transcription();
             }
         }
+    }
+
+    /// The job in flight has reached `stage`: published when that is news,
+    /// including the step from a download's 100% to whisper's 0%.
+    fn advance(&mut self, generation: u64, stage: Stage) {
+        if generation != self.transcribe_generation {
+            return;
+        }
+        let Some(active) = &mut self.transcribing else {
+            return;
+        };
+        if active.stage == stage {
+            return;
+        }
+        active.stage = stage;
+        self.publish_transcription();
     }
 
     /// The machine's write (spec S7): apply, save and publish, and **never**
@@ -506,8 +514,7 @@ impl Bus {
     fn publish_transcription(&self) {
         self.emit(Event::Transcription(TranscriptionState {
             queued: self.transcribe_queue.iter().copied().collect(),
-            running: self.transcribing.as_ref().map(|a| (a.clip, a.percent)),
-            downloading: self.transcribing.as_ref().and_then(|a| a.downloading),
+            running: self.transcribing.as_ref().map(|a| (a.clip, a.stage)),
             finished: self.transcribe_finished.clone(),
         }));
     }
@@ -553,6 +560,48 @@ mod tests {
                 "{model:?}"
             );
         }
+    }
+
+    /// **Switching models moves the path only when it is ours** — when the
+    /// job may download — and never a file `$COACH_CUTS_WHISPER_MODEL` names,
+    /// even one called what one of ours is: that is the coach's file, and
+    /// its sibling was never downloaded.
+    #[test]
+    fn switching_models_moves_only_a_path_that_is_ours() {
+        let mut kind = whisper_at("/opt/models/ggml-small.en.bin", None);
+        retarget(&mut kind, WhisperModel::Base);
+        assert_eq!(kind, whisper_at("/opt/models/ggml-small.en.bin", None));
+
+        let mut kind = whisper_at("/c/models/ggml-small.en.bin", Some(WhisperModel::Small));
+        retarget(&mut kind, WhisperModel::Base);
+        assert_eq!(
+            kind,
+            whisper_at("/c/models/ggml-base.en.bin", Some(WhisperModel::Base))
+        );
+    }
+
+    /// **And never turns a local fetch into a network one.** A test pointing
+    /// the transcriber at its own server keeps that server across a switch;
+    /// only our own fetch follows the model to Hugging Face.
+    #[test]
+    fn switching_models_never_sends_a_local_fetch_to_the_network() {
+        let local = video_coach_media::Fetch {
+            url: "http://127.0.0.1:1/ggml-small.en.bin".into(),
+            sha256: "0".repeat(64),
+            bytes: 1_000,
+        };
+        let mut kind = TranscribeKind::Whisper {
+            model: PathBuf::from("/t/ggml-small.en.bin"),
+            fetch: Some(local.clone()),
+        };
+        retarget(&mut kind, WhisperModel::Base);
+        assert_eq!(
+            kind,
+            TranscribeKind::Whisper {
+                model: PathBuf::from("/t/ggml-base.en.bin"),
+                fetch: Some(local),
+            }
+        );
     }
 
     /// **`$COACH_CUTS_WHISPER_MODEL` beats the choice, every time** — it is

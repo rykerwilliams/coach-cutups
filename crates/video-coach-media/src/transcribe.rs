@@ -178,11 +178,13 @@ pub enum TranscribeKind {
     /// whisper.cpp reading the model at `model` — downloaded there first, if
     /// it is absent and `fetch` says from where.
     ///
-    /// **`fetch` is the permission, and the path never implies it.** The app
-    /// sets it only for a model under its own cache directory (never under
-    /// `$COACH_CUTS_WHISPER_MODEL`, a file in a directory that is the
-    /// coach's), and tests pointing at a missing file carrying our own name
-    /// pass `None` so that CI never touches Hugging Face.
+    /// **`fetch` is the permission, and the path never implies it.** This is
+    /// the one place that reasoning lives; everything else points here. The
+    /// app sets it only for a model under its own cache directory — never
+    /// under `$COACH_CUTS_WHISPER_MODEL`, a file in a directory that is the
+    /// coach's, however it is named — and tests pointing at a missing file
+    /// carrying our own name pass `None`, so that CI never touches Hugging
+    /// Face.
     Whisper {
         model: PathBuf,
         fetch: Option<Fetch>,
@@ -193,6 +195,22 @@ pub enum TranscribeKind {
 }
 
 impl TranscribeKind {
+    /// What a job of this kind would download before it runs: the `fetch`,
+    /// when there is one and the model isn't on disk yet.
+    ///
+    /// The job asks this to decide, and the Transcribe button asks it to
+    /// offer the download before the coach presses it — so the two can't
+    /// disagree.
+    pub fn will_download(&self) -> Option<&Fetch> {
+        match self {
+            TranscribeKind::Whisper {
+                model,
+                fetch: Some(fetch),
+            } if !model.is_file() => Some(fetch),
+            _ => None,
+        }
+    }
+
     /// The words in `samples` (16 kHz mono, as [`read_all`] returns them).
     ///
     /// Called on the [`Transcriber`]'s thread. `progress` reports whole
@@ -238,9 +256,9 @@ fn whisper_run(
 ) -> Result<String, TranscribeError> {
     let name = model.file_name().unwrap_or_default().to_string_lossy();
     if !model.is_file() {
-        // Only reached when the job was not allowed to fetch it: under
-        // `$COACH_CUTS_WHISPER_MODEL`, or with no cache directory to put it
-        // in. So the coach is told where to get it by hand.
+        // Only reached when the job may not fetch it (see
+        // [`TranscribeKind::Whisper`]), so the coach is told where to get it
+        // by hand.
         //
         // **Only a model we ship has a URL.** The path is an escape hatch
         // (`$COACH_CUTS_WHISPER_MODEL`), so interpolating whatever file name
@@ -248,13 +266,13 @@ fn whisper_run(
         // 404 for a typo, a bare directory listing for a folder — and send
         // them looking for a download instead of at their own path.
         return Err(TranscribeError::Failed(
-            if WhisperModel::from_file_name(&name).is_some() {
-                format!(
-                    "no speech model at {}: download {MODEL_URL_PREFIX}{name} and save it there",
+            match WhisperModel::from_file_name(&name) {
+                Some(ours) => format!(
+                    "no speech model at {}: download {} and save it there",
                     model.display(),
-                )
-            } else {
-                format!("no speech model at {}", model.display())
+                    ours.url(),
+                ),
+                None => format!("no speech model at {}", model.display()),
             },
         ));
     }
@@ -521,8 +539,9 @@ impl Transcriber {
     /// Transcribes `recording` with `kind`.
     ///
     /// `on_message` is called on the transcription thread:
-    /// [`TranscribeMessage::Progress`] as the percent moves, then exactly one
-    /// [`TranscribeMessage::Finished`]. The sound is read **here**, not on
+    /// [`TranscribeMessage::Downloading`] while the model downloads, if it
+    /// must, then [`TranscribeMessage::Progress`] as the percent moves, then
+    /// exactly one [`TranscribeMessage::Finished`]. The sound is read **here**, not on
     /// the bus: a minute of commentary decodes in about a second, and the
     /// event loop has frames to deliver.
     pub fn start(
@@ -577,23 +596,17 @@ fn transcribe(
     cancel: &Arc<AtomicBool>,
     on_message: &mut impl FnMut(TranscribeMessage),
 ) -> Result<String, TranscribeError> {
-    if let TranscribeKind::Whisper {
-        model,
-        fetch: Some(fetch),
-    } = kind
-    {
-        if !model.is_file() {
-            download(
-                fetch,
-                model,
-                &mut |percent| on_message(TranscribeMessage::Downloading(percent)),
-                cancel,
-            )?;
-            // Whisper reports nothing until its percent moves off zero, which
-            // on a clip shorter than one chunk is never: this is what says
-            // the download is over.
-            on_message(TranscribeMessage::Progress(0));
-        }
+    if let (TranscribeKind::Whisper { model, .. }, Some(fetch)) = (kind, kind.will_download()) {
+        download(
+            fetch,
+            model,
+            &mut |percent| on_message(TranscribeMessage::Downloading(percent)),
+            cancel,
+        )?;
+        // Whisper reports nothing until its percent moves off zero, which on
+        // a clip shorter than one chunk is never: this is what says the
+        // download is over.
+        on_message(TranscribeMessage::Progress(0));
     }
     let samples = read_all(recording, cancel)?;
     kind.run(
@@ -774,7 +787,7 @@ mod tests {
                 "the message names no path: {message}"
             );
             assert!(
-                message.contains(&format!("{MODEL_URL_PREFIX}{}", model.file_name())),
+                message.contains(&model.url()),
                 "the message names no URL: {message}"
             );
         }
@@ -982,7 +995,7 @@ mod tests {
     /// which is as far as a test without a model can follow it.
     #[test]
     fn an_absent_model_is_downloaded_before_the_run() {
-        use crate::download::tests::{body, serve, Answer, BODY_SHA256};
+        use crate::fixtures::{serve, served_body, Answer, SERVED_SHA256};
 
         let dir = dir();
         let recording = fixtures::webm(dir.path(), "commentary.webm", 1, 160, 90, 25, 25);
@@ -992,9 +1005,9 @@ mod tests {
             TranscribeKind::Whisper {
                 model: model.clone(),
                 fetch: Some(Fetch {
-                    url: serve(Answer::Whole),
-                    sha256: BODY_SHA256.into(),
-                    bytes: body().len() as u64,
+                    url: serve(Answer::Whole, Duration::ZERO),
+                    sha256: SERVED_SHA256.into(),
+                    bytes: served_body().len() as u64,
                 }),
             },
         );
@@ -1016,7 +1029,7 @@ mod tests {
         };
         assert!(e.contains("could not load the speech model"), "{e}");
         assert!(
-            std::fs::read(&model).unwrap() == body(),
+            std::fs::read(&model).unwrap() == served_body(),
             "the model did not land"
         );
     }

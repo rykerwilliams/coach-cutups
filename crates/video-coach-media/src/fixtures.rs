@@ -1,5 +1,5 @@
-//! Synthetic media files for tests, and the one-entry compilation that drives
-//! an export of them.
+//! Synthetic media files for tests, the one-entry compilation that drives an
+//! export of them, and a local HTTP server for the model download.
 //!
 //! Every function writes into a directory the caller supplies, so the caller
 //! owns cleanup (normally a `tempfile::TempDir`) and this crate carries no
@@ -13,7 +13,10 @@
 //! `TIMEOUT`. A fixture that silently came out short would make every
 //! assertion built on it meaningless.
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -678,4 +681,80 @@ fn run_with(description: &str, path: &Path, setup: impl FnOnce(&gst::Pipeline)) 
         ),
         _ => panic!("fixture pipeline did not reach EOS within {TIMEOUT}\n{description}"),
     }
+}
+
+/// What [`serve`] sends: a body with no repeating pattern a short read could
+/// hide in.
+pub fn served_body() -> Vec<u8> {
+    (0..1_000_000u32).map(|i| (i % 251) as u8).collect()
+}
+
+/// [`served_body`]'s sha256, from `hashlib` and not from `glib`, so a hash the
+/// download computes wrongly can't agree with itself here.
+pub const SERVED_SHA256: &str = "2c030d49ec131bfbbb446ad21e7a2f12cdb4f2f4f3fda3ac709dd2e68a4646c7";
+
+/// What [`serve`] does with each request.
+#[derive(Debug, Clone, Copy)]
+pub enum Answer {
+    /// `200 OK` and the whole [`served_body`].
+    Whole,
+    /// `200 OK`, the headers and half the body — then nothing, with the
+    /// connection held open, as a transfer stalled mid-way.
+    Stall,
+    /// This status line and no body.
+    Status(&'static str),
+}
+
+/// A local HTTP server answering every request with `answer`, `delay` after
+/// reading it, and the URL of a file on it: the model downloader's tests, and
+/// the transcriber's. **No test touches Hugging Face.**
+///
+/// It lives as long as the test binary: nothing joins it, and a stalled
+/// connection's thread just sleeps.
+pub fn serve(answer: Answer, delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+    let url = format!(
+        "http://{}/ggml-test.bin",
+        listener
+            .local_addr()
+            .expect("a bound listener has an address")
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || respond(stream, answer, delay));
+        }
+    });
+    url
+}
+
+fn respond(mut stream: TcpStream, answer: Answer, delay: Duration) {
+    // The request's headers, whole, before any answer: a reply to half a
+    // request is a reset libsoup reports as something else entirely.
+    let mut request = Vec::new();
+    let mut byte = [0; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => request.push(byte[0]),
+            _ => return,
+        }
+    }
+    std::thread::sleep(delay);
+    let body = served_body();
+    let head = |status: &str, len: usize| {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+    };
+    let _ = match answer {
+        Answer::Whole => stream
+            .write_all(head("200 OK", body.len()).as_bytes())
+            .and_then(|()| stream.write_all(&body)),
+        Answer::Stall => {
+            let _ = stream
+                .write_all(head("200 OK", body.len()).as_bytes())
+                .and_then(|()| stream.write_all(&body[..body.len() / 2]))
+                .and_then(|()| stream.flush());
+            std::thread::sleep(Duration::from_secs(600));
+            Ok(())
+        }
+        Answer::Status(status) => stream.write_all(head(status, 0).as_bytes()),
+    };
 }

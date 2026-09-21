@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use video_coach_app::bus::{
     export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command, Event,
-    ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, StateFile, TargetState,
+    ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile, TargetState,
     TranscriptionState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
@@ -43,8 +43,7 @@ use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{
-    list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, TranscribeKind,
-    WhisperModel,
+    list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, WhisperModel,
 };
 
 use pickers::{Pick, Pickers};
@@ -116,8 +115,8 @@ struct UiState {
 struct Transcription {
     /// The queue, the job running and how the last one ended, whole.
     state: TranscriptionState,
-    /// When this UI first saw `state.running`'s clip running — or, after a
-    /// download, saw the download end, so the clock is whisper's alone.
+    /// When this UI first saw `state.running`'s clip at its current kind of
+    /// [`Stage`] — so after a download, the clock is whisper's alone.
     ///
     /// The one genuinely window-local field: the inspector's readout is this
     /// clock, not the percent, because whisper's progress callback fires at
@@ -1266,12 +1265,14 @@ fn on_event(w: &AppWindow, event: Event) {
         // reconstruct it could only ever guess.
         Event::Transcription(state) => UI.with_borrow_mut(|ui| {
             let t = &mut ui.transcription;
-            // A different clip restarts the clock, and so does the end of a
-            // download — the clock says how long *transcribing* has taken;
-            // the same one reporting a new percent keeps it.
-            if t.state.running_clip() != state.running_clip()
-                || (t.state.downloading.is_some() && state.downloading.is_none())
-            {
+            // A different clip restarts the clock, and so does a different
+            // kind of stage — the clock says how long *transcribing* has
+            // taken; the same one reporting a new percent keeps it.
+            let kind = |s: &TranscriptionState| {
+                s.running
+                    .map(|(id, stage)| (id, matches!(stage, Stage::Downloading(_))))
+            };
+            if kind(&t.state) != kind(&state) {
                 t.since = state.running.is_some().then(Instant::now);
             }
             t.state = state;
@@ -1543,23 +1544,17 @@ fn show_transcription(w: &AppWindow, ui: &UiState) {
 /// finishing, or the coach deleting the file, changes the answer, and a
 /// `stat` costs nothing beside the redraw.
 fn transcribe_download(w: &AppWindow) -> String {
-    let chosen = usize::try_from(w.get_transcript_model())
+    // Under `$COACH_CUTS_WHISPER_MODEL` the picker's one row stands for no
+    // choice at all, and `whisper` downloads nothing there anyway.
+    usize::try_from(w.get_transcript_model())
         .ok()
-        .and_then(|i| WhisperModel::ALL.get(i).copied());
-    match chosen.map(|m| (m, whisper(m))) {
-        // `whisper` gives no `fetch` under `$COACH_CUTS_WHISPER_MODEL`, which
-        // is also when the picker's one row stands for no choice at all.
-        Some((
-            m,
-            TranscribeKind::Whisper {
-                model,
-                fetch: Some(_),
-            },
-        )) if !model.is_file() => {
-            format!("Download {:.0} MB and transcribe", m.bytes() as f64 / 1e6)
-        }
-        _ => String::new(),
-    }
+        .and_then(|i| WhisperModel::ALL.get(i).copied())
+        .and_then(|m| {
+            whisper(m)
+                .will_download()
+                .map(|fetch| format!("Download {:.0} MB and transcribe", fetch.bytes as f64 / 1e6))
+        })
+        .unwrap_or_default()
 }
 
 /// What the inspector says about `clip`'s transcription.
@@ -1578,17 +1573,12 @@ fn transcribe_download(w: &AppWindow) -> String {
 /// **A download says so, with its percent and no clock:** unlike whisper's,
 /// its percent is honest, and the whisper clock starts when it ends.
 fn transcript_row(t: &Transcription, clip: &Clip) -> (TranscriptState, String) {
-    if let Some((_, percent)) = t.state.running.filter(|(id, _)| *id == clip.id) {
-        if let Some(done) = t.state.downloading {
-            return (
-                TranscriptState::Running,
-                format!("Downloading the speech model… {done}%"),
-            );
-        }
-        let elapsed = format_hms(t.since.map_or(0.0, |at| at.elapsed().as_secs_f64()));
-        let line = match percent {
-            0 => format!("Transcribing… {elapsed}"),
-            p => format!("Transcribing… {elapsed} · {p}%"),
+    if let Some((_, stage)) = t.state.running.filter(|(id, _)| *id == clip.id) {
+        let elapsed = || format_hms(t.since.map_or(0.0, |at| at.elapsed().as_secs_f64()));
+        let line = match stage {
+            Stage::Downloading(done) => format!("Downloading the speech model… {done}%"),
+            Stage::Transcribing(0) => format!("Transcribing… {}", elapsed()),
+            Stage::Transcribing(p) => format!("Transcribing… {} · {p}%", elapsed()),
         };
         return (TranscriptState::Running, line);
     }

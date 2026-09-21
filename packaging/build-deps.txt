@@ -1,0 +1,38 @@
+# The Ubuntu 24.04 packages that build, test and package the workspace: the
+# one list, read by both CI workflows and pointed at by the README. Install
+# them with
+#
+#   sudo apt install $(grep -o '^[^#]*' packaging/build-deps.txt)
+#
+# The .deb's own run-time Depends is a different list, in
+# crates/video-coach-app/Cargo.toml's [package.metadata.deb].
+
+# GStreamer: headers, and the plugin sets the code and the test fixtures use.
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-plugins-ugly
+gstreamer1.0-gl
+gstreamer1.0-pipewire
+# For `avenc_aac`, which is rank none and has no alternative. Also brings
+# `avdec_h264` (rank 256), which outranks `openh264dec` and so keeps CI's
+# decoder the dev machine's.
+gstreamer1.0-libav
+
+# Slint's UI.
+libfontconfig1-dev
+libfreetype-dev
+libxkbcommon-dev
+libegl-dev
+libgl-dev
+
+# whisper.cpp, which `whisper-rs` vendors and `video-coach-media` depends on
+# unconditionally (Phase 10 spec S1).
+cmake
+libclang-dev
+
+# The .deb: cargo-deb's `$auto` Depends is dpkg-shlibdeps, and without it
+# cargo-deb only warns.
+dpkg-dev

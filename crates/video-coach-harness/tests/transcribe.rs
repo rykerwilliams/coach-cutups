@@ -9,22 +9,21 @@
 //! Layout per test: `<tmp>/config` holds the state file, `<tmp>/project` the
 //! project and its `recordings/`, `<tmp>/media` the fixture game videos.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{
-    CaptureKind, Command, Event, Finish, RecordingStatus, StateFile, TranscriptionState,
+    CaptureKind, Command, Event, Finish, RecordingStatus, Stage, StateFile, TranscriptionState,
 };
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{clip, write_project, Harness};
-use video_coach_media::{fixtures, Fetch, TranscribeKind, WhisperModel};
+use video_coach_media::fixtures::{self, serve, served_body, Answer, SERVED_SHA256};
+use video_coach_media::{Fetch, TranscribeKind, WhisperModel};
 
 /// What the test transcriber says.
 const WORDS: &str = "he has to shoot there";
@@ -586,10 +585,12 @@ fn the_chosen_model_is_remembered_for_the_machine() {
     assert_eq!(state.last_project().as_deref(), Some(rig.folder.as_path()));
 }
 
-/// **Switching mid-queue never touches the job in flight.** Cancelling a
+/// **Switching mid-queue never touches a job transcribing.** Cancelling a
 /// whisper run costs about twelve seconds of CPU for nothing — it reads its
 /// abort flag once per encode and once per decode pass — and the coach asked
-/// for a different model *next*, not for this run to be thrown away.
+/// for a different model *next*, not for this run to be thrown away. (A job
+/// still *downloading* is another matter: see
+/// [`changing_the_model_mid_download_restarts_it_with_the_new_one`].)
 #[test]
 fn changing_the_model_leaves_the_running_job_alone() {
     let mut rig = Rig::open(2, SLOW);
@@ -611,25 +612,27 @@ fn changing_the_model_leaves_the_running_job_alone() {
     rig.h.shutdown();
 }
 
-/// ... and the job **started after** the change runs the model just picked.
+/// **A switch moves only a path that is ours** — one the job may download
+/// to (see `TranscribeKind::Whisper`). With no `fetch`, the path is a file the
+/// coach chose (`$COACH_CUTS_WHISPER_MODEL`), and the next job still looks
+/// for exactly that file even when it is named as ours are: its sibling was
+/// never downloaded, and nothing will download it.
 ///
 /// On the whisper transcriber, with no model file anywhere near it: a model
-/// that isn't downloaded is the ordinary `Failed`, and that message names the
-/// exact file it looked for. Which is the point — the failure has to name the
-/// model the coach has just chosen, and offer the URL for it.
-///
-/// **And a job with no `fetch` never downloads** (Phase 11 spec S3), not
-/// before the switch and not after it: the file is named as ours are, so a
-/// rule that read permission off the path — or a switch that handed out a
-/// `fetch` the job never had — would pull 148 MB from Hugging Face on CI.
+/// that isn't there is the ordinary `Failed`, whose message names the exact
+/// file it looked for. **And a job with no `fetch` never downloads**, not
+/// before the switch and not after it: a rule that read permission off the
+/// path — or a switch that handed out a `fetch` the job never had — would
+/// pull 148 MB from Hugging Face on CI.
 #[test]
-fn a_new_job_runs_the_model_just_picked() {
+fn a_switch_leaves_a_model_that_is_not_ours_alone() {
     let models = tempfile::tempdir().unwrap();
+    let chosen = models.path().join(WhisperModel::Small.file_name());
     let mut rig = Rig::open_with(
         1,
         SLOW_CAMERA,
         TranscribeKind::Whisper {
-            model: models.path().join(WhisperModel::Small.file_name()),
+            model: chosen.clone(),
             fetch: None,
         },
     );
@@ -637,30 +640,29 @@ fn a_new_job_runs_the_model_just_picked() {
     rig.transcribe(0);
     let first = rig.wait("the first failure", |t, _| t.finished.is_some());
     assert!(
-        failure(&first).contains(WhisperModel::Small.file_name()),
+        failure(&first).contains(&chosen.display().to_string()),
         "{:?}",
         first.finished
     );
 
     rig.h.send(Command::SetTranscribeModel(WhisperModel::Base));
     rig.transcribe(0);
-    let second = rig.wait("the second failure", |t, _| {
-        matches!(&t.finished, Some((_, Finish::Failed(m)))
-            if m.contains(WhisperModel::Base.file_name()))
-    });
+    rig.wait("the retry under way", |t, _| t.finished.is_none());
+    let second = rig.wait("the second failure", |t, _| t.finished.is_some());
     let message = failure(&second);
-    // The other model, beside the first: the directory is the one the app
-    // resolved at start-up, and only the file name follows the picker.
-    let wanted = models.path().join(WhisperModel::Base.file_name());
-    assert!(message.contains(&wanted.display().to_string()), "{message}");
-    // And it is one of ours, so it comes with somewhere to get it.
+    assert!(
+        message.contains(&chosen.display().to_string())
+            && !message.contains(WhisperModel::Base.file_name()),
+        "the switch moved the coach's own file: {message}"
+    );
+    // It is named as ours are, so it comes with somewhere to get it by hand.
     assert!(message.contains("https://huggingface.co/"), "{message}");
     assert_eq!(rig.saved_transcript(0), "", "no words were written");
 
     let mut log = rig.h.log().to_vec();
     log.extend(rig.h.shutdown());
     assert!(
-        states(&log).iter().all(|t| t.downloading.is_none()),
+        states(&log).iter().all(|t| downloading(t).is_none()),
         "a job with no fetch downloaded"
     );
     let left: Vec<_> = std::fs::read_dir(models.path())
@@ -673,44 +675,26 @@ fn a_new_job_runs_the_model_just_picked() {
     );
 }
 
-/// An HTTP server answering every request with `response`, `delay` after
-/// reading it, and the URL of a model on it. **No test touches Hugging
-/// Face.**
-fn serve(delay: Duration, response: Vec<u8>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!(
-        "http://{}/ggml-small.en.bin",
-        listener.local_addr().unwrap()
-    );
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let response = response.clone();
-            std::thread::spawn(move || {
-                let mut request = Vec::new();
-                let mut byte = [0; 1];
-                while !request.ends_with(b"\r\n\r\n") {
-                    match stream.read(&mut byte) {
-                        Ok(1) => request.push(byte[0]),
-                        _ => return,
-                    }
-                }
-                std::thread::sleep(delay);
-                let _ = stream.write_all(&response);
-            });
-        }
-    });
-    url
+/// How far the running job's download has got, if it is downloading.
+fn downloading(t: &TranscriptionState) -> Option<u8> {
+    match t.running {
+        Some((_, Stage::Downloading(percent))) => Some(percent),
+        _ => None,
+    }
 }
 
 /// A whisper transcriber for the model at `<models>/ggml-small.en.bin`,
-/// which isn't there, allowed to fetch it from `url`.
-fn fetching(models: &Path, url: String, sha256: &str, bytes: u64) -> TranscribeKind {
+/// which isn't there, allowed to fetch it from a local server that answers
+/// `answer` a second after each request — late enough that a second clip is
+/// certainly queued behind the first while it downloads. **No test touches
+/// Hugging Face.**
+fn fetching(models: &Path, answer: Answer) -> TranscribeKind {
     TranscribeKind::Whisper {
         model: models.join(WhisperModel::Small.file_name()),
         fetch: Some(Fetch {
-            url,
-            sha256: sha256.into(),
-            bytes,
+            url: serve(answer, Duration::from_millis(1_000)),
+            sha256: SERVED_SHA256.into(),
+            bytes: served_body().len() as u64,
         }),
     }
 }
@@ -722,27 +706,22 @@ fn fetching(models: &Path, url: String, sha256: &str, bytes: u64) -> TranscribeK
 #[test]
 fn a_failed_download_drops_the_queue() {
     let models = tempfile::tempdir().unwrap();
-    // Late enough that the second clip is certainly queued behind the first.
-    let url = serve(
-        Duration::from_millis(1_000),
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
-    );
     let mut rig = Rig::open_with(
         2,
         SLOW_CAMERA,
-        fetching(models.path(), url, &"0".repeat(64), 1_000),
+        fetching(models.path(), Answer::Status("404 Not Found")),
     );
     rig.transcribe(0);
     rig.transcribe(1);
     rig.wait("clip 0 downloading, clip 1 waiting", |t, id| {
-        t.running_clip() == Some(id[0]) && t.downloading.is_some() && t.queued == [id[1]]
+        t.running_clip() == Some(id[0]) && downloading(t).is_some() && t.queued == [id[1]]
     });
 
     let after = rig.wait("the failure", |t, _| t.finished.is_some());
     assert_eq!(after.finished.as_ref().map(|(c, _)| *c), Some(rig.id(0)));
     assert!(failure(&after).contains("could not download"), "{after:?}");
     assert!(
-        after.queued.is_empty() && after.running.is_none() && after.downloading.is_none(),
+        after.queued.is_empty() && after.running.is_none(),
         "the queue outlived the download: {after:?}"
     );
     let first = rig.id(0);
@@ -751,31 +730,22 @@ fn a_failed_download_drops_the_queue() {
     assert_eq!(runs(&log), [first], "clip 1 ran");
 }
 
-/// A download that **succeeds** hands over to whisper: the `downloading`
-/// state ends, and a failure after it — here, whisper refusing a "model"
-/// that is a sentence — is an ordinary failure that leaves the queue alone.
-/// The next clip then finds the file already there, and downloads nothing.
+/// A download that **succeeds** hands over to whisper: the download stage
+/// ends, and a failure after it — here, whisper refusing a "model" that is
+/// the test server's body — is an ordinary failure that leaves the queue
+/// alone. The next clip then finds the file already there, and downloads
+/// nothing.
 #[test]
 fn a_finished_download_hands_the_job_to_whisper() {
-    const MODEL: &[u8] = b"this is not a speech model";
-    const MODEL_SHA256: &str = "50deac7ae7a3e51baccfb5e55164061e0eeaf698929724eac6b46d9d076cd9e2";
     let models = tempfile::tempdir().unwrap();
-    let mut response =
-        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MODEL.len()).into_bytes();
-    response.extend_from_slice(MODEL);
-    let url = serve(Duration::from_millis(1_000), response);
-    let mut rig = Rig::open_with(
-        2,
-        SLOW_CAMERA,
-        fetching(models.path(), url, MODEL_SHA256, MODEL.len() as u64),
-    );
+    let mut rig = Rig::open_with(2, SLOW_CAMERA, fetching(models.path(), Answer::Whole));
     rig.transcribe(0);
     rig.transcribe(1);
     rig.wait("clip 0 downloading, clip 1 waiting", |t, id| {
-        t.running_clip() == Some(id[0]) && t.downloading.is_some() && t.queued == [id[1]]
+        t.running_clip() == Some(id[0]) && downloading(t).is_some() && t.queued == [id[1]]
     });
     rig.wait("the download over, clip 0 still running", |t, id| {
-        t.running_clip() == Some(id[0]) && t.downloading.is_none()
+        t.running_clip() == Some(id[0]) && downloading(t).is_none()
     });
     let last = rig.wait(
         "clip 1's failure",
@@ -784,7 +754,7 @@ fn a_finished_download_hands_the_job_to_whisper() {
     assert!(failure(&last).contains("could not load"), "{last:?}");
     assert_eq!(
         std::fs::read(models.path().join(WhisperModel::Small.file_name())).unwrap(),
-        MODEL
+        served_body()
     );
 
     let ids = [rig.id(0), rig.id(1)];
@@ -794,7 +764,7 @@ fn a_finished_download_hands_the_job_to_whisper() {
     assert!(
         states(&log)
             .iter()
-            .all(|t| t.downloading.is_none() || t.running_clip() == Some(ids[0])),
+            .all(|t| downloading(t).is_none() || t.running_clip() == Some(ids[0])),
         "clip 1 downloaded a model that was already there"
     );
 }
@@ -805,4 +775,34 @@ fn failure(t: &TranscriptionState) -> String {
         Some((_, Finish::Failed(message))) => message.clone(),
         other => panic!("a failure, not {other:?}"),
     }
+}
+
+/// **A job still downloading is preempted by a model switch**, and restarts
+/// on the model just picked. A download stops within a tenth of a second, so
+/// the twelve-second whisper cancel that keeps a *transcribing* job alone
+/// doesn't apply — and left alone, the job would fetch up to 488 MB of the
+/// model the coach just turned down.
+///
+/// The server stalls every transfer half way, so the only way to the new
+/// model's `.part` is a restart.
+#[test]
+fn changing_the_model_mid_download_restarts_it_with_the_new_one() {
+    let models = tempfile::tempdir().unwrap();
+    let mut rig = Rig::open_with(1, SLOW_CAMERA, fetching(models.path(), Answer::Stall));
+    rig.transcribe(0);
+    rig.wait("clip 0 downloading", |t, id| {
+        t.running_clip() == Some(id[0]) && downloading(t).is_some()
+    });
+
+    rig.h.send(Command::SetTranscribeModel(WhisperModel::Base));
+    rig.wait("clip 0 preempted", |t, id| {
+        t.running.is_none() && t.queued == [id[0]]
+    });
+    // Half the body is in the new `.part`, so the restart has opened it.
+    rig.wait("clip 0 downloading again, half way", |t, id| {
+        t.running_clip() == Some(id[0]) && downloading(t).is_some_and(|p| p >= 40)
+    });
+    let part = models.path().join("ggml-base.en.bin.part");
+    assert!(part.is_file(), "the restart did not fetch the new model");
+    rig.h.shutdown();
 }

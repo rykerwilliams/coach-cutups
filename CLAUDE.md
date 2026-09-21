@@ -90,16 +90,16 @@ on the laptop); the explicit `GGML_*=ON` flags are what survive
 `SOURCE_DATE_EPOCH`, which otherwise switches off *all* SIMD. **After changing
 any `GGML_*`, run `cargo clean -p whisper-rs-sys` and again with `--release`**
 — cargo does not rerun the build script when `[env]` changes, and each clean
-removes one profile's copy only. Check it took: every
-`target/*/build/whisper-rs-sys-*/output` should read `ggml-cpu: -msse4.2;…;-mavx2`,
-never `-march=native`.
+removes one profile's copy only. `packaging/build-deb.sh` checks the release
+build it packaged and fails on anything but `-mavx2` without `-march=native`.
 
 **Which model runs is the coach's, machine-wide.** The inspector's transcript
 row has a picker (`base.en` / `small.en`, default `small.en`), remembered in
 `state.json` and never in `project.json` — a `Preferences` field would be a
 format change every existing project fails `store::read`'s version guard on.
-Switching models leaves the job in flight alone (a whisper cancel costs ~12 s
-of CPU); the queue behind it picks the new one up. `$COACH_CUTS_WHISPER_MODEL`
+Switching models leaves a job *transcribing* alone (a whisper cancel costs
+~12 s of CPU) but preempts one still *downloading* (that stops within 100 ms),
+which restarts on the new model; the queue behind it picks the new one up. `$COACH_CUTS_WHISPER_MODEL`
 still beats the picker, which says so by going grey and showing the file that
 variable names. `WhisperModel` in `video-coach-media/src/transcribe.rs`
 carries each model's file name, size and **measured** sha256.
@@ -109,14 +109,14 @@ lives in `$XDG_CACHE_HOME/coach-cuts/models/`; a job whose model is absent
 downloads it first (`souphttpsrc ! filesink` to a `.part`, glib's sha256 of
 the file, rename), as `TranscribeMessage::Downloading` and its own
 inspector line. **Permission is `TranscribeKind::Whisper`'s `fetch`, never
-the path:** `bus::whisper` sets it only under the cache directory, never
-under `$COACH_CUTS_WHISPER_MODEL`, and tests that point at a missing
-`ggml-*.bin` pass `None` — **no test may reach Hugging Face**; serve from a
-local `TcpListener`. The URL is pinned to a Hugging Face commit, not `main`.
+the path** (the reasoning lives on that variant): `bus::whisper` sets it only
+under the cache directory, and a model switch moves only a path that has one.
+**No test may reach Hugging Face** — serve from `video_coach_media::fixtures::serve`.
+The URL is pinned to a Hugging Face commit, not `main`.
 The Transcribe button is the prompt ("Download 488 MB and transcribe"). A
-cancel leaves the `.part` (the transcriber is never joined, so a delete could
-hit the next job's file); a bad hash deletes it; a failed download drops the
-queue behind it.
+cancel leaves the `.part`; every other failure deletes it; a failed download
+drops the queue behind it. Downloads take turns process-wide, so a cancelled
+one can't rename a `.part` its successor is writing.
 
 **Transcription is asked for, never automatic.** `AUTO_TRANSCRIBE` in
 `bus/transcribe.rs` is `false`: a preempted job restarts from zero, so a coach
@@ -203,18 +203,21 @@ packaging/smoke-test.sh target/debian/coach-cuts_<version>_amd64.deb
   checks the libc floor, installs without Recommends, looks up every software-path
   element, and launches the app under Xvfb. A new element the code names goes in
   its list.
+- **Build dependencies are one list**, `packaging/build-deps.txt`, read by both
+  workflows and the README.
 - **Releasing:** bump `version` in the root `Cargo.toml`'s `[workspace.package]`,
   commit, then `git tag v<version> && git push origin v<version>`.
   `.github/workflows/release.yml` fails a tag that isn't `v` + that version, gates
-  on fmt/clippy/tests, builds on `ubuntu-24.04` (the libc floor), asserts whisper's
-  `-mavx2`, smoke-tests, and attaches the `.deb` to a GitHub Release. To check the
+  on `rust.yml` (called whole, via `workflow_call`), builds on `ubuntu-24.04` (the
+  libc floor) with `build-deb.sh` (which asserts whisper's `-mavx2`), smoke-tests,
+  and attaches the `.deb` to a GitHub Release. To check the
   pipeline without releasing, `gh workflow run release.yml --ref <branch>` runs
   everything and publishes nothing but a workflow artifact — **but only once
   `release.yml` exists on the default branch**; GitHub refuses to dispatch it
   otherwise (`HTTP 404: workflow … not found on the default branch`). Until then,
   a temporary `push: branches: [<branch>]` trigger does the same job; the release
-  job requires a tag ref, so a branch run cannot publish. It uses no build cache
-  on purpose (a cached whisper build can outlive an `[env]` change).
+  job requires a tag ref, so a branch run cannot publish. The `package` job uses
+  no build cache on purpose (a cached whisper build can outlive an `[env]` change).
 
 **Crate layout:**
 

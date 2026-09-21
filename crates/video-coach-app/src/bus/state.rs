@@ -149,8 +149,8 @@ fn config_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> 
 }
 
 /// `$XDG_CACHE_HOME`, else `~/.cache`: where the whisper models are looked
-/// for (Phase 10 spec S3). Hundreds of megabytes of downloaded weights are a
-/// cache, not configuration, and nothing is stored there by this app.
+/// for and downloaded to (Phase 10 spec S3, Phase 11 S3). Hundreds of
+/// megabytes of downloaded weights are a cache, not configuration.
 pub(super) fn cache_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     base_dir(xdg, home, ".cache")
 }

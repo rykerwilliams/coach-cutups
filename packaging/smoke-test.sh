@@ -31,7 +31,7 @@ deb=$2
 export DEBIAN_FRONTEND=noninteractive
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf '\nSMOKE TEST FAILED: %s\n' "$*" >&2; exit 1; }
-install() {
+apt_install() {
     apt-get install -y -qq --no-install-recommends "$@" >/dev/null ||
         fail "apt could not install: $*"
 }
@@ -44,12 +44,12 @@ echo "$depends"
 
 step "2. apt installs the package and its dependencies"
 apt-get update -qq
-install "$deb"
+apt_install "$deb"
 dpkg -s coach-cuts | grep -E '^(Package|Version|Status):'
 
 step "3. Every software-path element exists"
 # gst-inspect-1.0 is for this check only: nothing in Depends pulls it.
-install gstreamer1.0-tools
+apt_install gstreamer1.0-tools
 # The elements the code names, found by grepping crates/*/src and keeping
 # what gst-inspect-1.0 knows. Left out: the VA elements (vah264lpenc,
 # vajpegdec), absent without /dev/dri and checked by hand; the test sources
@@ -74,7 +74,7 @@ done
 echo "all ${#elements[@]} present"
 
 step "4. The app launches, stays up and creates a project"
-install xvfb xauth libgl1-mesa-dri libegl-mesa0
+apt_install xvfb xauth libgl1-mesa-dri libegl-mesa0
 project=$(mktemp -d)
 config=$(mktemp -d)
 log=$(mktemp)
