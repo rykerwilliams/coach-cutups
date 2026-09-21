@@ -23,9 +23,9 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    export_targets, whisper_model_override, whisper_model_path, Bus, BusHandle, CaptureKind,
-    Command, Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, StateFile,
-    TargetState, TranscriptionState,
+    export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command, Event,
+    ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, StateFile, TargetState,
+    TranscriptionState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
@@ -116,7 +116,8 @@ struct UiState {
 struct Transcription {
     /// The queue, the job running and how the last one ended, whole.
     state: TranscriptionState,
-    /// When this UI first saw `state.running`'s clip running.
+    /// When this UI first saw `state.running`'s clip running — or, after a
+    /// download, saw the download end, so the clock is whisper's alone.
     ///
     /// The one genuinely window-local field: the inspector's readout is this
     /// clock, not the percent, because whisper's progress callback fires at
@@ -179,13 +180,11 @@ fn main() {
     let bus = Bus::spawn(
         SinkKind::Gl,
         CaptureKind::Devices,
-        // The model is found, never fetched (Phase 10 spec S3): a missing one
-        // fails the job with a message naming this path and the URL to put
-        // there. Which model the coach picked is remembered in `state`, and
-        // the bus rewrites this when they pick another.
-        TranscribeKind::Whisper {
-            model: whisper_model_path(model),
-        },
+        // Downloaded into the cache on first use (Phase 11 spec S3), unless
+        // `$COACH_CUTS_WHISPER_MODEL` names a file of the coach's own. Which
+        // model the coach picked is remembered in `state`, and the bus
+        // rewrites this when they pick another.
+        whisper(model),
         state,
         Box::new(move |event| {
             let _ = weak.upgrade_in_event_loop(move |w| on_event(&w, event));
@@ -801,6 +800,7 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
     window.on_set_transcribe_model({
         let bus = bus.clone();
+        let weak = window.as_weak();
         move |index| {
             // The picker's rows are `WhisperModel::ALL`, in its order; under
             // `$COACH_CUTS_WHISPER_MODEL` it is disabled and holds one row
@@ -813,6 +813,10 @@ fn wire_inspector(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                 return;
             };
             bus.borrow().send(Command::SetTranscribeModel(model));
+            // The button names the download, and this one may not need it.
+            if let Some(w) = weak.upgrade() {
+                UI.with_borrow(|ui| show_transcription(&w, ui));
+            }
         }
     });
     window.on_suggest_tags(|text| {
@@ -1262,9 +1266,12 @@ fn on_event(w: &AppWindow, event: Event) {
         // reconstruct it could only ever guess.
         Event::Transcription(state) => UI.with_borrow_mut(|ui| {
             let t = &mut ui.transcription;
-            // A different clip restarts the clock; the same one reporting a
-            // new percent keeps it.
-            if t.state.running_clip() != state.running_clip() {
+            // A different clip restarts the clock, and so does the end of a
+            // download — the clock says how long *transcribing* has taken;
+            // the same one reporting a new percent keeps it.
+            if t.state.running_clip() != state.running_clip()
+                || (t.state.downloading.is_some() && state.downloading.is_none())
+            {
                 t.since = state.running.is_some().then(Instant::now);
             }
             t.state = state;
@@ -1506,8 +1513,10 @@ fn override_name(path: &Path) -> SharedString {
     }
 }
 
-/// The transcript row's state and its line, for the selected clip (spec S5).
+/// The transcript row's state, its line and its button, for the selected
+/// clip (spec S5).
 fn show_transcription(w: &AppWindow, ui: &UiState) {
+    w.set_transcribe_download(transcribe_download(w).into());
     let selected = selected_id(w);
     let (state, status) = ui
         .snapshot
@@ -1519,6 +1528,38 @@ fn show_transcription(w: &AppWindow, ui: &UiState) {
         );
     w.set_transcript_state(state);
     w.set_transcript_status(status.into());
+}
+
+/// What the Transcribe button says instead, when the chosen model isn't on
+/// disk and is ours to download; empty when it is just "Transcribe" (Phase
+/// 11 spec S3).
+///
+/// **The button is the prompt.** It names the download's size, and pressing
+/// it is the consent. A confirmation dialog would be the app's first
+/// two-button modal, inside the Esc cascade, to ask a question the button
+/// can ask itself. **The model's name is left to the picker above it:** the
+/// column is 280 px, and "Download small.en (488 MB) and transcribe" does not
+/// fit in it. Looked at on every refresh rather than remembered: a download
+/// finishing, or the coach deleting the file, changes the answer, and a
+/// `stat` costs nothing beside the redraw.
+fn transcribe_download(w: &AppWindow) -> String {
+    let chosen = usize::try_from(w.get_transcript_model())
+        .ok()
+        .and_then(|i| WhisperModel::ALL.get(i).copied());
+    match chosen.map(|m| (m, whisper(m))) {
+        // `whisper` gives no `fetch` under `$COACH_CUTS_WHISPER_MODEL`, which
+        // is also when the picker's one row stands for no choice at all.
+        Some((
+            m,
+            TranscribeKind::Whisper {
+                model,
+                fetch: Some(_),
+            },
+        )) if !model.is_file() => {
+            format!("Download {:.0} MB and transcribe", m.bytes() as f64 / 1e6)
+        }
+        _ => String::new(),
+    }
 }
 
 /// What the inspector says about `clip`'s transcription.
@@ -1533,8 +1574,17 @@ fn show_transcription(w: &AppWindow, ui: &UiState) {
 /// never transcribed (spec S4) and whisper returns no segments at all over
 /// silence, so an empty result would otherwise leave the inspector looking
 /// exactly as it did before the coach pressed the button.
+///
+/// **A download says so, with its percent and no clock:** unlike whisper's,
+/// its percent is honest, and the whisper clock starts when it ends.
 fn transcript_row(t: &Transcription, clip: &Clip) -> (TranscriptState, String) {
     if let Some((_, percent)) = t.state.running.filter(|(id, _)| *id == clip.id) {
+        if let Some(done) = t.state.downloading {
+            return (
+                TranscriptState::Running,
+                format!("Downloading the speech model… {done}%"),
+            );
+        }
         let elapsed = format_hms(t.since.map_or(0.0, |at| at.elapsed().as_secs_f64()));
         let line = match percent {
             0 => format!("Transcribing… {elapsed}"),

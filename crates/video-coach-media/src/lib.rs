@@ -6,6 +6,7 @@
 
 pub mod capture;
 pub mod composite;
+mod download;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod mailbox;
@@ -23,6 +24,7 @@ pub use composite::export::{
 };
 pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
 pub use composite::Gl;
+pub use download::{download, Fetch};
 pub use mailbox::{Frame, FrameMailbox};
 pub use player::{Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer};
 pub use probe::{probe, Probe, ProbeError};

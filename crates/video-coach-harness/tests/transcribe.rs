@@ -9,6 +9,8 @@
 //! Layout per test: `<tmp>/config` holds the state file, `<tmp>/project` the
 //! project and its `recordings/`, `<tmp>/media` the fixture game videos.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use video_coach_core::store;
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::Zoom;
 use video_coach_harness::{clip, write_project, Harness};
-use video_coach_media::{fixtures, TranscribeKind, WhisperModel};
+use video_coach_media::{fixtures, Fetch, TranscribeKind, WhisperModel};
 
 /// What the test transcriber says.
 const WORDS: &str = "he has to shoot there";
@@ -615,6 +617,11 @@ fn changing_the_model_leaves_the_running_job_alone() {
 /// that isn't downloaded is the ordinary `Failed`, and that message names the
 /// exact file it looked for. Which is the point — the failure has to name the
 /// model the coach has just chosen, and offer the URL for it.
+///
+/// **And a job with no `fetch` never downloads** (Phase 11 spec S3), not
+/// before the switch and not after it: the file is named as ours are, so a
+/// rule that read permission off the path — or a switch that handed out a
+/// `fetch` the job never had — would pull 148 MB from Hugging Face on CI.
 #[test]
 fn a_new_job_runs_the_model_just_picked() {
     let models = tempfile::tempdir().unwrap();
@@ -623,6 +630,7 @@ fn a_new_job_runs_the_model_just_picked() {
         SLOW_CAMERA,
         TranscribeKind::Whisper {
             model: models.path().join(WhisperModel::Small.file_name()),
+            fetch: None,
         },
     );
 
@@ -648,7 +656,147 @@ fn a_new_job_runs_the_model_just_picked() {
     // And it is one of ours, so it comes with somewhere to get it.
     assert!(message.contains("https://huggingface.co/"), "{message}");
     assert_eq!(rig.saved_transcript(0), "", "no words were written");
-    rig.h.shutdown();
+
+    let mut log = rig.h.log().to_vec();
+    log.extend(rig.h.shutdown());
+    assert!(
+        states(&log).iter().all(|t| t.downloading.is_none()),
+        "a job with no fetch downloaded"
+    );
+    let left: Vec<_> = std::fs::read_dir(models.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the models directory was written to: {left:?}"
+    );
+}
+
+/// An HTTP server answering every request with `response`, `delay` after
+/// reading it, and the URL of a model on it. **No test touches Hugging
+/// Face.**
+fn serve(delay: Duration, response: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/ggml-small.en.bin",
+        listener.local_addr().unwrap()
+    );
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let response = response.clone();
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => request.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                std::thread::sleep(delay);
+                let _ = stream.write_all(&response);
+            });
+        }
+    });
+    url
+}
+
+/// A whisper transcriber for the model at `<models>/ggml-small.en.bin`,
+/// which isn't there, allowed to fetch it from `url`.
+fn fetching(models: &Path, url: String, sha256: &str, bytes: u64) -> TranscribeKind {
+    TranscribeKind::Whisper {
+        model: models.join(WhisperModel::Small.file_name()),
+        fetch: Some(Fetch {
+            url,
+            sha256: sha256.into(),
+            bytes,
+        }),
+    }
+}
+
+/// **A failed download drops the queue behind it** (Phase 11 spec S3): the
+/// next clip would fail the same way — offline at the field, or another
+/// 488 MB after a bad hash — and so would every one after it. The clip that
+/// failed says why, and nothing else runs.
+#[test]
+fn a_failed_download_drops_the_queue() {
+    let models = tempfile::tempdir().unwrap();
+    // Late enough that the second clip is certainly queued behind the first.
+    let url = serve(
+        Duration::from_millis(1_000),
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    );
+    let mut rig = Rig::open_with(
+        2,
+        SLOW_CAMERA,
+        fetching(models.path(), url, &"0".repeat(64), 1_000),
+    );
+    rig.transcribe(0);
+    rig.transcribe(1);
+    rig.wait("clip 0 downloading, clip 1 waiting", |t, id| {
+        t.running_clip() == Some(id[0]) && t.downloading.is_some() && t.queued == [id[1]]
+    });
+
+    let after = rig.wait("the failure", |t, _| t.finished.is_some());
+    assert_eq!(after.finished.as_ref().map(|(c, _)| *c), Some(rig.id(0)));
+    assert!(failure(&after).contains("could not download"), "{after:?}");
+    assert!(
+        after.queued.is_empty() && after.running.is_none() && after.downloading.is_none(),
+        "the queue outlived the download: {after:?}"
+    );
+    let first = rig.id(0);
+    let mut log = rig.h.log().to_vec();
+    log.extend(rig.h.shutdown());
+    assert_eq!(runs(&log), [first], "clip 1 ran");
+}
+
+/// A download that **succeeds** hands over to whisper: the `downloading`
+/// state ends, and a failure after it — here, whisper refusing a "model"
+/// that is a sentence — is an ordinary failure that leaves the queue alone.
+/// The next clip then finds the file already there, and downloads nothing.
+#[test]
+fn a_finished_download_hands_the_job_to_whisper() {
+    const MODEL: &[u8] = b"this is not a speech model";
+    const MODEL_SHA256: &str = "50deac7ae7a3e51baccfb5e55164061e0eeaf698929724eac6b46d9d076cd9e2";
+    let models = tempfile::tempdir().unwrap();
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MODEL.len()).into_bytes();
+    response.extend_from_slice(MODEL);
+    let url = serve(Duration::from_millis(1_000), response);
+    let mut rig = Rig::open_with(
+        2,
+        SLOW_CAMERA,
+        fetching(models.path(), url, MODEL_SHA256, MODEL.len() as u64),
+    );
+    rig.transcribe(0);
+    rig.transcribe(1);
+    rig.wait("clip 0 downloading, clip 1 waiting", |t, id| {
+        t.running_clip() == Some(id[0]) && t.downloading.is_some() && t.queued == [id[1]]
+    });
+    rig.wait("the download over, clip 0 still running", |t, id| {
+        t.running_clip() == Some(id[0]) && t.downloading.is_none()
+    });
+    let last = rig.wait(
+        "clip 1's failure",
+        |t, id| matches!(t.finished, Some((c, _)) if c == id[1]),
+    );
+    assert!(failure(&last).contains("could not load"), "{last:?}");
+    assert_eq!(
+        std::fs::read(models.path().join(WhisperModel::Small.file_name())).unwrap(),
+        MODEL
+    );
+
+    let ids = [rig.id(0), rig.id(1)];
+    let mut log = rig.h.log().to_vec();
+    log.extend(rig.h.shutdown());
+    assert_eq!(runs(&log), ids);
+    assert!(
+        states(&log)
+            .iter()
+            .all(|t| t.downloading.is_none() || t.running_clip() == Some(ids[0])),
+        "clip 1 downloaded a model that was already there"
+    );
 }
 
 /// The message of the last failure.

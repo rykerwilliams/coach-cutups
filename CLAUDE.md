@@ -98,14 +98,25 @@ never `-march=native`.
 row has a picker (`base.en` / `small.en`, default `small.en`), remembered in
 `state.json` and never in `project.json` — a `Preferences` field would be a
 format change every existing project fails `store::read`'s version guard on.
-The model files are looked for in `$XDG_CACHE_HOME/coach-cuts/models/`, found
-and never fetched; a missing one fails the job with a message naming the path
-and the Hugging Face URL. Switching models leaves the job in flight alone (a
-whisper cancel costs ~12 s of CPU); the queue behind it picks the new one up.
-`$COACH_CUTS_WHISPER_MODEL` still beats the picker, which says so by going
-grey and showing the file that variable names. `WhisperModel` in
-`video-coach-media/src/transcribe.rs` carries each model's file name and its
-**measured** sha256, for Phase 11's downloader.
+Switching models leaves the job in flight alone (a whisper cancel costs ~12 s
+of CPU); the queue behind it picks the new one up. `$COACH_CUTS_WHISPER_MODEL`
+still beats the picker, which says so by going grey and showing the file that
+variable names. `WhisperModel` in `video-coach-media/src/transcribe.rs`
+carries each model's file name, size and **measured** sha256.
+
+**The model downloads on first use, and only when the bus says it may.** It
+lives in `$XDG_CACHE_HOME/coach-cuts/models/`; a job whose model is absent
+downloads it first (`souphttpsrc ! filesink` to a `.part`, glib's sha256 of
+the file, rename), as `TranscribeMessage::Downloading` and its own
+inspector line. **Permission is `TranscribeKind::Whisper`'s `fetch`, never
+the path:** `bus::whisper` sets it only under the cache directory, never
+under `$COACH_CUTS_WHISPER_MODEL`, and tests that point at a missing
+`ggml-*.bin` pass `None` — **no test may reach Hugging Face**; serve from a
+local `TcpListener`. The URL is pinned to a Hugging Face commit, not `main`.
+The Transcribe button is the prompt ("Download 488 MB and transcribe"). A
+cancel leaves the `.part` (the transcriber is never joined, so a delete could
+hit the next job's file); a bad hash deletes it; a failed download drops the
+queue behind it.
 
 **Transcription is asked for, never automatic.** `AUTO_TRANSCRIBE` in
 `bus/transcribe.rs` is `false`: a preempted job restarts from zero, so a coach

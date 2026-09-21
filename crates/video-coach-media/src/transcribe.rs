@@ -24,6 +24,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::composite::audio::Reader;
 use crate::composite::CompositeError;
+use crate::download::{download, Fetch};
 
 /// `WHISPER_SAMPLE_RATE`: the only rate whisper.cpp takes — `whisper_full`
 /// has no rate argument and does not resample, so the pipeline does.
@@ -35,10 +36,16 @@ const TRANSCRIBE_CHANNELS: usize = 1;
 /// How long the test transcriber sleeps between looks at the cancel flag.
 const TEST_TICK: Duration = Duration::from_millis(5);
 
-/// Where a model that isn't on disk is downloaded from, for the message that
-/// says so. The model is **found, never fetched** (spec S3): fetching it is
-/// Phase 11's, with the bundling decision.
-const MODEL_URL_PREFIX: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+/// Where a model that isn't on disk is downloaded from: by the job itself
+/// when the app may fetch it (Phase 11 spec S3), and otherwise by the coach,
+/// following the message that names it.
+///
+/// **Pinned to a commit, not `resolve/main/`.** `main` is mutable: an
+/// upstream re-upload would fail every download's hash against
+/// [`WhisperModel::sha256`], with no recovery short of a release. At this
+/// commit the redirect's `x-linked-etag` is the measured sha256.
+const MODEL_URL_PREFIX: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/";
 
 /// Which model whisper runs, and so the speed the coach waits at.
 ///
@@ -54,11 +61,9 @@ const MODEL_URL_PREFIX: &str = "https://huggingface.co/ggerganov/whisper.cpp/res
 /// place that answers "is this file ours".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum WhisperModel {
-    /// 147,964,211 bytes, sha256
-    /// `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`.
+    /// 148 MB.
     Base,
-    /// 487,614,201 bytes, sha256
-    /// `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d`.
+    /// 488 MB.
     #[default]
     Small,
 }
@@ -91,11 +96,8 @@ impl WhisperModel {
     /// The sha256 of [`WhisperModel::file_name`] as published, **measured on
     /// a downloaded copy, not read off a web page.**
     ///
-    /// Nothing in this phase verifies it: the model is found, never fetched
-    /// (spec S3). It is here because Phase 11's downloader needs a hash **per
-    /// model** — an earlier draft of the spec pinned one constant while
-    /// leaving the choice of model open — and because rediscovering it means
-    /// downloading 600 MB again.
+    /// What a download is checked against before it is renamed into place
+    /// (Phase 11 spec S3) — one **per model**, since the coach picks which.
     pub const fn sha256(self) -> &'static str {
         match self {
             WhisperModel::Base => {
@@ -104,6 +106,30 @@ impl WhisperModel {
             WhisperModel::Small => {
                 "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d"
             }
+        }
+    }
+
+    /// The file's length in bytes, measured beside [`WhisperModel::sha256`]:
+    /// the size the Transcribe button offers to download, the download's
+    /// progress denominator, and its first check.
+    pub const fn bytes(self) -> u64 {
+        match self {
+            WhisperModel::Base => 147_964_211,
+            WhisperModel::Small => 487_614_201,
+        }
+    }
+
+    /// Where [`WhisperModel::file_name`] is published, at the pinned commit.
+    pub fn url(self) -> String {
+        format!("{MODEL_URL_PREFIX}{}", self.file_name())
+    }
+
+    /// How to download this model and know it arrived whole.
+    pub fn fetch(self) -> Fetch {
+        Fetch {
+            url: self.url(),
+            sha256: self.sha256().into(),
+            bytes: self.bytes(),
         }
     }
 
@@ -149,8 +175,18 @@ pub type TranscribeError = CompositeError;
 /// GStreamer 1.28's `whispertranscriber` takes if this ever moves onto it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscribeKind {
-    /// whisper.cpp reading the model at this path.
-    Whisper { model: PathBuf },
+    /// whisper.cpp reading the model at `model` — downloaded there first, if
+    /// it is absent and `fetch` says from where.
+    ///
+    /// **`fetch` is the permission, and the path never implies it.** The app
+    /// sets it only for a model under its own cache directory (never under
+    /// `$COACH_CUTS_WHISPER_MODEL`, a file in a directory that is the
+    /// coach's), and tests pointing at a missing file carrying our own name
+    /// pass `None` so that CI never touches Hugging Face.
+    Whisper {
+        model: PathBuf,
+        fetch: Option<Fetch>,
+    },
     /// `text` after `delay`, with the cancel flag polled throughout. For
     /// tests: no model, no whisper build, no GPU.
     Test { delay: Duration, text: String },
@@ -178,7 +214,7 @@ impl TranscribeKind {
         cancel: &Arc<AtomicBool>,
     ) -> Result<String, TranscribeError> {
         match self {
-            TranscribeKind::Whisper { model } => whisper_run(model, samples, progress, cancel),
+            TranscribeKind::Whisper { model, .. } => whisper_run(model, samples, progress, cancel),
             TranscribeKind::Test { delay, text } => test_run(*delay, text, progress, cancel),
         }
     }
@@ -202,6 +238,10 @@ fn whisper_run(
 ) -> Result<String, TranscribeError> {
     let name = model.file_name().unwrap_or_default().to_string_lossy();
     if !model.is_file() {
+        // Only reached when the job was not allowed to fetch it: under
+        // `$COACH_CUTS_WHISPER_MODEL`, or with no cache directory to put it
+        // in. So the coach is told where to get it by hand.
+        //
         // **Only a model we ship has a URL.** The path is an escape hatch
         // (`$COACH_CUTS_WHISPER_MODEL`), so interpolating whatever file name
         // it ends in would hand the coach a fabricated Hugging Face URL — a
@@ -285,8 +325,9 @@ fn recognise(
             // therefore nowhere at all. The one fact still worth having is
             // how big the file the coach has actually is: a download that
             // stopped early is self-evident beside the 148 MB (`base.en`) or
-            // 488 MB (`small.en`) a whole one prints, and Phase 11 makes that
-            // the likeliest failure here.
+            // 488 MB (`small.en`) a whole one prints. The downloader checks
+            // what it fetches, so this is a file that came from somewhere
+            // else: `$COACH_CUTS_WHISPER_MODEL`, or a copy put there by hand.
             TranscribeError::Failed(format!(
                 "could not load the speech model at {} ({}): {e}",
                 model.display(),
@@ -383,7 +424,7 @@ fn recognise(
 /// every boundary and joining without trimming would leave the first one.
 ///
 /// Its own function because it is the only subtle thing in this file that a
-/// test can reach without a 466 MB model — the whole-run tests are
+/// test can reach without a 488 MB model — the whole-run tests are
 /// `#[ignore]`d, and a rule this easy to get backwards should not be pinned
 /// only by a test nobody runs on CI.
 fn join_segments<S: AsRef<str>>(segments: impl IntoIterator<Item = S>) -> String {
@@ -434,6 +475,12 @@ fn test_run(
 /// What a running transcription reports, on its own thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscribeMessage {
+    /// The model is being downloaded, this far along in whole percent — the
+    /// job's first step when the model is absent and the job may fetch it.
+    /// A [`TranscribeMessage::Progress`] follows the last one, so the
+    /// download is over when recognising begins, even if whisper never
+    /// reports a percent of its own.
+    Downloading(u8),
     /// How far along, in whole percent.
     ///
     /// **A floor, not the whole story:** whisper counts its 30-second chunks
@@ -515,13 +562,39 @@ impl Drop for Transcriber {
     }
 }
 
-/// Read the sound, then recognise it.
+/// Fetch the model if the job may and must, read the sound, then recognise
+/// it.
+///
+/// **The download is the job's first step** (Phase 11 spec S3), not a
+/// mechanism of its own, so it inherits the cancel, the one-at-a-time and
+/// `Failed` for free — and a recording that preempts the job preempts the
+/// download with it, which restarts from zero. First rather than after the
+/// read, so the coach sees "Downloading" at once instead of a second of
+/// "Transcribing" before it.
 fn transcribe(
     recording: &Path,
     kind: &TranscribeKind,
     cancel: &Arc<AtomicBool>,
     on_message: &mut impl FnMut(TranscribeMessage),
 ) -> Result<String, TranscribeError> {
+    if let TranscribeKind::Whisper {
+        model,
+        fetch: Some(fetch),
+    } = kind
+    {
+        if !model.is_file() {
+            download(
+                fetch,
+                model,
+                &mut |percent| on_message(TranscribeMessage::Downloading(percent)),
+                cancel,
+            )?;
+            // Whisper reports nothing until its percent moves off zero, which
+            // on a clip shorter than one chunk is never: this is what says
+            // the download is over.
+            on_message(TranscribeMessage::Progress(0));
+        }
+    }
     let samples = read_all(recording, cancel)?;
     kind.run(
         &samples,
@@ -689,6 +762,7 @@ mod tests {
             let path = dir.path().join(model.file_name());
             let error = TranscribeKind::Whisper {
                 model: path.clone(),
+                fetch: None,
             }
             .run(&[0.0], &mut |_| {}, &running())
             .expect_err("there is no model there");
@@ -714,6 +788,8 @@ mod tests {
             assert_eq!(WhisperModel::from_file_name(model.file_name()), Some(model));
             assert_eq!(WhisperModel::from_label(model.label()), Some(model));
             assert_eq!(model.sha256().len(), 64, "{model:?}");
+            // At a commit: `main` moves, and every hash would then fail.
+            assert!(!model.url().contains("/resolve/main/"), "{model:?}");
         }
         // A file the coach pointed us at, and a choice made by a version that
         // knows more models than this one: neither is ours.
@@ -729,6 +805,7 @@ mod tests {
         let dir = dir();
         let error = TranscribeKind::Whisper {
             model: dir.path().join("my-tuned-model.bin"),
+            fetch: None,
         }
         .run(&[0.0], &mut |_| {}, &running())
         .expect_err("there is no model there");
@@ -742,10 +819,11 @@ mod tests {
     }
 
     /// A file that is not a model at all — which is what a download cut off
-    /// half way through leaves behind, and Phase 11's likeliest failure.
+    /// half way through leaves behind, when it came from anywhere but the
+    /// downloader, which checks what it fetches.
     /// whisper-rs reports every loading failure as a bare `InitError`, and
     /// whisper.cpp's own reason for it is in the logging hooks and therefore
-    /// nowhere, so **the size is the diagnosis**: 0.0 MB where 466 MB should
+    /// nowhere, so **the size is the diagnosis**: 0.0 MB where 488 MB should
     /// be says what no error text here would. Needs no model.
     #[test]
     fn a_model_that_will_not_load_is_a_failure_that_names_its_size() {
@@ -754,6 +832,7 @@ mod tests {
         std::fs::write(&model, vec![0x5a; 20_000]).unwrap();
         let error = TranscribeKind::Whisper {
             model: model.clone(),
+            fetch: None,
         }
         .run(&[0.0], &mut |_| {}, &running())
         .expect_err("that is not a model");
@@ -796,9 +875,12 @@ mod tests {
         let path = fixtures::webm(dir.path(), "commentary.webm", 3, 160, 90, 25, 25);
         let samples = read_all(&path, &running()).expect("the recording has sound");
         let mut percents = Vec::new();
-        TranscribeKind::Whisper { model: model() }
-            .run(&samples, &mut |p| percents.push(p), &running())
-            .expect("the model recognises the recording");
+        TranscribeKind::Whisper {
+            model: model(),
+            fetch: None,
+        }
+        .run(&samples, &mut |p| percents.push(p), &running())
+        .expect("the model recognises the recording");
         eprintln!("transcribed, progress: {percents:?}");
     }
 
@@ -827,8 +909,11 @@ mod tests {
         // loads and `full` still starts, so the abort callback still fires —
         // at the end of the first pass instead of somewhere unrepeatable.
         let cancel = Arc::new(AtomicBool::new(true));
-        let outcome =
-            TranscribeKind::Whisper { model: model() }.run(&samples, &mut |_| {}, &cancel);
+        let outcome = TranscribeKind::Whisper {
+            model: model(),
+            fetch: None,
+        }
+        .run(&samples, &mut |_| {}, &cancel);
         assert_eq!(
             outcome,
             Err(TranscribeError::Cancelled),
@@ -888,6 +973,52 @@ mod tests {
             panic!("expected a failure, got {last:?}");
         };
         assert!(e.contains("could not read the sound"), "{e}");
+    }
+
+    /// **A job that may fetch its absent model downloads it first**, says so
+    /// with `Downloading`, and ends the download with a `Progress(0)` before
+    /// whisper starts — whisper itself may never report one. The "model" is
+    /// the test server's body, so the whisper run then fails to load it,
+    /// which is as far as a test without a model can follow it.
+    #[test]
+    fn an_absent_model_is_downloaded_before_the_run() {
+        use crate::download::tests::{body, serve, Answer, BODY_SHA256};
+
+        let dir = dir();
+        let recording = fixtures::webm(dir.path(), "commentary.webm", 1, 160, 90, 25, 25);
+        let model = dir.path().join("models").join("ggml-test.bin");
+        let messages = collect(
+            recording,
+            TranscribeKind::Whisper {
+                model: model.clone(),
+                fetch: Some(Fetch {
+                    url: serve(Answer::Whole),
+                    sha256: BODY_SHA256.into(),
+                    bytes: body().len() as u64,
+                }),
+            },
+        );
+
+        assert_eq!(messages.first(), Some(&TranscribeMessage::Downloading(0)));
+        let handoff = messages
+            .iter()
+            .position(|m| *m == TranscribeMessage::Progress(0))
+            .unwrap_or_else(|| panic!("the download never said it was over: {messages:?}"));
+        assert!(
+            messages[..handoff]
+                .iter()
+                .all(|m| matches!(m, TranscribeMessage::Downloading(_))),
+            "{messages:?}"
+        );
+        let Some(TranscribeMessage::Finished(Err(TranscribeError::Failed(e)))) = messages.last()
+        else {
+            panic!("expected whisper to refuse the body, got {messages:?}");
+        };
+        assert!(e.contains("could not load the speech model"), "{e}");
+        assert!(
+            std::fs::read(&model).unwrap() == body(),
+            "the model did not land"
+        );
     }
 
     /// A cancel is [`TranscribeError::Cancelled`], never a failure: the clip

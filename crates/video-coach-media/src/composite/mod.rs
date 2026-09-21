@@ -183,7 +183,7 @@ impl Gl {
 }
 
 /// A pipeline taken to NULL when dropped, on every exit path.
-struct Stopper(gst::Pipeline);
+pub(crate) struct Stopper(pub(crate) gst::Pipeline);
 
 impl std::ops::Deref for Stopper {
     type Target = gst::Pipeline;

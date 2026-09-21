@@ -335,6 +335,11 @@ component Inspector inherits Rectangle {
     /// `$COACH_CUTS_WHISPER_MODEL`, which runs what it points at whatever is
     /// picked.
     in property <bool> transcript-model-enabled;
+    /// Empty, or -- when the chosen model isn't downloaded yet -- what the
+    /// Transcribe button says instead: the download it starts first, and its
+    /// size (Phase 11 S3). The button is the prompt; pressing it is the
+    /// consent.
+    in property <string> transcribe-download;
     /// A field has focus: the window's shortcuts yield to it. **Every** text
     /// field belongs here: miss one and typing in it makes Space start
     /// playback and `r` start a recording.
@@ -514,13 +519,28 @@ component Inspector inherits Rectangle {
                 Tooltip { text: @markdown("Stop transcribing, and drop what's waiting"); }
             }
             if root.transcript-state != TranscriptState.queued
-                && root.transcript-state != TranscriptState.running: Button {
+                && root.transcript-state != TranscriptState.running
+                && root.transcribe-download == "": Button {
                 text: "Transcribe";
                 enabled: root.enabled;
                 clicked => { root.transcribe-clicked(); }
 
                 Tooltip { text: @markdown("Write out the commentary recorded over this clip"); }
             }
+        }
+        // **The download's prompt is the button itself** (Phase 11 S3), and
+        // on a row of its own: a caption row that fits "Transcribe" beside
+        // the picker has no room for a size, and a prompt that ran off the
+        // column's edge would hide the one number it exists to show. The
+        // row is there only until the model is -- once, per model.
+        if root.transcript-state != TranscriptState.queued
+            && root.transcript-state != TranscriptState.running
+            && root.transcribe-download != "": Button {
+            text: root.transcribe-download;
+            enabled: root.enabled;
+            clicked => { root.transcribe-clicked(); }
+
+            Tooltip { text: @markdown("The speech model isn't on this computer yet. It is downloaded once, then kept for every clip"); }
         }
         // A fixed height with its own scroll, deliberately: `notes` above
         // already takes this layout's slack, and a second stretchy box would
@@ -1416,6 +1436,10 @@ export component AppWindow inherits Window {
     in property <[string]> transcript-models;
     in-out property <int> transcript-model;
     in property <bool> transcript-model-enabled;
+    /// The download the Transcribe button starts first, if the chosen model
+    /// isn't on disk; empty otherwise (Phase 11 S3). Written by `src/main.rs`
+    /// with the rest of the row.
+    in property <string> transcribe-download;
     /// The clip an inspector field is editing, set when one gains focus and
     /// cleared when the last one loses it. Commits go to it, not to the
     /// selection, which a row click has already moved by the time a field's
@@ -2302,6 +2326,7 @@ export component AppWindow inherits Window {
                                 transcript-models: root.transcript-models;
                                 transcript-model <=> root.transcript-model;
                                 transcript-model-enabled: root.transcript-model-enabled;
+                                transcribe-download: root.transcribe-download;
                                 show-pip <=> root.clip-show-pip;
                                 begin-edit => { root.editing-clip-id = root.selected-clip; }
                                 commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }

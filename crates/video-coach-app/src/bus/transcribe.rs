@@ -18,6 +18,12 @@
 //! that finished before the cancel reached it keeps its words — the same
 //! trade export makes when a cancel loses the race to a written file.
 //!
+//! **The job may download its model first** (Phase 11 spec S3), when the
+//! model is absent and [`whisper`] gave it somewhere to fetch it from. That
+//! is its own state on screen, and a download that fails drops the queue
+//! behind it: otherwise every waiting clip tries again in turn — each one
+//! offline at the field, or each one another 488 MB after a bad hash.
+//!
 //! The transcriber's messages arrive as their own input, tagged with the
 //! generation of the job that sent them and the clip they are about: a
 //! cancelled job's `Finished` can still be in the channel when the next one
@@ -52,22 +58,24 @@ use super::{Bus, Event, Input};
 const AUTO_TRANSCRIBE: bool = false;
 
 /// Under the cache directory, beside nothing else: downloaded weights are a
-/// cache, not configuration, and nothing in this phase puts them there.
+/// cache, not configuration.
 const MODELS_DIRNAME: &str = "models";
 
 /// Points the app at a model somewhere else — which is also what makes the
 /// whole path testable, with a small model locally and none at all on CI.
 const MODEL_ENV: &str = "COACH_CUTS_WHISPER_MODEL";
 
-/// Where `model` is read from (spec S3): `$COACH_CUTS_WHISPER_MODEL` if set,
-/// else `$XDG_CACHE_HOME/coach-cuts/models/<its file name>` (with the
-/// `~/.cache` fallback).
+/// The transcriber that runs `model` (Phase 10 spec S3, Phase 11 S3):
+/// `$XDG_CACHE_HOME/coach-cuts/models/<its file name>` (with the `~/.cache`
+/// fallback), **downloaded there on first use** — or the file
+/// `$COACH_CUTS_WHISPER_MODEL` names, which is never fetched.
 ///
-/// **Found, never fetched.** Downloading it is Phase 11's, with the bundling
-/// decision; a model that isn't there fails the job with a message naming
-/// this path and the URL to put there.
-pub fn whisper_model_path(model: WhisperModel) -> PathBuf {
-    model_path(
+/// **This is the one place that decides whether a job may download.** The
+/// path alone can't say: the variable can name a file called
+/// `ggml-small.en.bin` in a directory that is the coach's, and the tests
+/// point the transcriber at a missing file of that name on purpose.
+pub fn whisper(model: WhisperModel) -> TranscribeKind {
+    whisper_kind(
         std::env::var_os(MODEL_ENV),
         std::env::var_os("XDG_CACHE_HOME"),
         std::env::var_os("HOME"),
@@ -86,27 +94,38 @@ pub fn whisper_model_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// [`whisper_model_path`] with the environment passed in, as
+/// [`whisper`] with the environment passed in, as
 /// [`config_dir`](super::state) takes it: the rule is worth a test, and
 /// `set_var` in one is a race with every other test in the binary.
-fn model_path(
+fn whisper_kind(
     env: Option<OsString>,
     xdg: Option<OsString>,
     home: Option<OsString>,
     model: WhisperModel,
-) -> PathBuf {
+) -> TranscribeKind {
     if let Some(path) = env.filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
+        return TranscribeKind::Whisper {
+            model: PathBuf::from(path),
+            fetch: None,
+        };
     }
-    cache_dir(xdg, home)
-        .map(|dir| {
-            dir.join(APP_DIR)
+    match cache_dir(xdg, home) {
+        Some(dir) => TranscribeKind::Whisper {
+            model: dir
+                .join(APP_DIR)
                 .join(MODELS_DIRNAME)
-                .join(model.file_name())
-        })
-        // No `$HOME` and no `$XDG_CACHE_HOME`: a bare file name is still a path
-        // for the failure to name, which is better than no failure at all.
-        .unwrap_or_else(|| PathBuf::from(model.file_name()))
+                .join(model.file_name()),
+            fetch: Some(model.fetch()),
+        },
+        // No `$HOME` and no `$XDG_CACHE_HOME`: a bare file name is still a
+        // path for the failure to name, which is better than no failure at
+        // all — and nowhere to download 488 MB into, since it would land in
+        // whatever the working directory is.
+        None => TranscribeKind::Whisper {
+            model: PathBuf::from(model.file_name()),
+            fetch: None,
+        },
+    }
 }
 
 /// How a job ended, when the ending is something the inspector has to say
@@ -131,6 +150,11 @@ pub enum Finish {
 pub struct TranscriptionState {
     pub queued: Vec<Uuid>,
     pub running: Option<(Uuid, u8)>,
+    /// The running job is downloading its model, this far along (Phase 11
+    /// spec S3). `running`'s percent is whisper's, and stays 0 until this is
+    /// `None` again: a screen reading "Transcribing… 63%" while 488 MB
+    /// arrives would be telling the coach the wrong thing.
+    pub downloading: Option<u8>,
     pub finished: Option<(Uuid, Finish)>,
 }
 
@@ -147,13 +171,16 @@ impl TranscriptionState {
 }
 
 /// The job in flight: the clip it is about, the thread doing it, and the
-/// percent it last reported.
+/// percents it last reported.
 pub(super) struct Active {
     clip: Uuid,
     /// Dropping it cancels the run and returns at once — see
     /// [`Bus::stop_transcription`].
     transcriber: Transcriber,
     percent: u8,
+    /// Set by `Downloading`, cleared by the `Progress` that follows the
+    /// download — so a failure while it is set is a failed download.
+    downloading: Option<u8>,
 }
 
 impl Bus {
@@ -241,7 +268,7 @@ impl Bus {
         }
         self.transcribe_model = model;
         self.state.set_whisper_model(model);
-        if let TranscribeKind::Whisper { model: path } = &mut self.transcribe {
+        if let TranscribeKind::Whisper { model: path, fetch } = &mut self.transcribe {
             // **Beside the model in use, and only when that is one of ours.**
             // `$COACH_CUTS_WHISPER_MODEL` points at a file the coach chose,
             // in a directory that is theirs; the picker is disabled under it,
@@ -254,6 +281,12 @@ impl Bus {
                 .is_some()
             {
                 path.set_file_name(model.file_name());
+                // And fetched from the new model's URL only if the old one
+                // was fetchable at all: a name of ours is not permission to
+                // download (see [`whisper`]).
+                if let Some(fetch) = fetch {
+                    *fetch = model.fetch();
+                }
             }
         }
     }
@@ -301,6 +334,7 @@ impl Bus {
                 clip: id,
                 transcriber,
                 percent: 0,
+                downloading: None,
             });
             break;
         }
@@ -318,6 +352,19 @@ impl Bus {
         msg: TranscribeMessage,
     ) {
         match msg {
+            TranscribeMessage::Downloading(percent) => {
+                if generation != self.transcribe_generation {
+                    return;
+                }
+                let Some(active) = &mut self.transcribing else {
+                    return;
+                };
+                if active.downloading == Some(percent) {
+                    return;
+                }
+                active.downloading = Some(percent);
+                self.publish_transcription();
+            }
             TranscribeMessage::Progress(percent) => {
                 if generation != self.transcribe_generation {
                     return;
@@ -325,10 +372,12 @@ impl Bus {
                 let Some(active) = &mut self.transcribing else {
                     return;
                 };
-                if active.percent == percent {
+                // The first one after a download ends it, even at the same 0.
+                if active.percent == percent && active.downloading.is_none() {
                     return;
                 }
                 active.percent = percent;
+                active.downloading = None;
                 self.publish_transcription();
             }
             TranscribeMessage::Finished(result) => {
@@ -352,6 +401,18 @@ impl Bus {
                     Err(TranscribeError::Failed(e)) => {
                         eprintln!("bus: transcribing {clip} failed: {e}");
                         if current {
+                            // A failed download fails every clip behind it
+                            // the same way — offline, or another 488 MB per
+                            // clip after a bad hash — so they stop waiting.
+                            // The clip that failed says why; pressing
+                            // Transcribe again is the retry.
+                            if self
+                                .transcribing
+                                .as_ref()
+                                .is_some_and(|a| a.downloading.is_some())
+                            {
+                                self.transcribe_queue.clear();
+                            }
                             self.transcribe_finished = Some((clip, Finish::Failed(e)));
                         }
                     }
@@ -440,12 +501,13 @@ impl Bus {
         )
     }
 
-    /// The whole state, every time (spec S5): three fields, so no view is
-    /// left holding something the bus has moved past.
+    /// The whole state, every time (spec S5), so no view is left holding
+    /// something the bus has moved past.
     fn publish_transcription(&self) {
         self.emit(Event::Transcription(TranscriptionState {
             queued: self.transcribe_queue.iter().copied().collect(),
             running: self.transcribing.as_ref().map(|a| (a.clip, a.percent)),
+            downloading: self.transcribing.as_ref().and_then(|a| a.downloading),
             finished: self.transcribe_finished.clone(),
         }));
     }
@@ -455,8 +517,16 @@ impl Bus {
 mod tests {
     use super::*;
 
+    fn whisper_at(model: &str, fetch: Option<WhisperModel>) -> TranscribeKind {
+        TranscribeKind::Whisper {
+            model: PathBuf::from(model),
+            fetch: fetch.map(WhisperModel::fetch),
+        }
+    }
+
     /// The chosen model's file under the cache directory, by the same XDG
-    /// rule everything else in `state.rs` follows.
+    /// rule everything else in `state.rs` follows — and **ours to download
+    /// there**, from that model's own URL.
     #[test]
     fn the_chosen_model_is_looked_for_under_the_cache_directory() {
         for (model, file) in [
@@ -464,18 +534,22 @@ mod tests {
             (WhisperModel::Small, "ggml-small.en.bin"),
         ] {
             assert_eq!(
-                model_path(None, Some("/x/cache".into()), Some("/home/u".into()), model),
-                PathBuf::from(format!("/x/cache/coach-cuts/models/{file}")),
+                whisper_kind(None, Some("/x/cache".into()), Some("/home/u".into()), model),
+                whisper_at(&format!("/x/cache/coach-cuts/models/{file}"), Some(model)),
             );
             assert_eq!(
-                model_path(None, None, Some("/home/u".into()), model),
-                PathBuf::from(format!("/home/u/.cache/coach-cuts/models/{file}")),
+                whisper_kind(None, None, Some("/home/u".into()), model),
+                whisper_at(
+                    &format!("/home/u/.cache/coach-cuts/models/{file}"),
+                    Some(model)
+                ),
             );
             // No `$HOME` and no `$XDG_CACHE_HOME`: a bare name is still a
-            // path for the failure to name.
+            // path for the failure to name — and not somewhere to download
+            // 488 MB into.
             assert_eq!(
-                model_path(None, None, None, model),
-                PathBuf::from(file),
+                whisper_kind(None, None, None, model),
+                whisper_at(file, None),
                 "{model:?}"
             );
         }
@@ -483,26 +557,30 @@ mod tests {
 
     /// **`$COACH_CUTS_WHISPER_MODEL` beats the choice, every time** — it is
     /// how the `#[ignore]`d whisper tests find a model, and how a coach runs
-    /// one we don't ship. An empty value is not a path, and is ignored.
+    /// one we don't ship — **and is never downloaded to**, even when the
+    /// file it names is called what one of ours is. An empty value is not a
+    /// path, and is ignored.
     #[test]
     fn the_environment_overrides_whatever_was_picked() {
         for model in WhisperModel::ALL {
+            for named in ["/opt/models/my-tuned.bin", "/opt/models/ggml-small.en.bin"] {
+                assert_eq!(
+                    whisper_kind(
+                        Some(named.into()),
+                        Some("/x/cache".into()),
+                        Some("/home/u".into()),
+                        model,
+                    ),
+                    whisper_at(named, None),
+                    "{model:?}"
+                );
+            }
             assert_eq!(
-                model_path(
-                    Some("/opt/models/my-tuned.bin".into()),
-                    Some("/x/cache".into()),
-                    Some("/home/u".into()),
-                    model,
+                whisper_kind(Some("".into()), None, Some("/home/u".into()), model),
+                whisper_at(
+                    &format!("/home/u/.cache/coach-cuts/models/{}", model.file_name()),
+                    Some(model)
                 ),
-                PathBuf::from("/opt/models/my-tuned.bin"),
-                "{model:?}"
-            );
-            assert_eq!(
-                model_path(Some("".into()), None, Some("/home/u".into()), model),
-                PathBuf::from(format!(
-                    "/home/u/.cache/coach-cuts/models/{}",
-                    model.file_name()
-                )),
                 "{model:?}"
             );
         }
