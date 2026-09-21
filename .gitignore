@@ -31,3 +31,6 @@ fixtures/
 
 # Git worktrees for feature development
 .worktrees/
+
+# Per-session git worktrees created by Claude Code; transient, never committed.
+.claude/worktrees/
