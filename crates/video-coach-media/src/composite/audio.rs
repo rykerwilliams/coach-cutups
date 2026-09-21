@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -46,18 +46,27 @@ use crate::player::seconds_to_clock;
 /// The mix is stereo: every sample position is a pair of floats.
 const CHANNELS: usize = 2;
 
+/// How long [`Reader::start`] waits for `decodebin3`'s stream collection. A
+/// file that posts neither a collection nor an `ERROR` — a directory, a named
+/// pipe with nothing behind it — would otherwise wait forever.
+const COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The format the readers decode to, the mixer produces and the encode side
 /// takes — one description so the three can't disagree.
 pub(super) fn caps_description() -> String {
-    format!(
-        "audio/x-raw,format=F32LE,rate={AUDIO_SAMPLE_RATE},channels={CHANNELS},layout=interleaved"
-    )
+    description(AUDIO_SAMPLE_RATE, CHANNELS)
 }
 
-fn caps() -> gst::Caps {
-    caps_description()
+/// A reader's own caps. The export's are [`caps_description`]'s; transcription
+/// reads the same files at whisper's 16 kHz mono (spec S2).
+fn caps(rate: u32, channels: usize) -> gst::Caps {
+    description(rate, channels)
         .parse()
         .expect("a constant caps description parses")
+}
+
+fn description(rate: u32, channels: usize) -> String {
+    format!("audio/x-raw,format=F32LE,rate={rate},channels={channels},layout=interleaved")
 }
 
 /// The audio edit, played out one output frame at a time.
@@ -220,8 +229,12 @@ fn reader<'a>(
 }
 
 /// One file's sound: an audio-only pipeline with a cursor, read forward from
-/// wherever the last seek put it.
-struct Reader {
+/// wherever the last seek put it, at the rate and channel count
+/// [`Reader::start`] was asked for.
+///
+/// [`Reader::read`] counts its frames in [`CHANNELS`], so only the export's
+/// stereo readers may use it; [`Reader::rest`] is channel-agnostic.
+pub(crate) struct Reader {
     pipeline: Stopper,
     appsink: gst_app::AppSink,
     path: PathBuf,
@@ -234,6 +247,11 @@ struct Reader {
     spent: usize,
     /// Nothing more will come: the end of the file, an error, or a cancel.
     done: bool,
+    /// Why, when it was not the end of the file. [`Reader::read`] pads over it
+    /// and the export goes quiet; [`Reader::rest`] must not, since a clip cut
+    /// short by a cancel is indistinguishable from a whole one once it is a
+    /// buffer of samples.
+    stopped: Option<CompositeError>,
     /// Where [`Reader::read`] hands its samples back.
     out: Vec<f32>,
 }
@@ -243,7 +261,7 @@ impl Reader {
     /// audio track (silently — footage filmed without sound is normal), or one
     /// that can't be read, with a line on stderr.
     fn open(path: &Path, cancel: &AtomicBool) -> Option<Reader> {
-        match Reader::start(path, cancel) {
+        match Reader::start(path, AUDIO_SAMPLE_RATE, CHANNELS, cancel) {
             Ok(reader) => reader,
             Err(CompositeError::Cancelled) => None,
             Err(CompositeError::Failed(e)) => {
@@ -253,9 +271,14 @@ impl Reader {
         }
     }
 
-    /// Builds the pipeline, prerolls it and sets it PLAYING. `Ok(None)` is a
-    /// file with no audio track.
-    fn start(path: &Path, cancel: &AtomicBool) -> Result<Option<Reader>, CompositeError> {
+    /// Builds the pipeline, prerolls it and sets it PLAYING, decoding to
+    /// `rate` and `channels`. `Ok(None)` is a file with no audio track.
+    pub(crate) fn start(
+        path: &Path,
+        rate: u32,
+        channels: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Reader>, CompositeError> {
         let pipeline = gst::Pipeline::new();
         let make = |factory: &str| {
             gst::ElementFactory::make(factory)
@@ -268,7 +291,7 @@ impl Reader {
         let convert = make("audioconvert")?;
         let resample = make("audioresample")?;
         let appsink = gst_app::AppSink::builder()
-            .caps(&caps())
+            .caps(&caps(rate, channels))
             .sync(false)
             .max_buffers(QUEUED as u32)
             .enable_last_sample(false)
@@ -311,6 +334,7 @@ impl Reader {
         // and it does **not** post `no-more-pads` (measured), so the collection
         // is also how a file with no audio track is recognised — waiting for
         // the appsink to preroll would wait forever.
+        let deadline = Instant::now() + COLLECTION_TIMEOUT;
         let audio = loop {
             watch.check()?;
             if let Some(collection) = &*streams.lock().expect("the stream slot isn't poisoned") {
@@ -318,6 +342,9 @@ impl Reader {
                     .iter()
                     .find(|s| s.stream_type().contains(gst::StreamType::AUDIO))
                     .and_then(|s| s.stream_id());
+            }
+            if Instant::now() >= deadline {
+                return Err(watch.failure("the sound's streams never appeared"));
             }
             std::thread::sleep(Duration::from(POLL));
         };
@@ -350,6 +377,7 @@ impl Reader {
             held: Vec::new(),
             spent: 0,
             done: false,
+            stopped: None,
             out: Vec::new(),
         }))
     }
@@ -364,6 +392,7 @@ impl Reader {
         self.held.clear();
         self.spent = 0;
         self.done = false;
+        self.stopped = None;
         if self
             .pipeline
             .seek_simple(
@@ -377,6 +406,10 @@ impl Reader {
                 self.path.display()
             );
             self.done = true;
+            self.stopped = Some(CompositeError::Failed(format!(
+                "{} refused a seek to {seconds} s",
+                self.path.display()
+            )));
         }
     }
 
@@ -400,8 +433,38 @@ impl Reader {
         &self.out
     }
 
+    /// Everything from the cursor to the end of the file, interleaved.
+    ///
+    /// Not over [`Reader::read`], which pads with silence past the end and so
+    /// never finishes; and a cancel or a decode error is an error here rather
+    /// than a short buffer, which a caller cannot tell from a whole one
+    /// (spec S2).
+    pub(crate) fn rest(&mut self, cancel: &AtomicBool) -> Result<Vec<f32>, CompositeError> {
+        let watch = Watch {
+            cancel,
+            error: self.errors.clone(),
+        };
+        let mut all = self.held[self.spent..].to_vec();
+        self.spent = self.held.len();
+        loop {
+            // The cancel flag between pulls as well as inside one: `pull` only
+            // reaches its own check when the sink starves, and a file decoding
+            // faster than it is read never starves.
+            watch.check()?;
+            if !self.pull(cancel) {
+                break;
+            }
+            all.extend_from_slice(&self.held[self.spent..]);
+            self.spent = self.held.len();
+        }
+        match &self.stopped {
+            Some(why) => Err(why.clone()),
+            None => Ok(all),
+        }
+    }
+
     /// Pulls the next non-empty buffer into `held`. `false` once nothing more
-    /// will come.
+    /// will come, with `stopped` saying why unless it was the end of the file.
     fn pull(&mut self, cancel: &AtomicBool) -> bool {
         let watch = Watch {
             cancel,
@@ -428,10 +491,11 @@ impl Reader {
             if self.appsink.is_eos() {
                 self.done = true;
             } else if let Err(e) = watch.check() {
-                if let CompositeError::Failed(e) = e {
+                if let CompositeError::Failed(e) = &e {
                     eprintln!("export: the sound of {} stopped: {e}", self.path.display());
                 }
                 self.done = true;
+                self.stopped = Some(e);
             }
         }
         false

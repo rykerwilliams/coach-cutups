@@ -12,6 +12,7 @@ pub mod mailbox;
 mod overlay;
 pub mod player;
 pub mod probe;
+pub mod transcribe;
 
 pub use capture::{
     list_devices, now_ns, resolve_camera, resolve_mic, Camera, CaptureSources, Devices, Mic,

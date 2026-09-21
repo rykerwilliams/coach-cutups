@@ -28,7 +28,7 @@
 //! timeouts, and every wait polls the cancel flag and the first error either
 //! pipeline posted.
 
-mod audio;
+pub(crate) mod audio;
 mod decode;
 pub mod export;
 pub mod preview;
