@@ -41,7 +41,8 @@ jobs:
       # One source of truth for the version: the workspace's, which is the
       # one the .deb carries. First, so a mistyped tag fails in seconds.
       - name: Check the tag matches the workspace version
-        if: github.event_name == 'push'
+        # The ref, not the event: a branch push has no tag to compare.
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           version=$(cargo metadata --no-deps --format-version 1 |
             jq -r '.packages[] | select(.name == "video-coach-app") | .version')
@@ -127,7 +128,10 @@ jobs:
   release:
     name: release
     needs: package
-    if: github.event_name == 'push'
+    # Both halves, deliberately. The event alone would publish on any branch
+    # push, were a branch trigger ever added; the ref alone would publish a
+    # workflow_dispatch run started from a tag. Only a pushed tag releases.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
