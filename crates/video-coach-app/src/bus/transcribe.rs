@@ -39,9 +39,17 @@ use super::{Bus, Event, Input};
 /// Whether stopping a recording queues its clip (spec S6).
 ///
 /// A `const`, not a preference: `Preferences` lives in `project.json`, so a
-/// field there is a format change, and the closeout flips this literal once
-/// there is a throughput number to flip it with.
-const AUTO_TRANSCRIBE: bool = true;
+/// field there is a format change.
+///
+/// **Off**, decided by the closeout measurement
+/// (`docs/superpowers/spikes/2026-09-21-whisper-throughput.md`). `small.en`
+/// runs at 0.73x realtime here, but the throughput is the weaker half of the
+/// argument: a preempted job restarts from zero, so while the coach records
+/// faster than a job finishes, *no job ever completes*. Six takes back to back
+/// would end the session with a full queue, no transcripts, and 8 whisper
+/// threads that spent it competing with the capture pipeline. Transcription
+/// happens when the coach asks for it.
+const AUTO_TRANSCRIBE: bool = false;
 
 /// Under the cache directory, beside nothing else: downloaded weights are a
 /// cache, not configuration, and nothing in this phase puts them there.

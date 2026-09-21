@@ -95,6 +95,24 @@ grey and showing the file that variable names. `WhisperModel` in
 `video-coach-media/src/transcribe.rs` carries each model's file name and its
 **measured** sha256, for Phase 11's downloader.
 
+**Transcription is asked for, never automatic.** `AUTO_TRANSCRIBE` in
+`bus/transcribe.rs` is `false`: a preempted job restarts from zero, so a coach
+recording faster than a job finishes would complete none of them. Measured:
+`small.en` runs at **0.73x realtime** on the reference laptop
+(`docs/superpowers/spikes/2026-09-21-whisper-throughput.md`).
+
+**Recording always wins, and cancelling is not free.** Starting a recording
+cancels the job in flight and puts its clip back at the **front** of the queue.
+whisper only consults its abort flag once per encode and once per decode pass,
+so a cancel costs **~12 s of CPU** — `Transcriber::drop` therefore cancels
+*without* joining, because the bus thread used to block on it and froze Stop
+Recording along with both deadlines.
+
+**Whisper's progress percentage is nearly useless on a short clip.** It is
+reported at the top of a loop advancing in <=30 s chunks and never reaches 100,
+so a 20 s clip yields exactly one callback reading 0. The inspector shows an
+elapsed clock and appends the percentage only once it moves off zero.
+
 The whisper tests are **`#[ignore]`d**, because they need a model CI has
 no copy of. Run them by pointing `$COACH_CUTS_WHISPER_MODEL` — the same
 variable the app finds its model with — at one, and read the throughput line

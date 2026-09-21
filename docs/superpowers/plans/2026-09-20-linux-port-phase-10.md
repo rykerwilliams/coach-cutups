@@ -107,13 +107,40 @@ Commit: `feat(app): the transcript field and Transcribe button`.
 
 Commit: `feat(media): whisper transcription`.
 
-## Task 5 — Closeout
+## Task 5 — Closeout (done)
 
 1. Adversarial review of the Phase 10 diff; apply and backlog.
 2. **Measure and record** `docs/superpowers/spikes/2026-09-20-whisper-throughput.md`: wall-clock per minute of audio for `small.en` and `base.en`, **pinning `n_threads`, the sampling strategy, `openmp`, the clip length and whether the machine was on AC** (a 15 W i7 throttles over a multi-minute run).
 3. **Pick the two defaults from it** — model, and whether auto-enqueue stays on. **Weigh the livelock more heavily than the raw number:** a preempted job restarts from zero, so if the coach's recording cadence is shorter than a job's runtime, *no job ever completes* while they keep recording — front-requeue or back, either way. It is bounded (the queue drains once recording stops) and the fixes all cost real complexity (chunked checkpointing, partial-transcript merge), so **no fix is recommended** — but it is the strongest argument for auto-enqueue defaulting off.
 4. `CLAUDE.md`: the build requirement and its first-build cost, the model path and the `#[ignore]`d test's command, the preemption rule, and the progress-reporting trap.
-5. Hands-on checklist items.
+5. Hands-on checklist — below.
+
+### Hands-on checklist (Phase 10)
+
+Batched with the other phases'. Needs a mic for items 1 and 2; the rest don't.
+
+1. **Record commentary over a clip, then press Transcribe.** The words should
+   be yours. Expect proper nouns and player names to come back mangled — that
+   is what the `small.en` / `base.en` picker is for.
+2. **Record ten seconds of silence and transcribe it.** Expect either "No
+   speech found" or a hallucinated "Thank you." / "(electronic beeping)" —
+   whisper's characteristic failure, named and accepted in S1. Tell me if it is
+   more annoying in practice than it reads on paper.
+3. **The model picker.** Switch to `base.en` and back; the choice should
+   survive a relaunch. **This is the one control no automated test covers** —
+   the popup click itself needs a human, since I don't inject synthetic input.
+   Everything around it is tested.
+4. **Speed.** Time a real take against its transcript. `small.en` measured
+   0.73x realtime; if a five-minute take costing seven minutes annoys you,
+   `base.en` is one click.
+5. **Cancel a run.** It should stop responding to the UI immediately, but the
+   CPU stays busy for ~12 s (BACKLOG #65). Confirm that reads as acceptable
+   rather than broken.
+6. **Hit record while a transcript is running.** The recording must start
+   immediately — this was a ~12 s freeze before `38854c4`, and it is the single
+   worst failure this phase had.
+7. **Edit a transcript, then Ctrl+Z.** It should undo *your* edit. A machine
+   write is never an undo step.
 
 ## Deliberately not in this phase
 

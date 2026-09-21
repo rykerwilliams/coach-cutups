@@ -152,9 +152,16 @@ fn add_clips_with_sound(folder: &Path, project: &mut Project, n: usize) -> Vec<C
     added
 }
 
-/// Spec S6: stopping a recording queues its clip, and the words land on it.
+/// Spec S6, as the closeout settled it: stopping a recording does **not**
+/// queue its clip, and asking for it afterwards transcribes it.
+///
+/// `AUTO_TRANSCRIBE` is off because a preempted job restarts from zero, so a
+/// coach recording faster than a job finishes would never complete one
+/// (`docs/superpowers/spikes/2026-09-21-whisper-throughput.md`). This test
+/// fails if that const is flipped, which is the point: the decision is worth
+/// re-arguing, not re-discovering.
 #[test]
-fn stopping_a_recording_transcribes_its_clip() {
+fn stopping_a_recording_leaves_the_transcript_to_the_coach() {
     let mut rig = Rig::open_with(
         0,
         CaptureKind::Test {
@@ -172,13 +179,21 @@ fn stopping_a_recording_transcribes_its_clip() {
     ));
     std::thread::sleep(Duration::from_millis(300));
     rig.h.send(Command::StopRecording);
+
+    // The clip's id before `Idle`, since both waits share one cursor and the
+    // project change may land either side of it.
+    let project = rig.h.wait_map("the recorded clip", |e| match e {
+        Event::ProjectChanged(s) => (!s.project.clips.is_empty()).then(|| s.project.clone()),
+        _ => None,
+    });
+    let id = project.clips[0].id;
     assert_eq!(rig.h.wait_recording(), RecordingStatus::Idle);
 
-    let id = rig
-        .h
-        .wait_transcription("the new clip running", |t| t.running.is_some())
-        .running_clip()
-        .expect("just checked");
+    // No `wait_idle` here: with the const off, the queue has never published
+    // anything to be idle *from*. That silence is the assertion.
+
+    // Asking for it is what runs it.
+    rig.h.send(Command::Transcribe { clip_id: id });
     let project = rig.h.wait_map("the transcript", |e| match e {
         Event::ProjectChanged(s) => s
             .project
@@ -273,7 +288,8 @@ fn runs(log: &[Event]) -> Vec<Uuid> {
 }
 
 /// Spec S5: recording always wins. The job in flight is cancelled and its
-/// clip goes back to the **front**, so it is the first thing to resume.
+/// clip goes back to the **front**, ahead of whatever was already waiting, so
+/// it is the first thing to resume.
 #[test]
 fn a_recording_preempts_the_running_job_and_it_resumes_first() {
     let mut rig = Rig::open_with(
@@ -284,6 +300,7 @@ fn a_recording_preempts_the_running_job_and_it_resumes_first() {
         transcriber(SLOW),
     );
     rig.transcribe(0);
+    rig.transcribe(1);
     rig.wait("clip 0 running", |t, id| t.running_clip() == Some(id[0]));
 
     // The record is not refused, and the transcript gives way to it.
@@ -294,7 +311,8 @@ fn a_recording_preempts_the_running_job_and_it_resumes_first() {
     let preempted = rig.wait("clip 0 preempted", |t, _| {
         t.running.is_none() && !t.queued.is_empty()
     });
-    assert_eq!(preempted.queued, [rig.id(0)]);
+    // Ahead of clip 1, which was already waiting: this is the "front" part.
+    assert_eq!(preempted.queued, [rig.id(0), rig.id(1)]);
 
     // Queued behind it while the recording runs -- the command is refused
     // while recording by construction, so this waits for the stop.
@@ -308,9 +326,10 @@ fn a_recording_preempts_the_running_job_and_it_resumes_first() {
 
     // The preempted clip is first, ahead of the clip the recording made.
     let resumed = rig.wait("clip 0 resumed", |t, id| t.running_clip() == Some(id[0]));
-    assert_eq!(resumed.queued.len(), 1, "the new clip waits behind it");
+    assert_eq!(resumed.queued, [rig.id(1)], "clip 1 still waits behind it");
     rig.wait_idle();
     assert_eq!(rig.saved_transcript(0), WORDS);
+    assert_eq!(rig.saved_transcript(1), WORDS);
     rig.h.shutdown();
 }
 
