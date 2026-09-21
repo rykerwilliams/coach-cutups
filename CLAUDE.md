@@ -75,6 +75,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+**Speech recognition needs `cmake` and `libclang-dev`** (`sudo apt install
+cmake libclang-dev`). `video-coach-media` depends on `whisper-rs`
+unconditionally — there is no feature gate, by decision — so without them
+nothing builds but `video-coach-core`. With them, the first build spends
+**about three minutes** compiling the vendored whisper.cpp, and nothing
+afterwards.
+
+The whisper tests are **`#[ignore]`d**, because they need a 466 MB model CI has
+no copy of. Run them by pointing `$COACH_CUTS_WHISPER_MODEL` — the same
+variable the app finds its model with — at one, and read the throughput line
+off `--nocapture`:
+
+```bash
+COACH_CUTS_WHISPER_MODEL=~/.cache/coach-cuts/models/ggml-small.en.bin \
+  cargo test -p video-coach-media transcribe -- --ignored --nocapture
+```
+
 **Running the app** (needs a display and GStreamer's runtime plugins incl.
 `gstreamer1.0-gl`):
 

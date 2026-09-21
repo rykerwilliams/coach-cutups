@@ -32,6 +32,10 @@ jobs:
       # has no alternative; it also brings `avdec_h264` (rank 256), which
       # outranks `openh264dec` and so moves this runner closer to the dev
       # machine.
+      # `cmake` and `libclang-dev` build whisper.cpp, which `whisper-rs`
+      # vendors and `video-coach-media` depends on unconditionally (Phase 10
+      # spec S1). `ubuntu-latest` already ships both; they are named here so
+      # that stops being luck.
       - name: Install GStreamer and UI build dependencies
         run: |
           sudo apt-get update
@@ -40,7 +44,8 @@ jobs:
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-gl \
             gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad gstreamer1.0-libav \
             libfontconfig1-dev libfreetype-dev libxkbcommon-dev \
-            libegl-dev libgl-dev
+            libegl-dev libgl-dev \
+            cmake libclang-dev
       - uses: dtolnay/rust-toolchain@1.92
         with:
           components: clippy, rustfmt

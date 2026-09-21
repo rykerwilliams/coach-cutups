@@ -34,4 +34,12 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "si
 # machine's fonts, and the bar is rendered from the vendored TTF alone, so an
 # export looks the same on every machine (and on CI, which installs no fonts).
 cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+# Speech recognition (Phase 10 spec S1), in video-coach-media only, and
+# deliberately **not** behind a feature: transcription is part of the product,
+# and a gate the app would always enable only buys a second, never-exercised
+# compilation of the UI. It vendors whisper.cpp and builds it with CMake, so
+# `cmake` and `libclang-dev` are build requirements of the whole workspace and
+# the first build costs about three minutes. Default features are a plain CPU
+# build: no CUDA, no Vulkan, no ROCm SDK.
+whisper-rs = "0.16"
 rfd = "0.17"

@@ -17,6 +17,7 @@ gstreamer-video.workspace = true
 cosmic-text.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+whisper-rs.workspace = true
 
 [features]
 # The synthetic media in `fixtures`, for tests here and in the harness.
