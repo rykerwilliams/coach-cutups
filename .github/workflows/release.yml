@@ -19,6 +19,11 @@ name: release
 on:
   push:
     tags: ['v*']
+    # TEMPORARY: one validation run of the whole pipeline from this branch,
+    # since workflow_dispatch only works once the file is on the default
+    # branch. The release job's tag gate means this cannot publish. Remove
+    # after the run.
+    branches: [claude/intelligent-lamport-m2indd]
   workflow_dispatch:
 
 permissions:
