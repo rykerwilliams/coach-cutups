@@ -635,3 +635,18 @@ Each entry: what, why deferred, when to revisit.
   overlap costing real time on a take, or when a cheaper stop exists — a
   whisper.cpp whose abort is honoured per graph node would make the whole
   question go away, so check it when bumping whisper-rs (BACKLOG #60).
+
+## Phase 11 deferrals (spec `docs/superpowers/specs/2026-09-21-linux-port-phase-11-design.md`)
+
+66. **`a_file_with_no_audio_track_is_a_failure` flaked once under a parallel
+  run.** In `video-coach-media`'s transcribe tests, matroskademux raised
+  "Internal data stream error" before the no-sound check ran, so the test saw a
+  different failure than the one it asserts. It passed three times alone and on
+  a full rerun, and nothing in its code path changed in the task that saw it.
+- **Why deferred:** once in many runs, under the parallel test load that also
+  hosts a wedged GPU-holding export binary from an earlier session; per
+  `no-detours`, a rare flake gets recorded, not chased.
+- **When to revisit:** if it recurs. The likely shape is that a demuxer error
+  can race the StreamCollection check in `Reader::start`, in which case both
+  outcomes are genuinely "this file has no usable sound" and the assertion
+  should accept either.

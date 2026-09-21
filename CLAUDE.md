@@ -178,6 +178,32 @@ touched. With
 the monitor off (DPMS), playback slows unless run with `vblank_mode=0`
 (BACKLOG #36).
 
+**Packaging** — a `.deb` for Ubuntu 24.04 / Mint 22 (needs `cargo install
+cargo-deb`, `cargo install cargo-about --features cli`, `dpkg-dev` and docker):
+
+```bash
+packaging/build-deb.sh                                           # → target/debian/coach-cuts_<version>_amd64.deb
+packaging/smoke-test.sh target/debian/coach-cuts_<version>_amd64.deb
+```
+
+- **Build with the script, never bare `cargo deb`.** It first generates the crate
+  licence notices with cargo-about, which the asset list ships. Its `accepted` list
+  (`packaging/about.toml`) is a **tripwire**: a crate licensed GPL-2.0-*only* can't
+  be combined with this AGPL program, so an unlisted licence fails the build.
+  Review it before adding one; never add GPL-2.0-only.
+- **`packaging/copyright` is hand-written** and covers what crate tools can't see:
+  whisper.cpp, the prebuilt Skia (with VulkanMemoryAllocator) and the DejaVu fonts.
+  A new statically linked C/C++ library or embedded asset needs a stanza there.
+- **`Depends:` is `$auto` plus a hand-kept list** (`[package.metadata.deb]`,
+  commented). `$auto` is `dpkg-shlibdeps`; without `dpkg-dev`, cargo-deb only warns.
+  Anything loaded at run time — a GStreamer element, a `dlopen`ed library — must
+  be added by hand.
+- **The smoke test is the only proof of the dependency list.** It runs in a clean
+  `ubuntu:24.04` container, because the laptop already has every dev package. It
+  checks the libc floor, installs without Recommends, looks up every software-path
+  element, and launches the app under Xvfb. A new element the code names goes in
+  its list.
+
 **Crate layout:**
 
 | Crate | Holds |
