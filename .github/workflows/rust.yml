@@ -56,8 +56,9 @@ jobs:
 
   # Advisory only. Per the spec: a red Windows build does not veto a
   # dependency that is right for Linux. Windows is not a release target
-  # until Phase 11, and video-coach-media would need GStreamer dev
-  # libraries on the runner to typecheck at all, so only core is checked.
+  # (release.yml builds only the Ubuntu .deb), and video-coach-media would
+  # need GStreamer dev libraries on the runner to typecheck at all, so only
+  # core is checked.
   windows:
     name: windows (advisory)
     runs-on: windows-latest
