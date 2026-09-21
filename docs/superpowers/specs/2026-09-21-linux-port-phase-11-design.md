@@ -1,10 +1,10 @@
 # Linux Port — Phase 11: Packaging
 
 **Date:** 2026-09-21
-**Status:** Draft, pre-review.
+**Status:** Reviewed (simplify and correctness passes applied)
 **Parent spec:** `docs/superpowers/specs/2026-09-19-linux-port-design.md` (Phase 11 — which is one line; open questions 3 and 4; risks 4, 5, 6)
 **Builds on:** Phase 10 (the model path this phase learns to fill), Phase 4 (capture's device requirements), Phase 5 (export's encoder fallbacks)
-**Evidence:** measured on the reference laptop — Linux Mint 22.1 (Ubuntu 24.04 base), glibc 2.39, GStreamer 1.24.2, Intel UHD (i7-10610U). Every plugin-to-package mapping below was resolved with `gst-inspect-1.0` → `dpkg -S`; the VA-API and `-march=native` findings were reproduced, not reasoned.
+**Evidence:** measured on the reference laptop — Linux Mint 22.1 (Ubuntu 24.04 base), X11 Cinnamon, glibc 2.39, GStreamer 1.24.2, Intel UHD (i7-10610U). Every plugin-to-package mapping was resolved with `gst-inspect-1.0` → `dpkg -S`; the whisper SIMD, registry and `souphttpsrc` findings were **reproduced**, and where an earlier draft overstated a finding, this one says so.
 
 ---
 
@@ -14,11 +14,11 @@ The coach installs Coach Cuts on their laptop, finds it in the applications menu
 
 ## Done when
 
-1. **`sudo apt install ./coach-cuts_<version>_amd64.deb` works** on the reference laptop, and pulls what it needs.
-2. **It is in the menu**, with an icon, and launching it from there behaves like launching it from a terminal.
-3. **Hardware decode still works** from the installed copy — `bus: loaded …` reports `vah265dec` / `memory:DMABuf` / `egl`, not a software decoder.
+1. **`sudo apt install ./coach-cuts_<version>_amd64.deb` works in a clean `ubuntu:24.04` container** — not only on the reference laptop, which already has every dev package installed and so cannot prove the dependency list.
+2. **It is in the menu**, with an icon, and the running window is associated with its launcher.
+3. **Hardware decode still works** from the installed copy on the laptop — `bus: loaded …` reports `vah265dec` / `memory:DMABuf` / `egl`.
 4. **The model downloads on first use**, with a prompt naming the size and visible progress, verified against its sha256.
-5. **CI builds the package** on a tag, and the binary runs on a machine that did not build it.
+5. **CI builds the package on a tag**, proves it installs and starts, and asserts the whisper build has its SIMD.
 6. **The README describes this app**, not the macOS one.
 
 ---
@@ -27,99 +27,105 @@ The coach installs Coach Cuts on their laptop, finds it in the applications menu
 
 ### S0. `.deb` only, for Ubuntu 24.04 / Mint 22, x86_64
 
-**User decision (2026-09-21), after the evidence below changed the answer.** The parent spec's open question 4 recommended AppImage, and BACKLOG #24 recorded the coach's `.app` mental model pointing the same way. The research says otherwise, and the deciding facts are not preferences:
+**User decisions (2026-09-21):** a `.deb`, after the evidence below changed the answer from AppImage; and a real CI release pipeline — tags, versioning, a built artifact — rather than a package built by hand on the laptop.
 
-- **Bundling creates a licence obligation that depending does not.** An AppImage ships GStreamer, ffmpeg and x264 *inside* it. Those are LGPL and GPL works, so distributing it means distributing their corresponding source. A `.deb` with `Depends:` distributes none of them and owes nothing. (No *incompatibility* either way — AGPLv3 §13 and GPLv3 §13 grant reciprocal permission, and x264 is GPL-2.0-**or-later** so it upgrades to v3. The tripwire to watch is a future GPL-2.0-**only** dependency, which would not be compatible. Nothing in the tree is that today.)
-- **AppImage does not actually deliver the `.app` experience.** One file to double-click, yes — but also `chmod +x`, and no menu entry without hand-placing a `.desktop` or installing AppImageLauncher. `dpkg` does both for free.
-- **VA-API is *least* guaranteed in the bundle.** `libva` and `iHD_drv_video.so` are host- and kernel-coupled and cannot be bundled, so an AppImage can only hope the host has them. A `.deb` can `Recommends:` the driver; Flatpak's runtime installs it automatically.
-- **Three bundle-specific traps**, all measured: the GStreamer registry is built per-machine from detected hardware (ship a stale one and VA-API is silently dead forever); setting `GST_PLUGIN_SYSTEM_PATH_1_0` at an empty path makes GStreamer **rewrite the user's shared `~/.cache/gstreamer-1.0/registry.x86_64.bin` as empty, breaking every other GStreamer app on the machine** (Tauri ships this bug today); and Skia links host `libfontconfig`/`libfreetype`, the classic AppImage breakage the parent spec already named at line 416.
-- **The tooling is alpha.** `linuxdeploy` has never cut 1.0; its GStreamer plugin has an open path-canonicalization bug; `cargo-appimage` auto-links everything, which is the over-bundling failure mode to avoid.
+The parent spec's open question 4 recommended AppImage, and BACKLOG #24 recorded the coach's `.app` mental model pointing the same way. What changed the answer:
 
-**Flatpak is out for different reasons, recorded so nobody re-derives them.** Flathub's linter treats `--filesystem=host` as a hard **error**, and this app stores source paths *relative to the project folder, possibly climbing out with `..`* (`bus/sources.rs:239-246`, with a test asserting `"../../media/cam/a.mp4"`), re-resolving them by path on every launch. There is also **no audio-input portal at all** — the microphone is a static filesystem hole (`--filesystem=xdg-run/pipewire-0`), not a portal. And the camera portal hands back a PipeWire node, not a device path, so `devices.rs:224` (which drops any camera lacking `api.v4l2.path`) would return an **empty camera list**, and the `exposure_dynamic_framerate=0` control that stops the measured 30→7.5 fps drop in low light **cannot be set through it**. Flatpak is a rewrite of the capture layer, not a packaging format.
+- **Bundling creates a licence obligation that depending does not.** An AppImage ships GStreamer, ffmpeg and x264 *inside* it — LGPL and GPL works — so distributing it means distributing their corresponding source. A `.deb` that `Depends:` on them distributes none of those. (No *incompatibility* either way: AGPLv3 §13 and GPLv3 §13 grant reciprocal permission, and x264 is GPL-2.0-**or-later**. The tripwire is a future GPL-2.0-**only** dependency. Nothing in the tree is that today.) **This is not "owes nothing" — see S6.**
+- **AppImage does not actually deliver the `.app` experience.** One file to double-click, but also `chmod +x`, and no menu entry without hand-placing a `.desktop` or installing AppImageLauncher. `dpkg` does both for free.
+- **VA-API is least guaranteed in a bundle.** `libva` and `iHD_drv_video.so` are host- and kernel-coupled and cannot be bundled, so an AppImage can only hope. A `.deb` can `Recommends:` the driver.
+- **The bundle carries GStreamer-registry hazards**, which an earlier draft overstated and this one corrects: the `va` plugin registers **zero** elements when `/dev/dri` is absent at scan time, but it declares a dependency on `renderD*`, so the registry rescans and hardware decode **recovers** once the device appears — not "dead forever". Likewise an empty `GST_PLUGIN_SYSTEM_PATH_1_0` does rewrite the shared registry to one plugin, but the next normal run rebuilds it — a costly rescan, not "breaks every other GStreamer app". Real hazards, both avoided entirely by not bundling.
+- **The tooling is alpha** (`linuxdeploy` has never cut 1.0) — not verified by this project, recorded as reported.
 
-**Scope, stated plainly:** one architecture, one distro family, the machine the coach owns. Both alternatives are backlogged with this evidence attached.
+**Flatpak is out for sharper reasons.** Flathub's linter treats `--filesystem=host` as a hard **error**, and this app stores source paths relative to the project folder that climb out with `..` (`bus/sources.rs:239-246`; the test is at `:286`). There is **no audio-input portal**, so the microphone is a static filesystem hole. And although cameras are *enumerated* through PipeWire's device provider, they are *captured* with `v4l2src`: the camera portal returns a PipeWire node with no `api.v4l2.path`, so `devices.rs` would return an empty camera list, and the `exposure_dynamic_framerate=0` control that stops the measured 30→7.5 fps low-light drop cannot be set through it. **That is a capture rewrite, not a packaging format.**
 
-### S1. `-march=native` must go — this is a correctness bug, not a packaging preference
+Both alternatives are backlogged pointing here.
 
-Measured: `target/release/build/whisper-rs-sys-*/output` contains `-- Adding CPU backend variant ggml-cpu: -march=native`. whisper.cpp's `ggml/CMakeLists.txt` defaults `GGML_NATIVE` **ON** unless cross-compiling or `SOURCE_DATE_EPOCH` is set, and `whisper-rs-sys`'s `build.rs` never overrides it.
+### S1. The whisper build's SIMD must be pinned, explicitly
 
-**A binary built on one machine can `SIGILL` on another.** That applies to any distributed artifact, `.deb` included, the moment CI builds it instead of the coach's own laptop.
+`whisper-rs-sys` builds whisper.cpp with `-march=native` by default: whisper.cpp's `ggml/CMakeLists.txt` sets `GGML_NATIVE` **on** unless cross-compiling or `SOURCE_DATE_EPOCH` is set. A binary built by CI can `SIGILL` on the laptop — a runner with AVX-512 emits instructions this CPU lacks.
 
-The fix is free: `build.rs` passes any `GGML_*` environment variable through as a cmake define, so **`GGML_NATIVE=OFF` in the release build** is enough, with no patch and no fork. Set it in CI and document it as a property of every release build.
+**An earlier draft called the fix "free". It is not, for three reproduced reasons:**
 
-### S2. Depend, don't bundle
+1. **Cargo does not notice the variable changing.** The build script emits `rerun-if-changed=wrapper.h` and no `rerun-if-env-changed=GGML_*`, and cargo's fingerprint tracks only `TARGET` and `BINDGEN_EXTRA_CLANG_ARGS*`. So `GGML_NATIVE=OFF cargo build` on a warm `target/` **silently reuses the native library**. CI's `rust-cache` caches exactly that output.
+2. **`SOURCE_DATE_EPOCH` turns off all SIMD.** The CMake logic enables instruction sets only when `NOT (GGML_NATIVE OR NOT GGML_NATIVE_DEFAULT)`, and `SOURCE_DATE_EPOCH` forces the default off. Reproduced: `SOURCE_DATE_EPOCH=0` with `GGML_NATIVE=OFF` gives `ggml-cpu:` with **no flags at all — a scalar whisper**. Debian's packaging tooling exports `SOURCE_DATE_EPOCH`, as do many reproducible-build setups. On a transcriber that already runs at 0.73× realtime, that would be crippling.
+3. **`OFF` is not a baseline.** Plain `GGML_NATIVE=OFF` yields `-msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2` — x86-64-v3, a Haswell-class floor. Fine for this laptop (AVX2/FMA/F16C/BMI2, no AVX-512), but it is a stated requirement, not nothing.
 
-```
-Depends: libgstreamer1.0-0 (>= 1.24), gstreamer1.0-plugins-base,
-         gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad,
-         gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gstreamer1.0-gl,
-         gstreamer1.0-pipewire, libva2, libegl1, libgl1, libfontconfig1,
-         libfreetype6, libxkbcommon0, libx11-6, libstdc++6
-Recommends: intel-media-va-driver | va-driver-all
-```
+**The fix:** commit `.cargo/config.toml` with `[env]` setting `GGML_NATIVE = "OFF"` **and** `GGML_SSE42`, `GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_BMI2` all `"ON"` explicitly. Reproduced: the explicit flags survive `SOURCE_DATE_EPOCH`. Every build — dev, test, CI, release — then produces the same library, with no CI-only switch to forget. Run `cargo clean -p whisper-rs-sys` once when it lands. **And CI asserts it:** grep the build output for the `-mavx2` line and fail without it, since reason 1 means a cached build could otherwise slip through unnoticed. The package states its x86-64-v3 floor.
 
-Every element the code names resolves into that set, verified element by element. Notes that matter:
+### S2. Depend, don't bundle — and let the tools compute what they can
 
-- **`gstreamer1.0-plugins-bad` is the price of VA-API**: `libgstva.so` (the `vah265dec`/`vah264lpenc` the zero-copy path needs) and `libgstvideoparsersbad.so` (`h264parse`) live there, and it carries **86 `Depends:`** on noble. There is no finer-grained package. It is still far less work than bundling.
-- **`avenc_aac` is rank none**, so it is never auto-plugged and the export path names it explicitly — `gstreamer1.0-libav` is not optional.
-- **`x264enc` is the software encoder fallback** (`gstreamer1.0-plugins-ugly`), reached when no VA encoder exists.
-- **`gstreamer1.0-pipewire` is the microphone** *and* the device enumerator. CI does not install it today, which is why capture tests use `CaptureKind::Test`.
-- **The VA driver is `Recommends:`, not `Depends:`** — the app runs without it, just slowly, and the existing export error already says what to install. `apt` installs recommends by default, so the coach gets it.
+Build with **`cargo-deb`**: a `[package.metadata.deb]` block in the app's `Cargo.toml`, the version taken from the workspace version, no hand-written control file or `dpkg-deb` tree.
 
-**Nothing is bundled, and that is the point:** no registry to stale, no `LD_LIBRARY_PATH` to get wrong, no fontconfig ABI to match, no corresponding-source obligation.
+`Depends:` is two parts:
 
-### S3. The model downloader, at last
+- **`$auto`** — cargo-deb's `dpkg-shlibdeps`, which derives the *linked* libraries from the binary: `libc6 (>= 2.39)`, `libglib2.0-0t64`, `libgstreamer1.0-0`, `libgstreamer-gl1.0-0`, `libgstreamer-plugins-base1.0-0`, fontconfig, freetype, `libstdc++6`, `libgcc-s1`. An earlier draft hand-listed some of these and missed the rest.
+- **Hand-listed, because nothing links them:**
+  - the **GStreamer plugin packages** — `gstreamer1.0-plugins-base`, `-good`, `-bad`, `-ugly`, `gstreamer1.0-libav`, `gstreamer1.0-gl`, `gstreamer1.0-pipewire`. All 37 elements the code names resolve into this set, verified element by element. `avenc_aac` is rank none, so it is never auto-plugged and `libav` is not optional; `-bad` is the price of VA-API (`vah265dec`, `vah264lpenc`, `h264parse`), and carries 86 dependencies of its own with no finer-grained package available.
+  - **libraries winit `dlopen`s on X11**, which `dpkg-shlibdeps` cannot see: **`libxcursor1`, `libxi6`, `libxkbcommon-x11-0`**. The coach's session is X11 Cinnamon, and winit's `XConnection::new` opens Xcursor and XInput2 with `?` — **without these the app does not start on a clean system.** Found only by reading winit's source; the laptop has them already, which is exactly why Done-when #1 insists on a clean container.
+- **Floor:** `libgstreamer1.0-0 (>= 1.24)`, deliberately. `dpkg-shlibdeps` derives only `>= 1.20` because the `v1_24` features enable bindings the code doesn't call — but 1.24 is what is tested, and the constraint documents that.
 
-Phase 10 decided this and deferred the implementation here (its S3). The decision stands: **download on first use, prompt first, `small.en` default**, per-model sha256, cached at `$XDG_CACHE_HOME/coach-cuts/models/`.
+`Recommends: intel-media-va-driver | va-driver-all` (in **universe** on noble; Mint enables it) and `zenity` (`rfd` uses the portal and falls back to it).
 
-**Use `souphttpsrc ! filesink`, not an HTTP crate.** The workspace has **no network dependency of any kind** today — no `reqwest`, `ureq`, `rustls`, `ring`, `sha2` — and adding a TLS tree for one download would be larger than everything Phases 5–9 added combined. `souphttpsrc` is already installed, rank primary, already in CI's plugin set, follows the Hugging Face redirect, and gives byte progress off the sink pad. **Zero new Rust dependencies**, in a crate that is already GStreamer-native.
+**Not listed, because the plugin packages already pull them:** `libva2` (a `NEEDED` of `libgstva`), `libegl1`, `libgl1`, `libx11-6` (all via `libgstreamer-gl1.0-0`).
 
-- **Both sha256s are already in the code**, measured, beside `WhisperModel` — `base.en` `a03779c8…c6d002` (147,964,211 bytes) and `small.en` `c6138d6d…c41e5d` (487,614,201 bytes). The verification needs a SHA-256 implementation; that is ~80 lines of pure Rust or one small no-dep crate, and is the *only* new code the download genuinely requires.
-- **`.part` then rename**, as the export path already does. A truncated model otherwise surfaces as a confusing whisper error much later — and Phase 10's load failure already prints the file's size for exactly this reason.
-- **It reuses the queue's shapes:** a `Downloading` state alongside `Queued`/`Running`, the whole-state event, and the existing progress relay. Do not invent a second long-running-job mechanism.
-- **A second launch mid-download** writes the same `.part`. Use a distinct temp name, or state that the collision is accepted.
-- **Disk full, `$XDG_CACHE_HOME` unset, sha mismatch** each need an answer. A corrupted cache that fails forever is the worst outcome: delete and retry once, then fail with the path.
+### S3. The model downloader
 
-### S4. Desktop integration, and the application-ID gap
+Phase 10 decided this and parked the implementation here. The decision stands: **download on first use, prompt first, `small.en` default**, cached at `$XDG_CACHE_HOME/coach-cuts/models/` (the `~/.cache` fallback is already implemented and tested).
 
-Ship a `.desktop` file, an icon, and an AppStream `metainfo.xml` (cheap, and it is what any future Flatpak would need anyway).
+- **`souphttpsrc ! filesink`, not an HTTP crate.** Verified: rank primary in `plugins-good` 1.24.2, a real fetch followed the 302 to Hugging Face's CDN and reported `size = 487614201`, and throughput matched `curl`. TLS is guaranteed — `plugins-good` hard-depends on `libsoup-3.0-0`, which depends on `glib-networking`. **Zero new Rust dependencies.** Set `iradio-mode=false`.
+- **The sha256 costs no new code.** `glib::Checksum::new(ChecksumType::Sha256)` is already linked through `gst::glib`, and can hash in a pad probe as the bytes arrive. An earlier draft proposed ~80 lines of hand-rolled cryptography; that would have been the worst option available. Both hashes are already in `WhisperModel`, measured.
+- **The download is the first step of the transcription job**, inside `TranscribeKind::Whisper` on the worker thread — not a separate `Downloading` mechanism. It then inherits cancel, the progress relay, one-at-a-time and `Failed` for free, and `TranscribeKind::Test` is untouched. (An earlier draft said "alongside `Queued`/`Running`"; there is no such enum — the state is `TranscriptionState { queued, running, finished }`.) **Accepted tradeoff:** a recording started mid-download preempts the job and restarts the download. Rare, since the coach just accepted a prompt to start it.
+- **The prompt stays on the UI side:** on Transcribe with no model present, confirm with the size, then send the command.
+- **`.part` then rename**, as export already does.
+- **On a sha mismatch, delete and fail** with a message naming the path. No automatic retry: pressing Transcribe again prompts again, which is the same outcome without a counter.
+- **Disk full** is `filesink`'s error, which is the job's ordinary `Failed`. **A second instance** is not supported by the app anyway — two would already fight over `state.json` — so it gets no design here.
+- **State the network facts:** `souphttpsrc` defaults to a 15 s timeout and 3 retries, and the CDN's signed URL expires about an hour after issue — which only matters below roughly 135 kB/s. Whether a retry re-requests the expired URL was not verified.
+- **Tests never touch Hugging Face.** They serve a file from a local `std::net::TcpListener`.
 
-**There is a real gap here that is not packaging's fault.** The app has **no application ID**: the binary is `video-coach-app`, the window title is `"Coach Cuts"`, and Slint 1.18's winit backend exposes no way to set the Wayland `app_id` / X11 `WM_CLASS` — grepped and confirmed. A `.desktop` file whose name does not match the surface's `app_id` means **the running window is not associated with its launcher**: wrong icon in the dock, no grouping, no "pin to taskbar". This must be solved, and the options (a winit patch, a Slint upgrade, an env-var or startup-id workaround) need investigating in the plan rather than assumed.
+### S4. Desktop integration
 
-Also name the launch quirks the app already has: `vblank_mode=0` when the monitor is off (BACKLOG #36) — decide whether the `.desktop` `Exec=` carries it or whether it stays a documented workaround.
+**One application ID, used everywhere.** Today the binary is `video-coach-app` while the config directory is `coach-cuts` — pick one ID and use it for the package name, the binary, the `.desktop` basename, `StartupWMClass=`, and the running window.
 
-### S5. Versioning and a release job
+**The running window's association is a one-line call.** An earlier draft called this "a real gap" needing a winit patch or a Slint upgrade, "grepped and confirmed". It was wrong: `slint::set_xdg_app_id(…)` is public in Slint 1.18 (`i-slint-core-1.18.0/api.rs:1443`, re-exported by `slint`), and the winit backend applies it through `with_name` for both Wayland `app_id` and X11 `WM_CLASS`. Call it right after `BackendSelector::select()` in `main.rs`, before `AppWindow::new()`. Slint passes an empty instance name (`WM_CLASS = ("", id)`), which is why `StartupWMClass=` is worth setting.
 
-There are **no git tags, no CHANGELOG, and `version = "0.1.0"`** inherited by all four crates. Phase 11 has to invent the scheme; invent the smallest one that works.
+- **The icon already exists:** `apple/App/Assets.xcassets/AppIcon.appiconset/` has it at 512 px and below. No design work.
+- **No AppStream `metainfo.xml`.** `apt install ./file.deb` never reads it, and it brings validation demands (releases, content rating, screenshots) for a Flatpak that isn't happening.
+- **`Exec=` carries no `%f` or `%U`.** `main.rs` treats argv[1] as a project folder, so a `file://` URI would open or create a bogus project under `$HOME`.
+- **`vblank_mode=0` stays out of `Exec=`.** It disables vsync for the whole Mesa process during normal use, to fix a slowdown that only happens with the monitor off (BACKLOG #36). It remains a documented workaround.
+- **No maintainer scripts.** dpkg's file triggers already cover `/usr/share/applications` and `/usr/share/icons/hicolor` (checked in `/var/lib/dpkg/triggers/File`). Say so, so the plan doesn't add a `postinst`.
+- **Launching from the menu hides diagnostics.** stderr goes to `~/.xsession-errors`, so both `bus: loaded …` and the panic when the renderer can't be selected land there. Document where to look; build nothing.
 
-- A tag drives the build; the `.deb` version comes from `Cargo.toml`'s workspace version.
-- **Build in a container, not on a runner image.** `ubuntu-22.04` entered deprecation on 2026-09-17 with full removal in April 2027, so pinning a runner label ties the glibc floor to GitHub's image lifecycle. A container decouples them. For a `.deb` targeting 24.04 this matters less than it would for an AppImage, but it is free to do right.
-- **`GGML_NATIVE=OFF`** (S1), non-negotiable.
-- The build needs network, because `skia-bindings` downloads prebuilt binaries — confirmed, and it is why the workspace compiles C++ without needing clang locally.
-- **Smoke-test the artifact**: install it in a clean container and check it starts and reports its decoder. A package that builds but does not run is the failure this phase exists to prevent.
+### S5. The release pipeline
 
-### S6. The README is rewritten, not edited
+There are no git tags, no CHANGELOG, and `version = "0.1.0"`. The user wants a real pipeline; keep it as small as a real one can be.
 
-BACKLOG #23 covers two false claims on line 5. The research found **at least eight**: "Native macOS app", "Built on Swift + SwiftUI + AVFoundation", "no network calls", "No FFmpeg", HEVC output (the port is H.264 High), the custom AVFoundation compositor, `recordings/` of `.mov` files (the port writes `.mkv`), format v6 (the port starts at v7), macOS 26 / Apple Silicon requirements, and a "Pre-built downloads" link to a Releases page **that does not exist**.
+- **One source of truth for the version.** CI fails a tag that doesn't equal the workspace `Cargo.toml` version. A draft that let "a tag drives the build" coexist with "the version comes from `Cargo.toml`" allowed them to drift.
+- **Build on `runs-on: ubuntu-24.04`** — the exact target distro. The binary already uses `GLIBC_2.39` symbols, so building on anything newer raises the floor above the target. An earlier draft proposed a build container; that was AppImage-era caution the spec itself called less relevant for a `.deb`.
+- **`GGML_NATIVE` comes from `.cargo/config.toml`** (S1), and CI **asserts the `-mavx2` line** in the build output.
+- **Strip the binary.** There is no `[profile.release]` today, and the release binary is 47 MB and unstripped.
+- **Smoke-test in a clean `ubuntu:24.04` container:** `apt install ./x.deb` must resolve — this, not the laptop, is what proves S2's list — and every *software-path* element the code names must exist (`gst-inspect-1.0`). Starting the app there needs Xvfb, Mesa EGL, `fonts-dejavu-core` (the UI asks fontconfig for "monospace"), a fixture project as argv[1], and a timeout, since the app runs until its window closes; it will report `avdec_*`, never `vah265dec`. **The hardware decoder check is Done-when #3, by hand on the laptop.** An earlier draft's smoke test could not have passed in CI at all.
+- **The Windows CI job's comment** says Windows is "not a release target until Phase 11". It still isn't — reword it.
 
-This is a rewrite. It should say what the app is, what it needs, how to install it, that transcription downloads a model once, and that export falls back to software encoding without a VA driver (parent spec risk 4 asks for exactly that).
+### S6. Licence notices ship with the binary
 
-### S7. Stale facts in our own documents, corrected here
+**An earlier draft said depending "owes nothing". That is true of GStreamer only.** The binary statically contains whisper.cpp (MIT), a prebuilt Skia (BSD, downloaded at build time), the DejaVu fonts via `include_bytes!`, and hundreds of MIT/Apache crates, and those licences require their notices to travel with the binary. Ship `/usr/share/doc/<package>/copyright` plus a generated third-party notices file.
 
-Found while researching; each would mislead a future reader:
+### S7. The README is rewritten, not edited
 
-- The parent spec's locked-decisions table says **"PipeWire capture"**. Only the *microphone* is PipeWire. The **camera is `v4l2src`**, and `devices.rs:224` discards any camera without a v4l2 path. This matters: "we already use PipeWire so the Flatpak camera portal is close" is false, and it is the reason S0 rejects Flatpak.
-- The same table says **"VA-API/NVENC encode"**. There is **no NVENC** — `grep` finds nothing, and the export path is `vah264lpenc` then `x264enc`.
-- **`scripts/linux-gate-check.sh` tells you to install `gstreamer1.0-vaapi`** — the old, separate, deprecated plugin. The code uses the newer `va` plugin from `gstreamer1.0-plugins-bad`.
-- **`CLAUDE.md` calls the reference laptop "Ubuntu 24.04"**; it is Linux Mint 22.1 on an Ubuntu 24.04 base. Cosmetic until this phase starts making distro claims.
-- **BACKLOG #22 and the parent spec price bundling the model at "~140 MB"** — that is `base.en`. The default is `small.en` at **487.6 MB**, 3.3× the number both documents reason with. Moot now that downloading won, but the numbers should not stay wrong.
+BACKLOG #23 names two false claims on line 5. There are many more — the README describes the macOS app throughout: its platform, its stack, HEVC output, `.mov` recordings, format v6, and a "Pre-built downloads" link to a Releases page that does not exist yet. Rewrite it for the port: what the app is, what it needs, how to install it, that transcription downloads a model once, and that export falls back to software encoding without a VA driver (parent spec risk 4). Link `apple/` as the reference implementation.
 
 ---
 
 ## Deliberately not in this phase
 
-- **AppImage and Flatpak** — backlogged with S0's evidence. Revisit if the app is ever handed to another coach or a different distro.
-- **Windows.** The parent spec puts it here, but nothing has been built toward it and CI only `cargo check`s core. It is its own phase.
-- **An apt repository.** Updating means downloading a new `.deb`. Hosting a repo is real work for one user.
-- **Auto-update**, and **code signing**.
-- **The GStreamer 1.28 `whispertranscriber` migration** (Phase 10's note) — it needs a GStreamer newer than the target distro ships.
+- **AppImage and Flatpak** — backlogged, pointing at S0.
+- **Windows** — its own phase; nothing has been built toward it.
+- **An apt repository and auto-update.** Updating means downloading the new `.deb`.
+- **Code signing.**
+- **The GStreamer 1.28 `whispertranscriber` migration** — needs a newer GStreamer than the target ships.
+- **BACKLOG #38, #39, #40 and #46**, which each name packaging or Phase 11 as their revisit point. #39 and #46 are triggered by growing hardware variety, which one `.deb` for one laptop does not cause; #38 and #40 are unaffected by how the app is installed. Re-deferred, each with a line.
+
+## Stale facts corrected alongside this phase (not design)
+
+Found during research, fixed in a separate docs commit rather than carried as spec decisions: the parent spec's "PipeWire capture" (cameras are enumerated through PipeWire but captured with `v4l2src`) and "VA-API/NVENC encode" (there is no NVENC); `scripts/linux-gate-check.sh`, which installs the deprecated `gstreamer1.0-vaapi`, checks `vah264enc` rather than the `vah264lpenc` the code uses, and describes `v4l2src` as a fallback when it is the primary path; the "Ubuntu 24.04" description of the reference laptop, which lives in the parent spec and the seek-latency spike (not `CLAUDE.md`, as an earlier draft claimed); and the "~140 MB" model figure, which is `base.en` — the default `small.en` is 487.6 MB.
