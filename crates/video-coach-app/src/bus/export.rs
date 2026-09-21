@@ -403,7 +403,11 @@ impl Bus {
             }
         };
         self.emit(Event::Export(active.run.clone()));
-        if !over {
+        if over {
+            // The run is over, so a transcript may have the machine back
+            // (Phase 10 spec S5).
+            self.run_next_if_idle();
+        } else {
             self.export = Some(active);
         }
     }

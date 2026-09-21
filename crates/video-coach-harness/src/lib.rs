@@ -17,10 +17,30 @@ use video_coach_app::bus::{
 };
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
-use video_coach_media::{fixtures, now_ns, probe, SinkKind};
+use video_coach_media::{fixtures, now_ns, probe, SinkKind, TranscribeKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One `Event::Transcription`: the whole queue state as the bus published it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transcription {
+    pub queued: Vec<Uuid>,
+    pub running: Option<(Uuid, u8)>,
+    pub failed: Option<(Uuid, String)>,
+}
+
+impl Transcription {
+    /// Nothing running and nothing waiting.
+    pub fn is_idle(&self) -> bool {
+        self.queued.is_empty() && self.running.is_none()
+    }
+
+    /// The clip running, whatever percent it reports.
+    pub fn running_clip(&self) -> Option<Uuid> {
+        self.running.map(|(id, _)| id)
+    }
+}
 
 pub struct Harness {
     bus: BusHandle,
@@ -45,10 +65,31 @@ impl Harness {
     /// [`Harness::new`] recording from `capture`: test sources with a video
     /// delay, as a camera warming up.
     pub fn with_capture(config_dir: &Path, capture: CaptureKind) -> Self {
+        // Nothing to say, at once: stopping a recording queues its clip
+        // (Phase 10 spec S6), and a transcript nobody asked about must not
+        // change the project under a test that isn't about one.
+        Self::with_transcribe(
+            config_dir,
+            capture,
+            TranscribeKind::Test {
+                delay: Duration::ZERO,
+                text: String::new(),
+            },
+        )
+    }
+
+    /// [`Harness::with_capture`] transcribing with `transcribe`: canned text
+    /// after a delay, and never a model (spec S8).
+    pub fn with_transcribe(
+        config_dir: &Path,
+        capture: CaptureKind,
+        transcribe: TranscribeKind,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let bus = Bus::spawn_with_state(
             SinkKind::System,
             capture,
+            transcribe,
             StateFile::in_config_dir(config_dir),
             Box::new(move |event| {
                 let _ = tx.send(event);
@@ -163,6 +204,31 @@ impl Harness {
     pub fn wait_preview(&mut self) -> Option<Uuid> {
         self.wait_map("Preview", |e| match e {
             Event::Preview(previewing) => Some(*previewing),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Transcription` that `f` accepts, skipping the ones
+    /// before it: the state travels whole in every event, so a test waits for
+    /// the state it means rather than counting events.
+    pub fn wait_transcription(
+        &mut self,
+        what: &str,
+        f: impl Fn(&Transcription) -> bool,
+    ) -> Transcription {
+        self.wait_map(what, |e| match e {
+            Event::Transcription {
+                queued,
+                running,
+                failed,
+            } => {
+                let state = Transcription {
+                    queued: queued.clone(),
+                    running: *running,
+                    failed: failed.clone(),
+                };
+                f(&state).then_some(state)
+            }
             _ => None,
         })
     }

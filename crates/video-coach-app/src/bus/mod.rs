@@ -17,8 +17,10 @@ mod recording;
 mod scoreboard;
 mod sources;
 mod state;
+mod transcribe;
 mod transport;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
@@ -37,12 +39,13 @@ use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
     ExportMessage, FrameMailbox, Gl, PositionHandle, PreviewMessage, PreviewPosition, ProbeError,
-    RecorderMessage, SinkKind, SourcePlayer,
+    RecorderMessage, SinkKind, SourcePlayer, TranscribeKind, TranscribeMessage,
 };
 
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
+pub use transcribe::whisper_model_path;
 
 /// What the UI asks the bus to do.
 #[derive(Debug)]
@@ -175,6 +178,19 @@ pub enum Command {
     /// run's own: a cancel too late to stop a target reports it done.
     CancelExport,
 
+    // Transcription (Phase 10 spec S5, S6).
+    /// Queue the clip's commentary for transcription, behind whatever is
+    /// already running. Does nothing if it is queued or running already;
+    /// re-running a clip that has a transcript overwrites it, as the coach
+    /// asked. Refused while recording, like every other edit.
+    Transcribe {
+        clip_id: Uuid,
+    },
+    /// Stop the transcription running **and drop the queue behind it**. The
+    /// clip goes back to idle, not to a failure; one that had already
+    /// finished keeps its words.
+    CancelTranscription,
+
     // Preview (Phase 7 spec P5).
     /// Show the clip's composite -- its source edited by the coach's plays,
     /// zoomed as they zoomed, with the webcam inset, the drawings and the
@@ -237,6 +253,18 @@ pub enum Event {
     Export(ExportRun),
     /// The clip being previewed, or `None` once the preview closed.
     Preview(Option<Uuid>),
+    /// The whole transcription state (Phase 10 spec S5), so no view is left
+    /// holding something the bus has moved past: the clips waiting in order,
+    /// the one running with its percent, and the last failure. A clip in
+    /// neither is idle.
+    ///
+    /// The words themselves arrive as a [`Event::ProjectChanged`], which
+    /// always precedes the event that stops saying the clip is running.
+    Transcription {
+        queued: Vec<Uuid>,
+        running: Option<(Uuid, u8)>,
+        failed: Option<(Uuid, String)>,
+    },
     /// Select this clip: an undo restored or edited it, or a redo edited it.
     /// Always sent after that change's `ProjectChanged`, which drops a
     /// selection whose clip is gone.
@@ -357,6 +385,10 @@ enum Input {
     /// From the preview with this generation. A closed preview's last
     /// message can still be in the channel.
     Preview(u64, PreviewMessage),
+    /// From the transcription with this generation, about this clip. A
+    /// cancelled job's last message can still be in the channel, and the clip
+    /// is what lets its words be kept anyway (spec S5).
+    Transcription(u64, Uuid, TranscribeMessage),
 }
 
 /// The project the bus has open: folder and document, committed together.
@@ -419,6 +451,23 @@ pub struct Bus {
     preview_position: PreviewPosition,
     /// The latest preview's generation. Messages from any other are stale.
     preview_generation: u64,
+    /// Where transcripts come from (spec S8), chosen at [`Bus::spawn`].
+    transcribe: TranscribeKind,
+    /// The clips waiting to be transcribed, in order. The clip running is
+    /// **not** in here, which is why enqueueing checks both.
+    transcribe_queue: VecDeque<Uuid>,
+    /// The transcription in progress.
+    transcribing: Option<transcribe::Active>,
+    /// The latest transcription's generation. Messages from any other are
+    /// stale: without this a cancelled job's `Finished` clears `running` and
+    /// a second job starts beside the one already going.
+    transcribe_generation: u64,
+    /// The last transcription failure, as macOS kept it: one slot, in memory,
+    /// cleared on that clip's next try, its next success and on project open.
+    transcribe_failed: Option<(Uuid, String)>,
+    /// A [`Command::Shutdown`] is being handled, so no new transcription
+    /// starts: the bus is about to drop, and the UI is waiting on it.
+    shutting_down: bool,
 }
 
 impl Bus {
@@ -430,21 +479,30 @@ impl Bus {
     /// so playback still runs in real time without a sound device.
     ///
     /// `capture` picks where recordings come from: the camera and microphone,
-    /// or test sources.
+    /// or test sources. `transcribe` picks where transcripts come from the
+    /// same way: whisper with a model, or canned text (spec S8).
     ///
     /// `events` is called on the bus thread.
     pub fn spawn(
         sinks: SinkKind,
         capture: CaptureKind,
+        transcribe: TranscribeKind,
         events: Box<dyn Fn(Event) + Send>,
     ) -> BusHandle {
-        Self::spawn_with_state(sinks, capture, StateFile::default_location(), events)
+        Self::spawn_with_state(
+            sinks,
+            capture,
+            transcribe,
+            StateFile::default_location(),
+            events,
+        )
     }
 
     /// [`Bus::spawn`] with an explicit state file, for tests.
     pub fn spawn_with_state(
         sinks: SinkKind,
         capture: CaptureKind,
+        transcribe: TranscribeKind,
         state: StateFile,
         events: Box<dyn Fn(Event) + Send>,
     ) -> BusHandle {
@@ -485,6 +543,12 @@ impl Bus {
             preview: None,
             preview_position: preview_position.clone(),
             preview_generation: 0,
+            transcribe,
+            transcribe_queue: VecDeque::new(),
+            transcribing: None,
+            transcribe_generation: 0,
+            transcribe_failed: None,
+            shutting_down: false,
         };
         let thread = std::thread::Builder::new()
             .name("bus".into())
@@ -528,7 +592,15 @@ impl Bus {
                 Some(Input::Recorder(generation, msg)) => self.recorder_message(generation, msg),
                 Some(Input::Export(msg)) => self.export_message(msg),
                 Some(Input::Preview(generation, msg)) => self.preview_message(generation, msg),
+                Some(Input::Transcription(generation, clip, msg)) => {
+                    self.transcription_message(generation, clip, msg)
+                }
                 Some(Input::Cmd(Command::Shutdown { ack })) => {
+                    // Nothing new is transcribed from here: stopping the
+                    // recording and closing the preview both look for a
+                    // queued job to start, and the one running is cancelled
+                    // and joined when the bus drops below.
+                    self.shutting_down = true;
                     // A recording keeps its clip (or is aborted while still
                     // starting) before anything is torn down. The preview's
                     // pipelines use the UI's GL context, so they go to NULL
@@ -635,6 +707,8 @@ impl Bus {
                 quality,
             } => self.export(targets, resolution, quality),
             Command::CancelExport => self.cancel_export(),
+            Command::Transcribe { clip_id } => self.transcribe(clip_id),
+            Command::CancelTranscription => self.cancel_transcription(),
             Command::OpenPreview(id) => self.open_preview(id),
             Command::ClosePreview => self.close_preview(),
             Command::GlReady { display, context } => {

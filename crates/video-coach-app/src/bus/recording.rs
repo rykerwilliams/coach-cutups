@@ -135,6 +135,13 @@ impl Bus {
             video_seen: false,
         });
         self.emit(Event::Recording(RecordingStatus::Starting));
+        // Recording always wins (Phase 10 spec S5): the transcript running
+        // gives way and goes back to the front of the queue. **Here**, once
+        // the recording exists — not at the top of `toggle_recording`, which
+        // bails at five points above, where a refused record would have
+        // killed a transcript for nothing. After the status, since this joins
+        // the transcription thread and the UI is waiting to say Recording.
+        self.preempt_transcription();
     }
 
     /// Stops the recording, keeping its clip, or aborts it if no video has
@@ -293,6 +300,7 @@ impl Bus {
             return;
         };
         let events = active.log.finish();
+        let clip_id = active.pending.id;
         let outcome = active.recorder.stop(STOP_TIMEOUT);
         if let Some(open) = &mut self.open {
             open.project
@@ -303,6 +311,9 @@ impl Bus {
         if !outcome.clean {
             self.emit(Event::Error(UserError::StopNotClean));
         }
+        // The clip exists and is saved, so it can be transcribed (Phase 10
+        // spec S6) -- and whatever this recording preempted resumes.
+        self.transcribe_after_recording(clip_id);
     }
 
     /// Drops a recording that never got video: no clip, no file.
@@ -314,6 +325,10 @@ impl Bus {
         drop(active.recorder);
         remove_recording(&active.path);
         self.emit(Event::Recording(RecordingStatus::Idle));
+        // A recording that produced no clip still preempted a transcript,
+        // which resumes here: this path is the easy one to miss, and missing
+        // it stalls the queue until the next enqueue (Phase 10 spec S5).
+        self.run_next_if_idle();
     }
 }
 

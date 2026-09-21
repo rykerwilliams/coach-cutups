@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const APP_DIR: &str = "coach-cuts";
+/// The app's own directory under whichever XDG base directory is in play.
+pub(super) const APP_DIR: &str = "coach-cuts";
 const FILE: &str = "state.json";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -86,16 +87,28 @@ fn write(path: &Path, folder: Option<&Path>) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The XDG base-directory rule: `$XDG_CONFIG_HOME` if set to an absolute
-/// path, else `$HOME/.config`.
-fn config_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+/// The XDG base-directory rule: the `$XDG_*_HOME` variable if it is set to an
+/// absolute path, else `$HOME/<fallback>`.
+fn base_dir(xdg: Option<OsString>, home: Option<OsString>, fallback: &str) -> Option<PathBuf> {
     xdg.map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
             home.map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .map(|h| h.join(".config"))
+                .map(|h| h.join(fallback))
         })
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`: where this file lives.
+fn config_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    base_dir(xdg, home, ".config")
+}
+
+/// `$XDG_CACHE_HOME`, else `~/.cache`: where the whisper model is looked for
+/// (Phase 10 spec S3). A 466 MB download is a cache, not configuration, and
+/// nothing is stored there by this app.
+pub(super) fn cache_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    base_dir(xdg, home, ".cache")
 }
 
 #[cfg(test)]
@@ -128,6 +141,20 @@ mod tests {
     #[test]
     fn no_config_dir_without_xdg_or_home() {
         assert_eq!(config_dir(None, None), None);
+    }
+
+    /// The same rule, a different base directory: the model is a cache.
+    #[test]
+    fn the_cache_directory_follows_its_own_variable() {
+        assert_eq!(
+            cache_dir(Some("/x/cache".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/x/cache"))
+        );
+        assert_eq!(
+            cache_dir(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.cache"))
+        );
+        assert_eq!(cache_dir(None, None), None);
     }
 
     #[test]

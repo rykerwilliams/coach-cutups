@@ -60,7 +60,9 @@ const QUEUED: u64 = 4;
 /// [`ExportError`](export::ExportError).
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum CompositeError {
-    #[error("the export was cancelled")]
+    /// The caller's cancel flag was set. Export, preview and transcription
+    /// all raise it, so the message names none of them.
+    #[error("cancelled")]
     Cancelled,
     #[error("{0}")]
     Failed(String),

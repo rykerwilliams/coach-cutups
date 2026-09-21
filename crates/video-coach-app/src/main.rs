@@ -21,8 +21,8 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    export_targets, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, ExportTargetRun,
-    RecordingStatus, Snapshot, TargetState,
+    export_targets, whisper_model_path, Bus, BusHandle, CaptureKind, Command, Event, ExportRun,
+    ExportTargetRun, RecordingStatus, Snapshot, TargetState,
 };
 use video_coach_app::drawing::{path_commands, InProgress};
 use video_coach_app::format::{finish_at, format_hms, sentence};
@@ -39,7 +39,9 @@ use video_coach_core::stroke::Stroke;
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
-use video_coach_media::{list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind};
+use video_coach_media::{
+    list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, TranscribeKind,
+};
 
 use pickers::{Pick, Pickers};
 
@@ -145,6 +147,11 @@ fn main() {
     let bus = Bus::spawn(
         SinkKind::Gl,
         CaptureKind::Devices,
+        // The model is found, never fetched (Phase 10 spec S3): a missing one
+        // fails the job with a message naming this path.
+        TranscribeKind::Whisper {
+            model: whisper_model_path(),
+        },
         Box::new(move |event| {
             let _ = weak.upgrade_in_event_loop(move |w| on_event(&w, event));
         }),
@@ -1181,6 +1188,10 @@ fn on_event(w: &AppWindow, event: Event) {
             // `total-seconds`, and picks it up from here.
             ui.preview_duration = clip.map(|c| c.recording_duration);
         }),
+        // The clip inspector's transcript row is what reads this (spec S5);
+        // it lands with the rest of that panel. The words themselves arrive
+        // as the `ProjectChanged` before it, so nothing is lost meanwhile.
+        Event::Transcription { .. } => {}
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {

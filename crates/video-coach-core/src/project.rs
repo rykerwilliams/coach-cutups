@@ -162,6 +162,9 @@ impl Clip {
             ClipEdit::Tags(v) => ClipEdit::Tags(std::mem::replace(&mut self.tags, v)),
             ClipEdit::Notes(v) => ClipEdit::Notes(std::mem::replace(&mut self.notes, v)),
             ClipEdit::ShowPip(v) => ClipEdit::ShowPip(std::mem::replace(&mut self.show_pip, v)),
+            ClipEdit::Transcript(v) => {
+                ClipEdit::Transcript(std::mem::replace(&mut self.transcript, v))
+            }
         }
     }
 }

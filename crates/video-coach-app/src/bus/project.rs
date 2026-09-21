@@ -99,6 +99,13 @@ impl Bus {
         if let Some(snapshot) = self.snapshot() {
             self.emit(Event::ProjectOpened(snapshot));
         }
+        // The transcription queue doesn't survive an open either, for the
+        // same reason the history doesn't: it holds ids of another project's
+        // clips, and a job left running would write its words into a project
+        // that is no longer open (Phase 10 spec S5). **After** the
+        // `ProjectOpened` it belongs to, so the UI hears it as this project's
+        // state rather than the last one's.
+        self.reset_transcription();
         self.ensure_loaded(0.0);
     }
 

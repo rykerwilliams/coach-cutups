@@ -100,7 +100,9 @@ impl Bus {
         };
 
         // Whatever was on screen stops first, and takes its frame with it.
-        self.close_preview();
+        // The teardown alone: this preview is replacing it, so nothing else
+        // may have the machine in between (Phase 10 spec S5).
+        self.stop_preview();
         if self.playing {
             self.set_playing(false);
         }
@@ -162,6 +164,17 @@ impl Bus {
     /// Closes the preview, if one is open, and clears the picture it left.
     /// Idempotent.
     pub(super) fn close_preview(&mut self) {
+        self.stop_preview();
+        // The preview held the picture and the audio sink, so a queued
+        // transcript may start now (Phase 10 spec S5). Not from
+        // [`Bus::stop_preview`], which `start_preview` uses to replace one
+        // preview with another; and not during a shutdown, which closes the
+        // preview on its way out.
+        self.run_next_if_idle();
+    }
+
+    /// The teardown alone.
+    fn stop_preview(&mut self) {
         // Dropping it takes its pipelines to NULL and joins its thread, so
         // nothing can refill the mailbox after this.
         let Some(active) = self.preview.take() else {
