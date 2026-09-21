@@ -557,3 +557,18 @@ Each entry: what, why deferred, when to revisit.
   of megabytes. Recorded only so nobody spends an afternoon hunting it.
 - **When to revisit:** never, unless a future caller sets callbacks in a loop.
 
+62. **Cache the `WhisperContext` across queued jobs.** Phase 10 runs one
+  worker thread per job, copying the `Exporter` precedent, so a six-clip
+  queue loads `ggml-small.en.bin` six times.
+- **Why deferred:** an earlier draft specified a long-lived worker holding the
+  context, justified as saving "minutes" on a six-clip session. That was
+  overstated — a warm `whisper_init_from_file` is sub-second — and it
+  contradicted the spec's own "the bus thread owns the queue", needing a
+  second channel and a drain protocol the design never named. It would also
+  hold 466 MB resident through an entire recording session, beside the capture
+  pipeline, on a 15 W laptop.
+- **When to revisit:** if the Phase 10 closeout's throughput measurement shows
+  model load is a material fraction of a job. The clean shape is a long-lived
+  worker that drops the context whenever the queue empties *or* a blocker
+  starts, which is what makes it more than a one-line change.
+
