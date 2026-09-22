@@ -2,7 +2,8 @@
 //!
 //! The version guard runs against the **raw JSON**, before deserialization, so
 //! a macOS-era file produces a clear "made by the macOS version" error rather
-//! than a confusing field-level decode failure.
+//! than a confusing field-level decode failure. It reads
+//! [`MIN_READABLE_FORMAT_VERSION`]`..=`[`CURRENT_FORMAT_VERSION`].
 
 use std::path::{Path, PathBuf};
 
@@ -10,14 +11,19 @@ use serde::Deserialize;
 
 use crate::project::Project;
 
-/// The format version this build writes and is the minimum it reads.
+/// The format version this build writes, and the newest it reads.
 ///
 /// Numbering continues from the Swift lineage (v1–v6) rather than resetting.
 /// Resetting would have made a Swift v1 file — which has no `formatVersion`
 /// key at all and so decodes as 1 — indistinguishable from a current file,
 /// and the guard would then need to sniff field shapes. One comparison cannot
 /// have holes.
-pub const CURRENT_FORMAT_VERSION: u32 = 7;
+pub const CURRENT_FORMAT_VERSION: u32 = 8;
+
+/// The oldest format version this build reads: the first the Linux port wrote.
+/// Everything below it is a macOS-era file. Every change since v7 is additive
+/// (spec F2), so an older file reads as it stands and needs no migration.
+pub const MIN_READABLE_FORMAT_VERSION: u32 = 7;
 
 pub const PROJECT_FILENAME: &str = "project.json";
 pub const RECORDINGS_DIRNAME: &str = "recordings";
@@ -115,10 +121,10 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
     }
 
     let found = format_version_of(&value)?;
-    if found < CURRENT_FORMAT_VERSION {
+    if found < MIN_READABLE_FORMAT_VERSION {
         return Err(StoreError::LegacyProject {
             found,
-            minimum: CURRENT_FORMAT_VERSION,
+            minimum: MIN_READABLE_FORMAT_VERSION,
         });
     }
     if found > CURRENT_FORMAT_VERSION {
@@ -159,13 +165,27 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
 /// Stamps `format_version` to current, and writes atomically — an interrupted
 /// save must not leave a truncated `project.json`, since that is the file the
 /// refuse-to-overwrite rule keys on.
+///
+/// **The first save after an upgrade keeps the old file.** When `project` was
+/// read at an older version, `project.json` is first copied to
+/// `project.json.v<old>`, unless that file already exists: it is never
+/// overwritten, so it stays the file as the older build last wrote it, and
+/// going back to that build stays possible (spec F1). Otherwise this save
+/// would lock it out with `TooNew`.
 pub fn write(project_dir: &Path, project: &mut Project) -> Result<(), StoreError> {
-    project.format_version = CURRENT_FORMAT_VERSION;
-
     match std::fs::create_dir(project_dir.join(RECORDINGS_DIRNAME)) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
         _ => {}
     }
+
+    let path = project_dir.join(PROJECT_FILENAME);
+    if project.format_version < CURRENT_FORMAT_VERSION {
+        let backup = project_dir.join(format!("{PROJECT_FILENAME}.v{}", project.format_version));
+        if path.exists() && !backup.exists() {
+            std::fs::copy(&path, &backup)?;
+        }
+    }
+    project.format_version = CURRENT_FORMAT_VERSION;
 
     let mut text =
         serde_json::to_string_pretty(project).map_err(|e| StoreError::Malformed(e.to_string()))?;
@@ -175,6 +195,6 @@ pub fn write(project_dir: &Path, project: &mut Project) -> Result<(), StoreError
     // would not be).
     let tmp = project_dir.join(".project.json.tmp");
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, project_dir.join(PROJECT_FILENAME))?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }

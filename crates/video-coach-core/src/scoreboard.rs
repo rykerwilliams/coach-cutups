@@ -152,6 +152,44 @@ pub struct MatchEventRecord {
     pub kind: MatchEventKind,
     pub source_index: usize,
     pub source_seconds: f64,
+    /// A goal's reel trim, in seconds: how long its reel entry runs before the
+    /// goal (`reel_lead_in`) and after it (`reel_tail`). Positive magnitudes,
+    /// relative to the goal so they follow it through a source move or relink,
+    /// and `None` for the reel's default. Set through
+    /// [`Project::set_reel_trim`]; always `None` on a start/stop.
+    ///
+    /// v8. Field-level defaults, because `None` is exactly what a v7 file
+    /// means (spec F2), and always serialized, so there is one shape on disk.
+    #[serde(default)]
+    pub reel_lead_in: Option<f64>,
+    #[serde(default)]
+    pub reel_tail: Option<f64>,
+}
+
+impl MatchEventKind {
+    pub fn is_goal(self) -> bool {
+        matches!(self, MatchEventKind::HomeGoal | MatchEventKind::AwayGoal)
+    }
+}
+
+/// Which end of a goal's reel entry a trim moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReelEnd {
+    Start,
+    End,
+}
+
+/// [`Project::set_reel_trim`] refused; the project is unchanged.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReelTrimError {
+    #[error("no goal has that id")]
+    NotAGoal,
+    #[error("the position is on a different video from the goal")]
+    OtherSource,
+    #[error("the reel must start before the goal")]
+    StartNotBeforeGoal,
+    #[error("the reel must end after the goal")]
+    EndNotAfterGoal,
 }
 
 // ---------------------------------------------------------- interpretation
@@ -491,6 +529,8 @@ impl Project {
             kind,
             source_index,
             source_seconds,
+            reel_lead_in: None,
+            reel_tail: None,
         });
         id
     }
@@ -510,6 +550,53 @@ impl Project {
                 abs_seconds: self.abs_seconds(m.source_index, m.source_seconds),
             })
             .collect()
+    }
+
+    /// Set one end of goal `goal`'s reel entry at `at` (`(source_index,
+    /// source_seconds)`, the scan position the caller captured), or reset that
+    /// end to the default with `None`. The other end is left alone.
+    ///
+    /// Stored relative to the goal, as `goal − at` for the start and `at −
+    /// goal` for the end, so a trim follows its goal through a source move or
+    /// relink. Refuses an id that isn't a goal, a position on another source
+    /// (a reel entry can't cross one), and a start that isn't before the goal
+    /// or an end that isn't after it.
+    pub fn set_reel_trim(
+        &mut self,
+        goal: Uuid,
+        end: ReelEnd,
+        at: Option<(usize, f64)>,
+    ) -> Result<(), ReelTrimError> {
+        let record = self
+            .match_events
+            .iter_mut()
+            .find(|m| m.id == goal && m.kind.is_goal())
+            .ok_or(ReelTrimError::NotAGoal)?;
+        let seconds = match at {
+            None => None,
+            Some((source_index, _)) if source_index != record.source_index => {
+                return Err(ReelTrimError::OtherSource)
+            }
+            Some((_, at)) => {
+                let (seconds, error) = match end {
+                    ReelEnd::Start => (
+                        record.source_seconds - at,
+                        ReelTrimError::StartNotBeforeGoal,
+                    ),
+                    ReelEnd::End => (at - record.source_seconds, ReelTrimError::EndNotAfterGoal),
+                };
+                // A NaN position is refused too.
+                if seconds.is_nan() || seconds <= 0.0 {
+                    return Err(error);
+                }
+                Some(seconds)
+            }
+        };
+        match end {
+            ReelEnd::Start => record.reel_lead_in = seconds,
+            ReelEnd::End => record.reel_tail = seconds,
+        }
+        Ok(())
     }
 
     /// Remove the event with `id` and return it, or `None` if there is none.
@@ -626,6 +713,8 @@ mod tests {
             kind: MatchEventKind::HomeGoal,
             source_index: 1,
             source_seconds: 123.5,
+            reel_lead_in: None,
+            reel_tail: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""sourceSeconds":123.5"#), "got {s}");
@@ -634,7 +723,7 @@ mod tests {
 
     /// Phase 9 dropped `isAutoBackAnchor` — the back-anchor is derived from the
     /// config now. A record written by a build that had it still loads, which
-    /// is why the format stays at v7.
+    /// is why Phase 9 kept the format at v7.
     #[test]
     fn a_record_carrying_the_old_anchor_flag_still_loads() {
         let with_flag = r#"{"id":"00000000-0000-0000-0000-000000000000","kind":"startStop","sourceIndex":0,"sourceSeconds":1.0,"isAutoBackAnchor":true}"#;

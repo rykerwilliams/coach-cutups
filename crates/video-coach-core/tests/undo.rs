@@ -55,6 +55,8 @@ fn match_events(source_index: usize) -> UndoAction {
             kind: MatchEventKind::StartStop,
             source_index,
             source_seconds: 1.0,
+            reel_lead_in: None,
+            reel_tail: None,
         }],
     }
 }

@@ -55,6 +55,8 @@ fn match_event_on(source_index: usize) -> MatchEventRecord {
         kind: MatchEventKind::HomeGoal,
         source_index,
         source_seconds: 1.0,
+        reel_lead_in: None,
+        reel_tail: None,
     }
 }
 

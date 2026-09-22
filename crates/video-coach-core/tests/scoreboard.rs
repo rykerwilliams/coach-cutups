@@ -8,7 +8,8 @@ use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::scoreboard::{
     format_clock, interpret, scoreboard_state, AbsoluteMatchEvent, ClockDisplay, MatchEventKind,
-    MatchFormat, PeriodRole, ScoreboardConfig, ScoreboardContext, ScoreboardState, TeamConfig,
+    MatchFormat, PeriodRole, ReelEnd, ReelTrimError, ScoreboardConfig, ScoreboardContext,
+    ScoreboardState, TeamConfig,
 };
 use video_coach_core::stroke::Rgba;
 
@@ -552,6 +553,97 @@ fn tagging_appends_a_record_with_its_own_id_and_deleting_removes_it() {
     assert_eq!(p.delete_match_event(first).unwrap().id, first);
     assert_eq!(p.match_events.len(), 1);
     assert!(p.delete_match_event(first).is_none());
+}
+
+// ------------------------------------------------------------ reel trims
+
+fn trims(p: &Project, id: Uuid) -> (Option<f64>, Option<f64>) {
+    let m = p.match_events.iter().find(|m| m.id == id).unwrap();
+    (m.reel_lead_in, m.reel_tail)
+}
+
+/// A trim is set from a position and stored relative to the goal: the lead-in
+/// as `goal − at`, the tail as `at − goal`, each side on its own.
+#[test]
+fn a_reel_trim_is_stored_relative_to_the_goal() {
+    let mut p = project_with_sources(&[600.0, 600.0]);
+    let goal = p.append_match_event(MatchEventKind::AwayGoal, 1, 100.0);
+
+    p.set_reel_trim(goal, ReelEnd::Start, Some((1, 88.0)))
+        .unwrap();
+    assert_eq!(trims(&p, goal), (Some(12.0), None));
+    p.set_reel_trim(goal, ReelEnd::End, Some((1, 104.5)))
+        .unwrap();
+    assert_eq!(trims(&p, goal), (Some(12.0), Some(4.5)));
+}
+
+/// `None` resets one side to the default and leaves the other alone.
+#[test]
+fn resetting_one_side_of_a_reel_trim_leaves_the_other() {
+    let mut p = project_with_sources(&[600.0]);
+    let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+    p.set_reel_trim(goal, ReelEnd::Start, Some((0, 90.0)))
+        .unwrap();
+    p.set_reel_trim(goal, ReelEnd::End, Some((0, 110.0)))
+        .unwrap();
+
+    p.set_reel_trim(goal, ReelEnd::Start, None).unwrap();
+    assert_eq!(trims(&p, goal), (None, Some(10.0)));
+    p.set_reel_trim(goal, ReelEnd::End, None).unwrap();
+    assert_eq!(trims(&p, goal), (None, None));
+}
+
+#[test]
+fn a_reel_trim_refuses_anything_but_a_goal() {
+    let mut p = project_with_sources(&[600.0]);
+    let start_stop = p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    for id in [start_stop, Uuid::new_v4()] {
+        assert_eq!(
+            p.set_reel_trim(id, ReelEnd::Start, Some((0, 5.0))),
+            Err(ReelTrimError::NotAGoal)
+        );
+        assert_eq!(
+            p.set_reel_trim(id, ReelEnd::End, None),
+            Err(ReelTrimError::NotAGoal)
+        );
+    }
+    assert_eq!(trims(&p, start_stop), (None, None));
+}
+
+#[test]
+fn a_reel_trim_refuses_a_position_on_another_source() {
+    let mut p = project_with_sources(&[600.0, 600.0]);
+    let goal = p.append_match_event(MatchEventKind::HomeGoal, 1, 100.0);
+    assert_eq!(
+        p.set_reel_trim(goal, ReelEnd::Start, Some((0, 90.0))),
+        Err(ReelTrimError::OtherSource)
+    );
+    assert_eq!(
+        p.set_reel_trim(goal, ReelEnd::End, Some((0, 110.0))),
+        Err(ReelTrimError::OtherSource)
+    );
+    assert_eq!(trims(&p, goal), (None, None));
+}
+
+/// A start must be before the goal and an end after it; the goal's own
+/// instant is neither.
+#[test]
+fn a_reel_trim_refuses_the_wrong_side_of_the_goal() {
+    let mut p = project_with_sources(&[600.0]);
+    let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+    for at in [100.0, 101.0] {
+        assert_eq!(
+            p.set_reel_trim(goal, ReelEnd::Start, Some((0, at))),
+            Err(ReelTrimError::StartNotBeforeGoal)
+        );
+    }
+    for at in [100.0, 99.0] {
+        assert_eq!(
+            p.set_reel_trim(goal, ReelEnd::End, Some((0, at))),
+            Err(ReelTrimError::EndNotAfterGoal)
+        );
+    }
+    assert_eq!(trims(&p, goal), (None, None));
 }
 
 /// The mutator has no cap: the command refuses out loud instead. macOS's

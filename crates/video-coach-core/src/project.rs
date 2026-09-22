@@ -3,11 +3,15 @@
 //! A project is a folder: `project.json` plus a `recordings/` subdirectory of
 //! commentary `.mkv` files. Sources are referenced, never copied.
 //!
-//! **Field-level `#[serde(default)]` is a hazard**: it resolves to
-//! `Default::default()`, which is `0.0` for `f64` and `false` for `bool`, so
-//! applying it per field would silently mute every volume and turn PiP off.
+//! **Field-level `#[serde(default)]` is a hazard on an `f64` or a `bool`**: it
+//! resolves to `Default::default()`, which is `0.0` and `false`, so applying it
+//! per field would silently mute every volume and turn PiP off.
 //! `Preferences` puts `default` on the container instead, which fills from its
-//! own `Default` impl. And only
+//! own `Default` impl. On an `Option` or a `Vec` a field-level default is
+//! exactly right: `None` and empty are what an older file, written before the
+//! field existed, means (spec F2). So a field added to an existing struct is an
+//! `Option` or a `Vec` with a field-level default, and a new struct's fields
+//! get none. And only
 //! genuinely optional keys get a default at all: defaulting `clips` would let a
 //! truncated `project.json` load as an empty project, after which the next save
 //! destroys the user's work.

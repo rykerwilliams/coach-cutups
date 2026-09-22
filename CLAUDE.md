@@ -233,6 +233,22 @@ or font crate, not a feature that pulls one in. CI runs its tests on a runner
 with no GStreamer installed, so adding one fails the build rather than passing
 silently. If you need a media type in core, you need a different design.
 
+**The project format reads `MIN_READABLE_FORMAT_VERSION..=CURRENT_FORMAT_VERSION`**
+(`store.rs`; v7, the first the port wrote, onward). Below it is a macOS file
+(`LegacyProject`), above it `TooNew`. See spec F in
+`docs/superpowers/specs/2026-09-22-match-vision-design.md`.
+- **Every phase that stores a new field bumps the version once**, even though
+  serde ignores unknown keys: an older build would ignore them too, and drop them
+  on its next save. The bump makes it refuse the file instead.
+- **A field added to an existing struct is an `Option` or a `Vec` with a
+  field-level `#[serde(default)]`**, which is exactly what an older file means. A
+  new struct's fields get no default: a missing one is a malformed file. Never a
+  field-level default on an `f64` or a `bool` (`project.rs`'s header).
+- **Every bump comes with a test that the oldest readable version still loads**
+  (`project_format.rs::a_v7_file_loads_under_the_current_version`).
+- **The first save after an upgrade keeps `project.json.v<old>`**, once, never
+  overwritten, so the older build can still be gone back to.
+
 **Bus contract — caller-captured timestamps.** Any command that lands in the
 commentary event log carries its timestamp (and source-position anchor) as a
 field, captured at the input event on the UI thread, never assigned by the bus

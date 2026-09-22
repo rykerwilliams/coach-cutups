@@ -1,4 +1,4 @@
-//! Project format v7: defaults, the version guard, and the store's contract.
+//! The project format: defaults, the version guard, and the store's contract.
 
 use std::path::Path;
 
@@ -12,7 +12,9 @@ use video_coach_core::recording::PendingClip;
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
 };
-use video_coach_core::store::{self, StoreError, CURRENT_FORMAT_VERSION};
+use video_coach_core::store::{
+    self, StoreError, CURRENT_FORMAT_VERSION, MIN_READABLE_FORMAT_VERSION,
+};
 use video_coach_core::stroke::Rgba;
 
 fn sample_clip() -> Clip {
@@ -73,6 +75,17 @@ fn sample_project() -> Project {
         kind: MatchEventKind::StartStop,
         source_index: 0,
         source_seconds: 0.0,
+        reel_lead_in: None,
+        reel_tail: None,
+    });
+    // One trimmed side and one default, so the round trip covers both.
+    p.match_events.push(MatchEventRecord {
+        id: Uuid::from_u128(1),
+        kind: MatchEventKind::HomeGoal,
+        source_index: 0,
+        source_seconds: 600.0,
+        reel_lead_in: Some(12.5),
+        reel_tail: None,
     });
     p
 }
@@ -216,6 +229,65 @@ fn round_trips_through_the_store() {
     assert_eq!(store::read(dir.path()).unwrap(), p);
 }
 
+/// F1. The oldest version this build reads, as the build that wrote it last
+/// left it: a goal with no trim keys. Every bump keeps a test like this one.
+#[test]
+fn a_v7_file_loads_under_the_current_version() {
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        dir.path(),
+        json!({
+            "formatVersion": 7,
+            "name": "x",
+            "sourceVideos": [{
+                "relativePath": "a.mp4",
+                "displayName": "a",
+                "durationSeconds": 2700.0,
+                "displayAspect": 1.5
+            }],
+            "clips": [],
+            "matchEvents": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "kind": "homeGoal",
+                "sourceIndex": 0,
+                "sourceSeconds": 600.0
+            }]
+        }),
+    );
+    let mut p = store::read(dir.path()).expect("a v7 file loads");
+    assert_eq!(p.format_version, 7, "read keeps the version it found");
+    assert_eq!(p.match_events.len(), 1);
+    assert_eq!(
+        (p.match_events[0].reel_lead_in, p.match_events[0].reel_tail),
+        (None, None)
+    );
+
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(
+        store::read(dir.path()).unwrap().format_version,
+        CURRENT_FORMAT_VERSION
+    );
+}
+
+/// v8. The trims are always written, `null` for the default, so there is one
+/// shape on disk; and they come back from the store as they went in.
+#[test]
+fn reel_trims_round_trip_and_are_always_written() {
+    let dir = TempDir::new().unwrap();
+    let mut p = sample_project();
+    p.match_events[1].reel_tail = Some(4.0);
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(store::read(dir.path()).unwrap(), p);
+
+    let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let start_stop = &value["matchEvents"][0];
+    assert_eq!(start_stop["reelLeadIn"], serde_json::Value::Null);
+    assert!(start_stop.as_object().unwrap().contains_key("reelTail"));
+    assert_eq!(value["matchEvents"][1]["reelLeadIn"], json!(12.5));
+    assert_eq!(value["matchEvents"][1]["reelTail"], json!(4.0));
+}
+
 #[test]
 fn swift_era_v6_is_refused() {
     let dir = TempDir::new().unwrap();
@@ -225,7 +297,7 @@ fn swift_era_v6_is_refused() {
     );
     match store::read(dir.path()) {
         Err(StoreError::LegacyProject { found, minimum }) => {
-            assert_eq!((found, minimum), (6, CURRENT_FORMAT_VERSION));
+            assert_eq!((found, minimum), (6, MIN_READABLE_FORMAT_VERSION));
         }
         other => panic!("expected LegacyProject, got {other:?}"),
     }
@@ -257,12 +329,12 @@ fn integral_float_format_version_is_accepted() {
 
     let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
     let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    value["formatVersion"] = json!(7.0);
+    value["formatVersion"] = json!(f64::from(CURRENT_FORMAT_VERSION));
     write_raw(dir.path(), value);
 
     assert!(
         store::read(dir.path()).is_ok(),
-        "7.0 must not be read as v1"
+        "an integral float must not be read as v1"
     );
 }
 
@@ -284,12 +356,17 @@ fn newer_format_is_refused_as_too_new() {
     let dir = TempDir::new().unwrap();
     write_raw(
         dir.path(),
-        json!({"formatVersion": 8, "name": "x", "sourceVideos": [], "clips": []}),
+        json!({"formatVersion": CURRENT_FORMAT_VERSION + 1, "name": "x", "sourceVideos": [], "clips": []}),
     );
-    assert!(matches!(
-        store::read(dir.path()),
-        Err(StoreError::TooNew { found: 8, .. })
-    ));
+    match store::read(dir.path()) {
+        Err(StoreError::TooNew { found, supported }) => {
+            assert_eq!(
+                (found, supported),
+                (CURRENT_FORMAT_VERSION + 1, CURRENT_FORMAT_VERSION)
+            );
+        }
+        other => panic!("expected TooNew, got {other:?}"),
+    }
 }
 
 #[test]
@@ -329,6 +406,47 @@ fn write_stamps_the_current_format_version() {
     assert_eq!(
         store::read(dir.path()).unwrap().format_version,
         CURRENT_FORMAT_VERSION
+    );
+}
+
+/// F1. The first save after an upgrade keeps the file the older build wrote,
+/// byte for byte, and never overwrites that copy; a save at the current version
+/// makes none.
+#[test]
+fn an_upgrade_keeps_the_old_file_once() {
+    let dir = TempDir::new().unwrap();
+    let mut v7 = serde_json::to_value(sample_project()).unwrap();
+    v7["formatVersion"] = json!(7);
+    write_raw(dir.path(), v7);
+    let original = std::fs::read(dir.path().join("project.json")).unwrap();
+    let backup = dir.path().join("project.json.v7");
+
+    let mut p = store::read(dir.path()).unwrap();
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+    // Read at v7 again (the file on disk is now current, so fake it): the
+    // backup already exists and is left alone.
+    p.format_version = 7;
+    p.name = "Renamed".into();
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+    // A project read at the current version makes no backup.
+    let current = TempDir::new().unwrap();
+    let mut p = sample_project();
+    store::write(current.path(), &mut p).unwrap();
+    let mut p = store::read(current.path()).unwrap();
+    store::write(current.path(), &mut p).unwrap();
+    let names: Vec<_> = std::fs::read_dir(current.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.to_string_lossy().starts_with("project.json.v")),
+        "got {names:?}"
     );
 }
 
