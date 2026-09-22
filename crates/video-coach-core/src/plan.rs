@@ -28,6 +28,9 @@ pub enum ExportTarget {
     /// One clip. A single-clip export is a one-entry compilation rather than a
     /// path of its own: one plan, one schedule, one progress model, one cancel.
     Clip(Uuid),
+    /// The goals reel: one entry per confirmed goal, cut from the game video
+    /// around it, and no clip at all ([`crate::reel`]).
+    Reel,
 }
 
 /// One entry's contribution to the output: a clip's, or a stretch of game
@@ -53,7 +56,8 @@ pub struct PlanEntry {
     pub frames: usize,
     /// The text bar's line: `"<n> / <total> | <name> | tag1, tag2"`, where
     /// `<total>` is the target's clip count. An empty part is dropped along
-    /// with its separator, so an unnamed, untagged clip reads `"3 / 7"`.
+    /// with its separator, so an unnamed, untagged clip reads `"3 / 7"`. A
+    /// reel entry's line names its goal instead ([`crate::reel`]).
     pub text: String,
 }
 
@@ -105,6 +109,8 @@ pub(crate) fn selected_clips<'a>(project: &'a Project, target: &ExportTarget) ->
             ExportTarget::AllClips => true,
             ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
             ExportTarget::Clip(id) => c.id == *id,
+            // Built from the goals, not from clips.
+            ExportTarget::Reel => false,
         })
         .collect()
 }
@@ -124,6 +130,9 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 
 /// Build a plan for `target`.
 ///
+/// [`ExportTarget::Reel`] builds its entries from the goals
+/// ([`crate::reel`]); every other target from [`selected_clips`].
+///
 /// **`SourceRef::duration_seconds` is the single duration authority.** Phase 2's
 /// probe writes it back when a source is added or relinked, so there is nothing
 /// to override it with. An earlier draft took a `HashMap` of probed durations
@@ -136,6 +145,11 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 /// to cover any in-range position the clip visits at rate 1, so the segment
 /// builder never clamps a forward skip it should not have.
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
+    if *target == ExportTarget::Reel {
+        return CompilationPlan {
+            entries: crate::reel::reel_entries(project),
+        };
+    }
     let clips = selected_clips(project, target);
     let count = clips.len();
 

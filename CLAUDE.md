@@ -323,6 +323,17 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
   both ends of its cell. The columns are sized so nothing realistic shrinks;
   fitting is what makes a spill impossible rather than unlikely.
 
+**The goals reel** (`video-coach-core/src/reel.rs`, spec R).
+- **It is an `ExportTarget` (`Reel`), never a clip.** Its entries have
+  `clip_id: None`, so its PiP is the GL filler and its audio is the game's alone.
+- **It holds confirmed goals only** (every goal match event), in match order.
+- **Each entry is one `Play` segment**, `[goal − lead-in, goal + tail]` on the
+  goal's source, clamped to the source and to the previous entry's end on it. A
+  goal at or before that end makes no entry of its own: it extends that one.
+- **The defaults are 30 s and 6 s** (`REEL_LEAD_IN`, `REEL_TAIL`), overridden per
+  side by the goal's trim. Never replace them with a guess that could be
+  shorter: a cut-off assist is the one failure the reel must not have.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not

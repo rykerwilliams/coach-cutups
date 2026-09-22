@@ -44,6 +44,8 @@ use super::{Bus, Event, Input, Open, UserError};
 
 /// What the every-clip target is called, in the sheet and in its file name.
 const ALL_CLIPS_LABEL: &str = "All clips";
+/// What the goals reel is called, in the sheet and in its file name.
+const REEL_LABEL: &str = "All goals";
 
 /// What a clip with no name of its own is called.
 const UNTITLED: &str = "Untitled";
@@ -423,6 +425,7 @@ fn label(open: &Open, target: &ExportTarget) -> Result<String, UserError> {
             .find(|c| c.id == *id)
             .map(|clip| clip_label(clip).to_owned())
             .ok_or_else(|| UserError::CantExport("the clip is gone".into())),
+        ExportTarget::Reel => Ok(REEL_LABEL.to_owned()),
     }
 }
 

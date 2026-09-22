@@ -13,6 +13,7 @@ pub mod layout;
 pub mod plan;
 pub mod project;
 pub mod recording;
+pub mod reel;
 pub mod scoreboard;
 pub mod skip;
 pub mod store;
