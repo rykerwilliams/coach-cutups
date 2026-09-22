@@ -1404,6 +1404,8 @@ export component AppWindow inherits Window {
     in property <int> missing-index: -1;
     in property <string> missing-name;
     in property <bool> playing;
+    /// The game video's speed, 1 to 32 (spec S), from the bus.
+    in property <float> scan-speed: 1;
     /// Sources, none missing: play, seek and scrub are possible.
     in property <bool> can-play;
 
@@ -1591,6 +1593,8 @@ export component AppWindow inherits Window {
     /// The error dialog's message; empty hides it.
     in-out property <string> error-message;
     /// A text field has focus: every shortcut yields to it (C6).
+    /// J, L and the speed button (spec S1, S2): only while scanning.
+    property <bool> can-scan-fast: root.playing && !root.recording && !root.previewing && root.can-play;
     property <bool> text-editing: name-edit.has-focus || inspector.editing;
 
     callback open-project();
@@ -1604,6 +1608,8 @@ export component AppWindow inherits Window {
     callback skip(float);
     /// `,` and `.`: one frame back or forward, while paused.
     callback step-frame(bool);
+    /// `J`, `L` and the speed button: this speed, while scanning.
+    callback set-scan-speed(float);
     callback scrub-move(float);
     callback scrub-release(float);
     /// R, Record or Stop: the bus starts a recording when idle, else stops
@@ -1866,6 +1872,16 @@ export component AppWindow inherits Window {
         if (event.text == "," || event.text == ".") {
             if (pressed && !root.recording && !root.previewing && root.can-play) {
                 root.step-frame(event.text == ".");
+            }
+            return accept;
+        }
+        // Faster or slower while scanning (spec S1): L doubles up to 32x, J
+        // halves down to 1x. Not while recording or previewing, which are 1x.
+        if (event.text == "j" || event.text == "J" || event.text == "l" || event.text == "L") {
+            if (pressed && !event.repeat && root.can-scan-fast) {
+                root.set-scan-speed(event.text == "l" || event.text == "L"
+                    ? min(root.scan-speed * 2, 32)
+                    : max(root.scan-speed / 2, 1));
             }
             return accept;
         }
@@ -2547,6 +2563,19 @@ export component AppWindow inherits Window {
                             enabled: root.can-play;
                             min-width: 72px;
                             clicked => { root.toggle-play(); }
+                        }
+                        // Cycles up, and back to 1x after 32x.
+                        Button {
+                            text: root.scan-speed + "×";
+                            enabled: root.can-scan-fast;
+                            min-width: 48px;
+                            clicked => {
+                                root.set-scan-speed(root.scan-speed >= 32 ? 1 : root.scan-speed * 2);
+                            }
+
+                            Tooltip {
+                                text: @markdown("Speed while playing (J slower, L faster)");
+                            }
                         }
                         Button {
                             text: root.recording ? "Stop" : "Record";

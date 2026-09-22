@@ -73,8 +73,9 @@ impl Harness {
     /// A bus with the app's own sinks: the GL video sink on a surfaceless EGL
     /// display, so hardware decoders hand it DMABufs as they do in the app,
     /// and `autoaudiosink` — **real speakers**, so a test should turn the
-    /// volume down. Only for `#[ignore]`d tests on real hardware: CI has
-    /// neither.
+    /// volume down. CI has neither, and runs it on Mesa's llvmpipe and
+    /// `autoaudiosink`'s fake fallback: fine for small fixtures, while real
+    /// footage stays in `#[ignore]`d tests.
     pub fn production(config_dir: &Path) -> Self {
         let h = Self::spawn(
             config_dir,

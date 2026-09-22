@@ -356,6 +356,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let send = send(bus);
         move |forward| send(Command::StepFrame { forward })
     });
+    window.on_set_scan_speed(cmd(bus, Command::SetScanSpeed));
     window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
     window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
     window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
@@ -1298,6 +1299,7 @@ fn on_event(w: &AppWindow, event: Event) {
             ui.target_abs = target_abs;
         }),
         Event::Playing(playing) => w.set_playing(playing),
+        Event::ScanSpeed(speed) => w.set_scan_speed(speed as f32),
         Event::Recording(status) => {
             // On every transition, start and stop alike: drawings belong to
             // one recording, and the phase change disables the drawing area
@@ -1802,7 +1804,12 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
             true => format_hms(current),
             false => format_hms_tenths(current),
         };
-        w.set_readout(format!("{now} / {}", format_hms(total)).into());
+        // The speed above 1x (spec S1). Never a preview's: it plays at 1x.
+        let speed = match w.get_scan_speed() {
+            s if s > 1.0 && ui.preview_duration.is_none() => format!(" · {s}×"),
+            _ => String::new(),
+        };
+        w.set_readout(format!("{now} / {}{speed}", format_hms(total)).into());
         // The Match panel's live line (spec S4), from the same anchor. It
         // **freezes while a preview is open**: the transport is then record
         // time within one clip, and the preview's own scoreboard is already

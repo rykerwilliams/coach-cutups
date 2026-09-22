@@ -134,6 +134,11 @@ pub enum Command {
     StepFrame {
         forward: bool,
     },
+    /// `J`, `L` and the speed button: play the game video at this speed, one
+    /// of 1, 2, 4, 8, 16 and 32 (spec S). Only while it plays, with no
+    /// preview open. Not while recording: the clip model, replay and export
+    /// are 1x. Any pause returns to 1x.
+    SetScanSpeed(f64),
     /// Linear slider value in `0..=1`. Persisted to `scan_volume` only when
     /// `commit` is set (on slider release).
     SetVolume {
@@ -260,6 +265,8 @@ pub enum Event {
         target_abs: Option<f64>,
     },
     Playing(bool),
+    /// The game video's speed (spec S): 1 after every pause.
+    ScanSpeed(f64),
     Recording(RecordingStatus),
     /// The microphone's loudest channel peak over the last 100 ms, in dB,
     /// while a recording runs.
@@ -723,6 +730,7 @@ impl Bus {
             Command::ScrubMove { abs } => self.scrub(abs, false),
             Command::ScrubRelease { abs } => self.scrub(abs, true),
             Command::StepFrame { forward } => self.step_frame(forward),
+            Command::SetScanSpeed(speed) => self.set_scan_speed(speed),
             Command::SetVolume { value, commit } => self.set_volume(value, commit),
             Command::ToggleRecording { zoom } => self.toggle_recording(zoom),
             Command::StopRecording => self.stop_recording(),

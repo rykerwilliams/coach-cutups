@@ -17,6 +17,10 @@ use video_coach_media::{Origin, PlayerEvent};
 use super::sources::END_MARGIN;
 use super::{Bus, Event, UserError};
 
+/// The game video's speeds (spec S1). `J` and `L` step through them, and the
+/// speed button cycles them.
+const SCAN_SPEEDS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
 impl Bus {
     /// Play is refused (answered with `Playing(false)`) with no sources or
     /// while any is missing. If the player dropped the current source (after
@@ -49,6 +53,11 @@ impl Bus {
 
     /// Plays or pauses whichever of the two is on screen. The bus keeps only
     /// one of them PLAYING, so this is the single play state (spec P5).
+    ///
+    /// Every pause of the game video returns it to 1x (spec S3), after the
+    /// pause, so the seek that does it lands paused where it stopped. Only
+    /// when it was fast: at 1x a pause adds no seek, which would change its
+    /// settling and a recording's pause anchors.
     pub(super) fn set_playing(&mut self, playing: bool) {
         self.playing = playing;
         match &self.preview {
@@ -56,6 +65,33 @@ impl Bus {
             None => self.player.set_playing(playing),
         }
         self.emit(Event::Playing(playing));
+        if !playing && self.preview.is_none() && self.player.rate() != 1.0 {
+            self.change_rate(1.0);
+        }
+    }
+
+    /// Plays the game video at `speed` (spec S1): one of [`SCAN_SPEEDS`],
+    /// only while it plays, with no preview open. The recording guard in
+    /// `Bus::command` refuses it while recording (S2).
+    pub(super) fn set_scan_speed(&mut self, speed: f64) {
+        if !SCAN_SPEEDS.contains(&speed)
+            || !self.playing
+            || self.preview.is_some()
+            || self.player.rate() == speed
+        {
+            return;
+        }
+        self.change_rate(speed);
+    }
+
+    /// Sets the player's rate, which it carries into every seek from now,
+    /// and tells the UI. A skip burst's live target was worked out at the
+    /// old rate, so the burst is dropped.
+    fn change_rate(&mut self, rate: f64) {
+        self.reset_skip();
+        let events = self.player.set_rate(rate);
+        self.player_events(events);
+        self.emit(Event::ScanSpeed(rate));
     }
 
     /// Applies at once; persists to `scan_volume` only on `commit`.
@@ -195,12 +231,13 @@ impl Bus {
             // The clamp keeps a recording's clip in one source. The
             // coordinator keeps its own targets unadvanced: it matches a
             // landing against them, and would otherwise refire forever.
+            // Playback advances at the rate, which a burst never spans: a
+            // rate change resets it.
             let mut target = seek.target_seconds;
             if self.playing {
                 let (lo, hi) = self.skip_range().into_inner();
-                target = (target + self.skip_since.elapsed().as_secs_f64())
-                    .min(hi.max(lo))
-                    .max(lo);
+                let played = self.skip_since.elapsed().as_secs_f64() * self.player.rate();
+                target = (target + played).min(hi.max(lo)).max(lo);
             }
             // A seek that can't be issued would leave the coordinator waiting
             // for its landing.

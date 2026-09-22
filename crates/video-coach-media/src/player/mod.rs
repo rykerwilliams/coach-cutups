@@ -149,6 +149,9 @@ pub struct SourcePlayer {
     /// it can no longer be trusted (an error, or a load dropped by `clear`).
     loaded_uri: Option<String>,
     want_playing: bool,
+    /// The playback rate every seek is issued at (spec S). See
+    /// [`SourcePlayer::set_rate`].
+    rate: f64,
 }
 
 impl SourcePlayer {
@@ -200,6 +203,7 @@ impl SourcePlayer {
             pending: None,
             loaded_uri: None,
             want_playing: false,
+            rate: 1.0,
         }
     }
 
@@ -312,6 +316,37 @@ impl SourcePlayer {
             false => shown.end - 1.5 * shown.period,
         };
         (target >= 0.0).then_some(target)
+    }
+
+    /// Sets the playback rate, forward, 1 for normal speed. Every seek is
+    /// issued at the rate stored when it is *issued*, so a scrub, a skip or
+    /// the next source keeps it. A seek still to be issued (a pending
+    /// request, or a load's) carries it; otherwise the player seeks
+    /// accurately to where it is heading, or is, so the picture never snaps
+    /// to a key frame. Above 1 the sound is muted: `TRICKMODE_NO_AUDIO` is
+    /// only a hint.
+    pub fn set_rate(&mut self, rate: f64) -> Vec<PlayerEvent> {
+        if rate == self.rate {
+            return Vec::new();
+        }
+        self.rate = rate;
+        self.pipeline.set_property("mute", rate != 1.0);
+        if self.pending.is_some() || matches!(self.flight, Flight::Loading(_)) {
+            return Vec::new();
+        }
+        let (Some(uri), Some(secs)) = (
+            self.loaded_uri.clone(),
+            self.target_secs()
+                .or_else(|| self.position_handle().query_position()),
+        ) else {
+            return Vec::new();
+        };
+        self.seek_to(&uri, secs, true, Origin::System)
+    }
+
+    /// The rate every seek is issued at (see [`SourcePlayer::set_rate`]).
+    pub fn rate(&self) -> f64 {
+        self.rate
     }
 
     /// Sets the volume from a linear slider value in `0..=1` (see [`gain`]).
@@ -480,16 +515,37 @@ impl SourcePlayer {
         }
     }
 
+    /// Issues `request` at the stored rate: never `seek_simple`, whose 1.0
+    /// would drop a fast scan on the next scrub or skip. Above 1x it is a
+    /// trick-mode seek without audio.
+    ///
+    /// Every frame is decoded even at 32x, never key frames only
+    /// (`TRICKMODE_KEY_UNITS`): the sink's QoS drops what can't be shown in
+    /// time, and that measured better. On 1080p30 H.264 (`vah264dec`, the
+    /// reference laptop, `real_footage_fast_scanning`) 32x showed 88 frames
+    /// a second, at most 0.12 s behind the position; key frames only showed
+    /// 16, up to 1.26 s behind. 16x shows ~440, every frame.
     fn seek(&mut self, request: Request, events: &mut Vec<PlayerEvent>) {
-        let flags = gst::SeekFlags::FLUSH
+        let mut flags = gst::SeekFlags::FLUSH
             | if request.accurate {
                 gst::SeekFlags::ACCURATE
             } else {
                 gst::SeekFlags::KEY_UNIT
             };
+        if self.rate > 1.0 {
+            flags |= gst::SeekFlags::TRICKMODE | gst::SeekFlags::TRICKMODE_NO_AUDIO;
+        }
         let position = seconds_to_clock(request.secs);
         let origin = request.origin;
-        match self.pipeline.seek_simple(flags, position) {
+        let seek = self.pipeline.seek(
+            self.rate,
+            flags,
+            gst::SeekType::Set,
+            position,
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        );
+        match seek {
             Ok(()) => self.flight = Flight::Seeking(request),
             Err(_) => {
                 events.push(PlayerEvent::SeekFailed { origin });

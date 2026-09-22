@@ -281,7 +281,7 @@ A coach tagging a 27-minute half, or looking for the next goal, wants to run the
 - **S2. Scanning only.** Fast playback is never part of a recording. `J`, `L` and the button do nothing while recording or previewing, and a recording starts paused, so it starts at 1×. The clip model, the event log, replay and export stay 1×, so no format changes.
 - **S3. Any pause returns to 1×.** That one rule covers Pause, a recording's start, a jump to a clip, the end of the last source and an unload, and so Play always starts at 1×. A scrub, a skip or running into the next source while fast keeps the speed.
 - **S4. Sound is muted above 1×.** No pitch-corrected audio.
-- **S5. The picture keeps up, or drops frames; it never lags.** The scan sink drops late frames (QoS), so the displayed frame stays with the position. At 32× (about 960 fps of 1080p) the player plays key frames only; whether 16× needs that too is measured on a Trace half, not assumed.
+- **S5. The picture keeps up, or drops frames; it never lags.** The scan sink drops late frames (QoS), so the displayed frame stays with the position. Measured on a Trace half: every speed decodes every frame, and QoS drops what's late (32× shows ~88 fps, lag ≤ 0.6 s). Key frames only was worse at 32× (16 fps, lag ~1 s), so there is no key-frame mode.
 - **S6. Find fast, tag paused.** At 32× a 300 ms reaction is 10 s of match, so the coach pauses, steps with `,`/`.` to the frame, then tags. A tag pressed while fast still works (caller-captured, as always); it is only as precise as the reaction.
 
 ### D. Suggested kick-offs, goals and periods

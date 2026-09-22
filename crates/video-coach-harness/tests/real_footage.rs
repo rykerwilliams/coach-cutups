@@ -178,3 +178,69 @@ fn real_footage_scrubs_land_on_the_frame_export_picks() {
         landing.check();
     }
 }
+
+/// Fast scanning (spec S5) on real footage, on the app's own sinks: 5 s at
+/// each speed from a minute in, each timed from the settle of the seek that
+/// set it. Prints, per speed, the frames the sink put up per second (the
+/// mailbox polled every 2 ms, faster than any display takes them), how fast
+/// their stream time ran against the wall clock, and how far the frame shown
+/// was from the position reported. It is what chose decoding every frame at
+/// every speed over key frames only (the player's `seek`), and would say so
+/// if 32x stopped keeping up. Asserts only that the picture moved at every
+/// speed.
+#[test]
+#[ignore]
+fn real_footage_fast_scanning() {
+    gstreamer::init().unwrap();
+    let footage = footage();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("project");
+    std::fs::create_dir(&folder).unwrap();
+    let project = write_one_source_project(&folder, &footage);
+    let duration = project.source_videos[0].duration_seconds;
+    // 5 s at each of 1+2+4+8+16+32 is 315 s of footage.
+    assert!(duration > 400.0, "needs seven minutes of footage");
+
+    let mut h = Harness::production(&tmp.path().join("config"));
+    open_muted(&mut h, &folder);
+    h.send(Command::ScrubRelease { abs: 60.0 });
+    h.wait_settled();
+    h.toggle_play();
+    h.wait_playing();
+    eprintln!(
+        "{:>5} {:>8} {:>8} {:>9} {:>9}",
+        "speed", "fps", "rate", "mean lag", "max lag"
+    );
+    for speed in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
+        if speed > 1.0 {
+            h.send(Command::SetScanSpeed(speed));
+            h.wait_map("the speed", |e| {
+                matches!(e, Event::ScanSpeed(s) if *s == speed).then_some(())
+            });
+            h.wait_settled();
+        }
+        let start = Instant::now();
+        let mut shown: Vec<(Instant, f64, f64)> = Vec::new();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Some(frame) = h.take_frame() {
+                let now = Instant::now();
+                if let (Some(t), Some(position)) = (frame.stream_time, h.position_secs()) {
+                    shown.push((now, t, position));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (&(t0, s0, _), &(t1, s1, _)) = (shown.first().unwrap(), shown.last().unwrap());
+        let wall = (t1 - t0).as_secs_f64();
+        let lags: Vec<f64> = shown.iter().map(|&(_, t, p)| (p - t).abs()).collect();
+        let max_lag = lags.iter().cloned().fold(0.0, f64::max);
+        let mean_lag = lags.iter().sum::<f64>() / lags.len() as f64;
+        eprintln!(
+            "{speed:>4}x {:>8.1} {:>7.2}x {mean_lag:>8.3}s {max_lag:>8.3}s",
+            (shown.len() - 1) as f64 / wall,
+            (s1 - s0) / wall,
+        );
+        assert!(s1 > s0, "the picture stood still at {speed}x");
+    }
+    h.shutdown();
+}
