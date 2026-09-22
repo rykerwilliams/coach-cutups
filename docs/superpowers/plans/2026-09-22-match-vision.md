@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-22
 **Spec:** `docs/superpowers/specs/2026-09-22-match-vision-design.md` (decisions F, C, R, H, D, T, J, B, L, G). It proceeds on the defaults for Q1, Q2, Q3, Q5 and Q6.
-**Status:** P0 shipped in 0.1.1 (`1e125ba`). P1 built and reviewed (`7cbd8df`). P2 next.
+**Status:** P0 shipped in 0.1.1 (`1e125ba`). P1 built and reviewed (`7cbd8df`). P2 built, reviewed (`c7d5c5c`) and shipped in 0.2.0 (`0bd18b3`). P3 needs the user's tagged matches (G1) and its own plan.
 
 **Scope.** P0, P1 and P2 are planned in full here: 4, 7 and 6 tasks. They need no ML and can be built now. P3–P7 are outlines only (see the end of this plan). Each depends on measurements from the user's tagged matches, and each gets its own detailed plan once its entry gate is met.
 
