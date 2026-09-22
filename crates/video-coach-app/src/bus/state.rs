@@ -1,8 +1,9 @@
 //! The app's own state file, `$XDG_CONFIG_HOME/coach-cuts/state.json`: the
 //! last successfully opened project folder (spec D6), which speech model
-//! transcription runs (Phase 10 S3) and which pen the coach draws with. **None
-//! is a project's.** The model describes how fast this machine is, not the
-//! match, the pen is the coach's habit, and `Preferences` lives
+//! transcription runs (Phase 10 S3), which pen the coach draws with and how
+//! big the window was. **None is a project's.** The model describes how fast
+//! this machine is, not the match, the pen and the window are the coach's
+//! habit, and `Preferences` lives
 //! in `project.json`, where a new field is a format change that
 //! [`store::read`](video_coach_core::store::read)'s exact-version guard would
 //! make every existing project unreadable for.
@@ -38,6 +39,27 @@ struct State {
     /// [`Pen::label`], for the same reasons.
     #[serde(default)]
     pen: Option<String>,
+    #[serde(default)]
+    window: Option<WindowSize>,
+}
+
+/// The main window's size, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for WindowSize {
+    /// The first launch's: roomy on a 1920x1080 laptop screen without
+    /// filling it. The window's minimum is well under it, for a smaller
+    /// screen.
+    fn default() -> Self {
+        WindowSize {
+            width: 1600,
+            height: 960,
+        }
+    }
 }
 
 /// Where the state file lives. `None` when there is no config directory at
@@ -113,6 +135,19 @@ impl StateFile {
     pub fn set_pen(&self, pen: Pen) {
         let mut state = self.read();
         state.pen = Some(pen.label().to_owned());
+        self.save(&state);
+    }
+
+    /// The window's size when it last closed. A file that doesn't say reads
+    /// as the default.
+    pub fn window_size(&self) -> WindowSize {
+        self.read().window.unwrap_or_default()
+    }
+
+    /// Remembers `size` for every project on this machine.
+    pub fn set_window_size(&self, size: WindowSize) {
+        let mut state = self.read();
+        state.window = Some(size);
         self.save(&state);
     }
 
@@ -261,9 +296,24 @@ mod tests {
         assert_eq!(StateFile::in_config_dir(dir.path()).pen(), Pen::Yellow);
     }
 
+    /// The window likewise: machine-wide, surviving a restart, and the
+    /// first launch's size until it has closed once.
+    #[test]
+    fn remembers_the_window_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateFile::in_config_dir(dir.path());
+        assert_eq!(state.window_size(), WindowSize::default());
+        let size = WindowSize {
+            width: 1400,
+            height: 900,
+        };
+        state.set_window_size(size);
+        assert_eq!(StateFile::in_config_dir(dir.path()).window_size(), size);
+    }
+
     /// **No setter may clobber another's field.** Each write rewrites the
     /// whole document, so one that didn't read first would forget the project
-    /// every time the model or the pen changed, and so on round.
+    /// every time the model, the pen or the window changed, and so on round.
     #[test]
     fn the_settings_are_independent() {
         let dir = tempfile::tempdir().unwrap();
@@ -271,6 +321,11 @@ mod tests {
         state.set_last_project(Some(Path::new("/p/game")));
         state.set_whisper_model(WhisperModel::Base);
         state.set_pen(Pen::Pink);
+        let size = WindowSize {
+            width: 1400,
+            height: 900,
+        };
+        state.set_window_size(size);
         assert_eq!(state.last_project(), Some(PathBuf::from("/p/game")));
         assert_eq!(state.whisper_model(), WhisperModel::Base);
         // (Base, not the default Small: a clobbered model must be visible.)
@@ -279,6 +334,13 @@ mod tests {
         state.set_pen(Pen::Blue);
         assert_eq!(state.last_project(), Some(PathBuf::from("/p/other")));
         assert_eq!(state.whisper_model(), WhisperModel::Base);
+        assert_eq!(state.window_size(), size);
+        state.set_window_size(WindowSize {
+            width: 1920,
+            height: 1012,
+        });
+        assert_eq!(state.pen(), Pen::Blue);
+        assert_eq!(state.last_project(), Some(PathBuf::from("/p/other")));
     }
 
     /// A state file from before the picker, and one from a version that knows

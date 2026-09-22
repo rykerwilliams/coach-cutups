@@ -4,7 +4,7 @@
 // Everything here is presentation. `src/main.rs` turns the callbacks into bus
 // commands and feeds bus events back in through the `in` properties.
 
-import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, Slider, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, TextEdit } from "std-widgets.slint";
 import { Scrubber } from "scrubber.slint";
 
 /// One row of the sidebar's Sources list.
@@ -1334,10 +1334,11 @@ component MatchSetupSheet inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Coach Cuts";
+    // Every control fits at this size. The window opens at the size it last
+    // closed at, which Rust sets from the app's state file, and at a roomier
+    // one the first time.
     min-width: 1100px;
     min-height: 700px;
-    preferred-width: 1100px;
-    preferred-height: 700px;
     background: Palette.background;
     forward-focus: keys;
 
@@ -2338,111 +2339,124 @@ export component AppWindow inherits Window {
                         clicked => { keys.focus(); }
                     }
 
-                    VerticalLayout {
-                        // The clip inspector, or the tag overview with
-                        // nothing selected; the Match panel is always under
-                        // it, since a match is the project's, not a clip's.
-                        Rectangle {
-                            vertical-stretch: 1;
+                    // Scrolls rather than push the transport bar off the
+                    // window: a selected clip's fields over the Match panel
+                    // are taller than a 700px window has room for. With room
+                    // to spare, the layout fills the column and Notes takes
+                    // the slack, as before. Clicks fall through it to the
+                    // TouchArea behind: it pans only on the wheel.
+                    ScrollView {
+                        VerticalLayout {
+                            // The clip inspector, or the tag overview with
+                            // nothing selected; the Match panel is always under
+                            // it, since a match is the project's, not a clip's.
+                            Rectangle {
+                                vertical-stretch: 1;
+                                // Only a shown inspector holds the column
+                                // open: hidden, its fields would still claim
+                                // their height over the tag overview and
+                                // scroll the Match panel for nothing.
+                                min-height: inspector.visible ? inspector.min-height : 0;
 
-                            // Hidden rather than removed, so `editing` always binds.
-                            inspector := Inspector {
-                                visible: root.selected-clip != "";
-                                enabled: !root.recording;
-                                name-text <=> root.clip-name;
-                                tags-text <=> root.clip-tags;
-                                notes-text <=> root.clip-notes;
-                                transcript-text <=> root.clip-transcript;
-                                transcript-state: root.transcript-state;
-                                transcript-status: root.transcript-status;
-                                transcript-models: root.transcript-models;
-                                transcript-model <=> root.transcript-model;
-                                transcript-model-enabled: root.transcript-model-enabled;
-                                transcribe-download: root.transcribe-download;
-                                show-pip <=> root.clip-show-pip;
-                                begin-edit => { root.editing-clip-id = root.selected-clip; }
-                                commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
-                                end-edit(field, text) => {
-                                    let id = root.editing-clip-id;
-                                    // Unless focus moved to another field, which
-                                    // goes on editing the same clip.
-                                    if (!self.editing) {
-                                        root.editing-clip-id = "";
+                                // Hidden rather than removed, so `editing` always binds.
+                                inspector := Inspector {
+                                    visible: root.selected-clip != "";
+                                    enabled: !root.recording;
+                                    name-text <=> root.clip-name;
+                                    tags-text <=> root.clip-tags;
+                                    notes-text <=> root.clip-notes;
+                                    transcript-text <=> root.clip-transcript;
+                                    transcript-state: root.transcript-state;
+                                    transcript-status: root.transcript-status;
+                                    transcript-models: root.transcript-models;
+                                    transcript-model <=> root.transcript-model;
+                                    transcript-model-enabled: root.transcript-model-enabled;
+                                    transcribe-download: root.transcribe-download;
+                                    show-pip <=> root.clip-show-pip;
+                                    begin-edit => { root.editing-clip-id = root.selected-clip; }
+                                    commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
+                                    end-edit(field, text) => {
+                                        let id = root.editing-clip-id;
+                                        // Unless focus moved to another field, which
+                                        // goes on editing the same clip.
+                                        if (!self.editing) {
+                                            root.editing-clip-id = "";
+                                        }
+                                        root.edit-clip(id, field, text);
                                     }
-                                    root.edit-clip(id, field, text);
-                                }
-                                can-preview: root.can-preview;
-                                previewing: root.previewing && root.previewing-clip == root.selected-clip;
-                                // The selection, since a click doesn't take focus
-                                // from a field.
-                                pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
-                                // Off the fields first, as the Preview button
-                                // does: a click doesn't move focus, and the
-                                // machine's write is refused a re-render while
-                                // a field holds one.
-                                transcribe-clicked => {
-                                    keys.focus();
-                                    root.transcribe(root.selected-clip);
-                                }
-                                cancel-transcribe-clicked => {
-                                    keys.focus();
-                                    root.cancel-transcription();
-                                }
-                                // Off the fields as its siblings are: the
-                                // popup takes focus from a field being
-                                // edited, and the window's shortcuts must
-                                // come back afterwards.
-                                transcript-model-chosen(index) => {
-                                    keys.focus();
-                                    root.set-transcribe-model(index);
-                                }
-                                preview-clicked => {
-                                    keys.focus();
-                                    if (self.previewing) {
-                                        root.close-preview();
-                                    } else {
-                                        root.open-preview(root.selected-clip);
+                                    can-preview: root.can-preview;
+                                    previewing: root.previewing && root.previewing-clip == root.selected-clip;
+                                    // The selection, since a click doesn't take focus
+                                    // from a field.
+                                    pip-toggled(on) => { root.set-show-pip(root.selected-clip, on); }
+                                    // Off the fields first, as the Preview button
+                                    // does: a click doesn't move focus, and the
+                                    // machine's write is refused a re-render while
+                                    // a field holds one.
+                                    transcribe-clicked => {
+                                        keys.focus();
+                                        root.transcribe(root.selected-clip);
                                     }
+                                    cancel-transcribe-clicked => {
+                                        keys.focus();
+                                        root.cancel-transcription();
+                                    }
+                                    // Off the fields as its siblings are: the
+                                    // popup takes focus from a field being
+                                    // edited, and the window's shortcuts must
+                                    // come back afterwards.
+                                    transcript-model-chosen(index) => {
+                                        keys.focus();
+                                        root.set-transcribe-model(index);
+                                    }
+                                    preview-clicked => {
+                                        keys.focus();
+                                        if (self.previewing) {
+                                            root.close-preview();
+                                        } else {
+                                            root.open-preview(root.selected-clip);
+                                        }
+                                    }
+                                    suggest-tags(text) => { return root.suggest-tags(text); }
+                                    take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
                                 }
-                                suggest-tags(text) => { return root.suggest-tags(text); }
-                                take-suggestion(text, tag) => { return root.take-suggestion(text, tag); }
+                                if root.selected-clip == "": TagOverview {
+                                    rows: root.tag-rows;
+                                    clip-count: root.clip-count;
+                                    filter <=> root.tag-filter;
+                                }
                             }
-                            if root.selected-clip == "": TagOverview {
-                                rows: root.tag-rows;
-                                clip-count: root.clip-count;
-                                filter <=> root.tag-filter;
-                            }
-                        }
 
-                        MatchPanel {
-                            configured: root.match-configured;
-                            score: root.match-score;
-                            clock: root.match-clock;
-                            rows: root.match-rows;
-                            can-tag: root.can-tag;
-                            at-cap: root.match-at-cap;
-                            // The bus refuses a scrub and an edit while
-                            // recording, and neither belongs to the game
-                            // video behind a preview.
-                            can-edit: root.can-play && !root.recording && !root.previewing;
-                            // Off any field first, as every other button
-                            // does: a click doesn't take focus from one, and
-                            // the tag keys have to keep working after it.
-                            tag(kind) => {
-                                keys.focus();
-                                root.tag-match-event(kind);
-                            }
-                            seek(id) => {
-                                keys.focus();
-                                root.seek-match-event(id);
-                            }
-                            remove(id) => {
-                                keys.focus();
-                                root.delete-match-event(id);
-                            }
-                            setup => {
-                                keys.focus();
-                                root.open-match-setup();
+                            MatchPanel {
+                                configured: root.match-configured;
+                                score: root.match-score;
+                                clock: root.match-clock;
+                                rows: root.match-rows;
+                                can-tag: root.can-tag;
+                                at-cap: root.match-at-cap;
+                                // The bus refuses a scrub and an edit while
+                                // recording, and neither belongs to the game
+                                // video behind a preview.
+                                can-edit: root.can-play && !root.recording && !root.previewing;
+                                // Off any field first, as every other button
+                                // does: a click doesn't take focus from one, and
+                                // the tag keys have to keep working after it.
+                                tag(kind) => {
+                                    keys.focus();
+                                    root.tag-match-event(kind);
+                                }
+                                seek(id) => {
+                                    keys.focus();
+                                    root.seek-match-event(id);
+                                }
+                                remove(id) => {
+                                    keys.focus();
+                                    root.delete-match-event(id);
+                                }
+                                setup => {
+                                    keys.focus();
+                                    root.open-match-setup();
+                                }
                             }
                         }
                     }
@@ -2508,6 +2522,60 @@ export component AppWindow inherits Window {
                                             : @markdown("Record (R)");
                             }
                         }
+                        // The stretch item, right-aligned: it holds the
+                        // controls either side of it apart.
+                        Text {
+                            text: root.readout;
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                            min-width: 130px;
+                            horizontal-alignment: right;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: "Volume";
+                            color: Palette.alternate-foreground;
+                            vertical-alignment: center;
+                        }
+                        Slider {
+                            width: 100px;
+                            minimum: 0;
+                            maximum: 1;
+                            value <=> root.volume;
+                            changed(value) => { root.volume-changed(value); }
+                            released(value) => { root.volume-released(value); }
+                        }
+                        Button {
+                            text: "Export…";
+                            // Still on while a run is going: the sheet is
+                            // where one is watched and cancelled from.
+                            enabled: root.has-project && root.clip-count > 0 && !root.recording && !root.previewing;
+                            clicked => {
+                                keys.focus();
+                                root.open-export();
+                            }
+
+                            Tooltip {
+                                text: @markdown("Export clips as videos");
+                            }
+                        }
+                        Button {
+                            text: "Devices…";
+                            enabled: root.has-project && !root.recording;
+                            clicked => {
+                                root.list-devices();
+                                devices-popup.show();
+                            }
+                        }
+                    }
+
+                    // Drawing's row, with the recording's status and the
+                    // notice line: at the window's 1100px minimum, sharing
+                    // the transport's row pushed Export and Devices off its
+                    // end and left the notice no width at all.
+                    HorizontalLayout {
+                        spacing: 8px;
+
                         // Drawing's controls (D6). Always mounted, and
                         // only disabled off a recording: mounting them with
                         // the recording would change the player's height,
@@ -2520,6 +2588,8 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 2px;
                             alignment: center;
+                            // Layouts stretch by default; only the notice may.
+                            horizontal-stretch: 0;
 
                             for ink[index] in root.pen-colors: VerticalLayout {
                                 alignment: center;
@@ -2552,6 +2622,7 @@ export component AppWindow inherits Window {
                         }
                         VerticalLayout {
                             alignment: center;
+                            horizontal-stretch: 0;
                             CheckBox {
                                 text: "Auto-clear";
                                 enabled: root.can-draw;
@@ -2577,6 +2648,7 @@ export component AppWindow inherits Window {
                         }
                         if root.recording-phase == RecordingPhase.recording: HorizontalLayout {
                             spacing: 6px;
+                            horizontal-stretch: 0;
 
                             VerticalLayout {
                                 alignment: center;
@@ -2628,6 +2700,7 @@ export component AppWindow inherits Window {
                         // up, over the clip's own duration.
                         if root.previewing: HorizontalLayout {
                             spacing: 6px;
+                            horizontal-stretch: 0;
 
                             Text {
                                 text: "Previewing " + root.previewing-name;
@@ -2659,48 +2732,6 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             horizontal-stretch: 1;
                             min-width: 0;
-                        }
-                        Text {
-                            text: root.readout;
-                            color: Palette.foreground;
-                            vertical-alignment: center;
-                            min-width: 130px;
-                            horizontal-alignment: right;
-                        }
-                        Text {
-                            text: "Volume";
-                            color: Palette.alternate-foreground;
-                            vertical-alignment: center;
-                        }
-                        Slider {
-                            width: 100px;
-                            minimum: 0;
-                            maximum: 1;
-                            value <=> root.volume;
-                            changed(value) => { root.volume-changed(value); }
-                            released(value) => { root.volume-released(value); }
-                        }
-                        Button {
-                            text: "Export…";
-                            // Still on while a run is going: the sheet is
-                            // where one is watched and cancelled from.
-                            enabled: root.has-project && root.clip-count > 0 && !root.recording && !root.previewing;
-                            clicked => {
-                                keys.focus();
-                                root.open-export();
-                            }
-
-                            Tooltip {
-                                text: @markdown("Export clips as videos");
-                            }
-                        }
-                        Button {
-                            text: "Devices…";
-                            enabled: root.has-project && !root.recording;
-                            clicked => {
-                                root.list-devices();
-                                devices-popup.show();
-                            }
                         }
                     }
                 }

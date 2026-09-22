@@ -25,7 +25,7 @@ use uuid::Uuid;
 use video_coach_app::bus::{
     export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command, Event,
     ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile, TargetState,
-    TranscriptionState,
+    TranscriptionState, WindowSize,
 };
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
 use video_coach_app::format::{finish_at, format_hms, sentence};
@@ -175,8 +175,8 @@ fn main() {
 
     let window = AppWindow::new().expect("create the window");
 
-    // The last project, the chosen speech model and pen, all this machine's
-    // and none the project's.
+    // The last project, the chosen speech model and pen and the window's
+    // size, all this machine's and none the project's.
     let state = StateFile::default_location();
     let model = state.whisper_model();
     show_transcribe_model(&window, model);
@@ -184,6 +184,18 @@ fn main() {
         Pen::ALL.map(|p| slint_color(p.color())).to_vec(),
     )));
     set_pen(&window, state.pen());
+    // The size the window last closed at. Whether it was maximised isn't
+    // kept: winit asks for that straight after mapping the window, before the
+    // window manager has taken it on, and Cinnamon's drops the request. A
+    // maximised window's own size does the job instead: too big for the
+    // screen with a frame on, it is maximised again.
+    let size = state.window_size();
+    window.window().set_size(slint::LogicalSize::new(
+        size.width as f32,
+        size.height as f32,
+    ));
+    // Written once the bus is gone, which also writes this file.
+    let state_on_close = state.clone();
 
     let weak = window.as_weak();
     let bus = Bus::spawn(
@@ -225,6 +237,18 @@ fn main() {
     window.run().expect("run the window");
     // Normally already done by the renderer's teardown; idempotent.
     bus.borrow_mut().shutdown();
+    state_on_close.set_window_size(closing_window_size(&window));
+}
+
+/// The size to reopen at, read from the window after it has closed, which
+/// still knows its last size.
+fn closing_window_size(w: &AppWindow) -> WindowSize {
+    let window = w.window();
+    let size = window.size().to_logical(window.scale_factor());
+    WindowSize {
+        width: size.width.round() as u32,
+        height: size.height.round() as u32,
+    }
 }
 
 /// Turns the window's callbacks into bus commands. Values are passed on as

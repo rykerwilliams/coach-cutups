@@ -46,7 +46,7 @@ use crate::drawing::Pen;
 
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
-pub use state::StateFile;
+pub use state::{StateFile, WindowSize};
 pub use transcribe::{whisper, whisper_model_override, Finish, Stage, TranscriptionState};
 
 /// What the UI asks the bus to do.
