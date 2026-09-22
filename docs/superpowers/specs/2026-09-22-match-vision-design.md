@@ -1,7 +1,7 @@
 # Match Vision: goals found for the coach, highlighted players, and a goals reel
 
 **Date:** 2026-09-22
-**Status:** Draft, adversarial review applied. Open questions Q1–Q9 wait on the user.
+**Status:** Draft, adversarial review applied. The user answered Q4, Q7, Q8 and Q9 on 2026-09-22 (Decided, at the end). Q1, Q2, Q3, Q5 and Q6 are still open; the plan proceeds on each one's recommended default unless the user says otherwise.
 **Builds on:** Phase 9 (match events, the scoreboard, `ScoreboardContext`), Phase 8 (the export graph, the overlay, the audio mix), Phase 10 (the transcription queue, the 16 kHz `Reader`), Phase 11 S3 (model download on first use)
 **Evidence:**
 - `docs/superpowers/spikes/2026-09-22-vision-feasibility.md`, cited below as **the spike**.
@@ -35,7 +35,7 @@ These are the user's decisions (2026-09-22). This spec follows them and does not
 
 - **Jersey reading is attempted but gated on research.** Typing "#7" is always available, and the jersey work never blocks anything else.
 - **The reel is a separate export, not a kind of clip.** "No commentary-less clips" still holds: nothing here adds to `Project::clips`.
-- **Drawing stays recording-only.** A player highlight is not a drawing (H1). That reading is the spec's, not yet the user's: **Q8** asks.
+- **Drawing stays recording-only; highlighting doesn't.** A player highlight is not a drawing (H1): it may be placed while scanning, and it is saved with the footage. Pen drawings stay recording-only.
 - **Everything runs offline on the CPU, off the UI thread, and can be cancelled.** Recording always wins.
 - **Only permissively licensed models and weights.**
 - **We build this ourselves.** Trace gives the user nothing but the video files [footage]: no events, highlights or player tags, and no export of any kind. No product fits: the services that detect events are cloud-only and tied to their own cameras, and nothing detects events offline or on Linux [footage].
@@ -71,13 +71,13 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 | **P2** Hand-placed highlights | The highlight data model, the H tool, keyframed boxes, rings in scan, preview, export and the reel, colours and typed labels | none | tests | v9 |
 | **P3** Measure | The analysis backend with no UI: audio and motion passes, `Analyzer`, core signals, kick-off pattern, confirmation rule, scoring tool; the runtime and detector spike (G5) | spike only | produces the bars' inputs (V-1 to V-8) | – |
 | **P4** Suggestions from sound and motion | Storing suggestions, the analysis job on the scheduler, the Match panel's suggestion rows | none (DSP) | G4 bars for periods and goals | v10 |
-| **P5** Formation check and side | Kit clustering and the formation test at kick-off candidates; the side label on goal rows (Q9) | detector (from P3) | G4 bars, precision and side | v11, only if Q9 keeps the side |
+| **P5** Formation check | Kit clustering and the formation test at kick-off candidates, dropping false kick-offs (D5). Built only if P3 shows the goal precision bars fail on sound and motion alone; P5 keeps its number even if skipped. | detector (from P3) | G4 goal precision bars | – |
 | **P6** Click-to-track | A click snaps to a player, and the range fills from the tracker between the coach's keys | detector (reused) | G4 tracking bar | – |
 | **P7** Jersey numbers | A research spike, then OCR voted over a track, auto-filling the label | OCR | G4 jersey bar; otherwise it stays typed | – |
 
-**The user's tagging (G1) starts when P0 ships** and runs alongside P1 and P2. It needs only today's app and P0's fix. P3 starts once one match is tagged: the signal passes, the tuning and V-2 to V-8 need only that. Its verdicts (V-1's held-out numbers and every G4 bar) wait for a second tagged match (G2). P3 is where the phase order stops being a guess: if sound and motion alone clear the goal bar, P5's detector exists for side attribution and tracking, not for precision.
+**The user's tagging (G1) starts when P0 ships** and runs alongside P1 and P2. It needs only today's app and P0's fix. P3 starts once one match is tagged: the signal passes, the tuning and V-2 to V-8 need only that. Its verdicts (V-1's held-out numbers and every G4 bar) wait for a second tagged match (G2). P3 is where the phase order stops being a guess: if sound and motion alone clear the goal bars, P5 is skipped and its detector arrives with P6, for tracking.
 
-**Why P4 comes before P5.** Sound and motion need no model download and no new stored field, and they already give "a kick-off happened here" (D3). If P3 shows the quiet tier is too noisy without the formation check, P4 ships the high tier and period suggestions only, and P5 brings the rest (G4).
+**Why P4 comes before P5.** Sound and motion need no model download, and they already give "a kick-off happened here" (D3). If P3 shows the quiet tier is too noisy without the formation check, P4 ships the high tier and period suggestions only, and P5 brings the rest (G4).
 
 ---
 
@@ -93,7 +93,7 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 
 **F2. Every change here is additive, and read as it stands.**
 
-- **A field added to a struct that already exists in an earlier version** (at v7: `MatchEventRecord.reel_lead_in` and `reel_tail`, and the new lists on `Project`; later: P5's `MatchSuggestion.kicking_kit`, added to a v10 struct) is an `Option` or a `Vec` with a field-level `#[serde(default)]`. `None` and empty are exactly what an older file means, so the hazard in `project.rs`'s header comment (an `f64` or `bool` defaulting to `0.0` or `false`) cannot arise.
+- **A field added to a struct that exists at v7** (`MatchEventRecord.reel_lead_in` and `reel_tail`, and the new lists on `Project`) is an `Option` or a `Vec` with a field-level `#[serde(default)]`. `None` and empty are exactly what an older file means, so the hazard in `project.rs`'s header comment (an `f64` or `bool` defaulting to `0.0` or `false`) cannot arise.
 - **The fields of a struct that is new here** (`PlayerHighlight`, `HighlightKey`, `MatchSuggestion`) get **no default at all**. Every file holding one was written by a build that writes all of them, so a missing one is a malformed file, as a missing field of `Clip` is.
 - `write` always stamps the current version. A non-additive change, if one ever comes, adds its migration step then.
 
@@ -104,9 +104,8 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 | v8 | P1 | `MatchEventRecord.reel_lead_in: Option<f64>`, `reel_tail: Option<f64>` |
 | v9 | P2 | `Project.player_highlights: Vec<PlayerHighlight>`, with `HighlightKey.tracked` from the start (H2) |
 | v10 | P4 | `Project.match_suggestions: Vec<MatchSuggestion>` |
-| v11 | P5 | `MatchSuggestion.kicking_kit: Option<KitColour>`, **only if Q9 keeps side detection**; otherwise P5 stores nothing and there is no v11 |
 
-P3, P6 and P7 store nothing new: P6's `tracked` ships with the struct in P2.
+P3, P5, P6 and P7 store nothing new: P5 only drops candidates, and P6's `tracked` ships with the struct in P2.
 
 **F4. Source edits remap the new fields, exactly as they remap match events.** `move_source` and `remove_source` remap `player_highlights` and `match_suggestions`. `source_is_referenced` counts highlights, so a source with highlights on it can't be removed until they are deleted. That is Phase 9's rule for match events, for the same reason: silently retargeting them would be subtly wrong. Suggestions are machine output, so removing a source **deletes** its suggestions instead of refusing. A relink keeps a source's suggestions, as it keeps its match events: relink is for a moved file, so the footage is the same.
 
@@ -159,7 +158,8 @@ A plan with fewer than two entries gets no chapters.
 - **Clamps:**
   - The segment is clamped to `[0, duration]` of its source. A segment cannot cross a source boundary, as for clips. Since every Trace file is one half, a period boundary is the only boundary it could cross anyway.
   - **A segment never starts before the previous goal's segment ends on the same source.** Two goals a minute apart would otherwise replay the same footage.
-- **Which goals:** every goal match event, whether tagged by hand or confirmed from a suggestion. A pending suggestion is not in the reel: it is unconfirmed, and a quiet-tier one has no time to cut around (D4). **Q7.**
+- **Which goals: confirmed ones only** (the user's decision, 2026-09-22). That is every goal match event, whether tagged by hand or confirmed from a suggestion. A pending suggestion is not in the reel: it can be a false alarm, the burned-in score wouldn't count it, and a quiet-tier one has no time to cut around (D4).
+  - **So none is left out by accident,** the export sheet's reel row says "N suggested goals not confirmed" while any goal suggestion is pending (neither resolved nor dismissed, D6).
 - **Order:** entries are in match order (`abs_seconds`).
 - **Entry text:** `"<n> / <total> | <team> goal | <home>-<away>"`. The score is the one after the goal, from `ScoreboardContext::state_at` at the goal's own time. **Where `state_at` is `None`** (no scoreboard configured, or no period started by then) the score part is dropped: `"3 / 5 | Home goal"`, with "Home"/"Away" standing in for team names when no scoreboard is configured. Every tagged goal is in the reel, including one the scoreboard doesn't count, which shows an unchanged score. That is a tagging slip for the coach to see, not something the reel hides.
 
@@ -190,7 +190,7 @@ A plan with fewer than two entries gets no chapters.
 
 ### H. Player highlights
 
-**H1. A highlight belongs to the footage, not to a clip.** It is stored on the project, positioned by `source_index` and source seconds, like a match event. Because of that it shows wherever that footage is on screen: scanning, recording, the preview, every clip export that crosses it, and the reel. Whether the user accepts highlights placed outside a recording at all is **Q8**; this section is the design if they do.
+**H1. A highlight belongs to the footage, not to a clip.** It is stored on the project, positioned by `source_index` and source seconds, like a match event. Because of that it shows wherever that footage is on screen: scanning, recording, the preview, every clip export that crosses it, and the reel. **Highlights may be placed outside a recording** (the user's decision, 2026-09-22), while pen drawings stay recording-only: a highlight that follows a player only works when placed on the footage before recording, the reel can only show highlights that belong to the footage, and the recording-only rule protects the commentary's meaning, which a label on the footage doesn't touch.
 
 - **Why not the clip's event log, like a stroke:**
   - Tracking runs on source time, offline, before the coach records.
@@ -236,7 +236,7 @@ pub struct HighlightKey {
 - **Esc:** the first Esc deselects a selected highlight; the next leaves the tool, ahead of the rest of the Esc cascade. In `handle-key` the H tool's Esc goes before the recording's, so Esc in the tool during a paused recording never stops the take.
 - **The box is mapped to source space** through the live zoom with `Zoom::source_point`, so a box drawn while zoomed is stored correctly.
 - **Keys are placed on a paused picture.** A drag or click in the H tool while the picture plays places nothing and shows a hint, "Pause to place a highlight (Space)", like the drawing hint. The key's source position is the paused position, captured by the caller at pen-down, per the bus contract. So the box and its time describe the same frame.
-- **The tool works while scanning or a recording is paused.** "While drawing", a coach can pause, ring a player and talk. `SetHighlightKey` joins `TagMatchEvent` on the recording allow-list.
+- **The tool works while scanning or a recording is paused.** "While drawing", a coach can pause, ring a player and talk. `SetHighlightKey` joins `TagMatchEvent` on the recording allow-list. A drag in the H tool never shows the pen's "Drawing works while recording — press R" hint.
 - **On a moving virtual camera, keys placed by hand need to be about a second apart.** Trace's framing pans, so the player's source-space position moves even when the player doesn't. That is the honest limit of P2, and it is what P6's tracker removes.
 - **The inspector:**
   - a highlight has a label field (typed "7" is shown as "#7"), a colour and a delete;
@@ -307,7 +307,7 @@ The mapping from source-normalized coordinates to picture pixels is the existing
 - **A period end** is the last long whistle in a source. On the design footage each file is a half, so this finds the half's own end. Other endings (three short whistles, a mid-file half-time on whole-match footage) are added only if the tuning match shows misses.
   - **Whether Trace's files include the opening kick-off is V-4.** If they don't, `auto_back_anchor_p1` already covers it.
 
-**D5. The formation check (P5) runs only at candidate kick-offs.**
+**D5. The formation check (P5) runs only at candidate kick-offs, and only drops false ones.** It is built only if P3 shows the goal precision bars (G4) fail on sound and motion alone. It stores nothing: a kick-off that fails it is dropped, which is the precision gain, and one that passes is suggested as it would be without the check.
 
 - **Which frames:** one frame a second in the 8 s before each `K`, read with `Decoder::frame_at`, scaled by GL and downloaded. Only these frames, never the whole half.
 - **Players:** a person detector (L1) finds them.
@@ -316,12 +316,8 @@ The mapping from source-normalized coordinates to picture pixels is the existing
   - Cluster the torso colours into two kits (k-means, k = 2, rejecting outliers). The referee and the goalkeepers are the outliers.
   - The kits pass if a line within ±30° of vertical in the image separates them with at least 85% of players on their own kit's side, and at least `MIN_PER_KIT` players of each kit are seen. `MIN_PER_KIT` starts at 4 and is an initial value that V-2 sets. The design footage is U10, which plays 7v7, so 4 means most of a team.
   - **Why this works on the design footage:** the camera sits at halfway, so the halfway line is near-vertical in the image.
-- **The kicking kit** is the kit of the player nearest the ball point: the point on the separating line closest to the frame centre, because the follow-the-play camera centres on the ball and at a kick-off the ball is on the spot. The laws keep the defending team outside the centre circle. V-2 also records how often this picks the right kit.
 - **Why the painted line isn't detected:** the kits' separation *is* the halfway line at a kick-off, and it survives the frames where the line itself is hidden or out of frame. Line detection is deferred until P3 shows the separation test isn't enough on its own.
-- **Effects of the check:**
-  - A kick-off that fails it is dropped, which is the precision gain.
-  - One that passes records `kicking_kit` (v11, if Q9 keeps the side).
-- **Home or Away (Q9):** the kit that kicks off conceded, so the other kit scored. The kit-to-side mapping is **derived, not stored**. It comes from any suggestion the coach has already resolved (D6), by comparing its `kicking_kit` with the side of the goal event that resolved it. So the first goal row of a match carries no side, and after that a goal row names the side it expects ("Home goal?"). The coach still confirms with Z or X, so the label saves no keystroke; whether it earns its cost is Q9.
+- **Which side scored is not detected** (the user's decision, 2026-09-22). The coach confirms with Z or X while watching the goal (D7), so a "Home goal?" label from the kit that kicks off would save no keystroke. See Deferred.
 - **Detector cost:** at most 60 candidates × 8 frames × about 50–120 ms per 640-input inference at B3's 4 threads is about 25–60 s per half [estimate: the spike's 40–90 ms is for 8 threads, and on 4 physical cores hyper-threading adds little to this work]. P3 chooses the input size by far-side recall (V-7).
 
 **D6. Suggestions are stored (v10), and resolving one is derived.**
@@ -333,7 +329,6 @@ pub struct MatchSuggestion {
     pub seconds: f64,                // K for a goal or period start; the whistle for a period end
     pub kind: SuggestionKind,
     pub dismissed: bool,
-    // v11 (P5, only if Q9 keeps the side): kicking_kit: Option<KitColour>
 }
 pub enum SuggestionKind {
     Goal { tier: GoalTier, window: (f64, f64), at: Option<f64> }, // at: high tier only
@@ -478,10 +473,12 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 **L2. Training-data licences, one row per model.**
 
-| Model | Code / weights | Trained on | The open question |
+**COCO- and ImageNet-descended Apache-2.0 weights are acceptable** (the user's decision on Q4, 2026-09-22). This table is the record of that decision: what each model was trained on, and the question it raised.
+
+| Model | Code / weights | Trained on | The question |
 |---|---|---|---|
-| D-FINE-N (or RTMDet-tiny) | Apache-2.0 | COCO 2017. The annotations are CC BY 4.0; the images are Flickr photos under their uploaders' individual licences. | Whether weights learned from COCO's images carry any obligation. Nearly every permissive detector is COCO-trained and ships under its code's licence. **Q4 asks the user to accept that.** Checkpoints pretrained on Objects365 are avoided until its terms are checked. |
-| D-FINE-N and RTMDet-tiny backbones | Apache-2.0 (PaddleClas HGNetV2 `stage1`; OpenMMLab CSPNeXt `imagenet_600e`) | ImageNet-1k (PaddleClas's SSLD stage 1 may also use unlabelled ImageNet-22k). The images are under ImageNet's terms of access: non-commercial research and education. | Whether weights descended from an ImageNet-pretrained backbone carry those terms. The same ancestry is nearly universal among permissive detectors. **Q4 covers it with COCO.** |
+| D-FINE-N (or RTMDet-tiny) | Apache-2.0 | COCO 2017. The annotations are CC BY 4.0; the images are Flickr photos under their uploaders' individual licences. | Whether weights learned from COCO's images carry any obligation. Nearly every permissive detector is COCO-trained and ships under its code's licence. **Accepted (Q4).** Checkpoints pretrained on Objects365 are avoided until its terms are checked. |
+| D-FINE-N and RTMDet-tiny backbones | Apache-2.0 (PaddleClas HGNetV2 `stage1`; OpenMMLab CSPNeXt `imagenet_600e`) | ImageNet-1k (PaddleClas's SSLD stage 1 may also use unlabelled ImageNet-22k). The images are under ImageNet's terms of access: non-commercial research and education. | Whether weights descended from an ImageNet-pretrained backbone carry those terms. The same ancestry is nearly universal among permissive detectors. **Accepted with COCO (Q4).** |
 | PARSeq, pretrained | Apache-2.0 | Synthetic text (MJSynth, SynthText) plus real scene-text sets with mixed, often research-only terms | Unclear provenance, which is why J2 lists a variant trained on SoccerTrack v2 |
 | Digit model trained by us | ours | SoccerTrack v2 jersey crops (CC BY 4.0, which needs an attribution in `packaging/copyright` and the model card) plus digits we render ourselves | None beyond the attribution |
 | `ocrs` | MIT/Apache | HierText (CC BY-SA 4.0) | Whether share-alike reaches the weights. Its obligations, if any, are compatible with AGPL, but it has to be checked |
@@ -510,7 +507,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 **Where the files are hosted:** the published checkpoints are PyTorch files, so we export them to ONNX (a documented script under `tools/`, out of the Rust build) and host them as a release asset of this repository, pinned by hash. **Why download rather than bundle:** it is one mechanism for every model. At 4–40 MB, bundling would also be viable (spike §1c), and that remains the fallback if hosting becomes a burden. The button carries the prompt, as Transcribe's does: "Download 15 MB and find goals".
 
-**With no model, analysis doesn't run a reduced pass.** Once P5 ships, the detector is part of the analysis: the job downloads it first, and a failed download fails the job and drops the queue behind it, which is Phase 11's rule for whisper. Falling back to the sound-and-motion stages would show tiers whose bars were accepted with the formation check behind them. Before P5 ships there is no model, and nothing downloads.
+**With no model, analysis doesn't run a reduced pass.** Once P5 ships, the detector is part of the analysis: the job downloads it first, and a failed download fails the job and drops the queue behind it, which is Phase 11's rule for whisper. Falling back to the sound-and-motion stages would show tiers whose bars were accepted with the formation check behind them. Until P5 ships, and always if it is skipped, analysis has no model and nothing downloads.
 
 ### G. Ground truth, scoring and acceptance
 
@@ -542,7 +539,6 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
   |---|---|
   | Goal | The truth lies in the suggestion's `window` |
   | Seek (high tier) | The truth lies in `[seek, seek + 20 s]`, reported for matched goals. It decides whether a high-tier Seek uses `at` or the window start (D6). |
-  | Goal side (P5, if Q9 keeps it) | Among matched goals with a side label, the label is the truth's side |
   | Period start or end | `\|seconds − truth\| ≤ 10 s` |
 
 - **Output, per event kind and per tier:** true positives, false positives, false negatives, precision and recall.
@@ -561,7 +557,6 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 | **Goals, high tier** | Precision ≥ 90% | The rows the coach will learn to trust |
 | **Goals, quiet tier** | Precision ≥ 40%, or the tier is hidden | The user's rule makes it lower confidence. Below 40% it's noise. |
 | **Seek** | 90% of matched high-tier goals lie within 20 s after their Seek point | Otherwise high-tier Seek goes to the window start, like the quiet tier |
-| **Side label (P5, if Q9 keeps it)** | ≥ 90% correct, shown only above the kit margin | A wrong label is worse than none |
 | **Periods** | Recall ≥ 90%, precision ≥ 80% | Four or so per match. They are cheap to confirm, and costly to miss because the clock needs them. |
 | **Tracking (P6)** | The tracker is given only each range's first and last hand key. The interpolated box's centre (after T2's thinning) lies inside the coach's box on ≥ 90% of the **interior** hand keys (about 10 per range at P2's ~1 s spacing), over ≥ 10 hand-keyed 10 s ranges. At most one identity switch per 30 s, where a switch is a run of ≥ 2 consecutive missed interior keys. | Truth is P2's hand keys the tracker never saw. It is below the bar that the coach stops correcting. |
 | **Jersey (P7)** | When it fills a label, it's right ≥ 95% of the time, and it fills ≥ 30% of tracks | An auto-fill that is wrong is worse than an empty field |
@@ -603,7 +598,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
   - **Cheers and still intervals:** synthetic series.
   - **The confirmation rule:** all three cases, period start and end, and the 10 s de-duplication on re-run.
   - **Resolving:** an event resolves the earliest suggestion that holds it, and undo un-resolves it.
-  - **Formation:** synthetic boxes, with outliers, a slanted split, too few players, and the ball point off-centre of the players.
+  - **Formation:** synthetic boxes, with outliers, a slanted split, and too few players.
   - **Tracker:** synthetic box sequences with crossings and a frame jump; thinning keeps the ends and every key interpolation misses by more than the tolerance, and never drops a coach key.
 - **Media:**
   - The `chpl` splice on a real `Exporter` output (the encoder CI selects, with `avenc_aac` audio), read back by `ffprobe -show_chapters` with every frame still decoding; the no-room path; a file with no `udta`.
@@ -630,11 +625,11 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 1. **The detectors may not clear their bars on this footage.** That is what P3 and G4 exist to find out, *before* P4 and P5 put anything in front of the coach. The fallback is honest: the tiers or kinds that fail stay hidden, and the manual Z / X / V path is untouched.
 2. **The virtual camera may not frame kick-offs** (V-2). If it often doesn't, P5's formation check can't raise precision, and sound and motion carry the goal detector alone.
-3. **Stoppages that look like kick-offs** (injuries, water breaks, an adjacent pitch's whistle). These are handled by the cheer tier, then by P5.
+3. **Stoppages that look like kick-offs** (injuries, water breaks, an adjacent pitch's whistle). These are handled by the cheer tier, then by P5 if the bars need it.
 4. **Tracker identity switches** in same-kit crowds. Handled by T3's correction model, which is the feature's real core, not its edge.
 5. **The first version bump** (F1). If the guard change lands late, every v7 project breaks. It goes first in P1, with its test.
 6. **Throughput on a 15 W chip under sustained load.** Measured over minutes in V-7, not seconds.
-7. **Licence drift at pin time:** re-verify each model's licence and hash when it is pinned (L2), including the backbone's pretraining checkpoint, not only the detector's.
+7. **Licence drift at pin time:** re-verify each model's licence and hash when it is pinned (L2), including the backbone's pretraining checkpoint, not only the detector's. The user has accepted COCO- and ImageNet-descended Apache-2.0 weights (Q4), so the check is that each pinned checkpoint is still Apache-2.0 and still descends only from those datasets; an Objects365 or other unreviewed ancestry goes back to the user.
 
 ## Deferred
 
@@ -643,6 +638,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 - **Previewing a reel entry in the app.** "Reel starts here" is set from the scan picture, which is the footage itself.
 - **A reel of one team's goals.** The user asked for every goal in one video. Revisit on request; it is `Reel` gaining a filter.
 - **An automatic guess at the move's start** (the last stoppage, or a change of possession) **and assist labels ("assist #7").** The 30 s default and the coach's trims already meet the build-up requirement, and a guess that can come out *shorter* is the one way to cut an assist out silently. Stoppage times are also not stored (D6), so a guess needs either a stored signal list or a re-analysis. Change of possession and assists need ball tracking, which the ball's few pixels in the wide framing make doubtful, and jersey numbers. **Revisit** only with an asymmetric bar: the guess starts at or before the coach's own trimmed start on ≥ 95% of goals, measured against trims collected on tagged matches. Otherwise it may only ever lengthen the default.
+- **Which side scored, from the kit that kicks off** (D5). The team that kicks off conceded, so the formation check could label a goal row "Home goal?". Dropped by the user (Q9): the coach confirms with Z or X while watching the goal, so the label saves no keystroke, and it would cost a stored kit colour, a format bump, a kit-to-side mapping, a scoring row and a bar. Revisit if a confirm path appears that doesn't involve watching the goal.
 - **Detecting the painted halfway line** (D5). Revisit if the kits' separation proves ambiguous.
 - **A kit-colour tie-break in the tracker** (T2). Same-kit crossings, the common switch, can't use it. Revisit if G4's tracking bar fails on opposite-kit identity switches.
 - **Kick-offs as reel entries** (the user listed them as optional). Revisit on request.
@@ -657,23 +653,26 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 ## Open questions for the user
 
-1. **Q1. Which matches are the ground truth?** The four halves on hand are two matches, and a third makes the held-out set (G2) meaningful. And can the tagged projects be copied to local disk for the scoring runs? Those runs decode every half in full. And can you note each post-goal restart time in a text file as you tag (G1)?
-2. **Q2. Should a highlight show in every clip that covers its moment** (the default, H1), or should a clip be able to hide one?
-3. **Q3. Is the default reel cut right,** 30 s before each goal and 6 s after? It is the only automatic cut; the coach trims each goal from there.
-4. **Q4. Is it acceptable to use detector weights descended from COCO and ImageNet** (L2)? COCO's images are Flickr photos under their uploaders' licences. The backbones both candidates start from were pretrained on ImageNet, whose terms say non-commercial research and education. Nearly every permissively licensed detector rests on this same judgement. If not, the detector has to be trained from random initialisation on SoccerTrack v2, with no ImageNet backbone either, which is a much bigger job with a weaker model.
-5. **Q5. Where do the reel and the exports get watched?** VLC and mpv show `chpl` chapters. iPhones need a QuickTime chapter track, which is a real piece of work. YouTube needs timestamps in the description.
-6. **Q6. Match events as chapters in exported videos, and a whole-match export.** You asked for match events as chapters in exported videos. As specced, the goals reel gets a chapter per goal and a clip export gets a chapter per clip; periods (kick-off, half-time) never become chapters in a file (C2). Is that enough, or do you want:
-   - **(a) a whole-match export** (the full game, no commentary, the scoreboard, and chapters at every goal and period) for sharing with parents? It is cheap once the reel exists (one entry per period), but it is a new kind of output.
-   - **(b) a chapter at each goal *inside* a clip export**, which would split that clip's chapter in two and title the rest of the clip with the goal?
+The questions keep their numbers, so earlier references stay valid. Each open one has a default, and **the plan proceeds on it unless the user says otherwise.**
 
-   **Recommendation:** the reel plus per-clip chapters now. Yes to (a) if parents or players watch whole matches, since that export is where match-event chapters fit naturally. No to (b).
-   **What changes:** as specced, nothing. (a) adds an `ExportTarget` whose plan has one entry per period and a chapter list built from match events, not plan entries. (b) changes C2's chapter list to interleave goal chapters within clip chapters.
-7. **Q7. Should unconfirmed detected goals go in the reel?** The reel includes every goal you tagged or confirmed. A goal the app detected but you haven't confirmed yet is left out until you confirm it (Z or X on its frame, R2).
-   **Recommendation:** confirmed only. A detection can be a false alarm, the burned-in score wouldn't count it, and a quiet-tier one has no time to cut around. Optionally, the export sheet's reel row says "N suggested goals not confirmed" while goal suggestions are pending, so none is left out by accident.
-   **What changes:** as specced, nothing. With unconfirmed goals in, R2's "Which goals" adds pending high-tier suggestions cut around `at` (the quiet tier still can't be placed), their text bar marks them unconfirmed, and the scoreboard shows no change at them.
-8. **Q8. May highlights be placed outside a recording?** A player highlight (a coloured ring with "#7" that follows a player) is placed while you're **scanning** the match, not only while recording. It is saved with the footage, so it shows in every clip and export that covers that moment, including the goals reel. You earlier decided pen drawings stay recording-only.
-   **Recommendation:** yes. Highlights "at a timestamp or across a range" that follow a player only work when placed on the footage before recording; the reel, which has no commentary, can only show highlights that belong to the footage; and the recording-only rule protects the commentary's meaning, which a label on the footage doesn't touch.
-   **What changes:** if yes, the "Drawing stays recording-only" rule becomes "Drawing stays recording-only; highlighting doesn't", and H3 adds that a drag in the H tool never shows the "Drawing works while recording — press R" hint. If no, highlights become clip events like strokes: they can't be tracked ahead of time (recording blocks heavy jobs, B2) and can't appear in the reel, so H1–H6 and T1–T4 are redesigned and P2 and P6 re-planned, not patched.
-9. **Q9. Keep side detection from the kicking kit?** Rows are confirmed by pressing Z or X while watching the goal (D7), so guessing the scoring side from the kit that kicks off saves no keystroke. It can only label a row "Home goal?" (D5).
-   **Recommendation:** drop it and backlog it. It costs `KitColour`, the v11 bump, `kicking_kit`, the kit-to-side mapping, D5's kicker rule, a G3 row and a G4 bar.
-   **What changes:** if kept, the spec stands as written. If dropped: P5 becomes "the formation check drops kick-offs whose players aren't split by kit at the halfway line", built only if P3 shows the goal precision bars fail on sound and motion alone, with its detector otherwise arriving with P6 for tracking; P5 keeps its number even if skipped. The paragraphs after the phase table say so in place of "side attribution". F3 loses v11, D5 loses the kicking kit and Home or Away bullets, D6 loses the `kicking_kit` comment, G3 loses the Goal side row and G4 the Side label row, and Deferred gains "which side scored, from the kit that kicks off".
+- **Q1. Which matches are the ground truth?** The four halves on hand are two matches, and a third makes the held-out set (G2) meaningful. And can the tagged projects be copied to local disk for the scoring runs? Those runs decode every half in full. And can you note each post-goal restart time in a text file as you tag (G1)?
+  **Default (the plan proceeds on this unless the user says otherwise):** the four halves on hand, as two projects, with a third match added if one is recorded; each copied to local disk for scoring, with a `kickoffs.txt` beside it (G1, G3).
+- **Q2. Should a highlight show in every clip that covers its moment** (H1), or should a clip be able to hide one?
+  **Default (the plan proceeds on this unless the user says otherwise):** it shows in every clip that covers its moment. Hiding one per clip stays in Deferred.
+- **Q3. Is the default reel cut right,** 30 s before each goal and 6 s after? It is the only automatic cut; the coach trims each goal from there.
+  **Default (the plan proceeds on this unless the user says otherwise):** 30 s and 6 s (R2).
+- **Q5. Where do the reel and the exports get watched?** VLC and mpv show `chpl` chapters. iPhones need a QuickTime chapter track, which is a real piece of work. YouTube needs timestamps in the description.
+  **Default (the plan proceeds on this unless the user says otherwise):** `chpl` only (C3, C4). QuickTime `chap` tracks and YouTube chapter text stay in Deferred.
+- **Q6. Match events as chapters in exported videos, and a whole-match export.** You asked for match events as chapters in exported videos. As specced, the goals reel gets a chapter per goal and a clip export gets a chapter per clip; periods (kick-off, half-time) never become chapters in a file (C2). Is that enough, or do you want:
+  - **(a) a whole-match export** (the full game, no commentary, the scoreboard, and chapters at every goal and period) for sharing with parents? It is cheap once the reel exists (one entry per period), but it is a new kind of output.
+  - **(b) a chapter at each goal *inside* a clip export**, which would split that clip's chapter in two and title the rest of the clip with the goal?
+
+  **Recommendation, and the default (the plan proceeds on this unless the user says otherwise):** the reel plus per-clip chapters now. Yes to (a) if parents or players watch whole matches, since that export is where match-event chapters fit naturally. No to (b). Until the user says yes to (a), it stays in Deferred.
+  **What changes:** as specced, nothing. (a) adds an `ExportTarget` whose plan has one entry per period and a chapter list built from match events, not plan entries. (b) changes C2's chapter list to interleave goal chapters within clip chapters.
+
+## Decided (the user's answers, 2026-09-22)
+
+- **Q4. COCO- and ImageNet-descended Apache-2.0 detector weights: acceptable.** Recorded in L2, whose per-model table is the record of the decision, and in Risk 7.
+- **Q7. The reel holds confirmed goals only,** and its export row says "N suggested goals not confirmed" while goal suggestions are pending (R2).
+- **Q8. Highlights may be placed outside a recording,** while scanning, and are saved with the footage. Pen drawings stay recording-only (Scope, H1, H3).
+- **Q9. No scoring-side detection from the kicking kit.** P5 is a formation check that only drops false kick-offs, is built only if P3 shows the precision bars need it, and stores nothing (D5). The side is in Deferred.
