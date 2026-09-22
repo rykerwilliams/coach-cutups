@@ -560,3 +560,32 @@ fn frame_boundaries_round_trip_to_the_exact_nanosecond() {
         );
     }
 }
+
+/// Taking the pipeline down while a load is still finding the file's type
+/// deadlocked GStreamer 1.24.2's `urisourcebin` (`SourcePlayer::take_down`,
+/// BACKLOG #47). Without the fix this hung in 4 of 6 runs.
+#[test]
+fn taking_the_pipeline_down_mid_load_never_deadlocks() {
+    const CYCLES: usize = 300;
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let a = uri(&fixtures::webm(dir.path(), "a.webm", 1, 320, 180, 30, 15));
+    let (done_tx, done_rx) = mpsc::channel();
+    // On its own thread so a deadlock fails the test instead of hanging it;
+    // the stuck thread is left behind.
+    std::thread::spawn(move || {
+        for i in 0..CYCLES {
+            // Nothing drives the player, so its messages are dropped.
+            let mut player = SourcePlayer::new(SinkKind::System, FrameMailbox::default(), |_| {});
+            player.seek_to(&a, 0.0, false, Origin::System);
+            if i % 2 == 0 {
+                player.unload(); // READY, as a missing source does
+            }
+            drop(player); // NULL, as the bus's shutdown does
+        }
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a player deadlocked while being taken down mid-load");
+}

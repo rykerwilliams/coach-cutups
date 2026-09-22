@@ -128,6 +128,11 @@ enum Flight {
 /// Soft-volume keeps `volume` on the pipeline rather than the sound server.
 const PLAYBIN_FLAGS: &str = "video+audio+soft-volume+native-video";
 
+/// The longest [`SourcePlayer::take_down`] waits for a load to preroll. A
+/// local file prerolls in milliseconds and a failure ends the wait at once, so
+/// this only bounds a load stuck some other way.
+const LOAD_SETTLE: gst::ClockTime = gst::ClockTime::from_seconds(5);
+
 pub struct SourcePlayer {
     pipeline: gst::Pipeline,
     /// `glupload` inside a [`SinkKind::Gl`] sink, for diagnostics; its
@@ -279,7 +284,7 @@ impl SourcePlayer {
         if !self.gl_gated() {
             // Downward, so synchronous: the streaming threads have stopped
             // and can't refill the mailbox once this returns.
-            let _ = self.pipeline.set_state(gst::State::Ready);
+            self.take_down(gst::State::Ready);
         }
         self.reset();
         self.mailbox.take();
@@ -398,6 +403,27 @@ impl SourcePlayer {
         self.glupload.is_some() && self.gl_slot.lock().unwrap().is_none()
     }
 
+    /// Takes the pipeline down to `state` (READY or NULL), first letting a
+    /// load that is still prerolling finish, for up to [`LOAD_SETTLE`].
+    ///
+    /// GStreamer 1.24.2's `urisourcebin` (Ubuntu 24.04's) deadlocks otherwise;
+    /// newer releases no longer take the lock. Its typefind thread, reporting
+    /// the file's type, checks for a shutdown and then takes the bin's state
+    /// lock to plug `parsebin`. A state change down that lands between the two
+    /// holds that lock while it stops the typefind thread, and each waits for
+    /// the other forever (BACKLOG #47). The typefind thread is past that
+    /// window once the load has prerolled (no frame reaches a sink before
+    /// then) or failed, and the wait below ends at either. Only a load has a
+    /// typefind in it: READY, going up.
+    fn take_down(&self, state: gst::State) {
+        if let (Ok(gst::StateChangeSuccess::Async), gst::State::Ready, _) =
+            self.pipeline.state(gst::ClockTime::ZERO)
+        {
+            let _ = self.pipeline.state(LOAD_SETTLE);
+        }
+        let _ = self.pipeline.set_state(state);
+    }
+
     fn issue(&mut self, request: Request, events: &mut Vec<PlayerEvent>) {
         if self.loaded_uri.as_deref() == Some(request.uri.as_str()) {
             self.seek(request, events);
@@ -407,7 +433,7 @@ impl SourcePlayer {
         // load's ASYNC_DONE, then seek. Setting `uri` outside READY/NULL only
         // queues the next file, and a seek before preroll is dropped.
         if !self.gl_gated() {
-            let _ = self.pipeline.set_state(gst::State::Ready);
+            self.take_down(gst::State::Ready);
         }
         self.pipeline.set_property("uri", &request.uri);
         self.loaded_uri = Some(request.uri.clone());
@@ -493,7 +519,7 @@ impl SourcePlayer {
 /// it down (and must happen before the UI's GL context goes away).
 impl Drop for SourcePlayer {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.take_down(gst::State::Null);
     }
 }
 

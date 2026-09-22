@@ -406,7 +406,7 @@ Each entry: what, why deferred, when to revisit.
   encoder entries then, measured.
 - **Re-deferred at Phase 11 (2026-09-21):** the release pipeline proves export on Mesa (llvmpipe in CI, Intel on the laptop) and nothing else. Unchanged trigger.
 
-### 47. Rare hang when a second bus shuts down while its player is prerolling
+### 47. Rare hang when a second bus shuts down while its player is prerolling — RESOLVED
 - **Why deferred:** seen only in tests: open → shutdown → open → shutdown in
   one process hung in the second `shutdown()` 3 times in 200 runs under 4×
   parallel load; a single open/shutdown never hung (240 runs). The bus thread
@@ -425,6 +425,16 @@ Each entry: what, why deferred, when to revisit.
   same test passed in the run before it and in attempt 1. CI jobs now carry
   `timeout-minutes`, so a recurrence fails in minutes instead of hanging. Its
   own revisit trigger — the end-of-port hardening pass — has now arrived. (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-6-design.md`)
+- **Resolved 2026-09-21:** a GStreamer 1.24.2 deadlock, not the bus. Taking
+  `playbin3` down (READY or NULL) while a load's typefind thread is reporting
+  the file's type deadlocks its `urisourcebin`: the state change holds the
+  bin's state lock and waits for the typefind thread to stop, and that thread
+  is waiting for the same lock to plug `parsebin` (gdb, every thread, in both
+  the player and the bus; newer GStreamer no longer takes the lock). Any
+  window close, source unload or reload inside a load's first milliseconds
+  could hit it. `SourcePlayer::take_down` now lets a load still prerolling
+  finish (bounded at 5 s) before any downward state change, and
+  `taking_the_pipeline_down_mid_load_never_deadlocks` fails without it.
 
 ### 48. Live drawing overlay has no automated coverage; two accepted gaps
 - **Why deferred:** `wire_drawing`, `show_strokes`, `clear_drawings` and the
