@@ -34,6 +34,7 @@ use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
+use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
 use video_coach_core::layout;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
@@ -64,6 +65,13 @@ const SELF_VIEW_QUIET: Duration = Duration::from_secs(1);
 /// What a drag over the picture says outside a recording, where it can only
 /// pan and at 1× visibly does nothing (`zoom_input::drawing_hint`).
 const DRAWING_HINT: &str = "Drawing works while recording — press R";
+/// What a drag in the H tool says while the picture plays (spec H3). A key
+/// sits on the frame it was placed on, and while the picture runs that frame
+/// is gone before the drag ends.
+const HIGHLIGHT_PAUSE_HINT: &str = "Pause to place a highlight (Space)";
+/// A drag shorter than this, in content-rect pixels, is a click: it selects
+/// the ring under it rather than ringing a sliver of pitch.
+const HIGHLIGHT_CLICK: f64 = 6.0;
 /// How long after the pen lifts a drawing clears, with Auto-clear on (Phase 6
 /// spec D3). The overlay's expiry is on `now_ns()`'s clock — the same anchor
 /// the logged rule counts from — and the same span goes into the stroke, so
@@ -111,6 +119,18 @@ struct UiState {
     /// changed**: Slint re-parses every path on every set, and this runs at
     /// 30 Hz over a picture that usually has no highlight on it at all.
     highlight_rings: Vec<Ring>,
+    /// The stream time of the scan frame on screen, as `video.rs` last drew
+    /// one (spec H3, H6). A highlight key is placed at this time, so the box
+    /// and the time describe one frame and `Decoder::frame_at` picks exactly
+    /// that frame for it in export. `None` before the first frame, while a
+    /// preview holds the shared mailbox, or on a frame with no stream time.
+    shown_stream_time: Option<f64>,
+    /// The drag in the H tool, from its press.
+    highlight_drag: Option<HighlightDrag>,
+    /// Whether the window was last told the frame on screen carries a key of
+    /// the selected highlight ("Delete key here"). Kept so the 30 Hz tick
+    /// sets the property only when the answer changes.
+    key_here: bool,
     /// When the notice line clears, if one is up.
     notice_until: Option<Instant>,
     /// The previewed clip's duration while a preview is open. The transport
@@ -126,6 +146,16 @@ struct UiState {
     scoreboard: Option<ScoreboardContext>,
     /// The transcription queue (Phase 10 S5).
     transcription: Transcription,
+}
+
+/// A drag in the H tool, from its press (spec H3).
+struct HighlightDrag {
+    /// Where it started, content-rect pixels.
+    press: (f64, f64),
+    /// Which frame was on screen then: the source and the stream time a key
+    /// carries, captured at the input event as the bus contract requires.
+    /// `None` while the picture plays, where the drag places nothing.
+    at: Option<(usize, f64)>,
 }
 
 /// The transcription as the UI knows it (Phase 10 spec S5): what the bus
@@ -161,6 +191,9 @@ impl Default for UiState {
             pen: Pen::default(),
             paths_rect: (0.0, 0.0),
             highlight_rings: Vec::new(),
+            shown_stream_time: None,
+            highlight_drag: None,
+            key_here: false,
             notice_until: None,
             preview_duration: None,
             export_targets: Vec::new(),
@@ -234,6 +267,7 @@ fn main() {
     wire_callbacks(&window, &bus);
     wire_zoom(&window, &bus);
     wire_drawing(&window, &bus);
+    wire_highlights(&window, &bus);
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, TICK, {
@@ -773,6 +807,35 @@ fn scan_source_position(position: &PositionHandle) -> Option<(usize, f64)> {
     })
 }
 
+/// Which frame is on screen, as the source and offset a **highlight key**
+/// carries (spec H3): the displayed frame's own stream time, so the box and
+/// the time describe one frame and `Decoder::frame_at` picks exactly that
+/// frame for it in export (H6). `None` with no project or no source.
+fn shown_source_position(position: &PositionHandle) -> Option<(usize, f64)> {
+    UI.with_borrow_mut(|ui| {
+        let project = ui.snapshot.as_ref()?.project.clone();
+        if project.source_videos.is_empty() {
+            return None;
+        }
+        let abs = scan_abs(ui, &project, position);
+        Some(shown_position(ui, &project, abs))
+    })
+}
+
+/// [`shown_source_position`] once the scan position is already in hand, which
+/// is how the 30 Hz tick asks without querying the player twice.
+///
+/// The displayed frame's time, or — with no frame yet, or a seek outstanding,
+/// where `ui.source_index` is already the *target's* and pairing it with the
+/// old frame's time would name the wrong source — the scan position through
+/// `locate`, as every other caller-captured position is taken.
+fn shown_position(ui: &UiState, project: &Project, abs: f64) -> (usize, f64) {
+    match (ui.shown_stream_time, ui.target_abs) {
+        (Some(t), None) if ui.source_index < project.source_videos.len() => (ui.source_index, t),
+        _ => project.locate(abs),
+    }
+}
+
 /// Seeds the setup sheet from the project's scoreboard — or from a blank one
 /// when there is none yet — and opens it. The only way in, so the fields are
 /// never stale.
@@ -883,6 +946,34 @@ fn show_match(w: &AppWindow, project: &Project) {
     w.set_match_rows(ModelRc::new(VecModel::from(rows)));
     w.set_match_configured(project.scoreboard.is_some());
     w.set_match_at_cap(project.start_stops_at_cap());
+}
+
+/// The Highlights panel's rows (spec H3), in stored order.
+///
+/// A highlight that is gone — its last key deleted, or an undo — takes the
+/// selection with it, so the panel never offers a label field for a player
+/// who isn't there.
+fn show_highlights(w: &AppWindow, project: &Project) {
+    let rows: Vec<HighlightRow> = project
+        .player_highlights
+        .iter()
+        .map(|h| HighlightRow {
+            id: h.id.to_string().into(),
+            ink: slint_color(h.color),
+            label: h.label.as_str().into(),
+        })
+        .collect();
+    w.set_highlight_rows(ModelRc::new(VecModel::from(rows)));
+    let selected =
+        selected_highlight(w).and_then(|id| project.player_highlights.iter().find(|h| h.id == id));
+    match selected {
+        // Not while the label is being typed in, which this would overwrite.
+        Some(h) if w.get_editing_highlight_id().is_empty() => {
+            w.set_highlight_label(h.label.as_str().into())
+        }
+        Some(_) => {}
+        None => select_highlight(w, project, None),
+    }
 }
 
 /// The inspector (Phase 3 C7, C8). A commit names its clip: the one the
@@ -1147,8 +1238,14 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             }) else {
                 return;
             };
-            // Once a drag, and only a drag: a click never gets this far.
-            if first && zoom_input::drawing_hint(zoom, w.get_recording()) {
+            // Once a drag, and only a drag: a click never gets this far. Not
+            // in the H tool (spec H3), where a drag over the picture rings a
+            // player; this one is in the letterbox bars, which the tool's
+            // touch area doesn't cover.
+            if first
+                && !w.get_in_highlight_tool()
+                && zoom_input::drawing_hint(zoom, w.get_recording())
+            {
                 show_notice(&w, DRAWING_HINT.into());
             }
             let (dx, dy) = delta;
@@ -1303,6 +1400,17 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             // carries its own colour.
             set_pen(&w, pen);
             bus.borrow().send(Command::SetPen(pen));
+            // In the H tool the swatch row also recolours the selected
+            // highlight (spec H2) — but never while recording, where placing
+            // a key is the one highlight edit allowed.
+            if w.get_in_highlight_tool() && !w.get_recording() {
+                if let Some(id) = selected_highlight(&w) {
+                    bus.borrow().send(Command::EditHighlight {
+                        id,
+                        edit: HighlightEdit::Color(pen.color()),
+                    });
+                }
+            }
         }
     });
     window.on_clear_drawings({
@@ -1318,6 +1426,171 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             }
         }
     });
+}
+
+/// The H tool and the Highlights panel (spec H3).
+///
+/// **A key's position is the caller's**, as the bus contract requires: the
+/// stream time of the frame that was on screen when the drag began, read here
+/// and not by the bus, which by then may be looking at another frame.
+fn wire_highlights(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_highlight_press({
+        let (weak, position) = (window.as_weak(), bus.borrow().position_handle().clone());
+        move |x, y| {
+            let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
+                return;
+            };
+            // A key sits on one frame, and a running picture has left that
+            // frame before the drag ends: the drag places nothing and says
+            // so, as a drag outside a recording says drawing needs one.
+            let at = if w.get_playing() {
+                show_notice(&w, HIGHLIGHT_PAUSE_HINT.into());
+                None
+            } else {
+                shown_source_position(&position)
+            };
+            UI.with_borrow_mut(|ui| ui.highlight_drag = Some(HighlightDrag { press: (x, y), at }));
+        }
+    });
+    window.on_highlight_release({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move |x, y| {
+            let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
+                return;
+            };
+            let Some(drag) = UI.with_borrow_mut(|ui| ui.highlight_drag.take()) else {
+                return;
+            };
+            // Nothing to place: the picture was playing, or there is no
+            // content rect to map the box against.
+            let (Some((source_index, source_seconds)), Some((cw, ch))) =
+                (drag.at, content_size(&w))
+            else {
+                return;
+            };
+            let (project, zoom, pen) = UI.with_borrow(|ui| {
+                (
+                    ui.snapshot.as_ref().map(|s| s.project.clone()),
+                    ui.zoom,
+                    ui.pen,
+                )
+            });
+            let Some(project) = project else { return };
+            // What is on the picture at the frame the drag started on, which
+            // is what the press can have landed on.
+            let shapes = highlight_shapes(
+                &project.player_highlights,
+                source_index,
+                source_seconds,
+                zoom,
+                cw,
+                ch,
+            );
+            // A click, not a box: it selects the ring under it, and on bare
+            // pitch changes nothing — Esc is what deselects.
+            if (x - drag.press.0).hypot(y - drag.press.1) < HIGHLIGHT_CLICK {
+                if let Some(id) = highlight_view::hit_test(&shapes, drag.press.0, drag.press.1) {
+                    select_highlight(&w, &project, Some(id));
+                }
+                return;
+            }
+            let Some(rect) = highlight_view::drag_rect(drag.press, (x, y), zoom, cw, ch) else {
+                return;
+            };
+            // The ring under the press, else the selection if it is near
+            // enough, else a new highlight, which the drag then selects.
+            let id = highlight_view::target_for_drag(
+                &project,
+                &shapes,
+                selected_highlight(&w),
+                source_index,
+                source_seconds,
+                drag.press,
+            )
+            .unwrap_or_else(Uuid::new_v4);
+            bus.borrow().send(Command::SetHighlightKey {
+                id,
+                source_index,
+                source_seconds,
+                rect,
+                color: pen.color(),
+            });
+            select_highlight(&w, &project, Some(id));
+        }
+    });
+    // The grab was taken away mid-drag (the tool left, the window closing):
+    // the box is dropped, as a stroke under the pen is.
+    window.on_highlight_cancel(|| UI.with_borrow_mut(|ui| ui.highlight_drag = None));
+    window.on_select_highlight({
+        let weak = window.as_weak();
+        move |id| {
+            let (Some(w), Some(id)) = (weak.upgrade(), parse_id(&id)) else {
+                return;
+            };
+            let project = UI.with_borrow(|ui| ui.snapshot.as_ref().map(|s| s.project.clone()));
+            if let Some(project) = project {
+                select_highlight(&w, &project, Some(id));
+            }
+        }
+    });
+    window.on_delete_highlight({
+        let bus = bus.clone();
+        move |id| {
+            if let Some(id) = parse_id(&id) {
+                bus.borrow().send(Command::DeleteHighlight(id));
+            }
+        }
+    });
+    // "Delete key here": the key at the displayed frame's stream time, which
+    // is the number that placed it (spec H2), so no tolerance is involved.
+    window.on_delete_highlight_key({
+        let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
+        move |id| {
+            let (Some(id), Some((_, source_seconds))) =
+                (parse_id(&id), shown_source_position(&position))
+            else {
+                return;
+            };
+            bus.borrow()
+                .send(Command::DeleteHighlightKey { id, source_seconds });
+        }
+    });
+    let label = |bus: &Rc<RefCell<BusHandle>>, weak: slint::Weak<AppWindow>| {
+        let bus = bus.clone();
+        move |text: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            // The highlight the field was editing, which needn't be the
+            // selection any more — the clip inspector's rule.
+            let editing = w.get_editing_highlight_id();
+            let Some(id) = (!editing.is_empty()).then(|| parse_id(&editing)).flatten() else {
+                return;
+            };
+            bus.borrow().send(Command::EditHighlight {
+                id,
+                edit: HighlightEdit::Label(text.to_string()),
+            });
+        }
+    };
+    window.on_commit_highlight_label(label(bus, window.as_weak()));
+    window.on_end_highlight_label(label(bus, window.as_weak()));
+}
+
+/// The one place the highlight selection changes from Rust: the panel's rows
+/// and a drag on a ring. The label field follows it, since only the selected
+/// row shows one. (Esc clears the selection in the window itself, where the
+/// field is then hidden anyway.)
+fn select_highlight(w: &AppWindow, project: &Project, id: Option<Uuid>) {
+    let label = id
+        .and_then(|id| project.player_highlights.iter().find(|h| h.id == id))
+        .map_or("", |h| h.label.as_str());
+    w.set_highlight_label(label.into());
+    w.set_selected_highlight(id.map(|id| id.to_string()).unwrap_or_default().into());
+}
+
+/// The selected highlight's id; `None` for no selection.
+fn selected_highlight(w: &AppWindow) -> Option<Uuid> {
+    let id = w.get_selected_highlight();
+    (!id.is_empty()).then(|| parse_id(&id)).flatten()
 }
 
 /// Wipes the live overlay: the drawings on screen and the one under the pen,
@@ -1495,6 +1768,9 @@ fn on_event(w: &AppWindow, event: Event) {
             // The duration alone: `tick` is the one writer of
             // `total-seconds`, and picks it up from here.
             ui.preview_duration = clip.map(|c| c.recording_duration);
+            // Opening or closing, the frame on screen is about to be one
+            // from the other pipeline (see `scan_frame_shown`).
+            ui.shown_stream_time = None;
         }),
         // The whole state, every time (spec S5), including how the last run
         // ended: the bus knew that in one `match`, and a window that tried to
@@ -1655,6 +1931,7 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         .collect();
     w.set_tag_rows(ModelRc::new(VecModel::from(tags)));
     show_match(w, project);
+    show_highlights(w, project);
     UI.with_borrow_mut(|ui| {
         // Rebuilt here and nowhere else: a source add, move, remove or
         // relink moves the offsets a context froze (spec S2), and every one
@@ -1856,6 +2133,23 @@ fn self_view_arrived() {
     UI.with_borrow_mut(|ui| ui.self_view_at = Some(Instant::now()));
 }
 
+/// `video.rs` drew a frame from the shared mailbox: which frame is on screen
+/// (spec H3, H6), for a highlight key and for "Delete key here".
+///
+/// **A preview fills the same mailbox**, and its frames are record time
+/// within one clip rather than a place in the footage, so they say nothing
+/// about where the game video is; `Event::Preview` drops the last scan
+/// frame's time as well, so a closed preview leaves nothing stale behind.
+fn scan_frame_shown(stream_time: Option<f64>) {
+    UI.with_borrow_mut(|ui| {
+        ui.shown_stream_time = ui
+            .preview_duration
+            .is_none()
+            .then_some(stream_time)
+            .flatten();
+    });
+}
+
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value
 /// while it's dragged, else the outstanding seek's target, else the player's
 /// position on the current source. Also the recording's elapsed time (R11),
@@ -1956,6 +2250,22 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
                 rings.iter().map(slint_highlight).collect::<Vec<_>>(),
             )));
             ui.highlight_rings = rings;
+        }
+        // Whether "Delete key here" has a key to remove (spec H3): the
+        // selected highlight's, on the frame on screen — the same number a
+        // key is placed at, so this is exact equality and not a tolerance.
+        // Only ever set on a change: Slint has no idea the answer is usually
+        // the same one 30 times a second.
+        let key_here = match (scan, selected_highlight(w)) {
+            (Some(abs), Some(id)) => {
+                let (_, secs) = shown_position(ui, &project, abs);
+                highlight_view::has_key_at(&project, id, secs)
+            }
+            _ => false,
+        };
+        if ui.key_here != key_here {
+            ui.key_here = key_here;
+            w.set_highlight_key_here(key_here);
         }
         // The Match panel's live line (spec S4), from the same anchor. It
         // **freezes while a preview is open**: the transport is then record

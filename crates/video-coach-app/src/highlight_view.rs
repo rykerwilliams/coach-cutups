@@ -10,7 +10,8 @@
 //! Pure code: the window hands in the sizes and takes back strings and
 //! numbers, so every rule here is tested without a display.
 
-use video_coach_core::highlight::{highlight_shapes, HighlightShape};
+use uuid::Uuid;
+use video_coach_core::highlight::{highlight_shapes, HighlightShape, NormRect};
 use video_coach_core::project::Project;
 use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
@@ -125,11 +126,118 @@ fn ring_commands(cx: f64, cy: f64, rx: f64, ry: f64) -> String {
     )
 }
 
+// --------------------------------------------------------------- the H tool
+
+/// How far from a highlight's key range a *selected* highlight still takes a
+/// new key (spec H3), seconds. Past it the drag starts a new highlight, so a
+/// selection left over from earlier in the match can never stretch one across
+/// it.
+pub const SELECTION_REACH: f64 = 10.0;
+
+/// The box a drag from `press` to `release` draws, in **source-normalized**
+/// coordinates: the key's rect.
+///
+/// Both are content-rect logical pixels, as the tool's touch area reports
+/// them. Each corner goes to a content fraction and then through
+/// [`Zoom::source_point`], so a box drawn while zoomed is stored where the
+/// player is in the footage; core's `highlight_shapes` is the exact inverse.
+///
+/// Clamped to the picture — the pointer is grabbed on press, so a drag runs
+/// off it — and `None` for a drag with no area, which is a click, or before
+/// the first layout.
+pub fn drag_rect(
+    press: (f64, f64),
+    release: (f64, f64),
+    zoom: Zoom,
+    content_w: f64,
+    content_h: f64,
+) -> Option<NormRect> {
+    if !(content_w > 0.0 && content_h > 0.0) {
+        return None;
+    }
+    let corner = |(x, y): (f64, f64)| {
+        let (sx, sy) = zoom.source_point(
+            (x / content_w).clamp(0.0, 1.0),
+            (y / content_h).clamp(0.0, 1.0),
+        );
+        (sx.clamp(0.0, 1.0), sy.clamp(0.0, 1.0))
+    };
+    let ((x0, y0), (x1, y1)) = (corner(press), corner(release));
+    let (x, w) = (x0.min(x1), x0.max(x1) - x0.min(x1));
+    let (y, h) = (y0.min(y1), y0.max(y1) - y0.min(y1));
+    // A NaN corner falls out here, as a zero-area drag does.
+    (w > 0.0 && h > 0.0).then_some(NormRect { x, y, w, h })
+}
+
+/// The highlight a press at `(x, y)` lands on, in content-rect pixels, or
+/// `None` for the bare picture.
+///
+/// Topmost first, which is the last of `shapes`: they are drawn in order, so
+/// the one on top is the one the coach sees under the pointer.
+pub fn hit_test(shapes: &[HighlightShape], x: f64, y: f64) -> Option<Uuid> {
+    shapes.iter().rev().find(|s| hits(s, x, y)).map(|s| s.id)
+}
+
+/// Whether `(x, y)` is on a shape: inside the box, or inside the ring it
+/// stands in. The ring is grown by its own stroke width, so a press on the
+/// line itself counts.
+fn hits(shape: &HighlightShape, x: f64, y: f64) -> bool {
+    let r = shape.rect;
+    if x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h {
+        return true;
+    }
+    let (cx, cy, rx, ry) = shape.ellipse;
+    let (rx, ry) = (rx + shape.width, ry + shape.width);
+    if !(rx > 0.0 && ry > 0.0) {
+        return false;
+    }
+    let (dx, dy) = ((x - cx) / rx, (y - cy) / ry);
+    dx * dx + dy * dy <= 1.0
+}
+
+/// Which highlight a drag from `press` puts its key on (spec H3), or `None`
+/// for a new one, which the caller gives a fresh id.
+///
+/// The ring under the press first — the coach is aiming at a player they can
+/// see — then the selected highlight, if it is on this source and the frame
+/// is within [`SELECTION_REACH`] of its keys.
+pub fn target_for_drag(
+    project: &Project,
+    shapes: &[HighlightShape],
+    selected: Option<Uuid>,
+    source_index: usize,
+    source_secs: f64,
+    press: (f64, f64),
+) -> Option<Uuid> {
+    if let Some(id) = hit_test(shapes, press.0, press.1) {
+        return Some(id);
+    }
+    let h = project
+        .player_highlights
+        .iter()
+        .find(|h| Some(h.id) == selected)?;
+    let (first, last) = (h.keys.first()?, h.keys.last()?);
+    (h.source_index == source_index
+        && source_secs >= first.source_seconds - SELECTION_REACH
+        && source_secs <= last.source_seconds + SELECTION_REACH)
+        .then_some(h.id)
+}
+
+/// Whether highlight `id` has a key at exactly `source_secs` — which "Delete
+/// key here" removes, and which is the number that placed it (spec H2: keys
+/// sit at the displayed frame's stream time, so one frame is one number).
+pub fn has_key_at(project: &Project, id: Uuid, source_secs: f64) -> bool {
+    project
+        .player_highlights
+        .iter()
+        .filter(|h| h.id == id)
+        .any(|h| h.keys.iter().any(|k| k.source_seconds == source_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
-    use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
+    use video_coach_core::highlight::{HighlightKey, PlayerHighlight};
     use video_coach_core::project::SourceRef;
 
     /// A 800 × 400 content rect throughout, so a fraction of the height is a
@@ -273,5 +381,185 @@ mod tests {
             "",
         );
         assert!(live_at(&p, 10.0, Zoom::IDENTITY).is_empty());
+    }
+
+    // ------------------------------------------------------- the H tool
+
+    /// The same drag core's round-trip test uses
+    /// (`a_box_drawn_while_zoomed_comes_back_where_it_was_drawn`): the box
+    /// goes to source space through `Zoom::source_point`, so
+    /// `highlight_shapes` brings it back at the pixels it was drawn at.
+    #[test]
+    fn a_drag_is_the_source_box_it_encloses() {
+        let (cw, ch) = (1600.0, 900.0);
+        let zoom = Zoom::new(2.5, 0.12, -0.08).clamped();
+        let (x0, y0, x1, y1) = (520.0, 300.0, 680.0, 660.0);
+        let corner = |x: f64, y: f64| zoom.source_point(x / cw, y / ch);
+        let (sx0, sy0) = corner(x0, y0);
+        let (sx1, sy1) = corner(x1, y1);
+
+        let got = drag_rect((x0, y0), (x1, y1), zoom, cw, ch).expect("a box");
+        assert_eq!(
+            got,
+            NormRect {
+                x: sx0,
+                y: sy0,
+                w: sx1 - sx0,
+                h: sy1 - sy0,
+            }
+        );
+        // Dragged from the far corner it is the same box: the coach may drag
+        // in any of the four directions.
+        assert_eq!(drag_rect((x1, y1), (x0, y0), zoom, cw, ch), Some(got));
+        assert_eq!(drag_rect((x0, y1), (x1, y0), zoom, cw, ch), Some(got));
+    }
+
+    /// The pointer is grabbed on press, so a drag runs off the picture; the
+    /// box stops at its edge rather than storing a box outside the source.
+    /// A drag with no area at all -- a click -- is no box.
+    #[test]
+    fn a_drag_clamps_to_the_picture_and_needs_an_area() {
+        let (cw, ch) = CONTENT;
+        assert_eq!(
+            drag_rect((-500.0, -500.0), (5000.0, 5000.0), Zoom::IDENTITY, cw, ch),
+            Some(NormRect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            })
+        );
+        assert_eq!(
+            drag_rect((10.0, 10.0), (10.0, 90.0), Zoom::IDENTITY, cw, ch),
+            None
+        );
+        // Nothing to normalize against before the first layout.
+        assert_eq!(
+            drag_rect((10.0, 10.0), (90.0, 90.0), Zoom::IDENTITY, 0.0, 0.0),
+            None
+        );
+    }
+
+    /// The 10% × 20% box of `project`, centred: 80 × 80 px at (360, 160), so
+    /// the ring is centred (400, 240) with rx 56 and ry 19.6.
+    fn centred() -> Project {
+        project(
+            NormRect {
+                x: 0.45,
+                y: 0.4,
+                w: 0.1,
+                h: 0.2,
+            },
+            "",
+        )
+    }
+
+    fn shapes_at(p: &Project, secs: f64) -> Vec<HighlightShape> {
+        highlight_shapes(
+            &p.player_highlights,
+            0,
+            secs,
+            Zoom::IDENTITY,
+            CONTENT.0,
+            CONTENT.1,
+        )
+    }
+
+    #[test]
+    fn a_press_on_a_ring_or_its_box_finds_the_highlight() {
+        let shapes = shapes_at(&centred(), 10.0);
+        // On the ring's near edge, inside it, and inside the box.
+        assert_eq!(hit_test(&shapes, 344.0, 240.0), Some(Uuid::nil()));
+        assert_eq!(hit_test(&shapes, 400.0, 245.0), Some(Uuid::nil()));
+        assert_eq!(hit_test(&shapes, 400.0, 200.0), Some(Uuid::nil()));
+        // Beyond the ring, and elsewhere on the picture.
+        assert_eq!(hit_test(&shapes, 400.0, 300.0), None);
+        assert_eq!(hit_test(&shapes, 100.0, 100.0), None);
+    }
+
+    /// A second highlight, on `source_index`, with a key at each of `keys`
+    /// and a box in the top-left corner (nowhere near `centred`'s).
+    fn with_other(p: &mut Project, source_index: usize, keys: &[f64]) -> Uuid {
+        let id = Uuid::from_u128(7);
+        p.player_highlights.push(PlayerHighlight {
+            id,
+            source_index,
+            color: Rgba::RED,
+            label: String::new(),
+            keys: keys
+                .iter()
+                .map(|&source_seconds| HighlightKey {
+                    source_seconds,
+                    rect: NormRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.05,
+                        h: 0.05,
+                    },
+                    tracked: false,
+                })
+                .collect(),
+        });
+        id
+    }
+
+    /// A press on a ring wins, whatever is selected: the coach is aiming at
+    /// the player they can see.
+    #[test]
+    fn a_press_on_a_ring_beats_the_selection() {
+        let mut p = centred();
+        let other = with_other(&mut p, 0, &[10.0, 12.0]);
+        let shapes = shapes_at(&p, 10.0);
+        assert_eq!(
+            target_for_drag(&p, &shapes, Some(other), 0, 10.0, (400.0, 240.0)),
+            Some(Uuid::nil())
+        );
+    }
+
+    /// With nothing under the press, the drag extends the selected highlight
+    /// -- but only within 10 s of its range, so a selection left over from
+    /// earlier in the match never stretches one across it.
+    #[test]
+    fn a_stale_selection_does_not_stretch_a_highlight() {
+        let mut p = Project::new("p");
+        p.source_videos.push(SourceRef {
+            relative_path: "0.mp4".into(),
+            display_name: "0".into(),
+            duration_seconds: 600.0,
+            display_aspect: 16.0 / 9.0,
+        });
+        let id = with_other(&mut p, 0, &[20.0, 25.0]);
+        let target = |secs: f64, selected: Option<Uuid>, source_index: usize| {
+            target_for_drag(
+                &p,
+                &shapes_at(&p, secs),
+                selected,
+                source_index,
+                secs,
+                (700.0, 380.0),
+            )
+        };
+        // Inside the range, and at either end of the 10 s reach.
+        assert_eq!(target(22.0, Some(id), 0), Some(id));
+        assert_eq!(target(35.0, Some(id), 0), Some(id));
+        assert_eq!(target(10.0, Some(id), 0), Some(id));
+        // Past it, on another source, and with nothing selected: a new one.
+        assert_eq!(target(35.1, Some(id), 0), None);
+        assert_eq!(target(22.0, Some(id), 1), None);
+        assert_eq!(target(22.0, None, 0), None);
+        // ... as for a selection that is no longer there at all.
+        assert_eq!(target(22.0, Some(Uuid::from_u128(99)), 0), None);
+    }
+
+    /// "Delete key here" is offered only on a frame that carries a key, and
+    /// the number it matches is the one that placed it.
+    #[test]
+    fn a_key_is_found_only_at_its_own_time() {
+        let mut p = Project::new("p");
+        let id = with_other(&mut p, 0, &[20.0, 25.0]);
+        assert!(has_key_at(&p, id, 20.0));
+        assert!(has_key_at(&p, id, 25.0));
+        assert!(!has_key_at(&p, id, 22.0));
+        assert!(!has_key_at(&p, Uuid::from_u128(99), 20.0));
     }
 }

@@ -912,6 +912,157 @@ component MatchPanel inherits VerticalLayout {
     }
 }
 
+/// One player highlight in the Highlights panel (spec H3): its id, the
+/// colour its ring is drawn in and the label on its pill.
+export struct HighlightRow {
+    id: string,
+    ink: color,
+    label: string,
+}
+
+/// The Highlights panel (spec H3), under the Match panel: the ringed players
+/// on the footage, with the selected one's label, its keys and a delete.
+///
+/// Everything it acts on goes through the bus, as the Match panel's rows do.
+/// Its edits are off while recording, where only *placing* a key is allowed:
+/// a coach mid-take can mark a player but not recolour or delete one.
+component HighlightsPanel inherits VerticalLayout {
+    in property <[HighlightRow]> rows;
+    /// The selected highlight's id, empty for none. A drag on a ring selects
+    /// it, and so does a click on a row.
+    in property <string> selected;
+    // Selecting another row removes the field under this one, and Slint does
+    // not promise a focus-change callback from an element it has destroyed:
+    // without this the window's shortcuts could stay switched off for good.
+    changed selected => { root.label-focused = false; }
+    /// The H tool is on, which is what the panel tells the coach how to use.
+    in property <bool> tool-on;
+    /// Edits are possible: not while recording, and not with nothing loaded.
+    in property <bool> can-edit;
+    /// The displayed frame carries one of the selected highlight's keys, so
+    /// "Delete key here" has something to remove.
+    in property <bool> key-here;
+    /// The selected highlight's label, two-way as the inspector's fields are:
+    /// a `text:` binding breaks the first time it's typed in.
+    in-out property <string> label-text;
+    /// The field has focus: the window's shortcuts yield to it. Read off a
+    /// property the field sets rather than off the field itself, which lives
+    /// inside the row loop and so has no name out here — and `and`ed with the
+    /// selection, so a highlight deleted while its label had focus can't
+    /// leave the shortcuts switched off.
+    out property <bool> editing: root.selected != "" && root.label-focused;
+    property <bool> label-focused;
+
+    callback select(string);
+    callback remove(string);
+    /// "Delete key here": the key on the frame on screen.
+    callback delete-key(string);
+    callback begin-edit();
+    callback commit(string);
+    callback end-edit(string);
+
+    padding: 12px;
+    spacing: 6px;
+
+    FieldLabel { text: "Highlights"; }
+
+    if root.rows.length == 0: Text {
+        text: root.tool-on
+            ? "Pause the game video and drag a box around a player."
+            : "Press H, pause, and drag a box around a player to ring them.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    for row in root.rows: VerticalLayout {
+        spacing: 4px;
+
+        Rectangle {
+            height: 28px;
+            border-radius: 4px;
+            background: row.id == root.selected ? Palette.selection-background : transparent;
+
+            // The whole row selects; the delete button in front takes its
+            // own clicks.
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.select(row.id); }
+            }
+
+            HorizontalLayout {
+                padding-left: 4px;
+                padding-right: 4px;
+                spacing: 6px;
+
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        background: row.ink;
+                        // The strokes' own dark edge, so white and yellow hold.
+                        border-width: 1px;
+                        border-color: #00000066;
+                    }
+                }
+                Text {
+                    text: row.label == "" ? "Unlabelled" : row.label;
+                    color: row.label == "" ? Palette.alternate-foreground : Palette.foreground;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "×";
+                        accessible-label: "Delete";
+                        enabled: root.can-edit;
+                        clicked => { root.remove(row.id); }
+
+                        Tooltip {
+                            text: @markdown("Delete this highlight (undoable)");
+                        }
+                    }
+                }
+            }
+        }
+
+        // The selected row's own controls: the label its pill shows, and the
+        // key on the frame the coach is looking at.
+        if row.id == root.selected: VerticalLayout {
+            spacing: 4px;
+
+            LineEdit {
+                enabled: root.can-edit;
+                placeholder-text: "Shirt number or name";
+                text <=> root.label-text;
+                accepted(text) => { root.commit(text); }
+                changed has-focus => {
+                    root.label-focused = self.has-focus;
+                    if (self.has-focus) {
+                        root.begin-edit();
+                    } else {
+                        root.end-edit(self.text);
+                    }
+                }
+            }
+            Button {
+                text: "Delete key here";
+                enabled: root.can-edit && root.key-here;
+                clicked => { root.delete-key(row.id); }
+
+                Tooltip {
+                    text: @markdown("Remove this player's key on the frame on screen. Their last key deletes the highlight.");
+                }
+            }
+        }
+    }
+}
+
 /// A live stroke: its commands, in the content rect's logical pixels, and
 /// the colour of the pen it was drawn with.
 export struct LiveStroke {
@@ -1667,6 +1818,29 @@ export component AppWindow inherits Window {
     /// They belong to the **footage**, not to a clip, so they show while
     /// scanning as well as while recording.
     in property <[LiveHighlight]> live-highlights;
+
+    // --- The H tool and the Highlights panel (spec H3) ---
+
+    /// The tool is on. UI state: `H` toggles it and Esc leaves it.
+    in-out property <bool> highlight-tool;
+    /// ... and there is a picture to use it on. The touch area, the panel's
+    /// hint and the swatch recolour all key off this, so a preview or an
+    /// unloaded project can't leave a live tool behind. `highlight-tool`
+    /// itself is left alone, so closing a preview gives the tool back.
+    out property <bool> in-highlight-tool: root.highlight-tool && root.can-play && !root.previewing;
+    /// Every highlight on the footage, in stored order.
+    in property <[HighlightRow]> highlight-rows;
+    /// The selected one's id, empty for none: a drag on its ring selects it,
+    /// as does a click on its row.
+    in-out property <string> selected-highlight;
+    /// Its label, two-way down to the field; the window owns the value.
+    in-out property <string> highlight-label;
+    /// Which highlight the label field is editing, so a commit names it even
+    /// after the selection has moved on -- `editing-clip-id`'s rule.
+    in-out property <string> editing-highlight-id;
+    /// The frame on screen carries one of the selected highlight's keys, so
+    /// "Delete key here" has something to remove. From the 30 Hz tick.
+    in property <bool> highlight-key-here;
     /// The stroke under the pen, likewise; empty when nothing is being drawn.
     in property <string> drawing-path;
     /// ... and its colour, the pen's when it went down.
@@ -1764,7 +1938,7 @@ export component AppWindow inherits Window {
     /// A text field has focus: every shortcut yields to it (C6).
     /// J, L and the speed button (spec S1, S2): only while scanning.
     property <bool> can-scan-fast: root.playing && !root.recording && !root.previewing && root.can-play;
-    property <bool> text-editing: name-edit.has-focus || inspector.editing;
+    property <bool> text-editing: name-edit.has-focus || inspector.editing || highlights.editing;
 
     callback open-project();
     callback add-source();
@@ -1873,6 +2047,23 @@ export component AppWindow inherits Window {
     /// The grab was taken away mid-stroke (see the drawing area): whatever is
     /// under the pen is dropped, unlogged.
     callback draw-cancel();
+    /// The H tool (spec H3): a press over the picture, and the release that
+    /// makes the box a key. Content-rect relative, like the pen's, and the
+    /// release may be outside it: Slint grabs the pointer on press.
+    callback highlight-press(length, length);
+    callback highlight-release(length, length);
+    /// The grab was taken away mid-drag: the box is dropped.
+    callback highlight-cancel();
+    /// The Highlights panel's rows.
+    callback select-highlight(string);
+    callback delete-highlight(string);
+    /// "Delete key here": the selected highlight's key on the frame on screen.
+    callback delete-highlight-key(string);
+    /// The label field committed with Enter, or lost focus, which commits
+    /// too. Gaining focus is the window's own business: it only notes which
+    /// highlight the field is on.
+    callback commit-highlight-label(string);
+    callback end-highlight-label(string);
     /// Clear: the button, or C.
     callback clear-drawings();
     /// A swatch was clicked: draw with the pen at this index from now on.
@@ -1997,6 +2188,16 @@ export component AppWindow inherits Window {
         if (event.text == "v" || event.text == "V") {
             return root.tag-key(MatchTag.start-stop, event, pressed);
         }
+        // The H tool (spec H3), under the tag keys' gate: like them it works
+        // while a recording is paused, because a highlight belongs to the
+        // footage rather than to the take. It toggles, so a held key would
+        // toggle straight back.
+        if (event.text == "h" || event.text == "H") {
+            if (pressed && !event.repeat && root.can-tag) {
+                root.highlight-tool = !root.highlight-tool;
+            }
+            return accept;
+        }
         // R and Space toggle, so an auto-repeat would toggle straight back.
         if (event.text == "r" || event.text == "R") {
             if (pressed && !event.repeat) {
@@ -2004,11 +2205,21 @@ export component AppWindow inherits Window {
             }
             return accept;
         }
-        // Esc cascade (C6, P6): the dialog above, then the recording, then
-        // the preview, then the selection.
+        // Esc cascade (C6, P6, H3): the dialog above, then the H tool, then
+        // the recording, then the preview, then the selection.
+        //
+        // **The tool goes before the recording** (H3): in it the first Esc
+        // deselects and the next leaves the tool, so a coach ringing a
+        // player during a paused take never stops the take with it.
         if (event.text == Key.Escape) {
             if (pressed) {
-                if (root.recording) {
+                if (root.in-highlight-tool) {
+                    if (root.selected-highlight != "") {
+                        root.selected-highlight = "";
+                    } else {
+                        root.highlight-tool = false;
+                    }
+                } else if (root.recording) {
                     root.stop-recording();
                 } else if (root.previewing) {
                     root.close-preview();
@@ -2541,12 +2752,12 @@ export component AppWindow inherits Window {
                     }
 
                     // --- Drawing (Phase 6 D1) ---
-                    // The player's LAST child: Slint visits children front to
-                    // back and a TouchArea grabs the pointer on press, so
-                    // declared any earlier the presses would go to `zoom-area`
-                    // and pan instead. Sized to the content rect, so a press
-                    // in the letterbox bars still pans, and `mouse-x/y` are
-                    // already content-relative.
+                    // The player's last child but the H tool's: Slint visits
+                    // children front to back and a TouchArea grabs the
+                    // pointer on press, so declared any earlier the presses
+                    // would go to `zoom-area` and pan instead. Sized to the
+                    // content rect, so a press in the letterbox bars still
+                    // pans, and `mouse-x/y` are already content-relative.
                     //
                     // It accepts no scroll event, so wheels fall through to
                     // `zoom-area` behind it and pan and Ctrl-zoom keep
@@ -2590,6 +2801,56 @@ export component AppWindow inherits Window {
                                 root.draw-move(self.mouse-x, self.mouse-y);
                             }
                         }
+                    }
+
+                    // --- The H tool (spec H3) ---
+                    // After the drawing area, so in the tool a press rings a
+                    // player rather than drawing one over. On the content
+                    // rect like it, so `mouse-x/y` are already the pixels
+                    // `drag_rect` maps through the zoom, and a drag in the
+                    // letterbox bars still pans.
+                    highlight-area := TouchArea {
+                        x: player.content.x;
+                        y: player.content.y;
+                        width: player.content.width;
+                        height: player.content.height;
+                        enabled: root.in-highlight-tool;
+                        mouse-cursor: crosshair;
+                        pointer-event(event) => {
+                            // As the drawing area's: a cancel carries
+                            // `button: other`, so it comes first.
+                            if (event.kind == PointerEventKind.cancel) {
+                                root.highlight-cancel();
+                                return;
+                            }
+                            if (event.button != PointerEventButton.left) {
+                                return;
+                            }
+                            if (event.kind == PointerEventKind.down) {
+                                keys.focus();
+                                root.highlight-press(self.mouse-x, self.mouse-y);
+                            }
+                            if (event.kind == PointerEventKind.up) {
+                                root.highlight-release(self.mouse-x, self.mouse-y);
+                            }
+                        }
+                    }
+
+                    // The box under the pointer, in the pen's colour: what
+                    // the key will hold. Only while the picture is paused,
+                    // which is the only time a drag places anything (H3);
+                    // clamped to the content rect, since the pointer is
+                    // grabbed and `drag_rect` clamps the same way.
+                    if highlight-area.pressed && !root.playing: Rectangle {
+                        property <length> left: max(0px, min(highlight-area.pressed-x, highlight-area.mouse-x));
+                        property <length> top: max(0px, min(highlight-area.pressed-y, highlight-area.mouse-y));
+                        x: player.content.x + self.left;
+                        y: player.content.y + self.top;
+                        width: max(0px, min(player.content.width, max(highlight-area.pressed-x, highlight-area.mouse-x)) - self.left);
+                        height: max(0px, min(player.content.height, max(highlight-area.pressed-y, highlight-area.mouse-y)) - self.top);
+                        border-width: 1px;
+                        border-color: root.pen-colors[root.pen-index];
+                        background: #ffffff1a;
                     }
                 }
 
@@ -2726,6 +2987,38 @@ export component AppWindow inherits Window {
                                 setup => {
                                     keys.focus();
                                     root.open-match-setup();
+                                }
+                            }
+
+                            highlights := HighlightsPanel {
+                                rows: root.highlight-rows;
+                                selected: root.selected-highlight;
+                                tool-on: root.in-highlight-tool;
+                                key-here: root.highlight-key-here;
+                                label-text <=> root.highlight-label;
+                                // The bus refuses every highlight edit but a
+                                // key while recording (H3), and none of them
+                                // belongs to the game video behind a preview.
+                                can-edit: root.can-play && !root.recording && !root.previewing;
+                                // Off any field first, as the Match panel's
+                                // buttons do.
+                                select(id) => {
+                                    keys.focus();
+                                    root.select-highlight(id);
+                                }
+                                remove(id) => {
+                                    keys.focus();
+                                    root.delete-highlight(id);
+                                }
+                                delete-key(id) => {
+                                    keys.focus();
+                                    root.delete-highlight-key(id);
+                                }
+                                begin-edit => { root.editing-highlight-id = root.selected-highlight; }
+                                commit(text) => { root.commit-highlight-label(text); }
+                                end-edit(text) => {
+                                    root.end-highlight-label(text);
+                                    root.editing-highlight-id = "";
                                 }
                             }
                         }
@@ -2926,6 +3219,17 @@ export component AppWindow inherits Window {
                             Tooltip {
                                 text: @markdown("Clear the drawings (C)");
                             }
+                        }
+                        // The H tool is a mode, so it says so (spec H3): the
+                        // pen swatches beside it are what a new ring is
+                        // coloured with, and the panel below lists them.
+                        if root.in-highlight-tool: Text {
+                            text: "Highlight tool — drag a box around a player (Esc to leave)";
+                            color: Palette.foreground;
+                            font-size: 11px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 0;
                         }
                         if root.recording-phase == RecordingPhase.starting: Text {
                             text: "Preparing recording…";

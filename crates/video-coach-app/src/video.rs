@@ -122,6 +122,10 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
                 let Some(frame) = bus.borrow().mailbox().take() else {
                     return;
                 };
+                // Which frame is about to be on screen (match vision spec
+                // H3): a highlight key is placed at this time, so its box
+                // and its time describe the same frame.
+                let stream_time = frame.stream_time;
                 if let Some(sync) = frame.buffer.meta::<gst_gl::GLSyncMeta>() {
                     sync.wait(context);
                 }
@@ -157,6 +161,7 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
                     w.set_frame_height(mapped.height() as f32);
                     w.set_frame(image);
                 }
+                crate::scan_frame_shown(stream_time);
                 current.replace(mapped);
             }
             // Everything Skia drew this frame sits between the two, so this
