@@ -4,7 +4,7 @@
 **Spec:** `docs/superpowers/specs/2026-09-22-match-vision-design.md` (decisions F, C, R, H, D, T, J, B, L, G). It proceeds on the defaults for Q1, Q2, Q3, Q5 and Q6.
 **Status:** Adversarial review applied, not yet executed.
 
-**Scope.** P0, P1 and P2 are planned in full here: 3, 7 and 6 tasks. They need no ML and can be built now. P3–P7 are outlines only (see the end of this plan). Each depends on measurements from the user's tagged matches, and each gets its own detailed plan once its entry gate is met.
+**Scope.** P0, P1 and P2 are planned in full here: 4, 7 and 6 tasks. They need no ML and can be built now. P3–P7 are outlines only (see the end of this plan). Each depends on measurements from the user's tagged matches, and each gets its own detailed plan once its entry gate is met.
 
 **Execution.** A fresh subagent per task (`superpowers:subagent-driven-development`), given this plan, the spec and `CLAUDE.md`.
 - Tasks run one at a time, in the order written, in one tree. The cargo lock serialises every build anyway.
@@ -142,7 +142,54 @@ Also a unit test in `format.rs`: `format_hms_tenths` floors (`754.99` → `12:34
 
 Commit: `feat(app): step one frame with , and ., and show tenths while paused`.
 
-**The 0.1.1 build.** The user's tagging (G1) waits for P0 and needs P0's fix and the frame step in the app they use. The spec names no release point, and nothing may block P1 or P2, so this plan chooses one here: a small build now, and 0.2.0 after P2.
+### Task 0.4: Fast scanning at 2×–32× (spec S)
+
+The user asked for it after the plan was written. It belongs in 0.1.1: tagging means running through whole halves.
+
+**Files:**
+- `crates/video-coach-media/src/player/{mod.rs,sink.rs}`
+- `crates/video-coach-app/src/{main.rs,bus/mod.rs,bus/transport.rs}`
+- `crates/video-coach-app/ui/app.slint`
+- `crates/video-coach-harness/tests/{transport.rs,real_footage.rs}`
+
+**Known facts:**
+- **Every scan seek is `seek_simple`** (`player/mod.rs` `seek`), which seeks at rate 1.0. A rate not carried into each seek is lost on the next scrub or skip.
+- **The player runs one request at a time** (the `Flight` slot, `pending`, `advance`), and a new `seek_to` displaces a pending one (dropping a scrub target, or resetting a skip burst through `SeekDisplaced{Skip}`).
+- **Every pause goes through `Bus::set_playing(false)`** (`transport.rs`): Pause, `start_recording`, `jump_to_clip`, the end of the last source, unload.
+- **The skip burst's live target assumes 1×:** `target + skip_since.elapsed()` in `apply_skip` (`transport.rs`).
+- **The scan appsink has no `qos`** and basesink's unlimited `max-lateness` (`player/sink.rs`), so a slow decode shows frames late instead of dropping them, while `query_position` runs on at the rate. `preview.rs`'s sink sets `qos=true`, and its comment says why that is load-bearing.
+- **`INSTANT_RATE_CHANGE` posts no `ASYNC_DONE`,** which `Flight::Seeking` waits for, and it can't change trick-mode flags. Don't use it.
+- `j`/`l` are free in `handle-key`.
+
+**What to build:**
+1. **The player owns the rate.** `Player::set_rate(rate)` stores it. Every seek is issued with `pipeline.seek(rate, …)` at the stored rate, read when the seek is *issued*, never `seek_simple`. Above 1× the flags add `TRICKMODE | TRICKMODE_NO_AUDIO`, and at 32× `TRICKMODE_KEY_UNITS` (the ignored test below confirms or moves that threshold; name it as a constant with the measurement beside it). If a request is pending, `set_rate` only stores the rate, and the pending seek carries it. Otherwise it queues an **ACCURATE** System request at `target_secs()` (falling back to the queried position), so the picture never snaps to a key frame. Above 1× it also sets playbin's `mute` (`TRICKMODE_NO_AUDIO` is only a hint), and clears it at 1×.
+2. **The sink drops late frames:** `qos=true` and a small `max-lateness` on the scan appsink (`sink.rs`), as `preview.rs` does.
+3. **One command: `Command::SetScanSpeed(f64)`.** The UI works out the next speed (`L` and `J` clamp, the button wraps), and the bus refuses anything not in {1, 2, 4, 8, 16, 32}, or anything while not playing, recording, or previewing. Not on the recording allow-list. The bus holds no copy: it reads and writes the player's rate, and emits the speed to the UI the way it emits `Event::Playing`.
+4. **Any pause returns to 1×,** in `Bus::set_playing(false)`, only when the rate isn't already 1 (a 1× pause must not add a seek: it would change settling and a recording's pause anchors). That covers Pause, a recording's start, a jump to a clip, the end of the last source and an unload, and Play then starts at 1× by itself.
+5. **The skip burst scales by the rate:** `target + elapsed × rate` in `apply_skip`, and a rate change calls `reset_skip()`.
+6. **UI.** `L`/`J` in `handle-key` after the `text-editing` yield, gated `pressed && !event.repeat && playing && !recording && !previewing && can-play`. A speed button beside Play, enabled on the same gate, showing `1×`…`32×`, wrapping to 1× after 32×. The readout appends ` · 8×` above 1×.
+
+**Test that must fail first:** `fast_scanning_runs_at_the_chosen_speed` in `harness/tests/transport.rs`, on a 60 s generated counter video, with timing started at the rate seek's `SeekDone`:
+- at 4×, the **displayed** frame's `Frame.stream_time` advances 4 × wall time ±25% over 2 s, and stays within 0.5 s of the reported position;
+- a scrub while at 4× keeps 4× (the `seek_simple` trap);
+- a pause returns to 1×, and the next Play runs at 1×;
+- `SetScanSpeed` while paused, while recording (`CaptureKind::Test`), or with a speed outside the set changes nothing.
+
+Run the 4× check under `Harness::production()` too, with the real `autoaudiosink`: a fast flushing seek is exactly what wedged `pulsesink` (CLAUDE.md).
+
+Also an `#[ignore]`d `real_footage_fast_scanning` in `real_footage.rs`, behind `COACH_FOOTAGE`: 5 s at each speed, printing the displayed frames per second, the displayed stream time's rate, and its lag behind the position. It confirms or moves the key-frame threshold.
+
+**Verify:** the gate, plus the ignored test on one Trace half.
+
+**CLAUDE.md:** one line under the transport rules: `J`/`L` set the scan speed (1×–32×, scanning only, any pause returns to 1×); every scan seek carries the player's rate, never `seek_simple`.
+
+**Hands-on (batched):** play a Trace half at each speed; the picture keeps moving at 32× and the readout keeps up; R while fast starts the take at 1×.
+
+Commit: `feat(app): fast scanning at 2x-32x with J and L`.
+
+### The 0.1.1 build
+
+The user's tagging (G1) waits for P0 and needs P0's fix, the frame step and fast scanning in the app they use. The spec names no release point, and nothing may block P1 or P2, so this plan chooses one here: a small build now, and 0.2.0 after P2.
 1. Bump `[workspace.package] version` to `0.1.1`.
 2. Build with `packaging/build-deb.sh` (it runs cargo itself; hold the lock around it: `flock /tmp/claude-1000/cargo.lock nice -n 19 packaging/build-deb.sh`). P0 changes no dependency, so the smoke test isn't needed.
 3. Copy the `.deb` to `~/Downloads`.
@@ -156,14 +203,14 @@ Commit: `chore: 0.1.1, the build the ground truth is tagged with`.
 
 ## The user's own steps (in order; they never block P1 or P2)
 
-1. **Install 0.1.1** from `~/Downloads` (`sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`). **Before tagging anything, confirm the scrub fix:** in a Trace half, scrub to a few places and check that the picture and the readout agree. Pause and press `.` a few times: the readout's tenths (`12:34.5`) move with each frame.
+1. **Install 0.1.1** from `~/Downloads` (`sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`). **Before tagging anything, confirm the scrub fix:** in a Trace half, scrub to a few places and check that the picture and the readout agree. Pause and press `.` a few times: the readout's tenths (`12:34.5`) move with each frame. Press `L` a few times while playing: the match runs faster, up to 32×, and `J` or a pause brings it back.
 2. **One project per match** (G1). Start from a new, empty folder for each match.
    - Put that match's video files **inside the project folder** before adding them. Then step 5's copy is one folder, and its relative paths still resolve.
    - Add the halves in order.
    - Open **Set up teams…** and enter the teams and the real format (the number of periods and their minutes).
 3. **Tag the whole match before any detector has seen it:**
    - `V` on the whistle that starts each period, and on the whistle that ends it;
-   - `Z` or `X` on the frame the ball crosses the line, not the celebration. Pause, then step one frame at a time with `,` (back) and `.` (forward) to find it.
+   - `Z` or `X` on the frame the ball crosses the line, not the celebration. Pause, then step one frame at a time with `,` (back) and `.` (forward) to find it. Run fast with `L` to find the moment, but always pause before tagging: at 32× a moment's reaction is 10 s of match.
 
    Don't tag near misses. If a file starts after its half's kick-off, or ends before the final whistle, leave that tag out and add a `# missing` line to `kickoffs.txt` (next step). The first half's missing kick-off is covered by the setup sheet's "My video starts after kick-off".
 4. **Write `kickoffs.txt`** beside `project.json`: one line per restart after a goal, at the moment the ball is played from the centre spot.

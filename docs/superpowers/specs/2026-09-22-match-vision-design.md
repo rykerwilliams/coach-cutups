@@ -66,7 +66,7 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 
 | Phase | Delivers | ML | Gate before it ships | Format |
 |---|---|---|---|---|
-| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). `,` and `.` step one frame back and forward while paused, for tagging and placing highlight keys on the exact frame (the arrows skip 3 s). The readout shows tenths while paused, so a step is visible. | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
+| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). `,` and `.` step one frame back and forward while paused, for tagging and placing highlight keys on the exact frame (the arrows skip 3 s). The readout shows tenths while paused, so a step is visible. Fast scanning at 2×–32× (S) | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
 | **P1** Reel and chapters | The goals reel with per-goal trims, MP4 chapters on every export, chapter markers on the scrubber and `[` / `]` to jump between them | none | tests | v8 |
 | **P2** Hand-placed highlights | The highlight data model, the H tool, keyframed boxes, rings in scan, preview, export and the reel, colours and typed labels | none | tests | v9 |
 | **P3** Measure | The analysis backend with no UI: audio and motion passes, `Analyzer`, core signals, kick-off pattern, confirmation rule, scoring tool; the runtime and detector spike (G5) | spike only | produces the bars' inputs (V-1 to V-8) | – |
@@ -272,6 +272,17 @@ The mapping from source-normalized coordinates to picture pixels is the existing
 - **#67 is also checked on the production path.** Only the System sink's frames can be read back, but the app runs `Harness::production()`'s sinks (`autoaudiosink` among them, which can supply the clock), so the same scrubs repeat there and assert the reported position is within one frame of the target.
 - **Real footage is never committed:** the repository is public and the footage shows children.
 - **If #67's root cause can be reproduced in a generated fixture** (for example an edit list or a non-zero first PTS), the fix also lands with a CI test on that fixture. If it can't, the ignored test is the only proof, and the spec says so in the fix's commit.
+
+### S. Fast scanning (P0; the user's request, 2026-09-22)
+
+A coach tagging a 27-minute half, or looking for the next goal, wants to run the match fast rather than skip 10 s at a time.
+
+- **S1. Speeds are 1×, 2×, 4×, 8×, 16× and 32×, forward only, while playing.** `L` doubles the speed, up to 32×. `J` halves it, down to 1×. Both act only while the scanner is playing; a held key doesn't repeat. A speed button beside Play shows the speed and cycles up on a click, back to 1× after 32×. The readout shows the speed above 1× (`12:34 / 27:10 · 8×`).
+- **S2. Scanning only.** Fast playback is never part of a recording. `J`, `L` and the button do nothing while recording or previewing, and a recording starts paused, so it starts at 1×. The clip model, the event log, replay and export stay 1×, so no format changes.
+- **S3. Any pause returns to 1×.** That one rule covers Pause, a recording's start, a jump to a clip, the end of the last source and an unload, and so Play always starts at 1×. A scrub, a skip or running into the next source while fast keeps the speed.
+- **S4. Sound is muted above 1×.** No pitch-corrected audio.
+- **S5. The picture keeps up, or drops frames; it never lags.** The scan sink drops late frames (QoS), so the displayed frame stays with the position. At 32× (about 960 fps of 1080p) the player plays key frames only; whether 16× needs that too is measured on a Trace half, not assumed.
+- **S6. Find fast, tag paused.** At 32× a 300 ms reaction is 10 s of match, so the coach pauses, steps with `,`/`.` to the frame, then tags. A tag pressed while fast still works (caller-captured, as always); it is only as precise as the reaction.
 
 ### D. Suggested kick-offs, goals and periods
 
@@ -682,4 +693,5 @@ The questions keep their numbers, so earlier references stay valid. Each open on
 - **Q4. COCO- and ImageNet-descended Apache-2.0 detector weights: acceptable.** Recorded in L2, whose per-model table is the record of the decision, and in Risk 7.
 - **Q7. The reel holds confirmed goals only,** and its export row says "N suggested goals not confirmed" while goal suggestions are pending (R2).
 - **Q8. Highlights may be placed outside a recording,** while scanning, and are saved with the footage. Pen drawings stay recording-only (Scope, H1, H3).
+- **Fast scanning (S), 2026-09-22:** scanning only, never while recording; `L` faster and `J` slower, forward only, sound muted above 1×; a speed button too.
 - **Q9. No scoring-side detection from the kicking kit.** P5 is a formation check that only drops false kick-offs, is built only if P3 shows the precision bars need it, and stores nothing (D5). The side is in Deferred.
