@@ -673,18 +673,24 @@ Each entry: what, why deferred, when to revisit.
   follows. Reading the collection first makes a video-only file always
   report "no sound" (commit `bb17011`).
 
-67. **A frame-accurate scrub on a full Trace file lands 0.2–0.3 s off target.**
-  On a ~27-minute Trace half (H.264 repackaged from Trace's HLS web stream,
-  `encoder=dailymotion/hls.js`, irregular ~29.997 fps), scrub releases read back
-  812 → 811.70 and 568 → 568.19. A 70 s local stream-copy of the same footage
-  was within 9 ms except once (25 → 24.50).
-- **Why deferred:** found while fixing the play-after-scrub freeze, which it
-  isn't the cause of. It looks like the edit-list / gapped-file class CLAUDE.md
-  already warns about (stream time vs raw PTS; ACCURATE seeks in VFR files), and
-  deserves its own investigation rather than riding on that fix.
-- **When to revisit:** before the vision work, which will lean on exact
-  timestamps on exactly this footage — or sooner if the coach notices a scrub
-  landing visibly early or late.
+67. ~~**A frame-accurate scrub on a full Trace file lands 0.2–0.3 s off
+  target.**~~ **RESOLVED — it was never off: the targets were misprinted.**
+  The readings came from a throwaway bus test that scrubbed to fractions of
+  the file's duration (½, ⅕, ⅘, 0.35) and printed each *target* rounded to
+  whole seconds (`{:.0}`), next to the position at full precision. On a
+  1623.3955 s half, ½ is 811.69775 and 0.35 is 568.188425, and the player
+  reported exactly those; the 70 s remux's "25 → 24.50" was 0.35 × 70.011
+  = 24.50385, likewise exact. Every one of the eight readings equals its true
+  target to the printed digit. Nothing on the UI path loses time either: the
+  scrubber's value is a continuous `f32` (0.25 ms resolution at an hour), the
+  release sends the last moved value, and the readout shows the seek's
+  target until it settles.
+  - **Standing proof:** the ignored
+  `real_footage_scrubs_land_on_the_frame_export_picks` (20 targets per half,
+  System and production sinks) — on two Trace halves, all 80 landings
+  reported their target to <0.1 ms and showed the frame export picks — and
+  the CI guard `a_paused_scrub_shows_the_frame_export_picks` on an
+  edit-listed fixture.
 
 68. **The volume slider still uses Slint's stock slider.** A volume drag that
   leaves the window on X11 ends with a cancel the stock `SliderBase` ignores
