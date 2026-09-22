@@ -29,12 +29,82 @@ const MIN_DISTANCE: f64 = 1.0;
 /// A stroke's width, as a fraction of the frame's height.
 const LINE_WIDTH: f64 = 0.005;
 
+/// The coach's pens: the swatches beside Clear, in their order. **All bright
+/// and no black**: every one is drawn over match video, where a dark line
+/// disappears into shadow and kit. The dark edge every stroke gets (see
+/// `video_coach_media`'s overlay) keeps the light ones crisp instead.
+///
+/// A stroke stores its colour, not its pen, so retuning a shade here never
+/// changes a drawing already recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Pen {
+    #[default]
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    White,
+    Pink,
+}
+
+impl Pen {
+    /// In the swatch row's order.
+    pub const ALL: [Pen; 6] = [
+        Pen::Red,
+        Pen::Yellow,
+        Pen::Green,
+        Pen::Blue,
+        Pen::White,
+        Pen::Pink,
+    ];
+
+    /// Its name in `state.json`: a name rather than the colour, so a pen
+    /// whose shade is retuned is still the one the coach picked.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Pen::Red => "red",
+            Pen::Yellow => "yellow",
+            Pen::Green => "green",
+            Pen::Blue => "blue",
+            Pen::White => "white",
+            Pen::Pink => "pink",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Pen> {
+        Pen::ALL.into_iter().find(|p| p.label() == label)
+    }
+
+    /// sRGB, 8 bits a channel: the swatch's colour and the stroke's.
+    pub const fn rgb8(self) -> [u8; 3] {
+        match self {
+            Pen::Red => [0xFF, 0x1A, 0x1A],
+            // Fluorescent "volt" yellow, a highlighter's.
+            Pen::Yellow => [0xCC, 0xFF, 0x00],
+            Pen::Green => [0x39, 0xFF, 0x14],
+            // A vivid sky blue: pure blue reads as dark over video.
+            Pen::Blue => [0x00, 0xB4, 0xFF],
+            Pen::White => [0xFF, 0xFF, 0xFF],
+            Pen::Pink => [0xFF, 0x2B, 0xD6],
+        }
+    }
+
+    /// The colour a stroke drawn with it stores. Opaque, which is what earns
+    /// it the dark edge.
+    pub fn color(self) -> Rgba {
+        let [r, g, b] = self.rgb8().map(|c| f64::from(c) / 255.0);
+        Rgba { r, g, b, a: 1.0 }
+    }
+}
+
 /// The stroke under the pen: content-rect pixels, and seconds since the
 /// press.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InProgress {
     /// When the pen went down, on `now_ns()`'s clock.
     start_ns: u64,
+    /// The pen's colour when it went down, which the whole stroke keeps.
+    color: Rgba,
     /// `(x, y)` in content-rect logical pixels, `t` in seconds from
     /// `start_ns`. Never empty: the press is the first point.
     points: Vec<(f64, f64, f64)>,
@@ -42,10 +112,11 @@ pub struct InProgress {
 
 impl InProgress {
     /// The pen went down at `(x, y)`, which becomes the first point, at
-    /// `t = 0`.
-    pub fn start(start_ns: u64, x: f64, y: f64) -> InProgress {
+    /// `t = 0`, drawing in `color`.
+    pub fn start(start_ns: u64, x: f64, y: f64, color: Rgba) -> InProgress {
         InProgress {
             start_ns,
+            color,
             points: vec![(x, y, 0.0)],
         }
     }
@@ -102,7 +173,7 @@ impl InProgress {
         let last_t = self.last().2;
         let stroke = Stroke {
             id: Uuid::new_v4(),
-            color: Rgba::RED,
+            color: self.color,
             line_width: LINE_WIDTH,
             // macOS didn't clamp, so a drag past the edge drew into the
             // letterbox bars on export.
@@ -173,7 +244,7 @@ mod tests {
 
     #[test]
     fn a_move_needs_both_the_time_and_the_distance() {
-        let mut ip = InProgress::start(0, 10.0, 10.0);
+        let mut ip = InProgress::start(0, 10.0, 10.0, Pen::default().color());
         assert!(!ip.moved(200.0, 10.0, S / 240)); // far enough, too soon
         assert!(!ip.moved(10.5, 10.0, S)); // long enough, too close
         assert_eq!(ip.points, vec![(10.0, 10.0, 0.0)]);
@@ -183,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_rejected_move_doesnt_become_the_reference() {
-        let mut ip = InProgress::start(0, 10.0, 10.0);
+        let mut ip = InProgress::start(0, 10.0, 10.0, Pen::default().color());
         // Rejected on distance. Were it kept as the reference, the next move
         // would be measured from it and rejected too.
         ip.moved(10.5, 10.0, S);
@@ -193,7 +264,7 @@ mod tests {
 
     #[test]
     fn a_click_is_one_point_stamped_at_the_release() {
-        let ip = InProgress::start(7 * S, 250.0, 100.0);
+        let ip = InProgress::start(7 * S, 250.0, 100.0, Pen::default().color());
         let (host_ns, stroke) = release(ip, 250.0, 100.0, 9 * S);
         assert_eq!(stroke.points.len(), 1);
         assert_eq!(stroke.points[0].t, 2.0);
@@ -204,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_release_that_fails_the_distance_gate_still_moves_the_last_time() {
-        let mut ip = InProgress::start(0, 10.0, 10.0);
+        let mut ip = InProgress::start(0, 10.0, 10.0, Pen::default().color());
         ip.moved(500.0, 250.0, S);
         // Held still for five seconds before lifting: without this the
         // stroke would be stamped five seconds early and clear early on
@@ -218,7 +289,7 @@ mod tests {
 
     #[test]
     fn a_release_that_moved_far_enough_is_appended() {
-        let mut ip = InProgress::start(0, 10.0, 10.0);
+        let mut ip = InProgress::start(0, 10.0, 10.0, Pen::default().color());
         ip.moved(500.0, 250.0, S);
         let (host_ns, stroke) = release(ip, 800.0, 250.0, 2 * S);
         assert_eq!(stroke.points.len(), 3);
@@ -231,7 +302,7 @@ mod tests {
     #[test]
     fn the_pen_up_time_back_computes_the_press() {
         let start_ns = 1_234_567_891_011_u64;
-        let mut ip = InProgress::start(start_ns, 0.0, 0.0);
+        let mut ip = InProgress::start(start_ns, 0.0, 0.0, Pen::default().color());
         ip.moved(400.0, 300.0, start_ns + S / 2);
         let (host_ns, stroke) = release(ip, 900.0, 300.0, start_ns + 3 * S);
         let last_t = stroke.points.last().unwrap().t;
@@ -242,7 +313,7 @@ mod tests {
     fn coordinates_are_clamped_to_the_content_rect() {
         // The pointer is grabbed on press, so a drag off the picture keeps
         // delivering moves; they draw along the edge.
-        let mut ip = InProgress::start(0, -40.0, -10.0);
+        let mut ip = InProgress::start(0, -40.0, -10.0, Pen::default().color());
         ip.moved(1400.0, 900.0, S);
         let (_, stroke) = release(ip, 1400.0, 900.0, 2 * S);
         assert_eq!((stroke.points[0].x, stroke.points[0].y), (0.0, 0.0));
@@ -250,12 +321,54 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_stroke_is_red_and_carries_the_auto_clear() {
-        let ip = InProgress::start(0, 1.0, 1.0);
+    fn a_finished_stroke_carries_the_line_width_and_the_auto_clear() {
+        let ip = InProgress::start(0, 1.0, 1.0, Pen::default().color());
         let (_, stroke) = ip.release(1.0, 1.0, S, (1000.0, 500.0), Some(5.0));
-        assert_eq!(stroke.color, Rgba::RED);
         assert_eq!(stroke.line_width, LINE_WIDTH);
         assert_eq!(stroke.auto_clear_after_seconds, Some(5.0));
+    }
+
+    /// A stroke is drawn in the pen picked when it started, and a stroke
+    /// already drawn keeps its own: the colour lives in the stroke, not in
+    /// the picker.
+    #[test]
+    fn each_stroke_keeps_the_pen_it_was_started_with() {
+        let (_, red) = release(
+            InProgress::start(0, 1.0, 1.0, Pen::Red.color()),
+            1.0,
+            1.0,
+            S,
+        );
+        let (_, yellow) = release(
+            InProgress::start(2 * S, 1.0, 1.0, Pen::Yellow.color()),
+            1.0,
+            1.0,
+            3 * S,
+        );
+        assert_eq!(red.color, Pen::Red.color());
+        assert_eq!(yellow.color, Pen::Yellow.color());
+    }
+
+    #[test]
+    fn the_pens_are_the_coachs_six_opaque_colours() {
+        let hex: Vec<String> = Pen::ALL
+            .iter()
+            .map(|p| {
+                let [r, g, b] = p.rgb8();
+                format!("#{r:02X}{g:02X}{b:02X}")
+            })
+            .collect();
+        assert_eq!(
+            hex,
+            ["#FF1A1A", "#CCFF00", "#39FF14", "#00B4FF", "#FFFFFF", "#FF2BD6"]
+        );
+        assert!(Pen::ALL.iter().all(|p| p.color().a == 1.0));
+        assert_eq!(Pen::default(), Pen::Red);
+        // The labels round-trip, and an unknown one reads as none.
+        for pen in Pen::ALL {
+            assert_eq!(Pen::from_label(pen.label()), Some(pen));
+        }
+        assert_eq!(Pen::from_label("black"), None);
     }
 
     #[test]
@@ -312,7 +425,7 @@ mod tests {
             "M 400.00 200.00 L 400.00 200.00"
         );
         assert_eq!(
-            InProgress::start(0, 3.0, 4.0).commands(),
+            InProgress::start(0, 3.0, 4.0, Pen::default().color()).commands(),
             "M 3.00 4.00 L 3.00 4.00"
         );
     }

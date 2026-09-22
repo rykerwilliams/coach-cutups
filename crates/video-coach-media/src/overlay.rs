@@ -66,6 +66,18 @@ const ELLIPSIS: &str = "…";
 /// The bar's background, over the picture: macOS's black at 60%.
 const BAR_ALPHA: f32 = 0.6;
 
+/// The dark edge under every opaque stroke, on **each side**, as a fraction of
+/// the stroke's width -- so it scales with the pen as the pen scales with the
+/// picture. A quarter reads as an outline: 1.35 px a side on a 1080p export,
+/// under a pen of 5.4. Much more and it reads as a drop shadow.
+///
+/// The app's live layer draws the same edge (`StrokePath` in `app.slint`).
+const STROKE_EDGE_RATIO: f64 = 0.25;
+/// The edge's opacity, over black: dark enough to hold a white or yellow line
+/// against a sunlit pitch, and short of opaque so it doesn't read as a black
+/// pen stroke of its own.
+const STROKE_EDGE_ALPHA: f32 = 0.8;
+
 /// The score cell's fill, and the clock cell's — the two that aren't a team's
 /// colour (spec S3). macOS's 0.1 and 0.05 grey, the clock's slightly darker
 /// and slightly translucent.
@@ -638,7 +650,8 @@ fn text_color(c: Rgba) -> TextColor {
     TextColor::rgba(channel(c.r), channel(c.g), channel(c.b), channel(c.a))
 }
 
-/// Draws the visible strokes over `pixmap`, mapped into the picture rect.
+/// Draws the visible strokes over `pixmap`, mapped into the picture rect, each
+/// on its thin dark edge ([`STROKE_EDGE_RATIO`]).
 ///
 /// The pen denormalizes against the picture's **height**, not the output's:
 /// a stroke keeps the weight it was drawn with when the picture is
@@ -657,6 +670,7 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         line_join: LineJoin::Round,
         ..tiny_skia::Stroke::default()
     };
+    let edge = Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour");
 
     for visible in visible_strokes(frame.clip, frame.record_time) {
         let stroke = visible.stroke;
@@ -687,8 +701,21 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         let Some(color) = Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32) else {
             continue;
         };
+        let width = stroke_line_width(stroke.line_width, h);
+        // The edge first, a wider stroke the line then covers, so only its
+        // rim shows. Each stroke's pair in turn: a later line crossing an
+        // earlier one is outlined over it, as a pen on a pen would be.
+        //
+        // **Opaque strokes only.** The edge runs under the whole line, so a
+        // see-through one would show it through its middle and read darker
+        // than its stored colour. Every pen the app offers is opaque.
+        if c.a >= 1.0 {
+            paint.set_color(edge);
+            pen.width = (width * (1.0 + 2.0 * STROKE_EDGE_RATIO)) as f32;
+            pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), None);
+        }
         paint.set_color(color);
-        pen.width = stroke_line_width(stroke.line_width, h) as f32;
+        pen.width = width as f32;
         pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), None);
     }
 }
@@ -819,6 +846,38 @@ mod tests {
         assert_eq!(at(&px, 200, 195, 50), [0, 0, 0, 0]);
     }
 
+    /// Every stroke sits on a thin dark edge, so a bright pen stays crisp over
+    /// grass, kits and compression noise: just past the coloured line the
+    /// picture is darkened, and further out it is left alone.
+    #[test]
+    fn a_stroke_has_a_thin_dark_edge() {
+        // A 10 px pen across the middle row of a 200×200 picture.
+        let px = render(&clip(vec![bar(1.0, 0.05, None)]), 1.0, 200, 200);
+        let line = 10.0;
+        let edge = line * (1.0 + 2.0 * STROKE_EDGE_RATIO);
+        // The row halfway between the coloured line's side and the edge's.
+        let just_outside = (100.0 + (line + edge) / 4.0) as u32;
+        let [r, g, b, a] = at(&px, 200, 100, just_outside);
+        assert!(
+            a >= 150 && r <= 20 && g <= 20 && b <= 20,
+            "row {just_outside}: {:?}",
+            [r, g, b, a]
+        );
+        // The line itself is still its own colour, fully covering the edge.
+        assert_eq!(at(&px, 200, 100, 100), [255, 51, 51, 255]);
+        // Well clear of both, nothing: an outline, not a shadow.
+        assert_eq!(at(&px, 200, 100, 100 + (edge as u32)), [0, 0, 0, 0]);
+
+        // A see-through stroke has none: it would show through the middle.
+        let mut ev = bar(1.0, 0.05, None);
+        let EventKind::Stroke(s) = &mut ev.kind else {
+            unreachable!()
+        };
+        s.color.a = 0.5;
+        let px = render(&clip(vec![ev]), 1.0, 200, 200);
+        assert_eq!(at(&px, 200, 100, just_outside), [0, 0, 0, 0]);
+    }
+
     #[test]
     fn every_pixel_is_premultiplied() {
         // A translucent stroke: half-covered edge pixels are where straight
@@ -882,11 +941,13 @@ mod tests {
         // The bar's thickness in pixels, down the centre column it crosses:
         // summed coverage rather than a count of opaque rows, so the two
         // anti-aliased edge pixels are measured instead of being a threshold
-        // to pick (tiny-skia's anti-aliasing is not a stable contract).
+        // to pick (tiny-skia's anti-aliasing is not a stable contract). The
+        // red channel, not alpha: the dark edge has alpha but no red, so this
+        // is the coloured line alone.
         let thickness = |w: u32, h: u32| {
             let px = render(&clip, 1.0, w, h);
-            let alpha: u32 = (0..h).map(|y| u32::from(at(&px, w, w / 2, y)[3])).sum();
-            f64::from(alpha) / 255.0
+            let red: u32 = (0..h).map(|y| u32::from(at(&px, w, w / 2, y)[0])).sum();
+            f64::from(red) / 255.0
         };
         // 0.05 x 100.
         assert!((thickness(200, 100) - 5.0).abs() < 0.5);
@@ -914,11 +975,12 @@ mod tests {
         // Nothing in the pillarbox bars, nor past the stroke's ends.
         assert_eq!(at(&px, 1280, 80, 360), [0, 0, 0, 0]);
         assert_eq!(at(&px, 1280, 1200, 360), [0, 0, 0, 0]);
-        assert_eq!(at(&px, 1280, 330, 360), [0, 0, 0, 0]);
+        // (The round cap and its edge reach 18 + 9 px before x = 352.)
+        assert_eq!(at(&px, 1280, 320, 360), [0, 0, 0, 0]);
         // The pen is 0.05 x 720 = 36 px, from the picture's height and not the
-        // output's (identical here) nor its width.
-        let alpha: u32 = (0..720).map(|y| u32::from(at(&px, 1280, 640, y)[3])).sum();
-        assert!((f64::from(alpha) / 255.0 - 36.0).abs() < 1.0);
+        // output's (identical here) nor its width. Red, as in the test above.
+        let red: u32 = (0..720).map(|y| u32::from(at(&px, 1280, 640, y)[0])).sum();
+        assert!((f64::from(red) / 255.0 - 36.0).abs() < 1.0);
     }
 
     /// The bar's background covers the bottom strip of the **output**, at the

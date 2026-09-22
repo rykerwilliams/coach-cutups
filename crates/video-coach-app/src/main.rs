@@ -27,7 +27,7 @@ use video_coach_app::bus::{
     ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile, TargetState,
     TranscriptionState,
 };
-use video_coach_app::drawing::{path_commands, InProgress};
+use video_coach_app::drawing::{path_commands, InProgress, Pen};
 use video_coach_app::format::{finish_at, format_hms, sentence};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
@@ -38,7 +38,7 @@ use video_coach_core::project::{Clip, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
-use video_coach_core::stroke::Stroke;
+use video_coach_core::stroke::{Rgba, Stroke};
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
@@ -54,6 +54,9 @@ slint::include_modules!();
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// How long a notice stays up.
 const NOTICE: Duration = Duration::from_secs(6);
+/// What a drag over the picture says outside a recording, where it can only
+/// pan and at 1× visibly does nothing (`zoom_input::drawing_hint`).
+const DRAWING_HINT: &str = "Drawing works while recording — press R";
 /// How long after the pen lifts a drawing clears, with Auto-clear on (Phase 6
 /// spec D3). The overlay's expiry is on `now_ns()`'s clock — the same anchor
 /// the logged rule counts from — and the same span goes into the stroke, so
@@ -89,6 +92,8 @@ struct UiState {
     live_strokes: Vec<(Stroke, Option<u64>)>,
     /// The drawing under the pen, if the coach is mid-stroke.
     drawing: Option<InProgress>,
+    /// The pen a new stroke is drawn with, as `state.json` remembers it.
+    pen: Pen,
     /// The content rect the window's `live-paths` were built for: their
     /// commands are in its pixels, so a resize has to rebuild them.
     paths_rect: (f64, f64),
@@ -138,6 +143,7 @@ impl Default for UiState {
             recording_t0: None,
             live_strokes: Vec::new(),
             drawing: None,
+            pen: Pen::default(),
             paths_rect: (0.0, 0.0),
             notice_until: None,
             preview_duration: None,
@@ -169,11 +175,15 @@ fn main() {
 
     let window = AppWindow::new().expect("create the window");
 
-    // The last project and the chosen speech model, both this machine's and
-    // neither the project's.
+    // The last project, the chosen speech model and pen, all this machine's
+    // and none the project's.
     let state = StateFile::default_location();
     let model = state.whisper_model();
     show_transcribe_model(&window, model);
+    window.set_pen_colors(ModelRc::new(VecModel::from(
+        Pen::ALL.map(|p| slint_color(p.color())).to_vec(),
+    )));
+    set_pen(&window, state.pen());
 
     let weak = window.as_weak();
     let bus = Bus::spawn(
@@ -967,10 +977,19 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
                 return;
             };
-            let delta = UI.with_borrow_mut(|ui| ui.drag.as_mut().and_then(|d| d.moved(x, y)));
-            if let Some((dx, dy)) = delta {
-                update_zoom(&w, &bus, |zoom, vp| zoom_input::panned(zoom, vp, dx, dy));
+            let Some((delta, first, zoom)) = UI.with_borrow_mut(|ui| {
+                let drag = ui.drag.as_mut()?;
+                let first = !drag.is_dragging();
+                Some((drag.moved(x, y)?, first, ui.zoom))
+            }) else {
+                return;
+            };
+            // Once a drag, and only a drag: a click never gets this far.
+            if first && zoom_input::drawing_hint(zoom, w.get_recording()) {
+                show_notice(&w, DRAWING_HINT.into());
             }
+            let (dx, dy) = delta;
+            update_zoom(&w, &bus, |zoom, vp| zoom_input::panned(zoom, vp, dx, dy));
         }
     });
     window.on_zoom_reset({
@@ -1045,10 +1064,15 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             let (Some(w), Some(x), Some(y)) = (weak.upgrade(), finite(x), finite(y)) else {
                 return;
             };
-            let start = InProgress::start(now_ns(), x, y);
-            // A press already draws its dot.
-            w.set_drawing_path(start.commands().into());
-            UI.with_borrow_mut(|ui| ui.drawing = Some(start));
+            let now_ns = now_ns();
+            UI.with_borrow_mut(|ui| {
+                // The pen as it is now: the whole stroke keeps it.
+                let start = InProgress::start(now_ns, x, y, ui.pen.color());
+                // A press already draws its dot.
+                w.set_drawing_ink(slint_color(ui.pen.color()));
+                w.set_drawing_path(start.commands().into());
+                ui.drawing = Some(start);
+            });
         }
     });
     window.on_draw_move({
@@ -1103,6 +1127,21 @@ fn wire_drawing(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             UI.with_borrow_mut(|ui| ui.drawing = None);
         }
     });
+    window.on_pick_pen({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move |index| {
+            let (Some(w), Some(&pen)) = (
+                weak.upgrade(),
+                usize::try_from(index).ok().and_then(|i| Pen::ALL.get(i)),
+            ) else {
+                return;
+            };
+            // New strokes only: every stroke on screen or in the log already
+            // carries its own colour.
+            set_pen(&w, pen);
+            bus.borrow().send(Command::SetPen(pen));
+        }
+    });
     window.on_clear_drawings({
         let (weak, bus) = (window.as_weak(), bus.clone());
         move || {
@@ -1137,13 +1176,28 @@ fn clear_drawings(w: &AppWindow) -> bool {
 /// every command string it's given, and a finished stroke's geometry is
 /// static.
 fn show_strokes(w: &AppWindow, ui: &mut UiState, rect: (f64, f64)) {
-    let paths: Vec<SharedString> = ui
+    let paths: Vec<LiveStroke> = ui
         .live_strokes
         .iter()
-        .map(|(s, _)| path_commands(&s.points, rect.0, rect.1).into())
+        .map(|(s, _)| LiveStroke {
+            commands: path_commands(&s.points, rect.0, rect.1).into(),
+            ink: slint_color(s.color),
+        })
         .collect();
     ui.paths_rect = rect;
     w.set_live_paths(ModelRc::new(VecModel::from(paths)));
+}
+
+/// The one place the pen changes, in the window and for the next stroke.
+fn set_pen(w: &AppWindow, pen: Pen) {
+    UI.with_borrow_mut(|ui| ui.pen = pen);
+    let index = Pen::ALL.iter().position(|&p| p == pen).unwrap_or(0);
+    w.set_pen_index(index as i32);
+}
+
+/// A stored colour as Slint's.
+fn slint_color(c: Rgba) -> slint::Color {
+    slint::Color::from_argb_f32(c.a as f32, c.r as f32, c.g as f32, c.b as f32)
 }
 
 /// The content rect's size, as the window lays it out: the letterboxed

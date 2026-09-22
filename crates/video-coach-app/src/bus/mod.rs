@@ -42,6 +42,8 @@ use video_coach_media::{
     RecorderMessage, SinkKind, SourcePlayer, TranscribeKind, TranscribeMessage, WhisperModel,
 };
 
+use crate::drawing::Pen;
+
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::StateFile;
@@ -158,6 +160,10 @@ pub enum Command {
     ClearAll {
         host_ns: u64,
     },
+    /// The coach picked a pen. Only remembered, machine-wide in `state.json`
+    /// (which the bus is the one writer of): the UI colours the strokes
+    /// itself, and each stroke carries its colour into the log.
+    SetPen(Pen),
     /// The project's preferred camera, by PipeWire `node.name`; `None` is
     /// the system default.
     SetCamera(Option<String>),
@@ -660,6 +666,7 @@ impl Bus {
                     | Command::Zoom { .. }
                     | Command::Stroke { .. }
                     | Command::ClearAll { .. }
+                    | Command::SetPen(_)
                     | Command::ToggleRecording { .. }
                     | Command::StopRecording
                     | Command::GlReady { .. }
@@ -710,6 +717,7 @@ impl Bus {
             Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
             Command::Stroke { host_ns, stroke } => self.log_stroke(host_ns, stroke),
             Command::ClearAll { host_ns } => self.log_clear_all(host_ns),
+            Command::SetPen(pen) => self.state.set_pen(pen),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
             Command::Export {

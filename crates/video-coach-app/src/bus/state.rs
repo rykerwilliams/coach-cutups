@@ -1,7 +1,8 @@
 //! The app's own state file, `$XDG_CONFIG_HOME/coach-cuts/state.json`: the
-//! last successfully opened project folder (spec D6) and which speech model
-//! transcription runs (Phase 10 S3). **Neither is a project's.** The model
-//! describes how fast this machine is, not the match, and `Preferences` lives
+//! last successfully opened project folder (spec D6), which speech model
+//! transcription runs (Phase 10 S3) and which pen the coach draws with. **None
+//! is a project's.** The model describes how fast this machine is, not the
+//! match, the pen is the coach's habit, and `Preferences` lives
 //! in `project.json`, where a new field is a format change that
 //! [`store::read`](video_coach_core::store::read)'s exact-version guard would
 //! make every existing project unreadable for.
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use video_coach_media::WhisperModel;
+
+use crate::drawing::Pen;
 
 /// The app's own directory under whichever XDG base directory is in play.
 pub(super) const APP_DIR: &str = "coach-cuts";
@@ -32,6 +35,9 @@ struct State {
     /// throwing the whole document away.
     #[serde(default)]
     whisper_model: Option<String>,
+    /// [`Pen::label`], for the same reasons.
+    #[serde(default)]
+    pen: Option<String>,
 }
 
 /// Where the state file lives. `None` when there is no config directory at
@@ -90,6 +96,23 @@ impl StateFile {
     pub fn set_whisper_model(&self, model: WhisperModel) {
         let mut state = self.read();
         state.whisper_model = Some(model.label().to_owned());
+        self.save(&state);
+    }
+
+    /// The pen new strokes are drawn with. A file that doesn't say, or names
+    /// a pen this version doesn't have, reads as the default.
+    pub fn pen(&self) -> Pen {
+        self.read()
+            .pen
+            .as_deref()
+            .and_then(Pen::from_label)
+            .unwrap_or_default()
+    }
+
+    /// Remembers `pen` for every project on this machine.
+    pub fn set_pen(&self, pen: Pen) {
+        let mut state = self.read();
+        state.pen = Some(pen.label().to_owned());
         self.save(&state);
     }
 
@@ -228,18 +251,33 @@ mod tests {
         );
     }
 
-    /// **Neither setter may clobber the other's field.** Each write rewrites
-    /// the whole document, so one that didn't read first would forget the
-    /// project every time the model changed, and the model every time a
-    /// project opened.
+    /// The pen likewise: machine-wide, surviving a restart, red until picked.
     #[test]
-    fn the_two_settings_are_independent() {
+    fn remembers_the_pen() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateFile::in_config_dir(dir.path());
+        assert_eq!(state.pen(), Pen::Red);
+        state.set_pen(Pen::Yellow);
+        assert_eq!(StateFile::in_config_dir(dir.path()).pen(), Pen::Yellow);
+    }
+
+    /// **No setter may clobber another's field.** Each write rewrites the
+    /// whole document, so one that didn't read first would forget the project
+    /// every time the model or the pen changed, and so on round.
+    #[test]
+    fn the_settings_are_independent() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateFile::in_config_dir(dir.path());
         state.set_last_project(Some(Path::new("/p/game")));
         state.set_whisper_model(WhisperModel::Base);
+        state.set_pen(Pen::Pink);
         assert_eq!(state.last_project(), Some(PathBuf::from("/p/game")));
+        assert_eq!(state.whisper_model(), WhisperModel::Base);
+        // (Base, not the default Small: a clobbered model must be visible.)
         state.set_last_project(Some(Path::new("/p/other")));
+        assert_eq!(state.pen(), Pen::Pink);
+        state.set_pen(Pen::Blue);
+        assert_eq!(state.last_project(), Some(PathBuf::from("/p/other")));
         assert_eq!(state.whisper_model(), WhisperModel::Base);
     }
 

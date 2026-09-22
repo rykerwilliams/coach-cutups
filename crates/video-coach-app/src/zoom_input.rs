@@ -148,6 +148,24 @@ impl DragPan {
         self.last = Some((x, y));
         Some((x - from.0, y - from.1))
     }
+
+    /// Past the threshold: a drag, not a click. [`Self::moved`] returns its
+    /// first step on the call that turns this on.
+    pub fn is_dragging(&self) -> bool {
+        self.last.is_some()
+    }
+}
+
+/// Whether a drag over the picture should say that drawing needs a recording.
+/// Outside one a drag pans, and at 1× a pan does nothing at all, so a coach
+/// trying to draw sees nothing happen and takes drawing for broken.
+///
+/// Not while recording (a drag there, in the letterbox bars, is a pan or a
+/// stroke already) nor starting one, and not when zoomed in, where the drag is
+/// visibly panning. The caller asks once per drag, on its first step.
+pub fn drawing_hint(zoom: Zoom, recording: bool) -> bool {
+    // `panned`'s own test for "nothing to pan".
+    !recording && zoom.scale <= 1.0
 }
 
 #[cfg(test)]
@@ -257,5 +275,28 @@ mod tests {
         assert_eq!(d.moved(103.0, 103.0), Some((3.0, 3.0))); // 4.2 px: all of it
         assert_eq!(d.moved(101.0, 103.0), Some((-2.0, 0.0))); // then each step
         assert_eq!(d.moved(101.0, 103.0), Some((0.0, 0.0)));
+    }
+
+    /// A click, or a wobble under the threshold, is never a drag; the first
+    /// step past it is, and every step after.
+    #[test]
+    fn a_drag_starts_at_the_threshold() {
+        let mut d = DragPan::new(100.0, 100.0);
+        assert!(!d.is_dragging());
+        d.moved(102.0, 102.0);
+        assert!(!d.is_dragging());
+        d.moved(103.0, 103.0);
+        assert!(d.is_dragging());
+    }
+
+    /// A drag, not recording, not zoomed: the hint. Recording, starting one
+    /// (both `recording` to the window) or zoomed in: none.
+    #[test]
+    fn the_drawing_hint_is_for_a_pan_that_does_nothing() {
+        let zoomed = Zoom::IDENTITY.zoomed_to_cursor(2.0, 0.5, 0.5);
+        assert!(drawing_hint(Zoom::IDENTITY, false));
+        assert!(!drawing_hint(Zoom::IDENTITY, true));
+        assert!(!drawing_hint(zoomed, false));
+        assert!(!drawing_hint(zoomed, true));
     }
 }

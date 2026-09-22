@@ -820,26 +820,53 @@ component MatchPanel inherits VerticalLayout {
     }
 }
 
-/// One live telestration stroke (Phase 6 D5). Its `commands` are in the
-/// content rect's logical pixels, which `fit: preserve` takes as they are:
-/// it short-circuits before any bounding-box or stroke-width fitting, so no
-/// viewbox is needed. The caller sets `commands` and `stroke-width`.
+/// A live stroke: its commands, in the content rect's logical pixels, and
+/// the colour of the pen it was drawn with.
+export struct LiveStroke {
+    commands: string,
+    ink: color,
+}
+
+/// One pass of a live telestration stroke (Phase 6 D5). Its `commands` are in
+/// the content rect's logical pixels, which `fit: preserve` takes as they
+/// are: it short-circuits before any bounding-box or stroke-width fitting, so
+/// no viewbox is needed.
 ///
 /// `fill` stays unset on purpose: a fill on an open polyline fills the area
 /// the line encloses.
-component StrokePath inherits Path {
+component StrokePass inherits Path {
     width: 100%;
     height: 100%;
     fit: preserve;
-    // Exactly core's `Rgba::RED`, which export burns in (Phase 8).
-    stroke: #ff3333;
-    // Exactly `drawing::LINE_WIDTH`, a fraction of the picture's height,
-    // which is what the logged stroke carries and export burns in. `self` is
-    // the content rect, by the 100% above.
-    stroke-width: self.height * 0.005;
     // Round caps also make a single point (`M x y L x y`) a dot.
     stroke-line-cap: round;
     stroke-line-join: round;
+}
+
+/// One live stroke, on the thin dark edge export and preview draw under it
+/// (the overlay's `draw_strokes`): the edge, then the line over it, so only
+/// the edge's rim shows. The caller sets `commands` and `ink`.
+component StrokePath inherits Rectangle {
+    in property <string> commands;
+    in property <color> ink;
+    width: 100%;
+    height: 100%;
+
+    // Exactly the overlay's `STROKE_EDGE_RATIO` (a quarter of the line a
+    // side, so 1.5 lines across) and `STROKE_EDGE_ALPHA` (black at 80%).
+    StrokePass {
+        commands: root.commands;
+        stroke: #000000cc;
+        stroke-width: root.height * 0.005 * 1.5;
+    }
+    StrokePass {
+        commands: root.commands;
+        stroke: root.ink;
+        // Exactly `drawing::LINE_WIDTH`, a fraction of the picture's height,
+        // which is what the logged stroke carries and export burns in. `root`
+        // is the content rect, by the 100% above.
+        stroke-width: root.height * 0.005;
+    }
 }
 
 /// A row of the export sheet's target list: its tick, what it covers and how
@@ -1458,12 +1485,19 @@ export component AppWindow inherits Window {
     /// A finished drawing clears itself 5 s after the pen lifts. UI state;
     /// `src/main.rs` reads it at pen-up.
     in-out property <bool> auto-clear: true;
-    /// The live overlay: one SVG command string per stroke still on screen,
-    /// in content-rect logical pixels. `src/main.rs` rebuilds it only when
+    /// The live overlay: one stroke still on screen per row, its commands in
+    /// content-rect logical pixels. `src/main.rs` rebuilds it only when
     /// something changes (D5) — Slint re-parses a `Path` on every set.
-    in property <[string]> live-paths;
+    in property <[LiveStroke]> live-paths;
     /// The stroke under the pen, likewise; empty when nothing is being drawn.
     in property <string> drawing-path;
+    /// ... and its colour, the pen's when it went down.
+    in property <color> drawing-ink;
+    /// The pens' colours, in the swatch row's order (`drawing::Pen::ALL`),
+    /// and which one new strokes are drawn with. `src/main.rs` owns the
+    /// choice and remembers it across sessions.
+    in property <[color]> pen-colors;
+    in property <int> pen-index;
 
     // --- Export (Phase 8 E8): the sheet is the only export UI ---
 
@@ -1645,6 +1679,8 @@ export component AppWindow inherits Window {
     callback draw-cancel();
     /// Clear: the button, or C.
     callback clear-drawings();
+    /// A swatch was clicked: draw with the pen at this index from now on.
+    callback pick-pen(int);
     /// Drag-to-reorder payload: a row index of the named list ("sources" or
     /// "clips") to and from `data-transfer`; -1 when it's another list's.
     pure callback drag-payload(string, int) -> data-transfer;
@@ -2171,13 +2207,15 @@ export component AppWindow inherits Window {
                         // and whatever is still on screen from scanning
                         // belongs to the game video, not to the clip.
                         if !root.previewing: Rectangle {
-                            for cmds in root.live-paths: StrokePath {
-                                commands: cmds;
+                            for stroke in root.live-paths: StrokePath {
+                                commands: stroke.commands;
+                                ink: stroke.ink;
                             }
                             // The one under the pen. An empty `commands` draws
                             // nothing, so it needs no `if`.
                             StrokePath {
                                 commands: root.drawing-path;
+                                ink: root.drawing-ink;
                             }
                         }
                     }
@@ -2470,11 +2508,48 @@ export component AppWindow inherits Window {
                                             : @markdown("Record (R)");
                             }
                         }
-                        // Drawing's two controls (D6). Always mounted, and
+                        // Drawing's controls (D6). Always mounted, and
                         // only disabled off a recording: mounting them with
                         // the recording would change the player's height,
                         // and with it the content rect strokes are
                         // normalized against. macOS learned this one.
+                        //
+                        // The pens first, and never disabled: the coach picks
+                        // one before a recording as well as during it. The
+                        // chosen one has a ring round it.
+                        HorizontalLayout {
+                            spacing: 2px;
+                            alignment: center;
+
+                            for ink[index] in root.pen-colors: VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 22px;
+                                    height: 22px;
+                                    border-radius: self.width / 2;
+                                    border-width: 2px;
+                                    border-color: index == root.pen-index ? Palette.foreground : transparent;
+
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        border-radius: self.width / 2;
+                                        background: ink;
+                                        // The strokes' own dark edge, so white
+                                        // and yellow hold on a light theme.
+                                        border-width: 1px;
+                                        border-color: #00000066;
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            keys.focus();
+                                            root.pick-pen(index);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         VerticalLayout {
                             alignment: center;
                             CheckBox {
