@@ -343,12 +343,14 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** after Phase 3 (which deliberately doesn't auto-delete
   unreferenced media); with a user-visible "clean up unused recordings"
   action, or at packaging.
+- **Re-deferred at Phase 11 (2026-09-21):** how the app is installed doesn't change what a crash leaves in `recordings/`. Revisit with the clean-up action, which is its own UX question.
 
 ### 39. Fall back to x264 when a VA encoder is present but broken
 - **Why deferred:** R4 picks the encoder by element presence. A VA element
   that exists but fails fails the recording with an error.
 - **When to revisit:** if a user's recording fails at start on a machine with
   VA elements, or at packaging (Phase 11) when hardware variety grows.
+- **Re-deferred at Phase 11 (2026-09-21):** one `.deb` for one laptop grows hardware variety by nothing. Revisit on the first report from another machine.
 
 ### 40. Camera format and audio-source fallbacks
 - **Why deferred:** R3 refuses cameras without a 16:9 ≤1280 30 fps mode
@@ -356,6 +358,7 @@ Each entry: what, why deferred, when to revisit.
   was measured ~473,000 s off monotonic, and the target runs PipeWire).
 - **When to revisit:** Phase 11 packaging, or when a real camera or system
   hits the refusal.
+- **Re-deferred at Phase 11 (2026-09-21):** packaging turned out not to touch capture — the `.deb` runs the same capture code as `cargo run`. Revisit when a real camera or system hits the refusal.
 
 ### 41. Live device list and global device preferences
 - **Why deferred:** devices are enumerated when the popover opens, not
@@ -401,6 +404,7 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** when someone runs the port on NVIDIA or an AMD/VA
   machine with `vah264enc`; add an EGL-device or GBM display path and the
   encoder entries then, measured.
+- **Re-deferred at Phase 11 (2026-09-21):** the release pipeline proves export on Mesa (llvmpipe in CI, Intel on the laptop) and nothing else. Unchanged trigger.
 
 ### 47. Rare hang when a second bus shuts down while its player is prerolling
 - **Why deferred:** seen only in tests: open → shutdown → open → shutdown in
@@ -412,8 +416,15 @@ Each entry: what, why deferred, when to revisit.
   scratchpad (`shutdown-hang/wip.diff`), not committed.
 - **When to revisit:** if closing the app ever hangs, or during the end-of-port
   hardening pass.
-
-## Phase 6 deferrals (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-6-design.md`)
+- **Seen on CI, 2026-09-21:** GitHub run 35668867690, attempt 2, hung in the
+  harness test `a_cancel_clears_the_queue_and_leaves_no_failure` for over two
+  hours before being cancelled — the test opens a project and shuts down
+  within about a second, so the bus is still loading the source when the
+  shutdown lands, which is this entry's shape. Both waits in
+  `BusHandle::shutdown` (`acked.recv()`, `thread.join()`) are unbounded. The
+  same test passed in the run before it and in attempt 1. CI jobs now carry
+  `timeout-minutes`, so a recurrence fails in minutes instead of hanging. Its
+  own revisit trigger — the end-of-port hardening pass — has now arrived. (spec `docs/superpowers/specs/2026-09-19-linux-port-phase-6-design.md`)
 
 ### 48. Live drawing overlay has no automated coverage; two accepted gaps
 - **Why deferred:** `wire_drawing`, `show_strokes`, `clear_drawings` and the

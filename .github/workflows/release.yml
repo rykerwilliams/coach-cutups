@@ -35,6 +35,7 @@ jobs:
   version:
     name: version
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -57,6 +58,7 @@ jobs:
     # The exact target distro: the binary needs GLIBC_2.39, so building on
     # anything newer would raise its libc floor above Ubuntu 24.04's.
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     # No Swatinem/rust-cache here, deliberately: this job builds the binary
     # that ships. On a key miss the cache restores the prefix key and keeps
     # dependency build dirs younger than a week, and cargo does not rerun
@@ -97,6 +99,7 @@ jobs:
     # workflow_dispatch run started from a tag. Only a pushed tag releases.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

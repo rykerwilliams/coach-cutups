@@ -12,6 +12,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Every job has a timeout-minutes a few times its normal run. Without one a
+  # hung test sits out GitHub's six-hour default: BACKLOG #47's shutdown hang
+  # held a workspace run for over two hours before it was cancelled.
   # Enforces the core-isolation invariant: video-coach-core must build and
   # test on a machine with NO GStreamer installed. If a media dependency is
   # ever added to that crate, this job fails to build. See the spec's
@@ -19,6 +22,7 @@ jobs:
   core:
     name: core (no GStreamer)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,6 +33,7 @@ jobs:
   workspace:
     name: workspace
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       # The one list, commented there: packaging/build-deps.txt.
@@ -53,6 +58,7 @@ jobs:
   windows:
     name: windows (advisory)
     runs-on: windows-latest
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
