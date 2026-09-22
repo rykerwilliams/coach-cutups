@@ -736,3 +736,18 @@ Each entry: what, why deferred, when to revisit.
   the encoder; find the true source first by recording a few seconds with and
   without each element.
 
+72. **A source's first load once never prerolled, on CI.** GitHub run
+  35697707647, attempt 1: `a_seek_in_the_final_second_stays_in_its_source`
+  (`crates/video-coach-harness/tests/transport.rs`) opened its project, the bus
+  issued the load of source 0 at 0 s (`Position { target_abs: Some(0.0) }`), and
+  no settled position followed within the harness's 15 s. Attempt 2 of the
+  same commit passed, as did the runs before and after.
+- **Why deferred:** once in roughly seven runs, and not reproduced. It is
+  probably not the BACKLOG #47 fix: `SourcePlayer::take_down` only waits when a
+  load is already in flight (READY, going up), and a first load starts from a
+  stopped player — unless two loads were issued back to back at open, when the
+  second would wait up to `LOAD_SETTLE` (5 s) on the first.
+- **When to revisit:** if it recurs on CI, or if a video ever fails to appear
+  when a project opens. Capture `GST_DEBUG=*:3,playbin3:5,urisourcebin:5` on
+  the failing run; check whether two loads were in flight at open.
+
