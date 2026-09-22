@@ -111,13 +111,13 @@ Hypotheses to rule in or out, in this order:
 
 Commit: `fix(player): a scrub on a Trace file lands on its target (BACKLOG #67)`.
 
-### Task 0.3: One-frame steps with `,` and `.`, and the 0.1.1 build
+### Task 0.3: One-frame steps with `,` and `.`, a tenths readout, and the 0.1.1 build
 
 The arrows skip 3 s, which is too coarse to find the frame the ball crosses the line, or to place a highlight key on the frame the coach means. This task adds a one-frame step while paused, then builds the app the user tags with.
 
 **Files:**
 - `crates/video-coach-app/ui/app.slint`
-- `crates/video-coach-app/src/{main.rs,bus/mod.rs,bus/transport.rs}`
+- `crates/video-coach-app/src/{main.rs,format.rs,bus/mod.rs,bus/transport.rs}`
 - `crates/video-coach-media/src/player/mod.rs` (if the step needs the player)
 - `crates/video-coach-harness/tests/transport.rs`
 - `Cargo.toml`, `Cargo.lock`
@@ -126,6 +126,7 @@ The arrows skip 3 s, which is too coarse to find the frame the ball crosses the 
 1. **`Command::StepFrame { forward: bool }`.** The bus acts on it only while the scan player is paused, with no seek outstanding and no preview open. It is **not** on the recording allow-list: a step during a paused take would move the source without a log entry that replay could follow.
 2. **The step lands on the neighbouring frame, and the reported position is that frame's stream time.** How it steps is the implementer's call (a one-buffer `Step` event, or an ACCURATE seek to just past the displayed frame's end or just before its start), provided it holds on irregular timestamps. The test decides.
 3. **`,` steps back and `.` steps forward,** in `handle-key` after the `text-editing` yield, gated `!recording && !previewing && can-play`. A held key repeats, as the skip keys do.
+4. **The time readout shows tenths while paused** (`12:34.5 / 27:10`), and whole seconds while playing, so the digits don't flicker. Without it a frame step is invisible: the whole-second readout holds for ~30 steps. The total stays whole seconds. The tenths are floored, like `format_hms`, so a frame at 12:34.99 never reads 12:35.0. Add a `format_hms_tenths` beside `format_hms` in `format.rs`, and pick between them in the 30 Hz readout update in `main.rs` by the player's paused state.
 
 **Test that must fail first:** `a_paused_step_moves_exactly_one_frame` in `harness/tests/transport.rs`, on the `H264Mp4BFrames` fixture, paused mid-file:
 - five `.` steps each show a frame (`Frame.stream_time`) exactly one fixture frame later, and the reported position equals it;
@@ -133,11 +134,13 @@ The arrows skip 3 s, which is too coarse to find the frame the ball crosses the 
 - `,` on the first frame does nothing;
 - a step while playing does nothing.
 
+Also a unit test in `format.rs`: `format_hms_tenths` floors (`754.99` → `12:34.9`), has an hours form (`1:02:03.4`), and reads `0:00.0` for non-finite or non-positive input, as `format_hms` does.
+
 **Verify:** the gate.
 
-**CLAUDE.md:** one line under the transport rules: `,` and `.` step one frame while paused, and the arrows skip.
+**CLAUDE.md:** one line under the transport rules: `,` and `.` step one frame while paused, and the arrows skip; the readout shows tenths while paused.
 
-Commit: `feat(app): step one frame with , and .`.
+Commit: `feat(app): step one frame with , and ., and show tenths while paused`.
 
 **The 0.1.1 build.** The user's tagging (G1) waits for P0 and needs P0's fix and the frame step in the app they use. The spec names no release point, and nothing may block P1 or P2, so this plan chooses one here: a small build now, and 0.2.0 after P2.
 1. Bump `[workspace.package] version` to `0.1.1`.
@@ -153,7 +156,7 @@ Commit: `chore: 0.1.1, the build the ground truth is tagged with`.
 
 ## The user's own steps (in order; they never block P1 or P2)
 
-1. **Install 0.1.1** from `~/Downloads` (`sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`). **Before tagging anything, confirm the scrub fix:** in a Trace half, scrub to a few places and check that the picture and the readout agree.
+1. **Install 0.1.1** from `~/Downloads` (`sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`). **Before tagging anything, confirm the scrub fix:** in a Trace half, scrub to a few places and check that the picture and the readout agree. Pause and press `.` a few times: the readout's tenths (`12:34.5`) move with each frame.
 2. **One project per match** (G1). Start from a new, empty folder for each match.
    - Put that match's video files **inside the project folder** before adding them. Then step 5's copy is one folder, and its relative paths still resolve.
    - Add the halves in order.

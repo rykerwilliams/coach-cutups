@@ -66,7 +66,7 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 
 | Phase | Delivers | ML | Gate before it ships | Format |
 |---|---|---|---|---|
-| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). `,` and `.` step one frame back and forward while paused, for tagging and placing highlight keys on the exact frame (the arrows skip 3 s). | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
+| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). `,` and `.` step one frame back and forward while paused, for tagging and placing highlight keys on the exact frame (the arrows skip 3 s). The readout shows tenths while paused, so a step is visible. | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
 | **P1** Reel and chapters | The goals reel with per-goal trims, MP4 chapters on every export, chapter markers on the scrubber and `[` / `]` to jump between them | none | tests | v8 |
 | **P2** Hand-placed highlights | The highlight data model, the H tool, keyframed boxes, rings in scan, preview, export and the reel, colours and typed labels | none | tests | v9 |
 | **P3** Measure | The analysis backend with no UI: audio and motion passes, `Analyzer`, core signals, kick-off pattern, confirmation rule, scoring tool; the runtime and detector spike (G5) | spike only | produces the bars' inputs (V-1 to V-8) | – |
