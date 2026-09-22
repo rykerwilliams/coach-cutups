@@ -720,3 +720,19 @@ Each entry: what, why deferred, when to revisit.
   (`MALLOC_CHECK_=3`, or valgrind on the single test) to catch it at the write
   rather than at the free.
 
+71. **A possible thump at the start of every commentary recording.** The
+  Android session's audio analyzer found that real Linux recordings open with
+  a full-scale negative DC step decaying over ~350 ms (its BACKLOG #70 on
+  `claude/android-tablet-port`). Suspects: `pipewiresrc` start-up, or
+  `opusenc`. Export's audio ramp is only `RAMP_SAMPLES` = 240 samples (5 ms),
+  far too short to hide it.
+- **Why deferred:** not yet confirmed by ear, and it can't be reproduced with
+  the test capture sources (`audiotestsrc` has no hardware start-up); the
+  agent working here doesn't open the real microphone without a task that
+  needs it. Added to the hands-on checklist instead.
+- **When to revisit:** if the user hears a thump or click at the start of a
+  take. Likely fixes, cheapest first: fade the first few hundred ms in, or put
+  a DC-blocking high-pass (`audiocheblimit mode=high-pass cutoff=20`) before
+  the encoder; find the true source first by recording a few seconds with and
+  without each element.
+

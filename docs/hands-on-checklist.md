@@ -46,6 +46,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
   Press **R** again to stop (**Esc** and the **Stop** button also stop). **Right:** a clip named like `1-00:12:34` (source number, then the game time where you started) appears under Clips. The button's tooltip reads "Record (R)", and "Stop recording (R or Esc)" while recording.
 - [ ] **Cancel and key repeat.** Press R, then press R again during "Preparing…". **Right:** it cancels and no clip appears. Holding R down doesn't flicker recording on and off.
+- [ ] **Listen to the start of a take.** Record a few seconds, then preview it with headphones on. **Right:** it starts cleanly. **Tell us** if you hear a thump, pop or click right at the start — an audio analyzer suggests there may be one.
 - [ ] **Clap test.** Start a take and clap once, clearly in view of the webcam. Keep this clip, because the preview and export checks use it.
 - [ ] **Picture and lip sync.** Record in a normally lit room. Open the newest `.mkv` in the project's `recordings/` folder in a video player. **Right:** the picture is reasonably sharp, not blocky, and your lips match your voice.
 - [ ] *(Optional, needs a USB camera or mic)* **Unplug a device.** Choose it in Devices…, unplug it, then press R. **Right:** a notice line says it fell back to the default device, instead of the recording failing. Plug it back in, and it's picked again.
