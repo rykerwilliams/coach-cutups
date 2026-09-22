@@ -35,7 +35,7 @@ use video_coach_app::match_panel::{
 };
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
-use video_coach_core::layout;
+use video_coach_core::layout::{self, STROKE_LINE_WIDTH};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
@@ -127,10 +127,6 @@ struct UiState {
     shown_stream_time: Option<f64>,
     /// The drag in the H tool, from its press.
     highlight_drag: Option<HighlightDrag>,
-    /// Whether the window was last told the frame on screen carries a key of
-    /// the selected highlight ("Delete key here"). Kept so the 30 Hz tick
-    /// sets the property only when the answer changes.
-    key_here: bool,
     /// When the notice line clears, if one is up.
     notice_until: Option<Instant>,
     /// The previewed clip's duration while a preview is open. The transport
@@ -193,7 +189,6 @@ impl Default for UiState {
             highlight_rings: Vec::new(),
             shown_stream_time: None,
             highlight_drag: None,
-            key_here: false,
             notice_until: None,
             preview_duration: None,
             export_targets: Vec::new(),
@@ -264,6 +259,9 @@ fn main() {
     let preview_position = bus.preview_position().clone();
     let bus = Rc::new(RefCell::new(bus));
     video::install(&window, bus.clone());
+    // The one pen width, from core: the live stroke layer and the highlight
+    // rings are drawn with it, and it never changes while the window is up.
+    window.set_stroke_line_width(STROKE_LINE_WIDTH as f32);
     wire_callbacks(&window, &bus);
     wire_zoom(&window, &bus);
     wire_drawing(&window, &bus);
@@ -1546,11 +1544,21 @@ fn wire_highlights(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_delete_highlight_key({
         let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
         move |id| {
-            let (Some(id), Some((_, source_seconds))) =
+            let (Some(id), Some((source_index, source_seconds))) =
                 (parse_id(&id), shown_source_position(&position))
             else {
                 return;
             };
+            // The button is only enabled when this highlight has a key on
+            // this frame (`has_key_at`, matching the source as well as the
+            // time), so the command can't reach another video's key.
+            if !UI.with_borrow(|ui| {
+                ui.snapshot.as_ref().is_some_and(|s| {
+                    highlight_view::has_key_at(&s.project, id, source_index, source_seconds)
+                })
+            }) {
+                return;
+            }
             bus.borrow()
                 .send(Command::DeleteHighlightKey { id, source_seconds });
         }
@@ -1631,8 +1639,12 @@ fn slint_highlight(ring: &Ring) -> LiveHighlight {
         commands: ring.commands.as_str().into(),
         ink: slint_color(ring.ink),
         label: ring.label.as_str().into(),
+        label_ink: slint_color(ring.label_ink),
         label_x: ring.label_x as f32,
         label_y: ring.label_y as f32,
+        font_size: ring.font_size as f32,
+        label_pad: ring.label_pad as f32,
+        pill_height: ring.pill_h as f32,
     }
 }
 
@@ -1665,6 +1677,7 @@ fn on_event(w: &AppWindow, event: Event) {
                 ui.source_index = 0;
                 ui.target_abs = None;
                 ui.last_secs = 0.0;
+                ui.shown_stream_time = None;
                 // The bus cancels and clears its queue on an open, and its
                 // own event follows; these three are the window's own.
                 ui.transcription = Transcription::default();
@@ -1686,6 +1699,16 @@ fn on_event(w: &AppWindow, event: Event) {
             source_index,
             target_abs,
         } => UI.with_borrow_mut(|ui| {
+            // A seek is on its way, or the source itself changed: the frame
+            // still on screen is the one *before* it. Dropping its time here
+            // — rather than waiting for the next frame to replace it — is
+            // what stops a key placed in the gap between a seek settling and
+            // the new frame being drawn from carrying the old frame's time.
+            // `shown_position` then falls back to the scan position, as every
+            // other caller-captured position is taken.
+            if target_abs.is_some() || ui.source_index != source_index {
+                ui.shown_stream_time = None;
+            }
             ui.source_index = source_index;
             ui.target_abs = target_abs;
         }),
@@ -2234,13 +2257,19 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
             _ => String::new(),
         };
         w.set_readout(format!("{now} / {}{speed}", format_hms(total)).into());
-        // The player highlights on the live picture (spec H5), from the same
-        // anchor as the Match panel's clock. Not while previewing: the
-        // preview's texture already carries its rings, and its transport is
-        // record time within one clip rather than a place in the footage.
-        let rings = match (scan, content) {
-            (Some(abs), Some((cw, ch))) => {
-                let (source_index, secs) = project.locate(abs);
+        // The player highlights on the live picture (spec H5). Not while
+        // previewing: the preview's texture already carries its rings, and
+        // its transport is record time within one clip rather than a place in
+        // the footage.
+        //
+        // **Which frame is on screen**, asked once (spec H3, H6): the
+        // displayed frame's own stream time. It is what a key is placed at
+        // and what `Decoder::frame_at` picks for it in export, so the ring
+        // drawn here is the ring export burns in, and "Delete key here" is
+        // offered on exactly the frame whose key it would remove.
+        let shown = scan.map(|abs| shown_position(ui, &project, abs));
+        let rings = match (shown, content) {
+            (Some((source_index, secs)), Some((cw, ch))) => {
                 highlight_view::live_highlights(&project, source_index, secs, ui.zoom, cw, ch)
             }
             _ => Vec::new(),
@@ -2254,19 +2283,12 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         // Whether "Delete key here" has a key to remove (spec H3): the
         // selected highlight's, on the frame on screen — the same number a
         // key is placed at, so this is exact equality and not a tolerance.
-        // Only ever set on a change: Slint has no idea the answer is usually
-        // the same one 30 times a second.
-        let key_here = match (scan, selected_highlight(w)) {
-            (Some(abs), Some(id)) => {
-                let (_, secs) = shown_position(ui, &project, abs);
-                highlight_view::has_key_at(&project, id, secs)
+        w.set_highlight_key_here(match (shown, selected_highlight(w)) {
+            (Some((source_index, secs)), Some(id)) => {
+                highlight_view::has_key_at(&project, id, source_index, secs)
             }
             _ => false,
-        };
-        if ui.key_here != key_here {
-            ui.key_here = key_here;
-            w.set_highlight_key_here(key_here);
-        }
+        });
         // The Match panel's live line (spec S4), from the same anchor. It
         // **freezes while a preview is open**: the transport is then record
         // time within one clip, and the preview's own scoreboard is already

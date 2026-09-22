@@ -23,11 +23,18 @@
 //! picture itself is drawn with, so a ring cannot drift from it. Strokes stay
 //! zoom-agnostic (they live in the content rect and deliberately don't move
 //! with the zoom); a highlight lives in source space and must move with it.
+//!
+//! **The label's geometry is owned here too** — its size, the pill's height
+//! and where the pill sits beside the box — for the same reason: three
+//! drawers (the media overlay, the live Slint layer and the window that lays
+//! it out) would otherwise each carry their own copy of a number they have to
+//! agree on. Only the pill's *width* is left to a drawer, since only one that
+//! shapes the text can know it.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::layout::Rect;
+use crate::layout::{stroke_line_width, Rect, STROKE_LINE_WIDTH};
 use crate::project::Project;
 use crate::stroke::Rgba;
 use crate::zoom::Zoom;
@@ -292,10 +299,29 @@ const RING_WIDTH_RATIO: f64 = 1.4;
 /// foreshortening of a circle on the pitch seen from a raised camera.
 const RING_ASPECT: f64 = 0.35;
 
-/// The ring's stroke width, as a fraction of the picture's height. The pen's
-/// own width (`drawing::LINE_WIDTH`), so a ring reads like a drawn ellipse at
-/// every output size.
-const RING_LINE_WIDTH: f64 = 0.005;
+/// A label's size, as a fraction of the picture's height — the picture's and
+/// not the output's, for the reason the pen has: a pillarboxed entry's ring
+/// and label keep the size they had beside the footage.
+const LABEL_FONT_RATIO: f64 = 0.03;
+
+/// The gap the label's pill keeps around its text, as a fraction of the font
+/// size: once on each side of the line, and once more split above and below
+/// it. Only a drawer that shapes the text needs it, since only one of those
+/// knows how wide the pill has to come out.
+pub const LABEL_PAD_RATIO: f64 = 0.35;
+
+/// The gap between the pill and the box, as a fraction of the font size.
+const LABEL_GAP_RATIO: f64 = 0.25;
+
+/// The pill's height, as a multiple of the font size, and the **one** formula
+/// for it: the usual 1.2 line height plus [`LABEL_PAD_RATIO`], split above and
+/// below the line.
+///
+/// A constant rather than something the rasterizer reports, because
+/// [`highlight_shapes`] has to place the pill — above the box or below it —
+/// before anyone has shaped a glyph, and the live layer and the burned-in one
+/// must put it in the same place.
+pub const LABEL_PILL_RATIO: f64 = 1.55;
 
 /// One highlight's drawing geometry, in **picture pixels** relative to the
 /// picture's origin. The overlay and the live layer both draw from this, so
@@ -312,12 +338,80 @@ pub struct HighlightShape {
     pub ellipse: (f64, f64, f64, f64),
     /// The stroke width for the ring.
     pub width: f64,
+    /// The label's font size. The pill is [`LABEL_PILL_RATIO`] × this tall;
+    /// how *wide* it comes out is the text shaper's to say, and only a drawer
+    /// has one.
+    pub font_size: f64,
+    /// The pill's top edge: above the box, below it where there is no room
+    /// above, and clamped into the picture either way.
+    ///
+    /// Placed rather than clipped — half a shirt number is a different shirt
+    /// number — and decided here so that the ring on screen and the ring
+    /// burned into the export carry their number in the same place.
+    pub label_y: f64,
+}
+
+impl HighlightShape {
+    /// Whether this shape can be drawn at all: every number finite, and a ring
+    /// with an area.
+    ///
+    /// A corrupt box is skipped whole, **label included** (BACKLOG #28): a
+    /// non-finite rect would otherwise drop its pill in the corner of the
+    /// frame, which reads as a real label on a player who isn't there.
+    pub fn is_drawable(&self) -> bool {
+        let (cx, cy, rx, ry) = self.ellipse;
+        [
+            cx,
+            cy,
+            rx,
+            ry,
+            self.rect.x,
+            self.rect.y,
+            self.rect.w,
+            self.rect.h,
+            self.font_size,
+            self.label_y,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && rx > 0.0
+            && ry > 0.0
+    }
 }
 
 /// The ring for a box: an ellipse centred on the box's bottom edge.
 fn highlight_ring(rect: Rect) -> (f64, f64, f64, f64) {
     let rx = RING_WIDTH_RATIO * rect.w / 2.0;
     (rect.x + rect.w / 2.0, rect.y + rect.h, rx, RING_ASPECT * rx)
+}
+
+/// Where a pill `pill_h` tall goes beside `rect`, with `gap` between the two:
+/// above the box, below it when there is no room above, and clamped into a
+/// picture `picture_h` tall.
+fn label_y(rect: Rect, gap: f64, pill_h: f64, picture_h: f64) -> f64 {
+    let above = rect.y - gap - pill_h;
+    let y = if above >= 0.0 {
+        above
+    } else {
+        rect.y + rect.h + gap
+    };
+    y.clamp(0.0, (picture_h - pill_h).max(0.0))
+}
+
+/// Black or white over `c`, whichever can be read on it.
+///
+/// A label's pill takes the highlight's own colour, and the swatch row runs
+/// from white through yellow to blue, so a fixed ink would be invisible at one
+/// end of it. The weights are the usual relative-luminance ones.
+pub fn label_ink(c: Rgba) -> Rgba {
+    let luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    let v = if luma > 0.5 { 0.0 } else { 1.0 };
+    Rgba {
+        r: v,
+        g: v,
+        b: v,
+        a: 1.0,
+    }
 }
 
 /// The shapes to draw at `t` seconds of source `source_index`, on a picture
@@ -336,6 +430,9 @@ pub fn highlight_shapes(
     picture_h: f64,
 ) -> Vec<HighlightShape> {
     let transform = zoom.transform(picture_w, picture_h, picture_w, picture_h);
+    let font_size = LABEL_FONT_RATIO * picture_h;
+    let pill_h = LABEL_PILL_RATIO * font_size;
+    let gap = LABEL_GAP_RATIO * font_size;
     highlights_at(highlights, source_index, t)
         .into_iter()
         .map(|h| {
@@ -352,7 +449,9 @@ pub fn highlight_shapes(
                 label: h.label.to_string(),
                 rect,
                 ellipse: highlight_ring(rect),
-                width: RING_LINE_WIDTH * picture_h,
+                width: stroke_line_width(STROKE_LINE_WIDTH, picture_h),
+                font_size,
+                label_y: label_y(rect, gap, pill_h, picture_h),
             }
         })
         .collect()

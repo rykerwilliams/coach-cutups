@@ -434,3 +434,163 @@ fn shapes_come_out_in_stored_order_and_skip_other_sources() {
             .collect();
     assert_eq!(ids, [Uuid::from_u128(1), Uuid::from_u128(3)]);
 }
+
+/// The shape carries the label's geometry as well as the ring's, so the media
+/// overlay and the live Slint layer draw one pill in one place (spec H4). The
+/// pill goes above the box, or below it where there is no room, and never
+/// outside the picture — only its *width* is a drawer's to decide, since only
+/// a drawer shapes the text.
+#[test]
+fn the_shape_places_the_label_for_every_drawer() {
+    let (p, _) = project_with_keys(&[key(10.0, rect(0.4, 0.4, 0.2, 0.2))]);
+    let at = |picture_h: f64, r: NormRect| {
+        let mut p = p.clone();
+        p.player_highlights[0].keys[0].rect = r;
+        highlight_shapes(
+            &p.player_highlights,
+            0,
+            10.0,
+            Zoom::IDENTITY,
+            800.0,
+            picture_h,
+        )[0]
+        .clone()
+    };
+
+    // A 400 px picture: a 12 px font and an 18.6 px pill, 3 px clear of a box
+    // whose top edge is 160 px down.
+    let mid = at(400.0, rect(0.4, 0.4, 0.2, 0.2));
+    assert_eq!(mid.font_size, 12.0);
+    assert_eq!(mid.label_y, 160.0 - 3.0 - 18.6);
+    // Against the top of the picture there is no room above, so it drops
+    // under the box's bottom edge (80 px down).
+    assert_eq!(at(400.0, rect(0.4, 0.0, 0.2, 0.2)).label_y, 80.0 + 3.0);
+    // A box taller than the picture leaves no room either way: the pill is
+    // clamped in rather than drawn off the bottom.
+    assert_eq!(at(400.0, rect(0.4, 0.0, 0.2, 1.0)).label_y, 400.0 - 18.6);
+}
+
+/// A corrupt box is skipped **whole**, its label with it (BACKLOG #28): a
+/// non-finite rect would otherwise put a pill in the corner of the frame,
+/// which reads as a real label on a player who isn't there. One rule, shared
+/// by both drawers.
+#[test]
+fn a_non_finite_or_empty_shape_is_not_drawable() {
+    let (p, _) = project_with_keys(&[key(10.0, rect(0.4, 0.4, 0.2, 0.2))]);
+    let drawable = |r: NormRect| {
+        let mut p = p.clone();
+        p.player_highlights[0].keys[0].rect = r;
+        highlight_shapes(&p.player_highlights, 0, 10.0, Zoom::IDENTITY, 800.0, 400.0)[0]
+            .is_drawable()
+    };
+    assert!(drawable(rect(0.4, 0.4, 0.2, 0.2)));
+    assert!(!drawable(rect(f64::NAN, 0.4, 0.2, 0.2)));
+    assert!(!drawable(rect(0.4, f64::INFINITY, 0.2, 0.2)));
+    // A box with no width has no ring to draw.
+    assert!(!drawable(rect(0.4, 0.4, 0.0, 0.2)));
+}
+
+// ------------------------------------------------- what a corrupt file does
+//
+// Nothing below can be reached through the app: the mutators keep `keys`
+// sorted and deduplicated, and a key is placed at a frame the player is
+// showing. They are what a hand-edited or half-written `project.json` can
+// hand `highlights_at`, and the rule for all of them is BACKLOG #28's --
+// draw nothing, or draw something odd, but never panic and never guess.
+
+/// A key past the end of its source is stored as given: core validates a
+/// highlight against the source **list**, not against a duration. It simply
+/// never shows, because no player and no export ever asks for a time past the
+/// footage -- and two keys straddling the end interpolate to the end and stop,
+/// as any other pair does.
+#[test]
+fn a_key_past_the_sources_duration_is_stored_and_never_reached() {
+    // `project_with_keys`'s source runs 1000 s.
+    let (p, _) = project_with_keys(&[
+        key(999.0, rect(0.1, 0.1, 0.2, 0.2)),
+        key(2000.0, rect(0.5, 0.1, 0.2, 0.2)),
+    ]);
+    assert_eq!(p.player_highlights[0].keys.len(), 2);
+    let at = |t| highlights_at(&p.player_highlights, 0, t);
+    // Inside the footage it is an ordinary interpolation ...
+    assert_eq!(at(999.0)[0].rect, rect(0.1, 0.1, 0.2, 0.2));
+    assert_eq!(at(1000.0).len(), 1);
+    // ... and the rest of its range is time the footage doesn't have.
+    assert_eq!(at(2000.0).len(), 1);
+    assert!(at(2000.001).is_empty());
+}
+
+/// `store::read` does **not** re-sort `keys` (see `PlayerHighlight::keys`):
+/// the mutators are the only way keys are added and they keep the order, so a
+/// list on every load would guard against an edit nobody makes. A file that
+/// breaks the order comes back exactly as written, and draws an odd ring
+/// rather than panicking.
+#[test]
+fn unsorted_keys_survive_a_read_and_draw_something_odd() {
+    let json = r#"{"id":"00000000-0000-0000-0000-000000000007","sourceIndex":0,
+        "color":{"r":0.0,"g":1.0,"b":0.0,"a":1.0},"label":"","keys":[
+        {"sourceSeconds":30.0,"rect":{"x":0.3,"y":0.0,"w":0.1,"h":0.1},"tracked":false},
+        {"sourceSeconds":10.0,"rect":{"x":0.1,"y":0.0,"w":0.1,"h":0.1},"tracked":false}]}"#;
+    let h: PlayerHighlight = serde_json::from_str(json).unwrap();
+    let times: Vec<f64> = h.keys.iter().map(|k| k.source_seconds).collect();
+    assert_eq!(times, [30.0, 10.0], "read re-sorted the keys");
+
+    // The range is [first, last], which this list turns inside out, so the
+    // highlight never shows at all. The point of the test is the sweep: no
+    // time panics, and nothing is drawn from a guess.
+    let highlights = vec![h];
+    for i in 0..=400 {
+        let t = i as f64 * 0.1;
+        assert!(highlights_at(&highlights, 0, t).is_empty(), "showed at {t}");
+    }
+}
+
+/// Two keys at one time can only come from a file -- `set_highlight_key`
+/// replaces rather than appends. The later one wins, and the zero-length span
+/// between them is never divided by.
+#[test]
+fn duplicate_key_times_take_the_later_key() {
+    let a = key(10.0, rect(0.1, 0.1, 0.2, 0.2));
+    let b = key(10.0, rect(0.5, 0.5, 0.2, 0.2));
+    let c = key(20.0, rect(0.9, 0.9, 0.2, 0.2));
+    let show = |keys: Vec<HighlightKey>| {
+        let highlights = vec![PlayerHighlight {
+            id: Uuid::from_u128(7),
+            source_index: 0,
+            color: GREEN,
+            label: String::new(),
+            keys,
+        }];
+        highlights_at(&highlights, 0, 10.0)[0].rect
+    };
+    // The whole highlight is one instant: its range is [10, 10].
+    assert_eq!(show(vec![a, b]), b.rect);
+    // ... and with a key after them, the pair's later box is where the run to
+    // the next key starts from.
+    assert_eq!(show(vec![a, b, c]), b.rect);
+}
+
+/// A NaN time draws nothing, with one key or with many: `rect_at`'s range
+/// check is written as a negation for exactly this reason, and the single-key
+/// span is a comparison a NaN also fails.
+#[test]
+fn a_nan_time_shows_nothing() {
+    let (one, _) = project_with_keys(&[key(10.0, rect(0.1, 0.1, 0.2, 0.2))]);
+    let (many, _) = project_with_keys(&[
+        key(10.0, rect(0.1, 0.1, 0.2, 0.2)),
+        key(20.0, rect(0.3, 0.1, 0.2, 0.2)),
+        key(30.0, rect(0.5, 0.1, 0.2, 0.2)),
+    ]);
+    for p in [one, many] {
+        assert!(highlights_at(&p.player_highlights, 0, f64::NAN).is_empty());
+        assert!(highlight_shapes(
+            &p.player_highlights,
+            0,
+            f64::NAN,
+            Zoom::IDENTITY,
+            800.0,
+            400.0
+        )
+        .is_empty());
+    }
+}

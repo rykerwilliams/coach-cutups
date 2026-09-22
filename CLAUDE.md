@@ -352,6 +352,18 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
   picture itself is drawn with. No new mapping function, in either the media
   overlay or the live Slint layer. Strokes stay zoom-agnostic (they live in the
   content rect); a highlight lives in source space and moves with the zoom.
+- **The shape carries the label too** — its font size, the pill's height
+  (`LABEL_PILL_RATIO`) and the pill's y, above the box or below it — and
+  `highlight::label_ink` says whether the number is black or white. A drawer
+  decides only how *wide* the pill comes out, because only a drawer shapes
+  text; `app.slint` takes the rest as properties rather than repeating the
+  ratios. The ring is stroked at `layout::STROKE_LINE_WIDTH`, the **one** pen
+  width, which the live stroke layer and a logged `Stroke` also take from
+  there.
+- **The live ring is placed on the displayed frame**, `main.rs`'s
+  `shown_position` — the same frame a key is placed on and "Delete key here"
+  offers — not on `project.locate`. That is what makes the ring on screen the
+  ring export burns in (spec H6).
 - **A highlight may be placed outside a recording**, while pen drawings stay
   recording-only: a highlight describes the footage, a drawing the commentary.
 

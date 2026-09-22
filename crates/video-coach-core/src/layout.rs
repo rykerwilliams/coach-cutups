@@ -247,6 +247,13 @@ pub fn scoreboard_rects(out_w: f64, out_h: f64) -> ScoreboardRects {
     }
 }
 
+/// The pen's width, as a fraction of the picture's height — the **one** pen
+/// width. Every drawer takes it from here: the app's live stroke layer, the
+/// [`Stroke::line_width`](crate::stroke::Stroke::line_width) a new drawing is
+/// logged with, and a highlight's ring, which is stroked at the same weight so
+/// it reads like a drawn ellipse.
+pub const STROKE_LINE_WIDTH: f64 = 0.005;
+
 /// A stroke's line width in pixels, from [`crate::stroke::Stroke::line_width`].
 ///
 /// `picture_h` is the **content rect's** height, not the output frame's (see

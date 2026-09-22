@@ -3,11 +3,11 @@
 //! them and the player bookkeeping.
 //!
 //! Position survives list changes: `current` goes through the same remap as
-//! clips, match events and player highlights, and the player reloads only when the current
-//! source itself was removed or relinked. Otherwise only concat offsets move,
-//! and a request in flight or pending still lands where it was headed: it
-//! names a file, not a concat time. Only the skip coordinator, whose target
-//! *is* a concat time, is reset on every change.
+//! clips, match events and player highlights, and the player reloads only
+//! when the current source itself was removed or relinked. Otherwise only
+//! concat offsets move, and a request in flight or pending still lands where
+//! it was headed: it names a file, not a concat time. Only the skip
+//! coordinator, whose target *is* a concat time, is reset on every change.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

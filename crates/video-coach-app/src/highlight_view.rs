@@ -7,32 +7,27 @@
 //! normalized against. So a ring on screen is the ring the export burns in,
 //! with no second mapping to drift.
 //!
+//! The label's size, its pill's height and where that pill sits are core's
+//! too; all this module adds is the ring's path string and the anchor the
+//! window clamps once it knows how wide the shaped text came out.
+//!
 //! Pure code: the window hands in the sizes and takes back strings and
 //! numbers, so every rule here is tested without a display.
 
 use uuid::Uuid;
-use video_coach_core::highlight::{highlight_shapes, HighlightShape, NormRect};
+use video_coach_core::highlight::{
+    highlight_shapes, label_ink, HighlightShape, NormRect, LABEL_PAD_RATIO, LABEL_PILL_RATIO,
+};
 use video_coach_core::project::Project;
 use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
 
-/// A label's size, as a fraction of the content rect's height. The overlay's
-/// `LABEL_FONT_RATIO`, so the live pill reads at the size export burns in.
-const LABEL_FONT_RATIO: f64 = 0.03;
-
-/// The pill's height, as a multiple of the font size. The overlay measures its
-/// own from the font it rasterizes with; here the window lays the pill out
-/// while this module decides whether it goes above the box or below, so the
-/// two have to agree on one number — `app.slint`'s `HighlightLabel` uses this
-/// same ratio.
-const LABEL_PILL_RATIO: f64 = 1.5;
-
-/// The gap between the pill and the box, as a fraction of the font size (the
-/// overlay's `LABEL_GAP_RATIO`).
-const LABEL_GAP_RATIO: f64 = 0.25;
-
 /// One highlight as the live layer draws it, in **content-rect logical
 /// pixels**.
+///
+/// Every number here is core's [`HighlightShape`], which is also what the
+/// media overlay draws from: the window lays the pill out, but it decides
+/// nothing about it beyond how wide the shaped text came out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveHighlight {
     /// The ring, as SVG path commands for a `Path` with `fit: preserve`,
@@ -41,6 +36,8 @@ pub struct LiveHighlight {
     pub ink: Rgba,
     /// Empty draws no pill.
     pub label: String,
+    /// Black or white, whichever can be read on the pill.
+    pub label_ink: Rgba,
     /// Where the pill is centred horizontally: the box's centre. The window
     /// clamps it to the content rect once it knows how wide the pill came
     /// out.
@@ -48,6 +45,13 @@ pub struct LiveHighlight {
     /// The pill's top edge, already placed above the box or below it and
     /// clamped to the content rect.
     pub label_y: f64,
+    /// The label's font size.
+    pub font_size: f64,
+    /// The padding the pill keeps around its text on each side — the window's
+    /// half of the width, which only a text shaper can finish.
+    pub label_pad: f64,
+    /// The pill's height.
+    pub pill_h: f64,
 }
 
 /// The highlights showing at `source_secs` of source `source_index`, drawn on
@@ -75,39 +79,26 @@ pub fn live_highlights(
         content_h,
     )
     .iter()
-    .filter_map(|shape| live(shape, content_h))
+    .filter(|shape| shape.is_drawable())
+    .map(live)
     .collect()
 }
 
-/// One shape's ring and pill, or `None` if its geometry isn't drawable.
-fn live(shape: &HighlightShape, content_h: f64) -> Option<LiveHighlight> {
+/// One drawable shape's ring and pill.
+fn live(shape: &HighlightShape) -> LiveHighlight {
     let (cx, cy, rx, ry) = shape.ellipse;
     let rect = shape.rect;
-    let finite = [cx, cy, rx, ry, rect.x, rect.y, rect.w, rect.h]
-        .iter()
-        .all(|v| v.is_finite());
-    if !finite || rx <= 0.0 || ry <= 0.0 {
-        return None;
-    }
-    // Above the box, or below it when there is no room — the overlay's rule
-    // (`draw_highlight_label`), for the same reason: half a shirt number is a
-    // different shirt number, so the pill is moved rather than clipped.
-    let font = LABEL_FONT_RATIO * content_h;
-    let pill_h = LABEL_PILL_RATIO * font;
-    let gap = LABEL_GAP_RATIO * font;
-    let above = rect.y - gap - pill_h;
-    let y = if above >= 0.0 {
-        above
-    } else {
-        rect.y + rect.h + gap
-    };
-    Some(LiveHighlight {
+    LiveHighlight {
         commands: ring_commands(cx, cy, rx, ry),
         ink: shape.color,
         label: shape.label.clone(),
+        label_ink: label_ink(shape.color),
         label_x: rect.x + rect.w / 2.0,
-        label_y: y.clamp(0.0, (content_h - pill_h).max(0.0)),
-    })
+        label_y: shape.label_y,
+        font_size: shape.font_size,
+        label_pad: LABEL_PAD_RATIO * shape.font_size,
+        pill_h: LABEL_PILL_RATIO * shape.font_size,
+    }
 }
 
 /// The ring as **two** SVG arcs, left point to right point and back: one arc
@@ -223,15 +214,22 @@ pub fn target_for_drag(
         .then_some(h.id)
 }
 
-/// Whether highlight `id` has a key at exactly `source_secs` — which "Delete
-/// key here" removes, and which is the number that placed it (spec H2: keys
-/// sit at the displayed frame's stream time, so one frame is one number).
-pub fn has_key_at(project: &Project, id: Uuid, source_secs: f64) -> bool {
+/// Whether highlight `id` has a key on source `source_index` at exactly
+/// `source_secs` — which "Delete key here" removes, and which is the number
+/// that placed it (spec H2: keys sit at the displayed frame's stream time, so
+/// one frame is one number).
+///
+/// The source is matched as well as the time, as [`target_for_drag`] matches
+/// it: with another video on screen, a highlight left selected in the panel
+/// must not offer its key for deletion at a coincidence of seconds.
+pub fn has_key_at(project: &Project, id: Uuid, source_index: usize, source_secs: f64) -> bool {
     project
         .player_highlights
         .iter()
-        .filter(|h| h.id == id)
-        .any(|h| h.keys.iter().any(|k| k.source_seconds == source_secs))
+        .find(|h| h.id == id)
+        .is_some_and(|h| {
+            h.source_index == source_index && h.keys.iter().any(|k| k.source_seconds == source_secs)
+        })
 }
 
 #[cfg(test)]
@@ -241,7 +239,7 @@ mod tests {
     use video_coach_core::project::SourceRef;
 
     /// A 800 × 400 content rect throughout, so a fraction of the height is a
-    /// round number: the font is 12 px, the pill 18 and the gap 3.
+    /// round number: the font is 12 px, the pill 18.6 and the gap 3.
     const CONTENT: (f64, f64) = (800.0, 400.0);
 
     /// One project with one source and one highlight, a single key at 10 s
@@ -332,8 +330,10 @@ mod tests {
         let live = live_at(&p, 10.0, Zoom::IDENTITY);
         assert_eq!(live[0].label, "#7");
         assert_eq!(live[0].label_x, 400.0);
-        // The box's top is 100 px down; the pill is 18 tall with a 3 px gap.
-        assert_eq!(live[0].label_y, 100.0 - 3.0 - 18.0);
+        // The box's top is 100 px down; the pill is 18.6 tall with a 3 px gap.
+        assert_eq!(live[0].label_y, 100.0 - 3.0 - 18.6);
+        assert_eq!(live[0].pill_h, 18.6);
+        assert_eq!(live[0].font_size, 12.0);
 
         let p = project(
             NormRect {
@@ -554,12 +554,15 @@ mod tests {
     /// "Delete key here" is offered only on a frame that carries a key, and
     /// the number it matches is the one that placed it.
     #[test]
-    fn a_key_is_found_only_at_its_own_time() {
+    fn a_key_is_found_only_at_its_own_time_on_its_own_source() {
         let mut p = Project::new("p");
         let id = with_other(&mut p, 0, &[20.0, 25.0]);
-        assert!(has_key_at(&p, id, 20.0));
-        assert!(has_key_at(&p, id, 25.0));
-        assert!(!has_key_at(&p, id, 22.0));
-        assert!(!has_key_at(&p, Uuid::from_u128(99), 20.0));
+        assert!(has_key_at(&p, id, 0, 20.0));
+        assert!(has_key_at(&p, id, 0, 25.0));
+        assert!(!has_key_at(&p, id, 0, 22.0));
+        assert!(!has_key_at(&p, Uuid::from_u128(99), 0, 20.0));
+        // Another video is on screen: the same second is a different frame,
+        // and this highlight has no key on it.
+        assert!(!has_key_at(&p, id, 1, 20.0));
     }
 }

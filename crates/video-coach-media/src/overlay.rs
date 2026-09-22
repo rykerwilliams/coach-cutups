@@ -44,7 +44,7 @@ use gstreamer_video as gst_video;
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, PixmapMut, Rect, Transform,
 };
-use video_coach_core::highlight::HighlightShape;
+use video_coach_core::highlight::{label_ink, HighlightShape, LABEL_PAD_RATIO, LABEL_PILL_RATIO};
 use video_coach_core::layout::{
     bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
     BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO,
@@ -82,16 +82,6 @@ const STROKE_EDGE_RATIO: f64 = 0.25;
 /// pen stroke of its own.
 const STROKE_EDGE_ALPHA: f32 = 0.8;
 
-/// A highlight label's size, as a fraction of the picture's height — the
-/// picture's and not the output's, for the reason the pen has: a pillarboxed
-/// entry's ring and label keep the size they had beside the footage.
-const LABEL_FONT_RATIO: f64 = 0.03;
-/// The gap the label's pill keeps around its text, as a fraction of the font
-/// size: once on each side of the line, and once more split above and below
-/// it, since [`OverlayRenderer::draw_label`] centres the line down its rect.
-const LABEL_PAD_RATIO: f32 = 0.35;
-/// The gap between the pill and the box, as a fraction of the font size.
-const LABEL_GAP_RATIO: f32 = 0.25;
 /// How far a label may be shrunk to fit its pill before it is ellipsized
 /// instead. A pill is only ever narrowed by the picture's own edge, so this
 /// costs nothing until a name is drawn beside a very narrow picture.
@@ -389,23 +379,11 @@ impl OverlayRenderer {
             self.mask = Some((key, mask));
         }
         let mask = &self.mask.as_ref().expect("built just above").1;
-        let mut paint = Paint {
-            anti_alias: true,
-            ..Paint::default()
-        };
-        // Round, like the pen: nothing here has a corner anyway, and a ring
-        // cut by the mask should end as softly as a stroke does.
-        let mut pen = tiny_skia::Stroke {
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..tiny_skia::Stroke::default()
-        };
-        let edge = Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour");
 
-        for shape in frame.highlights {
+        // A shape whose numbers aren't all finite is skipped **whole**, pill
+        // and all (`HighlightShape::is_drawable`, the live layer's own rule).
+        for shape in frame.highlights.iter().filter(|s| s.is_drawable()) {
             let (cx, cy, rx, ry) = shape.ellipse;
-            // `None` for a non-finite or empty ellipse — a corrupt project,
-            // not something to paint a guess over (BACKLOG #28).
             let Some(oval) = Rect::from_xywh(
                 (x0 + cx - rx) as f32,
                 (y0 + cy - ry) as f32,
@@ -417,27 +395,12 @@ impl OverlayRenderer {
             let Some(path) = PathBuilder::from_oval(oval) else {
                 continue;
             };
-            let c = shape.color;
-            let Some(color) = Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32)
-            else {
-                continue;
-            };
-            // The dark edge first, a wider stroke the ring then covers, as
-            // under a pen line — and for the same reason, only under an opaque
-            // ring, which would otherwise read darker than its stored colour.
-            if c.a >= 1.0 {
-                paint.set_color(edge);
-                pen.width = (shape.width * (1.0 + 2.0 * STROKE_EDGE_RATIO)) as f32;
-                pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), Some(mask));
-            }
-            paint.set_color(color);
-            pen.width = shape.width as f32;
-            pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), Some(mask));
+            stroke_with_edge(pixmap, &path, shape.color, shape.width, Some(mask));
         }
 
         // Every pill over every ring, so one player's label is never cut in
         // half by the next player's ring.
-        for shape in frame.highlights {
+        for shape in frame.highlights.iter().filter(|s| s.is_drawable()) {
             self.draw_highlight_label(pixmap, frame, shape);
         }
     }
@@ -458,33 +421,33 @@ impl OverlayRenderer {
         if shape.label.is_empty() {
             return;
         }
-        let (x0, y0, w, h) = frame.picture;
-        let (x0, y0, w, h) = (f64::from(x0), f64::from(y0), f64::from(w), f64::from(h));
-        let font_size = (LABEL_FONT_RATIO * h) as f32;
+        let (x0, y0, w, _) = frame.picture;
+        let (x0, y0, w) = (f64::from(x0), f64::from(y0), f64::from(w));
+        let font_size = shape.font_size as f32;
         if font_size <= 0.0 || w <= 0.0 {
             return;
         }
         let style = Style::new(font_size, Weight::BOLD);
-        let pad = font_size * LABEL_PAD_RATIO;
+        let pad = (shape.font_size * LABEL_PAD_RATIO) as f32;
         // The pill is measured around the line rather than the line fitted to
         // a pill, so it is exactly as wide as it needs to be. The picture's
         // own width is the only thing that ever narrows it, and `draw_label`
         // then fits the line to what is left.
+        //
+        // **Only the width is decided here.** The height is core's
+        // `LABEL_PILL_RATIO` (this font's line height plus the padding), and
+        // so is the y, because the pill has to be placed above or below the
+        // box before a glyph is shaped. The live layer's pill can come out a
+        // pixel or two wider or narrower than this one — Slint shapes the
+        // text with its own engine — and that is fine: a number a pixel wider
+        // is the same number in the same place.
         let pill_w = f64::from(self.width(&shape.label, style) + 2.0 * pad).min(w);
-        let pill_h = f64::from(style.metrics.line_height + pad);
-        let gap = f64::from(font_size * LABEL_GAP_RATIO);
-        let above = shape.rect.y - gap - pill_h;
-        let y = if above >= 0.0 {
-            above
-        } else {
-            shape.rect.y + shape.rect.h + gap
-        };
         let rect = LayoutRect {
             x: x0
                 + (shape.rect.x + (shape.rect.w - pill_w) / 2.0).clamp(0.0, (w - pill_w).max(0.0)),
-            y: y0 + y.clamp(0.0, (h - pill_h).max(0.0)),
+            y: y0 + shape.label_y,
             w: pill_w,
-            h: pill_h,
+            h: LABEL_PILL_RATIO * shape.font_size,
         };
         fill(pixmap, &rect, fill_color(shape.color));
         self.draw_label(
@@ -494,7 +457,7 @@ impl OverlayRenderer {
                 rect,
                 style,
                 min_font_size: font_size * LABEL_MIN_FONT_RATIO,
-                color: label_ink(shape.color),
+                color: text_color(label_ink(shape.color)),
                 align: Align::Center,
                 pad,
                 // No slot: a ring moves every frame, and so does its pill.
@@ -822,20 +785,6 @@ fn fill_color(c: Rgba) -> Color {
     Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32).unwrap_or(Color::TRANSPARENT)
 }
 
-/// Black or white over `c`, whichever can be read on it.
-///
-/// A label's pill takes the highlight's own colour, and the swatch row runs
-/// from white through yellow to black, so a fixed ink would be invisible at
-/// one end of it. The weights are the usual relative-luminance ones.
-fn label_ink(c: Rgba) -> TextColor {
-    let luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-    if luma > 0.5 {
-        TextColor::rgb(0, 0, 0)
-    } else {
-        TextColor::rgb(255, 255, 255)
-    }
-}
-
 /// A mask covering the picture rect on an `out_w`×`out_h` frame, which is what
 /// the highlights are clipped to. `None` for an empty or non-finite rect,
 /// which draws nothing.
@@ -872,18 +821,6 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
     };
     let (x0, y0, w, h) = frame.picture;
     let (x0, y0, w, h) = (f64::from(x0), f64::from(y0), f64::from(w), f64::from(h));
-    let mut paint = Paint {
-        anti_alias: true,
-        ..Paint::default()
-    };
-    // Round both, always: the coach draws with a pen, and a mitre join spikes
-    // on the sharp reversals a freehand stroke is full of.
-    let mut pen = tiny_skia::Stroke {
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..tiny_skia::Stroke::default()
-    };
-    let edge = Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour");
 
     for visible in visible_strokes(clip, frame.record_time) {
         let stroke = visible.stroke;
@@ -910,27 +847,62 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         // something to paint a guess over (BACKLOG #28).
         let Some(path) = path.finish() else { continue };
 
-        let c = stroke.color;
-        let Some(color) = Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32) else {
-            continue;
-        };
         let width = stroke_line_width(stroke.line_width, h);
-        // The edge first, a wider stroke the line then covers, so only its
-        // rim shows. Each stroke's pair in turn: a later line crossing an
-        // earlier one is outlined over it, as a pen on a pen would be.
-        //
-        // **Opaque strokes only.** The edge runs under the whole line, so a
-        // see-through one would show it through its middle and read darker
-        // than its stored colour. Every pen the app offers is opaque.
-        if c.a >= 1.0 {
-            paint.set_color(edge);
-            pen.width = (width * (1.0 + 2.0 * STROKE_EDGE_RATIO)) as f32;
-            pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), None);
-        }
-        paint.set_color(color);
-        pen.width = width as f32;
-        pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), None);
+        // One stroke's edge and line in turn, not every edge and then every
+        // line: a later stroke crossing an earlier one is outlined over it,
+        // as a pen on a pen would be.
+        stroke_with_edge(pixmap, &path, stroke.color, width, None);
     }
+}
+
+/// Strokes `path` in `color`, `width` px wide, on the thin dark edge
+/// ([`STROKE_EDGE_RATIO`]): the edge first, a wider stroke the line then
+/// covers, so only its rim shows. The pen's rule and the ring's, in one
+/// place, because they are the same rule.
+///
+/// **The edge goes under opaque lines only.** It runs the whole length, so a
+/// see-through line would show it through its middle and read darker than its
+/// stored colour. Every pen the app offers is opaque.
+///
+/// A colour out of range draws nothing — a corrupt project, not something to
+/// paint a guess over (BACKLOG #28).
+fn stroke_with_edge(
+    pixmap: &mut PixmapMut,
+    path: &tiny_skia::Path,
+    color: Rgba,
+    width: f64,
+    mask: Option<&Mask>,
+) {
+    let Some(ink) = Color::from_rgba(
+        color.r as f32,
+        color.g as f32,
+        color.b as f32,
+        color.a as f32,
+    ) else {
+        return;
+    };
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    // Round both, always: the coach draws with a pen, and a mitre join spikes
+    // on the sharp reversals a freehand stroke is full of. A ring has no
+    // corner either, and one cut by the picture's edge should end as softly
+    // as a stroke does.
+    let mut pen = tiny_skia::Stroke {
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..tiny_skia::Stroke::default()
+    };
+    if color.a >= 1.0 {
+        paint
+            .set_color(Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour"));
+        pen.width = (width * (1.0 + 2.0 * STROKE_EDGE_RATIO)) as f32;
+        pixmap.stroke_path(path, &paint, &pen, Transform::identity(), mask);
+    }
+    paint.set_color(ink);
+    pen.width = width as f32;
+    pixmap.stroke_path(path, &paint, &pen, Transform::identity(), mask);
 }
 
 #[cfg(test)]
@@ -1555,6 +1527,24 @@ mod tests {
         };
         assert!(lit(160..220), "no label at the left edge");
         assert!(lit(580..640), "no label at the right edge");
+    }
+
+    /// A corrupt box is skipped **whole**, its pill with it: the guard is
+    /// `HighlightShape::is_drawable`, at the top of both passes, so a
+    /// non-finite rect can't drop a label in the corner of the frame — which
+    /// would read as a real number on a player who isn't there (BACKLOG #28).
+    #[test]
+    fn a_non_finite_box_draws_neither_ring_nor_label() {
+        let shapes = shapes(
+            rgba(0.0, 0.0, 1.0),
+            "#7",
+            norm(f64::NAN, 0.4, 0.2, 0.2),
+            800.0,
+            800.0,
+        );
+        assert_eq!(shapes.len(), 1, "core still hands the shape over");
+        let px = render_rings(&shapes, (0, 0, 800, 800), 800, 800);
+        assert!(px.iter().all(|p| p[3] == 0), "something was painted");
     }
 
     /// No highlights, nothing drawn — the layer as it was before them.

@@ -20,14 +20,13 @@
 //! when something downstream gets round to it.
 
 use uuid::Uuid;
+use video_coach_core::layout::STROKE_LINE_WIDTH;
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 
 /// A point is kept only once this long has passed since the last kept one.
 const MIN_INTERVAL: f64 = 1.0 / 60.0;
 /// ... and this far, in content-rect logical pixels.
 const MIN_DISTANCE: f64 = 1.0;
-/// A stroke's width, as a fraction of the frame's height.
-const LINE_WIDTH: f64 = 0.005;
 
 /// The coach's pens: the swatches beside Clear, in their order. **All bright
 /// and no black**: every one is drawn over match video, where a dark line
@@ -174,7 +173,7 @@ impl InProgress {
         let stroke = Stroke {
             id: Uuid::new_v4(),
             color: self.color,
-            line_width: LINE_WIDTH,
+            line_width: STROKE_LINE_WIDTH,
             // macOS didn't clamp, so a drag past the edge drew into the
             // letterbox bars on export.
             points: self
@@ -324,7 +323,7 @@ mod tests {
     fn a_finished_stroke_carries_the_line_width_and_the_auto_clear() {
         let ip = InProgress::start(0, 1.0, 1.0, Pen::default().color());
         let (_, stroke) = ip.release(1.0, 1.0, S, (1000.0, 500.0), Some(5.0));
-        assert_eq!(stroke.line_width, LINE_WIDTH);
+        assert_eq!(stroke.line_width, STROKE_LINE_WIDTH);
         assert_eq!(stroke.auto_clear_after_seconds, Some(5.0));
     }
 

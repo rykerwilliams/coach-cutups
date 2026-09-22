@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{Command, Event, TargetState, UserError};
-use video_coach_core::highlight::{HighlightEdit, NormRect, PlayerHighlight};
+use video_coach_core::highlight::{HighlightEdit, NormRect};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Project, Quality, Resolution};
 use video_coach_core::store::{self, EXPORTS_DIRNAME};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
-use video_coach_harness::{add_clips, write_project, Harness};
-use video_coach_media::fixtures;
+use video_coach_harness::{add_clips, write_project, Harness, SAME_FRAME};
+use video_coach_media::{fixtures, frame_times};
 
 /// A project of 2-second fixture videos, as written.
 struct Proj {
@@ -54,6 +54,12 @@ impl Proj {
     fn saved(&self) -> Project {
         store::read(&self.folder).unwrap()
     }
+
+    /// Source `index`'s file, as the bus and the export driver open it.
+    fn source(&self, index: usize) -> PathBuf {
+        self.folder
+            .join(&self.saved().source_videos[index].relative_path)
+    }
 }
 
 /// A key as the H tool sends it: the displayed frame's stream time and a box
@@ -78,10 +84,6 @@ fn rect(x: f64, y: f64) -> NormRect {
     }
 }
 
-fn highlights(p: &Project) -> Vec<PlayerHighlight> {
-    p.player_highlights.clone()
-}
-
 fn no_project_changed(rest: &[Event]) {
     assert!(
         !rest.iter().any(|e| matches!(e, Event::ProjectChanged(_))),
@@ -98,7 +100,7 @@ fn a_key_creates_a_highlight_and_one_at_the_same_time_replaces_it() {
     let id = Uuid::new_v4();
 
     h.send(key(id, 0, 1.0, rect(0.1, 0.1)));
-    let one = highlights(&h.wait_changed().project);
+    let one = h.wait_changed().project.player_highlights.clone();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].id, id);
     assert_eq!(one[0].color, Rgba::RED);
@@ -108,14 +110,14 @@ fn a_key_creates_a_highlight_and_one_at_the_same_time_replaces_it() {
 
     // A later frame is a second key; the same frame again replaces it.
     h.send(key(id, 0, 1.5, rect(0.3, 0.3)));
-    assert_eq!(highlights(&h.wait_changed().project)[0].keys.len(), 2);
+    assert_eq!(h.wait_changed().project.player_highlights[0].keys.len(), 2);
     h.send(key(id, 0, 1.5, rect(0.4, 0.4)));
-    let replaced = highlights(&h.wait_changed().project);
+    let replaced = h.wait_changed().project.player_highlights.clone();
     assert_eq!(replaced[0].keys.len(), 2);
     assert_eq!(replaced[0].keys[1].rect, rect(0.4, 0.4));
 
     h.shutdown();
-    assert_eq!(highlights(&p.saved()), replaced);
+    assert_eq!(p.saved().player_highlights, replaced);
 }
 
 /// A label of digits is stored as a shirt number, "Delete key here" on the
@@ -127,12 +129,12 @@ fn edits_are_saved_and_undone_a_step_at_a_time() {
     let id = Uuid::new_v4();
 
     h.send(key(id, 0, 1.0, rect(0.1, 0.1)));
-    let created = highlights(&h.wait_changed().project);
+    let created = h.wait_changed().project.player_highlights.clone();
     h.send(Command::EditHighlight {
         id,
         edit: HighlightEdit::Label("7".into()),
     });
-    let labelled = highlights(&h.wait_changed().project);
+    let labelled = h.wait_changed().project.player_highlights.clone();
     assert_eq!(labelled[0].label, "#7");
 
     // Its one key: deleting it deletes the highlight.
@@ -140,24 +142,24 @@ fn edits_are_saved_and_undone_a_step_at_a_time() {
         id,
         source_seconds: 1.0,
     });
-    assert!(highlights(&h.wait_changed().project).is_empty());
+    assert!(h.wait_changed().project.player_highlights.is_empty());
 
     // Back a step at a time: the delete, then the label.
     h.send(Command::Undo);
-    assert_eq!(highlights(&h.wait_changed().project), labelled);
+    assert_eq!(h.wait_changed().project.player_highlights, labelled);
     h.send(Command::Undo);
-    assert_eq!(highlights(&h.wait_changed().project), created);
+    assert_eq!(h.wait_changed().project.player_highlights, created);
     h.send(Command::Redo);
-    assert_eq!(highlights(&h.wait_changed().project), labelled);
+    assert_eq!(h.wait_changed().project.player_highlights, labelled);
 
     // And `DeleteHighlight` takes the whole thing, undoably.
     h.send(Command::DeleteHighlight(id));
-    assert!(highlights(&h.wait_changed().project).is_empty());
+    assert!(h.wait_changed().project.player_highlights.is_empty());
     h.send(Command::Undo);
-    assert_eq!(highlights(&h.wait_changed().project), labelled);
+    assert_eq!(h.wait_changed().project.player_highlights, labelled);
 
     h.shutdown();
-    assert_eq!(highlights(&p.saved()), labelled);
+    assert_eq!(p.saved().player_highlights, labelled);
 }
 
 /// The coach rings a player while the take is paused, so `SetHighlightKey`
@@ -178,7 +180,7 @@ fn a_key_lands_while_recording_and_the_other_edits_are_refused() {
     h.wait_recording();
 
     h.send(key(id, 0, 1.5, rect(0.3, 0.3)));
-    assert_eq!(highlights(&h.wait_changed().project)[0].keys.len(), 2);
+    assert_eq!(h.wait_changed().project.player_highlights[0].keys.len(), 2);
 
     h.send(Command::EditHighlight {
         id,
@@ -227,14 +229,62 @@ fn a_source_move_purges_the_highlight_history() {
     h.wait_changed();
 
     h.send(Command::MoveSource { from: 1, to: 0 });
-    let moved = highlights(&h.wait_changed().project);
+    let moved = h.wait_changed().project.player_highlights.clone();
     assert_eq!(moved[0].source_index, 0);
 
     h.send(Command::Undo);
     h.send(Command::Redo);
     let rest = h.shutdown();
     no_project_changed(&rest);
-    assert_eq!(highlights(&p.saved()), moved);
+    assert_eq!(p.saved().player_highlights, moved);
+}
+
+/// **H6's round trip, with nothing to hide behind.** A key is placed at the
+/// stream time of the frame the scan player is actually showing, and export's
+/// own choice for that number — `Decoder::frame_at`, through P0's
+/// `frame_times` seam — has to be that same frame. If the player and the
+/// decoder disagreed about stream time, the coach's ring would be burned in
+/// one frame away from the player they drew it round.
+///
+/// The export test above can't see this: two keys a second apart hold one box
+/// over every frame, and a lone key holds its box for `SINGLE_KEY_SPAN`, so
+/// either would draw the same ring on the wrong frame without complaining.
+#[test]
+fn a_key_names_the_frame_export_picks_for_it() {
+    let (mut h, p) = Proj::open(&["a.webm"]);
+    h.wait_settled();
+
+    // Paused, part-way into the 2 s fixture: the frame on screen is the one
+    // the H tool would put a key on.
+    let (_, frame) = h.seek_and_settle(Command::ScrubRelease { abs: 1.0 });
+    let placed = frame.stream_time.expect("a displayed frame is timed");
+    let shown_end = frame.stream_end.expect("a displayed frame has an end");
+
+    let id = Uuid::new_v4();
+    h.send(key(id, 0, placed, rect(0.4, 0.4)));
+    let saved = h.wait_changed().project.player_highlights.clone();
+    assert_eq!(saved[0].keys[0].source_seconds, placed);
+    let source = p.source(0);
+    h.shutdown();
+
+    let picked = frame_times(&source, &[placed]).expect("export's frame times");
+    let picked = picked[0].clone();
+    // A seek clips the frame it lands on to the target, so only its end names
+    // it; the key's own number has to fall inside what export picked.
+    assert!(
+        (picked.end - shown_end).abs() <= SAME_FRAME,
+        "export picked a different frame for the key: \
+         placed {placed:.6}, shown ..{shown_end:.6}, export {:.6}..{:.6}",
+        picked.start,
+        picked.end
+    );
+    assert!(
+        picked.start <= placed && placed < picked.end,
+        "the key's own time is outside the frame export picked for it: \
+         placed {placed:.6}, export {:.6}..{:.6}",
+        picked.start,
+        picked.end
+    );
 }
 
 /// The highlights the commands write reach the export driver, so the ring is
