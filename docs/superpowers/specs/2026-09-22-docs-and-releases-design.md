@@ -1,151 +1,163 @@
 # Docs and Releases — Design
 
 **Date:** 2026-09-22
-**Status:** Draft, before review.
-**Branch:** `claude/docs`, a worktree off `main` (at `1213305`, fast-forwarded that day to the Linux port).
+**Status:** Reviewed. Simplification and correctness passes applied.
+**Branch:** `claude/docs`, a worktree off `origin/main` (`1213305`, fast-forwarded that day to the Linux port).
 
 ## Goal
 
-Two things, both kept up to date by CI rather than by memory:
-
-1. **A published docs site.** It holds four sets of docs:
+1. **A docs site, published by CI on every merge to `main`.** It holds:
    - a **user guide** for coaches;
-   - a **changelog**;
-   - **developer docs**: architecture, the specs and spikes, and rustdoc;
-   - a **check** that fails CI when the repo's own docs point at things that no longer exist.
-2. **GitHub Releases** actually appear, each with a `.deb` and readable notes.
+   - the **changelog**;
+   - **developer docs**, meaning an orientation page plus rustdoc;
+   - a **staleness check** that fails CI when the repo's docs point at things that no longer exist.
+2. **GitHub Releases actually appear,** each with a `.deb` and notes a coach can read.
 
 ## Decisions (the user's, 2026-09-22)
 
 | Question | Answer |
 |---|---|
-| Which docs | All four: the user guide, the changelog and release notes, the developer docs, and the README/CLAUDE.md sync. |
+| Which docs | All four: the user guide, the changelog and release notes, the developer docs, and README/CLAUDE.md sync. |
 | "Autogenerating" | **CI publishes on merge.** Docs are files in the repo, and a GitHub Action builds and publishes them whenever `main` changes. |
 | Releases | **Tag when the user says.** Keep `release.yml`: bump the version, then push `v<version>`. |
 | Base | `main` is fast-forwarded to the Linux branch first. **Done:** `main` = `1213305`. |
 
 ## Starting state
 
-- **Repo.** `rykerwilliams/coach-cutups` is **public**, on the free plan. GitHub Pages is not enabled (`GET /pages` returns 404). There are **no releases and no tags**.
-- **`README.md`** (117 lines) does double duty. It is the whole user guide (what it does, install, requirements, transcription and the network, troubleshooting) and the build guide. It also says "there are no releases published yet".
-- **`docs/hands-on-checklist.md`** (140 lines) is a try-everything walkthrough written for the user. It is the most detailed description of how the app behaves. It belongs to the Linux session.
-- **`CLAUDE.md`** (333 lines) holds the conventions for agents and developers. It includes the release process (lines ~208-220).
-- **`docs/superpowers/`** holds 55 specs, plans and spikes, which are not linked from anywhere.
-- **Rustdoc.** Each crate has a `//!` header, and the code is heavily doc-commented. Nothing builds or publishes it.
-- **`release.yml`.**
-  - On a `v*` tag it runs `rust.yml` as a gate, checks that the tag matches the workspace version, builds and smoke-tests the `.deb`, and publishes a Release.
-  - The notes come from `gh release create --generate-notes`, which builds notes from **merged PRs**. This repo mostly pushes commits (PR #11 is the only one), so the notes would be nearly empty.
-- **Commits.** 172 of the 179 on `main` use Conventional Commit prefixes (79 `docs`, 58 `feat`, 22 `fix`, 6 `ci`, 5 `chore`, 2 `build`). That is enough to build a changelog from.
+- **The repo:**
+  - `rykerwilliams/coach-cutups` is **public**, on the free plan, and the user is an admin.
+  - Pages is not enabled (`GET /pages` returns 404).
+  - There are **no releases, no tags and no PRs**. The `(#N)` suffixes on seven commits come from another repo.
+  - `main` has no branch protection.
+- **`README.md`** (117 lines) is the whole user guide (what it does, install, requirements, transcription, troubleshooting) and the build guide. It says "there are none published yet".
+- **`docs/hands-on-checklist.md`** is a try-everything walkthrough for the user, and the most detailed description of the app's behaviour. It belongs to the Linux session.
+- **`CLAUDE.md`** (333 lines) holds the agent and developer conventions, including Packaging and Releasing (lines ~181-220). `release.yml:8` points at it.
+- **`docs/superpowers/`** holds 51 specs, plans and spikes, linked from nowhere.
+- **Rustdoc:** every crate has a `//!` header and the code is heavily doc-commented, but nothing builds or publishes it. Most internals are private or `pub(crate)`.
+- **Release notes:** `release.yml` publishes with `gh release create --generate-notes`, which builds notes from merged PRs. With no PRs, the notes would be a single "Full Changelog" link.
+- **Commits:** 172 of 179 use Conventional Commit prefixes. Their subjects are written for developers (`fix(media, app): apply Phase 5 code review`) and include the macOS era.
 
 ## Design
 
 ### One site: mdBook on GitHub Pages
 
-**Why mdBook:**
-- It is the Rust ecosystem's own docs tool: one static binary, Markdown in, HTML out.
-- It has search, a sidebar, light and dark themes, and `{{#include}}`.
-- It needs no Node and no Python.
-- Rustdoc output is copied in under `/api/`, so everything is one site at one URL: `https://rykerwilliams.github.io/coach-cutups/`.
-
-**Layout:**
+mdBook is the Rust ecosystem's docs tool: a single binary, Markdown in, HTML out, with search, a sidebar and themes. The site's URL is `https://rykerwilliams.github.io/coach-cutups/`. Rustdoc is published under `api/` in the same site.
 
 ```text
 docs/book/
-  book.toml
+  book.toml             # site-url = "/coach-cutups/", create-missing = false,
+                        # git-repository-url
   src/
-    SUMMARY.md          # hand-written, except the generated parts noted below
-    index.md            # what Coach Cuts is, and a link to the latest release
-    guide/              # user guide (for coaches)
+    SUMMARY.md
+    index.md            # what Coach Cuts is; download from releases/latest
+    guide/              # user guide, for coaches
       install.md
       first-project.md
       recording.md      # commentary, drawing, zoom
-      clips.md          # naming, tags, notes, filtering, undo
+      clips.md          # naming, tags, notes, filter, undo
       scoreboard.md
       transcripts.md
       export.md
       keyboard.md
       troubleshooting.md
-    changelog.md        # generated by git-cliff at build time
-    dev/                # developer docs
-      building.md       # moved from README "Build from source"
-      architecture.md   # the crate map, the bus, the pixel split
-      releasing.md      # the release process (moved from CLAUDE.md)
-      design-docs.md    # generated index of docs/superpowers/{specs,plans,spikes}
+    changelog.md        # {{#include ../../../CHANGELOG.md}}
+    developers.md       # orientation plus links (below)
 ```
 
-The specs, plans and spikes are **not moved or copied**. `design-docs.md` is generated at build time: one entry per file, with its title (the first `#` line) and date. It links to each file on GitHub (`blob/main/...`), so the existing paths, and every reference to them in CLAUDE.md and BACKLOG, stay valid.
+- **`create-missing = false`.** mdBook's default quietly creates an empty page for a missing SUMMARY entry. With it off, the build fails instead.
+- **`site-url`** is required for a project site. Without it, the 404 page's assets break under `/coach-cutups/`.
 
-### What moves where (one home per fact)
+### One home per fact
 
-- **README.md shrinks to a front page:** a three-line pitch, the install command against the latest Release, the requirements in one short list, and links to the site's guide, changelog and developer docs. It no longer says there are no releases.
-- **"Build from source" moves to `dev/building.md`.** The README links to it.
-- **The release process moves out of CLAUDE.md** into `dev/releasing.md`. CLAUDE.md keeps a two-line pointer, because agents read CLAUDE.md, not the site.
-- **The rest of CLAUDE.md stays where it is.** It is the agent-facing contract and is read in the repo, not on a site. The developer docs link to it instead of duplicating it.
-- **The user guide is written fresh for coaches.** The source material is the README's user sections and the hands-on checklist, which describes the app's behaviour in the most detail. The checklist itself stays as it is: it belongs to the Linux session, and it is a test script, not a guide.
+- **The README becomes a front page, with build instructions.** It keeps:
+  - the pitch;
+  - how to install: *download the `.deb` from [the latest release](…/releases/latest), then `sudo apt install ./coach-cuts_*_amd64.deb`*. That wording needs no edit per release, and the asset name carries the version;
+  - the requirements as a short list;
+  - **Build from source**, where developers look for it on GitHub, and where `packaging/build-deps.txt:2` points.
 
-### Generated at build time, never committed
+  Its user-guide sections (What it does in detail, Transcription and the network, When something goes wrong) move into the guide, and the README links there.
+- **The user guide is written fresh for coaches.** The source material is the README's user sections and the hands-on checklist. The checklist itself stays as it is: it is the Linux session's, and it is a test script, not a guide.
+- **`developers.md` is one page, and copies no content from CLAUDE.md.** It has:
+  - two paragraphs of orientation: the crate map in a sentence each, and a link to the Linux port spec;
+  - links to `README.md#build-from-source`, `CLAUDE.md` (the conventions, including the release process), the `docs/superpowers/` tree on GitHub (the design history, which already sorts by date because the filenames do), and each crate's rustdoc (`api/video_coach_core/index.html` and the others). `cargo doc` writes no top-level index, so these links are how rustdoc is reached.
+- **The release process stays in CLAUDE.md.** Agents cut releases and they read CLAUDE.md, and `release.yml` points there. It gains the changelog step (below).
 
-| Page | Generator |
-|---|---|
-| `changelog.md` | `git-cliff` over the full history, grouped by tag (`Unreleased` on top). Features, fixes and performance changes are shown; `docs`/`ci`/`chore`/`build`/`test` are hidden. The scopes (`app`, `media`, …) are kept. |
-| `design-docs.md` | A small script in `docs/book/` that lists `docs/superpowers/*/` by date. |
-| `/api/` | `cargo doc --workspace --no-deps`, copied into the built book. |
+### Changelog: committed and curated, published by CI
 
-Generated pages are **gitignored**, so they never drift from their source and never conflict in merges. A committed placeholder isn't needed, because mdBook runs only in CI and in `docs/book/build.sh`.
+`CHANGELOG.md` at the root has one `## v<version> — <date>` section per release, written for coaches: what's new, what's fixed.
+
+- **When it's written:** in the version-bump commit. The agent cutting the release drafts it from `git log v<prev>..HEAD` (Conventional Commit prefixes make that quick) and rewrites it in plain language. The user reviews it as part of saying "release".
+- **No chicken-and-egg problem:** the section is on `main` before the tag exists, so the site already shows it.
+- **The site** includes the file (see `changelog.md` above). **The release notes** are the same section, cut out by a few lines of `awk` in `release.yml`. The two can't disagree.
+- **`release.yml`'s `version` job also checks that `CHANGELOG.md` has a `## v<version>` section,** failing in seconds, like the tag check.
+
+**Why not generate it from commits (git-cliff):** the subjects are written for developers, and v0.1.0's notes would be about 80 lines spanning the macOS app. Filtering that out takes brittle config. A generated page would also list a release under "Unreleased" until the next merge, because the tag push doesn't redeploy Pages. A curated file costs one paragraph per release, at a moment when a person is already involved.
+
+### Rustdoc, the cheap way
+
+- **The command:** `DOCS_RS=1 cargo doc --workspace --no-deps --document-private-items --exclude video-coach-harness`.
+- **Why `DOCS_RS=1` makes it cheap:** under it, `whisper-rs-sys` skips its CMake build, the gtk-rs `-sys` crates skip pkg-config, and `skia-bindings` uses its pre-generated bindings. The only system package left is `libfontconfig1-dev`. This is read from the build scripts, and D1's first CI run confirms it. If it doesn't hold, publish core only, which needs no GStreamer, and say so on the page.
+- **`--document-private-items`,** because the useful docs are on internals.
+- **The harness is excluded:** it is test scaffolding.
+- **`RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"`** makes rustdoc its own check. Whether `main` passes today is unknown, so D1 fixes whatever it finds.
+- **Output:** copied to `<book>/api/`.
 
 ### CI: `docs.yml`
 
-- **On a PR:** it builds the site and runs the checks below. Nothing is published.
-- **On a push to `main`:** it builds, checks, and deploys to Pages with `actions/upload-pages-artifact` plus `actions/deploy-pages`. Pages is set to the "GitHub Actions" source, once, through `gh api`.
-- **Tool versions are pinned** (`mdbook`, `git-cliff`), installed as release binaries rather than compiled.
-- **Rustdoc needs GStreamer's dev libraries** for media and app, so the job installs `packaging/build-deps.txt`, as `rust.yml` does, and uses `Swatinem/rust-cache`.
-- It needs `fetch-depth: 0`, because git-cliff needs the tags and full history.
-- **It is its own workflow, not a job in `rust.yml`**, so a docs failure never blocks a release gate, and `release.yml`'s `workflow_call` of `rust.yml` stays unchanged.
-
-### The staleness check ("README / CLAUDE.md sync")
-
-This is a check, not a generator. Three parts, all in `docs.yml`, all of which fail the build:
-
-1. **Repo paths.** Every repo-relative path written in backticks or as a link, in `README.md`, `CLAUDE.md` and `docs/book/src/**`, must exist on disk. A small script picks out tokens that look like paths (they contain `/` or end in a known extension) and skips globs and `<placeholders>`. Most of CLAUDE.md's drift risk is a renamed file or script, and this catches exactly that.
-2. **Links.** The built site's internal links and anchors are checked (mdBook's own warnings plus `lychee --offline` on the output). External links are not checked, because they are flaky in CI.
-3. **Rustdoc.** It builds with `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"`.
-
-**What it can't catch:** a doc whose prose describes behaviour that has since changed. That is left to the review loop in CLAUDE.md. A generated keyboard-shortcut table would catch one class of it, and is a candidate for later (see Non-goals).
+- **Triggers:** every PR, every push to `main`, and `workflow_dispatch`. No path filter, because the checks exist to catch a code PR that renames a file the docs name.
+- **Job `build`:**
+  - install pinned `mdbook` and `lychee` (e.g. `taiki-e/install-action`), plus `libfontconfig1-dev` and the Rust toolchain;
+  - `mdbook build docs/book`;
+  - rustdoc into `book/api/`;
+  - upload the Pages artifact (`actions/upload-pages-artifact`) on `main` only.
+- **Job `check`,** in parallel with `build`:
+  1. **Links.** `lychee --offline --include-fragments` over the built HTML, excluding `api/` and `404.html`. It also runs over `README.md`, `CLAUDE.md` and `docs/book/src/**` as Markdown, so linked repo paths and anchors must exist.
+  2. **Repo paths in backticks.** A few lines of shell find tokens in those files that **start with a real top-level directory** (`crates/`, `docs/`, `packaging/`, `scripts/`, `apple/`, `.github/`, `.claude/skills/`). Tokens containing a space, `$`, `~`, `<` or `*` are skipped. Every token found must exist. Crate-relative mentions (`bus/transcribe.rs`) and runtime paths (`~/.cache/...`) are deliberately out of scope. Run against today's files, this has zero false positives and still catches a renamed script or spec.
+- **Job `deploy`:**
+  - `needs: build` (not `check`), on a push to `main` only;
+  - `permissions: pages: write, id-token: write`, `environment: github-pages`, `concurrency: {group: pages, cancel-in-progress: false}`;
+  - runs `actions/deploy-pages`.
+  - **Why deploy doesn't wait on `check`:** a stray path in CLAUDE.md shouldn't hold back a fixed user guide. `check` is a red mark to fix; making it a required status check is the user's call later.
+- **A one-time step:** enable Pages with the Actions source, `gh api -X POST repos/rykerwilliams/coach-cutups/pages -f build_type=workflow`, before the first deploy. The workflow's header comment records this, along with the fact that a private repo needs a paid plan for Pages.
 
 ### Releases
 
-- **The process stays tag-driven:** bump `[workspace.package] version`, commit, then `git tag v<version> && git push origin v<version>`. It is documented in `dev/releasing.md`.
-- **Release notes come from git-cliff, not `--generate-notes`.** `release.yml` runs `git-cliff --latest --strip header` (it needs `fetch-depth: 0` in that job) and passes the result to `gh release create --notes-file`. Because the site's changelog and the release notes are built by the same tool from the same config (`cliff.toml` at the root), they can't disagree.
-- **The first release is `v0.1.0`,** at the current `main`, once this track's changes have merged. The workspace version is already `0.1.0`. The Linux session plans `0.1.1` and `0.2.0`, and no one tags those ahead of its version-bump commits.
-- **The site's front page and the README** link to `releases/latest`, so neither needs editing for each release.
+- **The process, recorded in CLAUDE.md:**
+  1. Write the `CHANGELOG.md` section.
+  2. Bump `[workspace.package] version` in the same commit.
+  3. Merge it to `main`.
+  4. `git tag v<version> && git push origin v<version>`.
+- **`release.yml` changes:**
+  - the `version` job also checks the changelog section;
+  - the `release` job checks out the repo (it has no checkout today), cuts the section to a file, and runs `gh release create … --notes-file` in place of `--generate-notes`.
+- **The first release is `v0.1.0`,** at `main`'s current app code. The workspace version is already `0.1.0`. The Linux session plans `0.1.1` and `0.2.0`; nobody tags those ahead of their version-bump commits.
 
 ## Non-goals
 
-- **Versioned docs** (a site per release). One live site tracks `main`; the changelog marks what shipped when. Revisit if users sit on old versions.
-- **Generating guide prose from code.** The exception worth considering later is the keyboard-shortcut table, if the app's bindings live in one place. It is not in this track.
-- **Automatic releases on merge** (release-please or similar). The user chose manual tagging.
-- **Rewriting the hands-on checklist, the specs or BACKLOG.** They are the Linux session's, or historical records.
-- **Android docs.** That port is paused at its device session.
+- **Versioned docs.** One live site tracks `main`, and the changelog says what shipped when.
+- **Generating guide prose from code.** A keyboard-shortcut table generated from the app's bindings is the one worth considering later.
+- **Automatic releases on merge.** The user chose manual tags.
+- **Changing the hands-on checklist, the specs, the plans or BACKLOG.**
+- **Android docs.** That port is paused.
 
 ## Phasing
 
 | Phase | Delivers | Done when |
 |---|---|---|
-| D1 | mdBook skeleton, `docs.yml` build and deploy, Pages enabled, generated `changelog.md`, `design-docs.md` and `/api/` | the site is live at the Pages URL after a merge to `main` |
-| D2 | user guide written; README cut down; "Build from source" and releasing moved | every README user section has a home in the guide; the README is a front page |
-| D3 | the staleness checks (paths, links, rustdoc) in `docs.yml` | each check fails on a planted error and passes on `main` |
-| D4 | `cliff.toml`, `release.yml` notes from git-cliff, then **`v0.1.0` cut** (the user confirms first) | the Release page shows the `.deb` and grouped notes |
-
-D4 can go first if the user wants a release out sooner. It depends only on `cliff.toml`.
+| R1 | `CHANGELOG.md` with a hand-written `v0.1.0` section ("the first Linux release: what it does"); the `release.yml` notes and section check; README install text against `releases/latest`; CLAUDE.md's release steps. Then **`v0.1.0` is cut, after the user confirms.** | The Release page shows the `.deb` and the section's notes. |
+| D1 | The mdBook skeleton (`index`, `changelog`, `developers`), `docs.yml` (build, rustdoc, checks, deploy), Pages enabled, and any intra-doc links or paths the checks find, fixed. | The site is live at the Pages URL after a merge; each check fails on a planted error and passes on `main`. |
+| D2 | The user guide; the README's user sections moved into it. | Every README user section has a home in the guide, and the README is a front page with build instructions. |
 
 ## Coordination
 
 The Linux session (`claude/intelligent-lamport-m2indd`) is still committing.
-- **Its files this track leaves alone:** `docs/hands-on-checklist.md`, `docs/superpowers/{specs,plans}/2026-09-22-match-vision*` and `BACKLOG.md`.
-- **Files both tracks edit:** it will add lines to CLAUDE.md's transport rules. This track only replaces the release paragraph with a pointer. Both rebase onto whatever lands first.
+
+- **Files this track leaves alone:** `docs/hands-on-checklist.md`, `docs/superpowers/{specs,plans}/2026-09-22-match-vision*` and `BACKLOG.md`.
+- **CLAUDE.md is edited by both.** That session adds transport rules; this track edits only the Releasing bullet. Whoever lands second rebases.
+- **A path it renames** will show up in this track's check as a red mark, which is the point of the check.
 
 ## Risks
 
-- **Rustdoc CI time.** Building media and app docs compiles GStreamer bindings and Slint. With a warm rust-cache that is a few minutes. If it is too slow, publish `/api/` for core only (which needs no GStreamer), and say so on the page.
-- **git-cliff's output on older commits.** The seven non-conventional commits fall into "Other", which is hidden. Nothing is lost that matters to a coach.
-- **Pages and a private repo.** If the repo is ever made private, Pages needs a paid plan and the site goes dark. Record that in `dev/releasing.md`.
+- **`DOCS_RS=1` may not cover every build script.** Fallback: core-only rustdoc (above).
+- **The intra-doc lint may need a round of fixes on `main`.** That is D1's job, and it is mostly mechanical.
+- **Curation takes discipline.** The section check makes a forgotten changelog fail the release in seconds rather than ship empty notes.
