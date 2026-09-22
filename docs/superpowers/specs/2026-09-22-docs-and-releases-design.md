@@ -111,7 +111,7 @@ docs/book/
 
 ### Rustdoc, the cheap way
 
-- **The command:** `DOCS_RS=1 cargo doc --workspace --no-deps --document-private-items --exclude video-coach-harness`.
+- **The command:** `DOCS_RS=1 WHISPER_DONT_GENERATE_BINDINGS=1 cargo doc --workspace --no-deps --document-private-items --exclude video-coach-harness`. `whisper-rs-sys` runs bindgen, which needs libclang, before it checks `DOCS_RS`; the second variable makes it copy its bundled bindings instead.
 - **Why `DOCS_RS=1` makes it cheap:** under it, `whisper-rs-sys` skips its CMake build, the gtk-rs `-sys` crates skip pkg-config, and `skia-bindings` uses its pre-generated bindings. The only system package left is `libfontconfig1-dev`. This is read from the build scripts, and D1's first CI run confirms it. If it doesn't hold, publish core only, which needs no GStreamer, and say so on the page.
 - **`--document-private-items`,** because the useful docs are on internals.
 - **The harness is excluded:** it is test scaffolding.
@@ -127,7 +127,7 @@ docs/book/
   - rustdoc into `book/api/`;
   - upload the Pages artifact (`actions/upload-pages-artifact`) on `main` only.
 - **Job `check`,** in parallel with `build`:
-  1. **Links.** `lychee --offline --include-fragments` over the built HTML, excluding `api/` and `404.html`. It also runs over `README.md`, `CLAUDE.md` and `docs/book/src/**` as Markdown, so linked repo paths and anchors must exist.
+  1. **Links.** `lychee --offline --include-fragments` over the source Markdown (`README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/book/src/**`), so linked repo paths and anchors must exist. `--remap` points `github.com/…/blob|tree/main/` URLs at local files, so the book's links into the repo are checked too. The `api/` links are excluded, and `build` checks them with `test -f`. There is no pass over the built HTML: it would mostly test mdBook's own rewriting.
   2. **Repo paths in backticks.** A few lines of shell find tokens in those files that **start with a real top-level directory** (`crates/`, `docs/`, `packaging/`, `scripts/`, `apple/`, `.github/`, `.claude/skills/`). Tokens containing a space, `$`, `~`, `<` or `*` are skipped. Every token found must exist. Crate-relative mentions (`bus/transcribe.rs`) and runtime paths (`~/.cache/...`) are deliberately out of scope. Run against today's files, this has zero false positives and still catches a renamed script or spec.
 - **Job `deploy`:**
   - `needs: build` (not `check`), on a push to `main` only;
