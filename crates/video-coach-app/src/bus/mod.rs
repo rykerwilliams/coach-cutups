@@ -11,6 +11,7 @@
 
 mod clips;
 mod export;
+mod highlights;
 mod preview;
 mod project;
 mod recording;
@@ -29,12 +30,13 @@ use std::time::Instant;
 use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use uuid::Uuid;
+use video_coach_core::highlight::{HighlightEdit, NormRect};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{AspectMismatch, Project, Quality, Resolution, SourceReferenced};
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
-use video_coach_core::stroke::Stroke;
+use video_coach_core::stroke::{Rgba, Stroke};
 use video_coach_core::undo::{ClipEdit, UndoController};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::{
@@ -125,6 +127,35 @@ pub enum Command {
     /// The teams, their colours, the match format and the back-anchor flag,
     /// from the setup sheet. A team without a name is refused.
     SetScoreboard(ScoreboardConfig),
+
+    // Player highlights (match vision spec H). Each is one undo step, holding
+    // the whole list.
+    /// Put a box around a player on the frame the coach is looking at.
+    /// `source_seconds` is that frame's stream time and `rect` is the box in
+    /// source fractions, both captured by the caller at pen-up (never by the
+    /// bus: queue delay would ring the wrong frame). The caller generates
+    /// `id`, so a new highlight can be selected the moment this goes out;
+    /// `color` is the current pen's, and is ignored for a highlight that
+    /// already exists.
+    SetHighlightKey {
+        id: Uuid,
+        source_index: usize,
+        source_seconds: f64,
+        rect: NormRect,
+        color: Rgba,
+    },
+    /// Rename or recolour a highlight from the Highlights panel.
+    EditHighlight {
+        id: Uuid,
+        edit: HighlightEdit,
+    },
+    /// "Delete key here": the key at exactly the displayed frame's stream
+    /// time, again captured by the caller. Its last key takes the highlight.
+    DeleteHighlightKey {
+        id: Uuid,
+        source_seconds: f64,
+    },
+    DeleteHighlight(Uuid),
 
     // Transport. Positions are concat-timeline seconds unless named `source_`.
     // `host_ns` is `now_ns()` at the input event, captured by the caller
@@ -338,7 +369,9 @@ pub enum UserError {
     LegacyProject { found: u32 },
     #[error("this project was made by a newer version of Coach Cuts (format v{found})")]
     TooNewProject { found: u32 },
-    #[error("that video is still used by a clip or match event; delete those first")]
+    #[error(
+        "that video is still used by a clip, a match event or a highlight; delete those first"
+    )]
     SourceReferenced { index: usize },
     /// Recording is refused: the project isn't ready for it.
     #[error("can't record: {0}")]
@@ -717,6 +750,10 @@ impl Bus {
                     // (spec S4): the three keys are live throughout. Deleting
                     // and the setup sheet wait, as every other edit does.
                     | Command::TagMatchEvent { .. }
+                    // The coach pauses the take, rings a player and talks
+                    // about them (spec H3), so placing a key is live too.
+                    // Renaming, recolouring and deleting wait.
+                    | Command::SetHighlightKey { .. }
             )
         {
             return eprintln!("bus: refused while recording: {cmd:?}");
@@ -744,6 +781,18 @@ impl Bus {
             Command::DeleteMatchEvent(id) => self.delete_match_event(id),
             Command::SetReelTrim { goal, end, at } => self.set_reel_trim(goal, end, at),
             Command::SetScoreboard(config) => self.set_scoreboard(config),
+            Command::SetHighlightKey {
+                id,
+                source_index,
+                source_seconds,
+                rect,
+                color,
+            } => self.set_highlight_key(id, source_index, source_seconds, rect, color),
+            Command::EditHighlight { id, edit } => self.edit_highlight(id, edit),
+            Command::DeleteHighlightKey { id, source_seconds } => {
+                self.delete_highlight_key(id, source_seconds)
+            }
+            Command::DeleteHighlight(id) => self.delete_highlight(id),
             Command::TogglePlay {
                 host_ns,
                 source_secs,

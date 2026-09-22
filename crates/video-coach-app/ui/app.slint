@@ -13,7 +13,7 @@ export struct SourceRow {
     /// Already formatted.
     duration: string,
     missing: bool,
-    /// Used by a clip or match event, so it can't be removed.
+    /// Used by a clip, a match event or a highlight, so it can't be removed.
     referenced: bool,
 }
 
@@ -2141,7 +2141,7 @@ export component AppWindow inherits Window {
 
                                                     Tooltip {
                                                         text: source.referenced
-                                                            ? @markdown("Used by a clip or match event. Delete those first.")
+                                                            ? @markdown("Used by a clip, a match event or a highlight. Delete those first.")
                                                             : @markdown("Remove from the project");
                                                     }
                                                 }

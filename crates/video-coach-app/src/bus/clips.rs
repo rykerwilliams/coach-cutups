@@ -198,9 +198,9 @@ impl Bus {
     }
 
     /// Drops the history entries a source move or removal invalidated — the
-    /// deletes on the undo stack (spec C4) and the match-event snapshots on
-    /// both (Phase 9 spec S5) — and shreds the trashed recordings that leaves
-    /// unreachable.
+    /// deletes on the undo stack (spec C4) and the match-event and highlight
+    /// snapshots on both (Phase 9 spec S5, match vision spec H3) — and shreds
+    /// the trashed recordings that leaves unreachable.
     pub(super) fn purge_history_for_source_change(&mut self) {
         let evicted = self.history.purge_for_source_change();
         self.shred(evicted);

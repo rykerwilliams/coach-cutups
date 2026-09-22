@@ -3,7 +3,7 @@
 //! them and the player bookkeeping.
 //!
 //! Position survives list changes: `current` goes through the same remap as
-//! clips and match events, and the player reloads only when the current
+//! clips, match events and player highlights, and the player reloads only when the current
 //! source itself was removed or relinked. Otherwise only concat offsets move,
 //! and a request in flight or pending still lands where it was headed: it
 //! names a file, not a concat time. Only the skip coordinator, whose target
