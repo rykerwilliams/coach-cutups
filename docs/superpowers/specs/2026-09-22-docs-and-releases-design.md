@@ -20,6 +20,7 @@
 | Which docs | All four: the user guide, the changelog and release notes, the developer docs, and README/CLAUDE.md sync. |
 | "Autogenerating" | **CI publishes on merge.** Docs are files in the repo, and a GitHub Action builds and publishes them whenever `main` changes. |
 | Releases | **Tag when the user says.** Keep `release.yml`: bump the version, then push `v<version>`. |
+| Changelog | **Keep a Changelog format plus semver**, curated by hand. v0.1.0's section is written from scratch. |
 | Base | `main` is fast-forwarded to the Linux branch first. **Done:** `main` = `1213305`. |
 
 ## Starting state
@@ -82,16 +83,31 @@ docs/book/
   - links to `README.md#build-from-source`, `CLAUDE.md` (the conventions, including the release process), the `docs/superpowers/` tree on GitHub (the design history, which already sorts by date because the filenames do), and each crate's rustdoc (`api/video_coach_core/index.html` and the others). `cargo doc` writes no top-level index, so these links are how rustdoc is reached.
 - **The release process stays in CLAUDE.md.** Agents cut releases and they read CLAUDE.md, and `release.yml` points there. It gains the changelog step (below).
 
-### Changelog: committed and curated, published by CI
+### Changelog: Keep a Changelog, curated, published by CI
 
-`CHANGELOG.md` at the root has one `## v<version> — <date>` section per release, written for coaches: what's new, what's fixed.
+`CHANGELOG.md` at the root follows **[Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)**, and versions follow **[Semantic Versioning](https://semver.org/)** (the user's standard).
 
-- **When it's written:** in the version-bump commit. The agent cutting the release drafts it from `git log v<prev>..HEAD` (Conventional Commit prefixes make that quick) and rewrites it in plain language. The user reviews it as part of saying "release".
+- **Format:**
+  - `## [Unreleased]` on top, then one `## [x.y.z] - YYYY-MM-DD` per release, newest first;
+  - the standard groups inside each: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`;
+  - link references at the bottom: `[x.y.z]: …/compare/vPREV...vx.y.z`, `[Unreleased]: …/compare/vX...HEAD`, and for the first release `…/releases/tag/v0.1.0`.
+- **Written for coaches:** what's new, what's fixed, in plain language. It is not a commit log.
+- **v0.1.0 is curated by hand:** the first Linux release, "what Coach Cuts does", grouped under `Added`.
+- **After that, entries accrue under `[Unreleased]`.** A commit that changes what a user sees adds a line there, as Keep a Changelog intends. CLAUDE.md states the rule, so both agent sessions follow it.
+- **A release** renames `[Unreleased]` to `[x.y.z] - <date>`, adds a fresh empty `[Unreleased]`, fixes the link references and bumps `[workspace.package] version`, all in one commit.
+- **Choosing the number (semver, pre-1.0):**
+  - a minor bump (`0.x.0`) for new features, or for a change that breaks an existing project;
+  - a patch bump (`0.x.y`) for fixes and small additions.
+
+  A `project.json` format bump (`formatVersion`) is at least a minor bump.
 - **No chicken-and-egg problem:** the section is on `main` before the tag exists, so the site already shows it.
 - **The site** includes the file (see `changelog.md` above). **The release notes** are the same section, cut out by a few lines of `awk` in `release.yml`. The two can't disagree.
-- **`release.yml`'s `version` job also checks that `CHANGELOG.md` has a `## v<version>` section,** failing in seconds, like the tag check.
+- **`release.yml`'s `version` job also checks that `CHANGELOG.md` has a non-empty `## [<version>]` section,** failing in seconds, like the tag check.
 
-**Why not generate it from commits (git-cliff):** the subjects are written for developers, and v0.1.0's notes would be about 80 lines spanning the macOS app. Filtering that out takes brittle config. A generated page would also list a release under "Unreleased" until the next merge, because the tag push doesn't redeploy Pages. A curated file costs one paragraph per release, at a moment when a person is already involved.
+**Why not generate it from commits (git-cliff):**
+- The subjects are written for developers, and v0.1.0's notes would be about 80 lines spanning the macOS app.
+- A generated page would also list a release under "Unreleased" until the next merge, because the tag push doesn't redeploy Pages.
+- The user chose curation.
 
 ### Rustdoc, the cheap way
 
@@ -123,9 +139,9 @@ docs/book/
 ### Releases
 
 - **The process, recorded in CLAUDE.md:**
-  1. Write the `CHANGELOG.md` section.
-  2. Bump `[workspace.package] version` in the same commit.
-  3. Merge it to `main`.
+  1. Choose the number by semver (above).
+  2. In one commit, turn `[Unreleased]` into the version's section (the user reads it before saying go) and bump `[workspace.package] version`.
+  3. Merge that commit to `main`.
   4. `git tag v<version> && git push origin v<version>`.
 - **`release.yml` changes:**
   - the `version` job also checks the changelog section;
@@ -144,7 +160,7 @@ docs/book/
 
 | Phase | Delivers | Done when |
 |---|---|---|
-| R1 | `CHANGELOG.md` with a hand-written `v0.1.0` section ("the first Linux release: what it does"); the `release.yml` notes and section check; README install text against `releases/latest`; CLAUDE.md's release steps. Then **`v0.1.0` is cut, after the user confirms.** | The Release page shows the `.deb` and the section's notes. |
+| R1 | `CHANGELOG.md` in Keep a Changelog format, with a hand-curated `[0.1.0]` ("the first Linux release: what it does") and an empty `[Unreleased]`; the `release.yml` notes and section check; README install text against `releases/latest`; CLAUDE.md's release steps and the `[Unreleased]` rule. Then **`v0.1.0` is cut, once the user has seen the notes.** | The Release page shows the `.deb` and the section's notes. |
 | D1 | The mdBook skeleton (`index`, `changelog`, `developers`), `docs.yml` (build, rustdoc, checks, deploy), Pages enabled, and any intra-doc links or paths the checks find, fixed. | The site is live at the Pages URL after a merge; each check fails on a planted error and passes on `main`. |
 | D2 | The user guide; the README's user sections moved into it. | Every README user section has a home in the guide, and the README is a front page with build instructions. |
 
@@ -160,4 +176,4 @@ The Linux session (`claude/intelligent-lamport-m2indd`) is still committing.
 
 - **`DOCS_RS=1` may not cover every build script.** Fallback: core-only rustdoc (above).
 - **The intra-doc lint may need a round of fixes on `main`.** That is D1's job, and it is mostly mechanical.
-- **Curation takes discipline.** The section check makes a forgotten changelog fail the release in seconds rather than ship empty notes.
+- **Curation takes discipline.** The `[Unreleased]` rule spreads the work across commits, and the section check makes a forgotten changelog fail the release in seconds rather than ship empty notes.
