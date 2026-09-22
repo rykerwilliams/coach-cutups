@@ -66,7 +66,7 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 
 | Phase | Delivers | ML | Gate before it ships | Format |
 |---|---|---|---|---|
-| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
+| **P0** Round trip | Fix BACKLOG #67 (a scrub on a Trace file reports landing 0.2–0.3 s off target). Prove the scan-to-export round trip on a Trace file (H6). `,` and `.` step one frame back and forward while paused, for tagging and placing highlight keys on the exact frame (the arrows skip 3 s). | none | A scrub lands within one frame, and the scan player's displayed frame is the one export picks for the same position (H6) | – |
 | **P1** Reel and chapters | The goals reel with per-goal trims, MP4 chapters on every export, chapter markers on the scrubber and `[` / `]` to jump between them | none | tests | v8 |
 | **P2** Hand-placed highlights | The highlight data model, the H tool, keyframed boxes, rings in scan, preview, export and the reel, colours and typed labels | none | tests | v9 |
 | **P3** Measure | The analysis backend with no UI: audio and motion passes, `Analyzer`, core signals, kick-off pattern, confirmation rule, scoring tool; the runtime and detector spike (G5) | spike only | produces the bars' inputs (V-1 to V-8) | – |
@@ -75,7 +75,7 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 | **P6** Click-to-track | A click snaps to a player, and the range fills from the tracker between the coach's keys | detector (reused) | G4 tracking bar | – |
 | **P7** Jersey numbers | A research spike, then OCR voted over a track, auto-filling the label | OCR | G4 jersey bar; otherwise it stays typed | – |
 
-**The user's tagging (G1) starts when P0 ships** and runs alongside P1 and P2. It needs only today's app and P0's fix. P3 starts once one match is tagged: the signal passes, the tuning and V-2 to V-8 need only that. Its verdicts (V-1's held-out numbers and every G4 bar) wait for a second tagged match (G2). P3 is where the phase order stops being a guess: if sound and motion alone clear the goal bars, P5 is skipped and its detector arrives with P6, for tracking.
+**The user's tagging (G1) starts when P0 ships** and runs alongside P1 and P2. It needs only today's app and P0's fix, so it runs on an interim 0.1.1 build of P0 (the plan's choice of release point), which changes no format: the projects it tags are v7. P3 starts once one match is tagged: the signal passes, the tuning and V-2 to V-8 need only that. Its verdicts (V-1's held-out numbers and every G4 bar) wait for a second tagged match (G2). P3 is where the phase order stops being a guess: if sound and motion alone clear the goal bars, P5 is skipped and its detector arrives with P6, for tracking.
 
 **Why P4 comes before P5.** Sound and motion need no model download, and they already give "a kick-off happened here" (D3). If P3 shows the quiet tier is too noisy without the formation check, P4 ships the high tier and period suggestions only, and P5 brings the rest (G4).
 
@@ -89,7 +89,8 @@ The phases are ordered by risk and value. **The ones that need no ML come first*
 
 - adds `MIN_READABLE_FORMAT_VERSION = 7`;
 - makes `read` accept `MIN_READABLE..=CURRENT`;
-- keeps `LegacyProject` for versions below 7 and `TooNew` for versions above current.
+- keeps `LegacyProject` for versions below 7 and `TooNew` for versions above current;
+- **keeps a one-time backup on upgrade:** when `store::write` raises a file's `formatVersion`, it first copies `project.json` to `project.json.v<old>`, only if that file doesn't exist yet, and never overwrites it. That makes going back to the older build possible (restore the backup, losing the changes since), where otherwise the first save would lock it out with `TooNew`.
 
 **F2. Every change here is additive, and read as it stands.**
 
@@ -150,6 +151,7 @@ A plan with fewer than two entries gets no chapters.
 
 - One run, one progress model and one cancel serve every target, as today.
 - **The file name** follows spec E6: `<label> - <project>.mp4`.
+- **The Export… button is enabled whenever the sheet would have a row** (`export_targets` is not empty), not on "the project has clips". A project with goals and no clips, which every ground-truth project is, can export its reel.
 
 **R2. Each goal is one plan entry, with one `Play` segment.** The segment spans `[goal − lead_in, goal + tail]` on the goal's own source.
 
@@ -158,6 +160,7 @@ A plan with fewer than two entries gets no chapters.
 - **Clamps:**
   - The segment is clamped to `[0, duration]` of its source. A segment cannot cross a source boundary, as for clips. Since every Trace file is one half, a period boundary is the only boundary it could cross anyway.
   - **A segment never starts before the previous goal's segment ends on the same source.** Two goals a minute apart would otherwise replay the same footage.
+  - **A goal at or before the previous entry's end on the same source makes no entry of its own.** Its moment is already in that entry, so it extends that entry's end to `max(previous end, goal + tail)`. The numbering (`<n> / <total>`) counts entries, and the merged entry keeps its first goal's text; the burned-in score still turns over on each goal's frame.
 - **Which goals: confirmed ones only** (the user's decision, 2026-09-22). That is every goal match event, whether tagged by hand or confirmed from a suggestion. A pending suggestion is not in the reel: it can be a false alarm, the burned-in score wouldn't count it, and a quiet-tier one has no time to cut around (D4).
   - **So none is left out by accident,** the export sheet's reel row says "N suggested goals not confirmed" while any goal suggestion is pending (neither resolved nor dismissed, D6).
 - **Order:** entries are in match order (`abs_seconds`).
@@ -184,8 +187,8 @@ A plan with fewer than two entries gets no chapters.
   - `PlanEntry.clip_id` becomes `Option<Uuid>`: `None` for a reel entry.
   - `compilation_schedule` walks a reel entry with no events, so `zoom_at(&[], t)` gives identity zoom. It stops assuming every target selects clips: `Reel` builds its entries from the goals (R2), not from `selected_clips`.
   - `audio_regions` adds a commentary region only for an entry with a `clip_id`.
-  - `stroke_replay::visible_strokes` and `OverlayFrame` take the entry's `&[CommentaryEvent]` instead of `&Clip`. A reel entry passes `&[]`, which draws no strokes.
-  - Media's `EntryMedia` becomes `{ recording: Option<PathBuf>, events: Vec<CommentaryEvent> }`. `None` gets the GL filler, and the bus passes `None` for a reel entry and for a clip with `show_pip` off, so `Pip::open` no longer reads the clip.
+  - **`ExportJob.entries` becomes `Vec<Option<EntryMedia>>`,** with `EntryMedia` unchanged (`{ recording, clip }`), and `None` only for a reel entry. A clip with `show_pip` off still has its media: the mixer needs its recording for the commentary, and `Pip::open` keeps deciding on `show_pip`. `None` gets the GL filler, and the mixer treats a commentary region with no media as silence, as it already treats a game region with no file.
+  - **`OverlayFrame.clip` becomes `Option<&Clip>`,** and `None` draws no strokes. That is the smaller reshape: `stroke_replay::visible_strokes` keeps its `&Clip` argument and its call sites.
   - The pump, the mixer geometry, the audio pipeline, the `.part` rename and the progress model are unchanged.
 
 ### H. Player highlights
@@ -218,6 +221,7 @@ pub struct HighlightKey {
 
 - `NormRect` is new in core. It is source-normalized, never output space. The spike's §1b sketch had a separate `corrections` list, which is dropped: a coach key *is* a correction (T3).
 - **`tracked` ships with the struct in P2,** where it is always `false`. It is what lets P6 re-track a stretch without touching the coach's keys (T3), and declaring it now means P6 needs no format change and no default: like every field of a new struct, it is required (F2).
+- **A key's `source_seconds` is the stream time of the frame it was placed on** (H3), so two keys on one frame are the same number. A key replaces another only at exactly the same time, and no tolerance is stored or needed. The mutators keep `keys` sorted; `read` doesn't re-sort them.
 - **With two or more keys, the range is `[first key, last key]`.** Between two keys the rect is linearly interpolated, and outside the range nothing is drawn.
 - **A highlight with a single key is "at a timestamp".** It holds its box for `SINGLE_KEY_SPAN = 1.0 s`, centred on the key (`[k − 0.5 s, k + 0.5 s]`).
   - So it shows for the whole of a commentary pause on that frame, and for a readable second when the footage plays through it.
@@ -229,24 +233,25 @@ pub struct HighlightKey {
 
 - **A drag draws a box around the player and makes it a key at the displayed frame:**
   - on the highlight whose ring it starts on, if one shows at this frame;
-  - otherwise on the selected highlight;
+  - otherwise on the selected highlight, if it is on this source and the frame is within 10 s of its range, so a stale selection never stretches a highlight across the match;
   - otherwise on a new highlight, which becomes selected.
 
-  A key at a frame that already has one replaces it. Selecting a highlight in the inspector, or starting a drag on its ring, selects it.
+  A key at a frame that already has one replaces it (the same stream time, exactly: H2). Selecting a highlight in the inspector, or starting a drag on its ring, selects it.
 - **Esc:** the first Esc deselects a selected highlight; the next leaves the tool, ahead of the rest of the Esc cascade. In `handle-key` the H tool's Esc goes before the recording's, so Esc in the tool during a paused recording never stops the take.
 - **The box is mapped to source space** through the live zoom with `Zoom::source_point`, so a box drawn while zoomed is stored correctly.
-- **Keys are placed on a paused picture.** A drag or click in the H tool while the picture plays places nothing and shows a hint, "Pause to place a highlight (Space)", like the drawing hint. The key's source position is the paused position, captured by the caller at pen-down, per the bus contract. So the box and its time describe the same frame.
+- **Keys are placed on a paused picture.** A drag or click in the H tool while the picture plays places nothing and shows a hint, "Pause to place a highlight (Space)", like the drawing hint. The key's source position is **the displayed frame's stream time** (`Frame.stream_time`, H6), captured by the caller at pen-down, per the bus contract. So the box and its time describe the same frame, and `Decoder::frame_at` picks exactly that frame for it in export.
+- **`,` and `.` step one frame back and forward while paused** (P0), so the coach can put a key on the frame they mean. The arrows skip 3 s.
 - **The tool works while scanning or a recording is paused.** "While drawing", a coach can pause, ring a player and talk. `SetHighlightKey` joins `TagMatchEvent` on the recording allow-list. A drag in the H tool never shows the pen's "Drawing works while recording — press R" hint.
 - **On a moving virtual camera, keys placed by hand need to be about a second apart.** Trace's framing pans, so the player's source-space position moves even when the player doesn't. That is the honest limit of P2, and it is what P6's tracker removes.
 - **The inspector:**
   - a highlight has a label field (typed "7" is shown as "#7"), a colour and a delete;
-  - **"Delete key here"** removes the key at the displayed frame, enabled when there is one. Deleting a highlight's last key deletes the highlight.
+  - **"Delete key here"** removes the key at the displayed frame, enabled when the displayed frame's stream time equals one of its keys'. Deleting a highlight's last key deletes the highlight.
 - **Undo:** `UndoAction::EditHighlights { before, after }`, a whole-list snapshot like `EditMatchEvents`. It is purged from both stacks on a source move or remove, for Phase 9's reason: a snapshot isn't remapped.
 
 **H4. How a highlight is drawn:**
 
 - a ring at the feet: an ellipse centred on the box's bottom edge, `1.4 × box width` wide and `0.35 ×` that tall, stroked in the highlight colour with the strokes' dark edge;
-- the label in a pill of the same colour above the box;
+- the label in a pill of the same colour above the box, placed inside the picture rect (below the box, or shifted sideways, at an edge), because the label drawing isn't masked;
 - **a stroke width that scales with the picture's height**, like a pen;
 - **anything outside the picture rect is clipped away.**
 
@@ -254,7 +259,7 @@ The mapping from source-normalized coordinates to picture pixels is the existing
 
 **H5. Where highlights are drawn:**
 
-- **Preview and export:** `overlay.rs` draws them first, under the strokes (the coach's live pen is on top), the text bar and the scoreboard. The driver passes `highlights_at(&project.player_highlights, frame.source_index, frame.source_time)`. It is a core function that returns each visible highlight's colour, label and interpolated source-normalized rect. The overlay maps them through `Zoom::transform` (H4). Nothing is derived, so there is no context object: the job reads the highlights from the project snapshot it started with.
+- **Preview and export:** `overlay.rs` draws them first, under the strokes (the coach's live pen is on top), the text bar and the scoreboard. The driver passes `highlight_shapes(&project.player_highlights, frame.source_index, frame.source_time, frame.zoom, …)`, one core function that the live layer uses too. It takes each visible highlight's interpolated source-normalized rect (`highlights_at`), maps it through `Zoom::transform` (H4), and returns the ring and the box in picture pixels, so the overlay itself stays zoom-agnostic. Nothing is derived, so there is no context object: the job reads the highlights from the project snapshot it started with.
 - **No inference runs in the preview or export path.** They read stored keys only, so export stays deterministic and its throughput unchanged: the overlay is 3.6 ms a frame [measured].
 - **Scanning and recording:** Slint path elements on the live layer that draws strokes. They are fed from the tick's position query, which is the one pipeline access CLAUDE.md permits outside the bus, and from the UI's zoom.
   - The ring can trail the picture by up to a frame during playback.
@@ -262,7 +267,9 @@ The mapping from source-normalized coordinates to picture pixels is the existing
 
 **H6. P0's round trip is a hard prerequisite for P2 and for tagging.** A key (like a Z/X tag) is stored at the position the scan player reports, and export draws it on the frame `Decoder::frame_at` picks for that position. The two must be the same frame. They can differ when the player and the decoder disagree on stream time: CLAUDE.md's MP4 edit-list class, which BACKLOG #67's symptoms point at (on a Trace half, a scrub to 812 reports 811.70).
 
+- **The seams:** `mailbox::Frame` gains `stream_time` (the sample's `segment.to_stream_time(pts)`), and media gains `frame_times(source, targets)`, which answers with the stream time of the frame `Decoder::frame_at` picks for each target, without an export. Neither is reachable from the harness today. `Frame.stream_time` is also what P2's highlight keys are placed at (H3).
 - **The test:** extend `video-coach-harness/tests/real_footage.rs` (`#[ignore]`d behind `COACH_FOOTAGE`, as it is today). On an HLS-remuxed Trace file, scrub to about 20 targets across the half, paused. For each, take the displayed frame from the mailbox (`SinkKind::System`) and assert that its stream time equals that of the frame `Decoder::frame_at(reported position)` returns, and that the reported position is within one frame of the target.
+- **#67 is also checked on the production path.** Only the System sink's frames can be read back, but the app runs `Harness::production()`'s sinks (`autoaudiosink` among them, which can supply the clock), so the same scrubs repeat there and assert the reported position is within one frame of the target.
 - **Real footage is never committed:** the repository is public and the footage shows children.
 - **If #67's root cause can be reproduced in a generated fixture** (for example an edit list or a non-zero first PTS), the fix also lands with a CI test on that fixture. If it can't, the ignored test is the only proof, and the spec says so in the fix's commit.
 
@@ -581,7 +588,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 | Crate | Contents |
 |---|---|
 | `video-coach-core` | The format bumps (F3): the new types, `MIN_READABLE_FORMAT_VERSION`, remapping on source edits, the mutators. `PlanEntry.clip_id: Option`, `ExportTarget::Reel` and the reel's plan. The chapter list. `PlayerHighlight`, `NormRect`, interpolation, `highlights_at`, the tracked-key thinning. The signals (whistles, cheers, still intervals), kick-off patterns, the confirmation rule, kit clustering, the formation test, and the single-track Kalman tracker and its gate. No new dependency: the core audit still lists exactly `serde`, `serde_json`, `thiserror` and `uuid`. |
-| `video-coach-media` | The motion sampler and the crop sampler (GL scale and crop, then `gldownload`). Torso colour sampling. The inference runtime and the model table. `Analyzer` and `Tracker`, and the one-`Finished` job helper (B1). Highlights in `overlay.rs`. `EntryMedia`'s optional recording. `chapters.rs` (the `chpl` splice). |
+| `video-coach-media` | The motion sampler and the crop sampler (GL scale and crop, then `gldownload`). Torso colour sampling. The inference runtime and the model table. `Analyzer` and `Tracker`, and the one-`Finished` job helper (B1). Highlights in `overlay.rs`. `ExportJob`'s optional per-entry media. `chapters.rs` (the `chpl` splice). |
 | `video-coach-app` | Bus: the commands (tag and trim a reel, set a highlight key, edit, delete, track, analyse, dismiss or restore a suggestion), the heavy-job scheduler (B2), `EditHighlights` undo and its purge. UI: scrubber markers, `[` and `]`, the H tool, the highlight inspector, the suggestion rows, the reel row in the export sheet. |
 | `video-coach-harness` | A reel export end to end, highlights reaching an export, preemption by recording and by tracking, a track waiting for transcription, and a panicking job. The P0 round trip in `real_footage.rs` and `ground_truth.rs` (both `#[ignore]`d), and the scorer (`score.rs`) it uses. |
 
@@ -602,7 +609,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
   - **Tracker:** synthetic box sequences with crossings and a frame jump; thinning keeps the ends and every key interpolation misses by more than the tolerance, and never drops a coach key.
 - **Media:**
   - The `chpl` splice on a real `Exporter` output (the encoder CI selects, with `avenc_aac` audio), read back by `ffprobe -show_chapters` with every frame still decoding; the no-room path; a file with no `udta`.
-  - An entry with no recording exports with game audio only, and a filler PiP.
+  - An entry with no media exports with game audio only, and a filler PiP.
   - Highlight pixels land inside the picture rect under zoom. These are properties, not golden images, as in Phase 9.
   - The motion sampler's rate and cancel on a fixture.
   - `Analyzer` and `Tracker` cancel within 0.5 s.
