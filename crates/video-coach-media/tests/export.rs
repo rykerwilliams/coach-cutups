@@ -137,6 +137,7 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     }
 }
 
@@ -343,6 +344,7 @@ fn fiducial(kind: CounterKind) {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     })
     .unwrap();
     assert_eq!(done.path, path);
@@ -451,6 +453,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     })
     .unwrap();
 
@@ -765,6 +768,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             resolution: Resolution::R720,
             quality: Quality::Medium,
             scoreboard: None,
+            highlights: Vec::new(),
         },
         path,
     )
@@ -923,6 +927,7 @@ fn the_export_burns_in_the_scoreboard() {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: ScoreboardContext::for_project(&project),
+        highlights: Vec::new(),
     })
     .unwrap();
 
@@ -981,6 +986,7 @@ fn sounded_job(
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     }
 }
 
@@ -1175,6 +1181,7 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     })
     .unwrap();
 
@@ -1369,6 +1376,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
+        highlights: Vec::new(),
     })
     .unwrap();
     assert_eq!(done.chapters, ChapterOutcome::Written(3));

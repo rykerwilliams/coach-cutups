@@ -54,6 +54,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
+use video_coach_core::highlight::{highlight_shapes, HighlightShape, PlayerHighlight};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::Clip;
 use video_coach_core::scoreboard::{ScoreboardConfig, ScoreboardContext, ScoreboardState};
@@ -101,6 +102,10 @@ pub struct PreviewJob {
     /// scoreboard configured. Built once by the bus, and **never reused across
     /// a source add, move, remove or relink** — see [`ScoreboardContext`].
     pub scoreboard: Option<ScoreboardContext>,
+    /// The project's player highlights, a snapshot like the clip itself. They
+    /// belong to the footage rather than to the clip (spec H1), so the preview
+    /// shows every one the clip's span crosses.
+    pub highlights: Vec<PlayerHighlight>,
 }
 
 /// What a running preview reports, on its own thread.
@@ -410,25 +415,43 @@ fn run(
         ended = false;
         let frame = &job.compilation.frames[n as usize];
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), watch)?;
+        let entry = job.compilation.plan.entries.get(frame.entry);
         // The scoreboard's clock is the **displayed** frame's source time, so
         // a pause in the commentary leaves it where it was (BACKLOG #27).
-        let scoreboard = job.scoreboard.as_ref().and_then(|context| {
-            let entry = job.compilation.plan.entries.get(frame.entry)?;
-            let state = context.state_at(entry.source_index, frame.source_time)?;
-            Some((context.config(), state))
-        });
+        let scoreboard = job
+            .scoreboard
+            .as_ref()
+            .zip(entry)
+            .and_then(|(context, entry)| {
+                let state = context.state_at(entry.source_index, frame.source_time)?;
+                Some((context.config(), state))
+            });
         // The first frame's caps shape the composite: its size, PAR and
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
             composite = Some(Composite::start(sample, job, gl, mailbox, shared, watch)?);
         }
         let composite = composite.as_ref().expect("started above");
+        // Highlights are keyed by the displayed frame's source time as well,
+        // and mapped through its own zoom. Core owns that geometry; the
+        // overlay only draws what comes back.
+        let highlights = entry.map_or_else(Vec::new, |entry| {
+            highlight_shapes(
+                &job.highlights,
+                entry.source_index,
+                frame.source_time,
+                frame.zoom,
+                f64::from(composite.picture.2),
+                f64::from(composite.picture.3),
+            )
+        });
         composite.push(
             Frame {
                 n,
                 generation,
                 sample,
                 clip: &job.clip,
+                highlights: &highlights,
                 scoreboard,
             },
             &mut overlays,
@@ -491,6 +514,8 @@ struct Frame<'a> {
     sample: &'a gst::Sample,
     /// The clip, for the drawings the overlay replays.
     clip: &'a Clip,
+    /// The rings showing at this frame, in picture pixels.
+    highlights: &'a [HighlightShape],
     /// The board at this frame, from the job's context, or `None` when the
     /// project has no scoreboard or nothing has been tagged yet.
     scoreboard: Option<(&'a ScoreboardConfig, ScoreboardState)>,
@@ -695,6 +720,7 @@ impl Composite {
             generation,
             sample,
             clip,
+            highlights,
             scoreboard,
         } = frame;
         let base = stamp(sample, n);
@@ -705,6 +731,7 @@ impl Composite {
                 clip: Some(clip),
                 record_time: n as f64 / f64::from(OUTPUT_FPS),
                 picture: self.picture,
+                highlights,
                 text: &self.text,
                 scoreboard,
             },

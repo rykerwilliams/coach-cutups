@@ -120,6 +120,7 @@ impl Running {
             compilation,
             commentary_volume: 0.0,
             scoreboard: None,
+            highlights: Vec::new(),
         };
         let mailbox = FrameMailbox::default();
         let position = PreviewPosition::default();

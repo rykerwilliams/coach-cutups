@@ -1,8 +1,9 @@
 //! The vector overlay layer, rasterized once per output frame (spec P4, E2).
 //!
 //! Phase 8 draws the strokes and the text bar; Phase 9's scoreboard joins them,
-//! **last, over everything** (spec S3). Geometry stays in core
-//! ([`video_coach_core::layout`]), pixels stay here.
+//! **last, over everything** (spec S3), and the player highlights go under all
+//! of it (spec H5). Geometry stays in core ([`video_coach_core::layout`] and
+//! [`video_coach_core::highlight`]), pixels stay here.
 //!
 //! **The rect is the output frame; the strokes are mapped into the picture.**
 //! One layer carries both, because they belong to different spaces: the coach
@@ -40,7 +41,10 @@ use cosmic_text::{
 };
 use gstreamer as gst;
 use gstreamer_video as gst_video;
-use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, PixmapMut, Rect, Transform};
+use tiny_skia::{
+    Color, FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, PixmapMut, Rect, Transform,
+};
+use video_coach_core::highlight::HighlightShape;
 use video_coach_core::layout::{
     bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
     BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO,
@@ -78,6 +82,21 @@ const STROKE_EDGE_RATIO: f64 = 0.25;
 /// pen stroke of its own.
 const STROKE_EDGE_ALPHA: f32 = 0.8;
 
+/// A highlight label's size, as a fraction of the picture's height — the
+/// picture's and not the output's, for the reason the pen has: a pillarboxed
+/// entry's ring and label keep the size they had beside the footage.
+const LABEL_FONT_RATIO: f64 = 0.03;
+/// The gap the label's pill keeps around its text, as a fraction of the font
+/// size: once on each side of the line, and once more split above and below
+/// it, since [`OverlayRenderer::draw_label`] centres the line down its rect.
+const LABEL_PAD_RATIO: f32 = 0.35;
+/// The gap between the pill and the box, as a fraction of the font size.
+const LABEL_GAP_RATIO: f32 = 0.25;
+/// How far a label may be shrunk to fit its pill before it is ellipsized
+/// instead. A pill is only ever narrowed by the picture's own edge, so this
+/// costs nothing until a name is drawn beside a very narrow picture.
+const LABEL_MIN_FONT_RATIO: f32 = 0.5;
+
 /// The score cell's fill, and the clock cell's — the two that aren't a team's
 /// colour (spec S3). macOS's 0.1 and 0.05 grey, the clock's slightly darker
 /// and slightly translucent.
@@ -104,6 +123,12 @@ pub(crate) struct OverlayFrame<'a> {
     /// The letterboxed picture rect inside the output frame, `(x, y, w, h)`:
     /// the base pad's rect, which is the space the strokes were drawn in.
     pub picture: (i32, i32, i32, i32),
+    /// The player highlights showing at this frame, already in **picture
+    /// pixels** relative to the picture rect's origin
+    /// (`video_coach_core::highlight::highlight_shapes`). The driver maps them
+    /// through the frame's own zoom, so this layer stays zoom-agnostic exactly
+    /// as it is for strokes (spec H4).
+    pub highlights: &'a [HighlightShape],
     /// The bar's line. **Empty draws no bar at all** — neither its background
     /// nor its glyphs: that is how a caller suppresses the bar. Neither
     /// shipping caller does; both draw the entry's own line (spec E7).
@@ -127,7 +152,17 @@ pub(crate) struct OverlayRenderer {
     /// and its search run once an entry rather than once a frame: none of
     /// those lines changes inside one.
     fitted: [Option<Fitted>; TextSlot::COUNT],
+    /// The highlights' clip, with the picture rect and output size it was
+    /// built for. Remembered for the same reason a line's fit is: the picture
+    /// rect changes once an entry, while building the mask means zeroing and
+    /// then filling a whole output frame's worth of bytes — measured at 0.45 ms
+    /// of a 3.2 ms overlay at 1080p.
+    mask: Option<(MaskKey, Mask)>,
 }
+
+/// What a remembered [`Mask`] was built for: the picture rect, and the output
+/// size that is the mask's own size.
+type MaskKey = ((i32, i32, i32, i32), u32, u32);
 
 /// A line that holds still for a whole entry, and so gets a memo slot of its
 /// own. The score, the clock and the stoppage tail change every frame and are
@@ -242,6 +277,7 @@ impl OverlayRenderer {
             fonts: font_system(),
             cache: SwashCache::new(),
             fitted: [const { None }; TextSlot::COUNT],
+            mask: None,
         }
     }
 
@@ -284,11 +320,15 @@ impl OverlayRenderer {
     /// **The order is macOS's:** the bar's background, then the strokes, then
     /// the glyphs, and the scoreboard over all of it. A drawing near the bottom
     /// of the picture stays visible over the bar's tint, the words stay legible
-    /// over the drawing, and the board is never drawn through.
+    /// over the drawing, and the board is never drawn through. The highlights
+    /// go under all of it (spec H5): they mark the footage, and the coach's own
+    /// pen is what they must never hide.
     fn draw(&mut self, pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         // The allocator hands back whatever was in that memory, and nothing
         // else clears it: `from_bytes` adopts the bytes as they are.
         pixmap.fill(Color::TRANSPARENT);
+
+        self.draw_highlights(pixmap, frame);
 
         let (out_w, out_h) = (f64::from(pixmap.width()), f64::from(pixmap.height()));
         let bar = bar_rect(out_w, out_h);
@@ -324,6 +364,143 @@ impl OverlayRenderer {
         if let Some((config, state)) = frame.scoreboard {
             self.draw_scoreboard(pixmap, config, state, out_w, out_h);
         }
+    }
+
+    /// Draws the player highlights: a ring at each one's feet, and its label
+    /// in a pill above it (spec H4).
+    ///
+    /// **The shapes arrive in picture pixels**, already mapped through the
+    /// frame's zoom by `core::highlight::highlight_shapes`, so all that is
+    /// left here is the picture's origin. The box itself is never drawn — it
+    /// is the geometry the ring and the pill hang off.
+    fn draw_highlights(&mut self, pixmap: &mut PixmapMut, frame: &OverlayFrame) {
+        if frame.highlights.is_empty() {
+            return;
+        }
+        let (x0, y0, ..) = frame.picture;
+        let (x0, y0) = (f64::from(x0), f64::from(y0));
+        // A ring at the edge of the footage is cut there rather than drawn
+        // across the letterbox bars, which belong to the frame.
+        let key = (frame.picture, pixmap.width(), pixmap.height());
+        if self.mask.as_ref().is_none_or(|(k, _)| *k != key) {
+            let Some(mask) = picture_mask(frame.picture, pixmap.width(), pixmap.height()) else {
+                return;
+            };
+            self.mask = Some((key, mask));
+        }
+        let mask = &self.mask.as_ref().expect("built just above").1;
+        let mut paint = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        // Round, like the pen: nothing here has a corner anyway, and a ring
+        // cut by the mask should end as softly as a stroke does.
+        let mut pen = tiny_skia::Stroke {
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..tiny_skia::Stroke::default()
+        };
+        let edge = Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour");
+
+        for shape in frame.highlights {
+            let (cx, cy, rx, ry) = shape.ellipse;
+            // `None` for a non-finite or empty ellipse — a corrupt project,
+            // not something to paint a guess over (BACKLOG #28).
+            let Some(oval) = Rect::from_xywh(
+                (x0 + cx - rx) as f32,
+                (y0 + cy - ry) as f32,
+                (2.0 * rx) as f32,
+                (2.0 * ry) as f32,
+            ) else {
+                continue;
+            };
+            let Some(path) = PathBuilder::from_oval(oval) else {
+                continue;
+            };
+            let c = shape.color;
+            let Some(color) = Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32)
+            else {
+                continue;
+            };
+            // The dark edge first, a wider stroke the ring then covers, as
+            // under a pen line — and for the same reason, only under an opaque
+            // ring, which would otherwise read darker than its stored colour.
+            if c.a >= 1.0 {
+                paint.set_color(edge);
+                pen.width = (shape.width * (1.0 + 2.0 * STROKE_EDGE_RATIO)) as f32;
+                pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), Some(mask));
+            }
+            paint.set_color(color);
+            pen.width = shape.width as f32;
+            pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), Some(mask));
+        }
+
+        // Every pill over every ring, so one player's label is never cut in
+        // half by the next player's ring.
+        for shape in frame.highlights {
+            self.draw_highlight_label(pixmap, frame, shape);
+        }
+    }
+
+    /// Draws `shape`'s label in a pill of its own colour, above the box.
+    ///
+    /// **[`Self::draw_label`] bypasses the mask**, so the pill is *placed*
+    /// inside the picture rect rather than clipped to it: below the box when
+    /// there is no room above, and shifted in at the left and right edges. A
+    /// clipped label would be worse than a moved one anyway — half a shirt
+    /// number is a different shirt number.
+    fn draw_highlight_label(
+        &mut self,
+        pixmap: &mut PixmapMut,
+        frame: &OverlayFrame,
+        shape: &HighlightShape,
+    ) {
+        if shape.label.is_empty() {
+            return;
+        }
+        let (x0, y0, w, h) = frame.picture;
+        let (x0, y0, w, h) = (f64::from(x0), f64::from(y0), f64::from(w), f64::from(h));
+        let font_size = (LABEL_FONT_RATIO * h) as f32;
+        if font_size <= 0.0 || w <= 0.0 {
+            return;
+        }
+        let style = Style::new(font_size, Weight::BOLD);
+        let pad = font_size * LABEL_PAD_RATIO;
+        // The pill is measured around the line rather than the line fitted to
+        // a pill, so it is exactly as wide as it needs to be. The picture's
+        // own width is the only thing that ever narrows it, and `draw_label`
+        // then fits the line to what is left.
+        let pill_w = f64::from(self.width(&shape.label, style) + 2.0 * pad).min(w);
+        let pill_h = f64::from(style.metrics.line_height + pad);
+        let gap = f64::from(font_size * LABEL_GAP_RATIO);
+        let above = shape.rect.y - gap - pill_h;
+        let y = if above >= 0.0 {
+            above
+        } else {
+            shape.rect.y + shape.rect.h + gap
+        };
+        let rect = LayoutRect {
+            x: x0
+                + (shape.rect.x + (shape.rect.w - pill_w) / 2.0).clamp(0.0, (w - pill_w).max(0.0)),
+            y: y0 + y.clamp(0.0, (h - pill_h).max(0.0)),
+            w: pill_w,
+            h: pill_h,
+        };
+        fill(pixmap, &rect, fill_color(shape.color));
+        self.draw_label(
+            pixmap,
+            &Label {
+                text: &shape.label,
+                rect,
+                style,
+                min_font_size: font_size * LABEL_MIN_FONT_RATIO,
+                color: label_ink(shape.color),
+                align: Align::Center,
+                pad,
+                // No slot: a ring moves every frame, and so does its pill.
+                slot: None,
+            },
+        );
     }
 
     /// Draws the scoreboard top-left, over everything else (spec S3).
@@ -645,6 +822,38 @@ fn fill_color(c: Rgba) -> Color {
     Color::from_rgba(c.r as f32, c.g as f32, c.b as f32, c.a as f32).unwrap_or(Color::TRANSPARENT)
 }
 
+/// Black or white over `c`, whichever can be read on it.
+///
+/// A label's pill takes the highlight's own colour, and the swatch row runs
+/// from white through yellow to black, so a fixed ink would be invisible at
+/// one end of it. The weights are the usual relative-luminance ones.
+fn label_ink(c: Rgba) -> TextColor {
+    let luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    if luma > 0.5 {
+        TextColor::rgb(0, 0, 0)
+    } else {
+        TextColor::rgb(255, 255, 255)
+    }
+}
+
+/// A mask covering the picture rect on an `out_w`×`out_h` frame, which is what
+/// the highlights are clipped to. `None` for an empty or non-finite rect,
+/// which draws nothing.
+fn picture_mask(picture: (i32, i32, i32, i32), out_w: u32, out_h: u32) -> Option<Mask> {
+    let (x, y, w, h) = picture;
+    let rect = Rect::from_xywh(x as f32, y as f32, w as f32, h as f32)?;
+    let mut mask = Mask::new(out_w, out_h)?;
+    // Anti-aliasing off: the picture rect is an axis-aligned block, and a soft
+    // edge on the clip would only leak a ring into the letterbox bars.
+    mask.fill_path(
+        &PathBuilder::from_rect(rect),
+        FillRule::Winding,
+        false,
+        Transform::identity(),
+    );
+    Some(mask)
+}
+
 /// A stored colour as cosmic-text's, which is 8-bit and straight-alpha.
 fn text_color(c: Rgba) -> TextColor {
     let channel = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -728,9 +937,11 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
 mod tests {
     use uuid::Uuid;
     use video_coach_core::event::{CommentaryEvent, EventKind};
+    use video_coach_core::highlight::{highlight_shapes, HighlightKey, NormRect, PlayerHighlight};
     use video_coach_core::layout::{BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO};
     use video_coach_core::scoreboard::{ClockDisplay, MatchFormat, TeamConfig};
     use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
+    use video_coach_core::zoom::Zoom;
 
     use super::*;
 
@@ -782,30 +993,11 @@ mod tests {
         )
     }
 
-    /// The rendered pixels, as `[r, g, b, a]` per pixel in row order, for a
-    /// `w`×`h` output whose picture is `picture`, whose bar reads `text` and
-    /// whose scoreboard is `scoreboard`.
-    fn render_frame(
-        clip: &Clip,
-        record_time: f64,
-        text: &str,
-        picture: (i32, i32, i32, i32),
-        scoreboard: Option<(&ScoreboardConfig, ScoreboardState)>,
-        w: u32,
-        h: u32,
-    ) -> Vec<[u8; 4]> {
+    /// The rendered pixels of `frame`, as `[r, g, b, a]` per pixel in row
+    /// order, on a `w`×`h` output.
+    fn render_frame(frame: &OverlayFrame, w: u32, h: u32) -> Vec<[u8; 4]> {
         gst::init().unwrap();
-        let buffer = OverlayRenderer::new().render(
-            &OverlayFrame {
-                clip: Some(clip),
-                record_time,
-                picture,
-                text,
-                scoreboard,
-            },
-            w,
-            h,
-        );
+        let buffer = OverlayRenderer::new().render(frame, w, h);
         let meta = buffer.meta::<gst_video::VideoMeta>().expect("a VideoMeta");
         assert_eq!(meta.format(), gst_video::VideoFormat::Rgba);
         assert_eq!((meta.width(), meta.height()), (w, h));
@@ -816,7 +1008,8 @@ mod tests {
         map.as_chunks::<4>().0.to_vec()
     }
 
-    /// [`render_frame`] with no scoreboard, which is Phase 8's overlay.
+    /// An overlay over `clip` with no scoreboard and no highlights, which is
+    /// Phase 8's.
     fn render_at(
         clip: &Clip,
         record_time: f64,
@@ -825,7 +1018,18 @@ mod tests {
         w: u32,
         h: u32,
     ) -> Vec<[u8; 4]> {
-        render_frame(clip, record_time, text, picture, None, w, h)
+        render_frame(
+            &OverlayFrame {
+                clip: Some(clip),
+                record_time,
+                picture,
+                highlights: &[],
+                text,
+                scoreboard: None,
+            },
+            w,
+            h,
+        )
     }
 
     /// [`render_at`] over a picture filling the whole output and no bar.
@@ -1095,6 +1299,271 @@ mod tests {
         assert_eq!(right_edge, 0);
     }
 
+    // -------------------------------------------------- the player highlights
+
+    fn norm(x: f64, y: f64, w: f64, h: f64) -> NormRect {
+        NormRect { x, y, w, h }
+    }
+
+    /// The shapes core makes for one highlight box, on a `w`×`h` picture with
+    /// no zoom: the drivers' own call, so the ring geometry under test is the
+    /// shipping one rather than a copy of it.
+    fn shapes(color: Rgba, label: &str, rect: NormRect, w: f64, h: f64) -> Vec<HighlightShape> {
+        let highlight = PlayerHighlight {
+            id: Uuid::nil(),
+            source_index: 0,
+            color,
+            label: label.to_owned(),
+            keys: vec![HighlightKey {
+                source_seconds: 0.0,
+                rect,
+                tracked: false,
+            }],
+        };
+        highlight_shapes(&[highlight], 0, 0.0, Zoom::IDENTITY, w, h)
+    }
+
+    /// `highlights` alone: no drawings, no bar and no board.
+    fn render_rings(
+        highlights: &[HighlightShape],
+        picture: (i32, i32, i32, i32),
+        w: u32,
+        h: u32,
+    ) -> Vec<[u8; 4]> {
+        render_frame(
+            &OverlayFrame {
+                clip: Some(&clip(Vec::new())),
+                record_time: 0.0,
+                picture,
+                highlights,
+                text: "",
+                scoreboard: None,
+            },
+            w,
+            h,
+        )
+    }
+
+    /// Whether any pixel within `r` of `(x, y)` satisfies `matches`: an
+    /// anti-aliased curve's ink lands within a pixel or two of its geometry.
+    fn near(
+        px: &[[u8; 4]],
+        w: u32,
+        x: u32,
+        y: u32,
+        r: u32,
+        matches: impl Fn([u8; 4]) -> bool,
+    ) -> bool {
+        (y.saturating_sub(r)..=y + r)
+            .flat_map(|y| (x.saturating_sub(r)..=x + r).map(move |x| (x, y)))
+            .any(|(x, y)| matches(at(px, w, x, y)))
+    }
+
+    /// The ring's own colour, premultiplied and opaque.
+    fn blue(p: [u8; 4]) -> bool {
+        p == [0, 0, 255, 255]
+    }
+
+    /// A label's ink over a dark pill: the only thing in these frames that is
+    /// white in every channel.
+    fn white(p: [u8; 4]) -> bool {
+        p[0] > 200 && p[1] > 200 && p[2] > 200
+    }
+
+    /// The rows carrying `matches` ink, in order.
+    fn ink_rows(px: &[[u8; 4]], w: u32, h: u32, matches: impl Fn([u8; 4]) -> bool) -> Vec<u32> {
+        (0..h)
+            .filter(|&y| (0..w).any(|x| matches(at(px, w, x, y))))
+            .collect()
+    }
+
+    /// The first few painted pixels outside `picture`, which is where nothing
+    /// belongs: the ring is masked to the footage, and the pill is placed
+    /// inside it.
+    fn painted_outside(
+        px: &[[u8; 4]],
+        picture: (i32, i32, i32, i32),
+        w: u32,
+        h: u32,
+    ) -> Vec<(u32, u32)> {
+        let (x0, y0, pw, ph) = picture;
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| at(px, w, x, y)[3] > 0)
+            .filter(|&(x, y)| {
+                (x as i32) < x0 || (x as i32) >= x0 + pw || (y as i32) < y0 || (y as i32) >= y0 + ph
+            })
+            .take(8)
+            .collect()
+    }
+
+    /// The ring is an ellipse at the box's feet, in the highlight's colour and
+    /// on the strokes' dark edge. The box itself is geometry, not ink.
+    #[test]
+    fn a_highlight_draws_a_ring_at_the_boxs_feet() {
+        let w = 800;
+        let shapes = shapes(
+            rgba(0.0, 0.0, 1.0),
+            "",
+            norm(0.4, 0.3, 0.2, 0.4),
+            800.0,
+            800.0,
+        );
+        let px = render_rings(&shapes, (0, 0, 800, 800), w, 800);
+        // The box is (320, 240, 160, 320), so the ring is centred on
+        // (400, 560) with rx = 1.4 x 160 / 2 = 112 and ry = 0.35 x 112 = 39.2.
+        assert!(near(&px, w, 400, 599, 3, blue), "no ring below the feet");
+        assert!(near(&px, w, 400, 521, 3, blue), "no ring above the feet");
+        assert!(near(&px, w, 288, 560, 3, blue), "no ring to the left");
+        assert!(near(&px, w, 512, 560, 3, blue), "no ring to the right");
+        // The dark edge, as under a stroke: just past the ring's bottom the
+        // picture is darkened, and the blue channel says it is not the ring.
+        assert!(
+            (560..620).any(|y| {
+                let [r, g, b, a] = at(&px, w, 400, y);
+                a > 150 && r < 60 && g < 60 && b < 60
+            }),
+            "the ring has no dark edge"
+        );
+        // The box is not drawn, and nothing is painted well clear of the ring.
+        assert_eq!(at(&px, w, 400, 300), [0, 0, 0, 0], "the box was drawn");
+        assert_eq!(at(&px, w, 400, 470), [0, 0, 0, 0]);
+        assert_eq!(at(&px, w, 400, 660), [0, 0, 0, 0]);
+    }
+
+    /// A ring reaching past the picture is cut at its edge: the letterbox bars
+    /// are the frame's, and a highlight belongs to the footage (spec H4).
+    #[test]
+    fn a_ring_is_clipped_to_the_picture_rect() {
+        let picture = (160, 40, 480, 640);
+        let (pw, ph) = (480.0, 640.0);
+        let color = rgba(0.0, 0.0, 1.0);
+        // A box at the left edge, one whose feet sit on the bottom edge, one
+        // at the right edge, and one whose ring is entirely above the picture.
+        let mut all = shapes(color, "", norm(0.0, 0.4, 0.08, 0.2), pw, ph);
+        for rect in [
+            norm(0.4, 0.85, 0.2, 0.15),
+            norm(0.92, 0.4, 0.08, 0.2),
+            norm(0.4, -0.2, 0.2, 0.15),
+        ] {
+            all.extend(shapes(color, "", rect, pw, ph));
+        }
+        let (w, h) = (800, 720);
+        let px = render_rings(&all, picture, w, h);
+
+        let outside = painted_outside(&px, picture, w, h);
+        assert!(
+            outside.is_empty(),
+            "painted outside the picture: {outside:?}"
+        );
+        assert!(px.iter().copied().any(blue), "no ring was drawn at all");
+    }
+
+    /// Highlights go under everything, so the coach's pen stays on top of a
+    /// ring it crosses (spec H5).
+    #[test]
+    fn a_stroke_crossing_a_ring_shows_the_strokes_colour() {
+        let w = 800;
+        let shapes = shapes(
+            rgba(0.0, 0.0, 1.0),
+            "",
+            norm(0.4, 0.25, 0.2, 0.25),
+            800.0,
+            800.0,
+        );
+        let px = render_frame(
+            &OverlayFrame {
+                clip: Some(&clip(vec![bar(1.0, 0.05, None)])),
+                record_time: 1.0,
+                picture: (0, 0, 800, 800),
+                highlights: &shapes,
+                text: "",
+                scoreboard: None,
+            },
+            w,
+            800,
+        );
+        // The stroke runs along y = 400, which is the ring's own centre line,
+        // and the ring's left extreme (288, 400) is under it.
+        assert_eq!(at(&px, w, 288, 400), [255, 51, 51, 255]);
+        // The ring is still drawn where the stroke doesn't reach.
+        assert!(near(&px, w, 400, 439, 3, blue), "no ring below the stroke");
+    }
+
+    /// The label sits in a pill of the highlight's own colour, above the box.
+    #[test]
+    fn the_label_pill_sits_above_the_box() {
+        let (w, h) = (800, 800);
+        let shapes = shapes(
+            rgba(0.0, 0.0, 1.0),
+            "#7",
+            norm(0.4, 0.4, 0.2, 0.2),
+            800.0,
+            800.0,
+        );
+        let px = render_rings(&shapes, (0, 0, 800, 800), w, h);
+        // The pill is a line high plus its padding, a small gap above the
+        // box's top edge at y = 320.
+        let rows = ink_rows(&px, w, h, white);
+        let (&top, &bottom) = (
+            rows.first().expect("no label was drawn"),
+            rows.last().expect("no label was drawn"),
+        );
+        assert!(
+            bottom < 320,
+            "the label is not above the box: {top}..{bottom}"
+        );
+        assert!(top > 260, "the label is far above the box: {top}..{bottom}");
+        // It is a pill, not bare glyphs: the highlight's colour is painted
+        // behind the ink.
+        assert!(
+            (top..=bottom).any(|y| (0..w).any(|x| blue(at(&px, w, x, y)))),
+            "the label has no pill behind it"
+        );
+    }
+
+    /// [`OverlayRenderer::draw_label`] bypasses the mask, so a pill is moved
+    /// rather than clipped: below the box when there is no room above it, and
+    /// shifted sideways at the picture's left and right edges.
+    #[test]
+    fn a_pill_at_an_edge_stays_inside_the_picture() {
+        let picture = (160, 40, 480, 640);
+        let (pw, ph) = (480.0, 640.0);
+        let color = rgba(0.0, 0.0, 1.0);
+        let mut all = shapes(color, "#7", norm(0.4, 0.0, 0.2, 0.2), pw, ph);
+        for rect in [norm(0.0, 0.5, 0.03, 0.2), norm(0.97, 0.5, 0.03, 0.2)] {
+            all.extend(shapes(color, "#77", rect, pw, ph));
+        }
+        let (w, h) = (800, 720);
+        let px = render_rings(&all, picture, w, h);
+
+        let outside = painted_outside(&px, picture, w, h);
+        assert!(
+            outside.is_empty(),
+            "painted outside the picture: {outside:?}"
+        );
+        // The first box's top edge is the picture's, so its pill goes below
+        // the box instead: under the box's bottom edge at output y = 168.
+        let rows = ink_rows(&px, w, h, white);
+        let &top = rows.first().expect("no label was drawn");
+        assert!(top > 168, "a pill was drawn above its box: row {top}");
+        // The two edge boxes' pills are shifted in rather than dropped.
+        let lit = |cols: std::ops::Range<u32>| {
+            (0..h)
+                .flat_map(|y| cols.clone().map(move |x| (x, y)))
+                .any(|(x, y)| white(at(&px, w, x, y)))
+        };
+        assert!(lit(160..220), "no label at the left edge");
+        assert!(lit(580..640), "no label at the right edge");
+    }
+
+    /// No highlights, nothing drawn — the layer as it was before them.
+    #[test]
+    fn no_highlights_draws_nothing() {
+        let px = render_rings(&[], (0, 0, 800, 800), 800, 800);
+        assert!(px.iter().all(|p| p[3] == 0));
+    }
+
     // ------------------------------------------------------- the scoreboard
 
     fn rgba(r: f64, g: f64, b: f64) -> Rgba {
@@ -1134,11 +1603,14 @@ mod tests {
     /// export's output size.
     fn render_scoreboard(config: &ScoreboardConfig, state: ScoreboardState) -> Vec<[u8; 4]> {
         render_frame(
-            &clip(Vec::new()),
-            0.0,
-            "",
-            (0, 0, OUT_W as i32, OUT_H as i32),
-            Some((config, state)),
+            &OverlayFrame {
+                clip: Some(&clip(Vec::new())),
+                record_time: 0.0,
+                picture: (0, 0, OUT_W as i32, OUT_H as i32),
+                highlights: &[],
+                text: "",
+                scoreboard: Some((config, state)),
+            },
             OUT_W,
             OUT_H,
         )
@@ -1315,11 +1787,14 @@ mod tests {
         );
         let config = scoreboard_config();
         let px = render_frame(
-            &clip(vec![across]),
-            1.5,
-            "",
-            (0, 0, OUT_W as i32, OUT_H as i32),
-            Some((&config, state(ClockDisplay::Running { seconds: 1.0 }))),
+            &OverlayFrame {
+                clip: Some(&clip(vec![across])),
+                record_time: 1.5,
+                picture: (0, 0, OUT_W as i32, OUT_H as i32),
+                highlights: &[],
+                text: "",
+                scoreboard: Some((&config, state(ClockDisplay::Running { seconds: 1.0 }))),
+            },
             OUT_W,
             OUT_H,
         );

@@ -97,6 +97,7 @@ impl Bus {
             compilation,
             commentary_volume: open.project.preferences.preview_commentary_volume,
             scoreboard: ScoreboardContext::for_project(&open.project),
+            highlights: open.project.player_highlights.clone(),
         };
 
         // Whatever was on screen stops first, and takes its frame with it.

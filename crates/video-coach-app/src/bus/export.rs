@@ -536,6 +536,7 @@ fn job(
         // Frozen with the project as it is now: the run's own copy of the
         // events on the concat timeline (spec S2).
         scoreboard: ScoreboardContext::for_project(&open.project),
+        highlights: open.project.player_highlights.clone(),
     };
     Ok(job)
 }

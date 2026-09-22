@@ -38,6 +38,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use video_coach_core::audio::{Region, AUDIO_SAMPLE_RATE};
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
+use video_coach_core::highlight::{highlight_shapes, PlayerHighlight};
 use video_coach_core::layout::pip_rect;
 use video_coach_core::project::{Clip, Quality, Resolution};
 use video_coach_core::scoreboard::ScoreboardContext;
@@ -89,6 +90,10 @@ pub struct ExportJob {
     /// scoreboard configured. Built once by the bus, and **never reused across
     /// a source add, move, remove or relink** — see [`ScoreboardContext`].
     pub scoreboard: Option<ScoreboardContext>,
+    /// The project's player highlights, a snapshot taken when the run starts.
+    /// They belong to the footage rather than to a clip (spec H1), so an entry
+    /// with no clip — a reel piece — gets them too.
+    pub highlights: Vec<PlayerHighlight>,
 }
 
 /// What one entry needs beside its `PlanEntry`, which carries the edit but
@@ -322,11 +327,23 @@ fn export(
             let state = context.state_at(entry.source_index, frame.source_time)?;
             Some((context.config(), state))
         });
+        // A highlight lives in the footage, so it is keyed by the displayed
+        // frame's source time too, and mapped through that frame's own zoom.
+        // Core owns the geometry; the overlay only draws what comes back.
+        let highlights = highlight_shapes(
+            &job.highlights,
+            entry.source_index,
+            frame.source_time,
+            frame.zoom,
+            f64::from(picture.2),
+            f64::from(picture.3),
+        );
         let overlay = overlays.render(
             &OverlayFrame {
                 clip: media.map(|m| &m.clip),
                 record_time,
                 picture,
+                highlights: &highlights,
                 text: &entry.text,
                 scoreboard,
             },
@@ -913,6 +930,7 @@ mod tests {
             resolution: Resolution::R720,
             quality: Quality::Medium,
             scoreboard: None,
+            highlights: Vec::new(),
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
