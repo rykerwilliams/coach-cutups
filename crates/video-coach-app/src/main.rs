@@ -36,8 +36,9 @@ use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::layout;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::reel::reel_goals;
 use video_coach_core::scoreboard::{
-    MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
+    MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
 use video_coach_core::stroke::{Rgba, Stroke};
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
@@ -541,10 +542,16 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         let rows: Vec<TargetRow> = targets
             .iter()
             .map(|row| {
-                let clips = if row.entries == 1 { "clip" } else { "clips" };
+                // The reel counts its goals, not its entries: two goals close
+                // together share one.
+                let (count, noun) = match row.target {
+                    ExportTarget::Reel => (reel_goals(project).len(), "goal"),
+                    _ => (row.entries, "clip"),
+                };
+                let plural = if count == 1 { "" } else { "s" };
                 TargetRow {
                     label: row.label.as_str().into(),
-                    detail: format!("{} {clips} · {}", row.entries, format_hms(row.seconds)).into(),
+                    detail: format!("{count} {noun}{plural} · {}", format_hms(row.seconds)).into(),
                     // The clip's row is the one that differs: it is ticked
                     // when the sheet was opened on it, and only then.
                     ticked: matches!(row.target, ExportTarget::Clip(_)) == only_clip,
@@ -604,15 +611,7 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_tag_match_event({
         let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
         move |tag| {
-            // Captured here, at the input event, as the bus contract
-            // requires, and mapped back through `locate`: reading the index
-            // and the offset separately would pair a new source with the old
-            // one's offset across a cross-source seek (spec S5).
-            let Some((source_index, source_seconds)) = UI.with_borrow_mut(|ui| {
-                let project = ui.snapshot.as_ref()?.project.clone();
-                let abs = scan_abs(ui, &project, &position);
-                (!project.source_videos.is_empty()).then(|| project.locate(abs))
-            }) else {
+            let Some((source_index, source_seconds)) = scan_source_position(&position) else {
                 return;
             };
             bus.borrow().send(Command::TagMatchEvent {
@@ -648,6 +647,47 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             if let Some(id) = parse_id(&id) {
                 bus.borrow().send(Command::DeleteMatchEvent(id));
             }
+        }
+    });
+    // A goal's reel span (R3), set where the coach is looking: the scan
+    // position, taken at the click as a tag's is.
+    window.on_reel_trim({
+        let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
+        move |id, trim| {
+            let Some(goal) = parse_id(&id) else { return };
+            let (end, here) = match trim {
+                ReelTrim::StartHere => (ReelEnd::Start, true),
+                ReelTrim::EndHere => (ReelEnd::End, true),
+                ReelTrim::ResetStart => (ReelEnd::Start, false),
+                ReelTrim::ResetEnd => (ReelEnd::End, false),
+            };
+            // `None` is a reset, so a set with no position sends nothing.
+            let at = match here {
+                true => match scan_source_position(&position) {
+                    Some(at) => Some(at),
+                    None => return,
+                },
+                false => None,
+            };
+            bus.borrow().send(Command::SetReelTrim { goal, end, at });
+        }
+    });
+    // `[` and `]` (C1): the same frame-accurate seek as a row's.
+    window.on_jump_chapter({
+        let (bus, position) = (bus.clone(), bus.borrow().position_handle().clone());
+        move |forward| {
+            let Some(abs) = UI.with_borrow_mut(|ui| {
+                let project = ui.snapshot.as_ref()?.project.clone();
+                let now = scan_abs(ui, &project, &position);
+                let rows = match_panel::match_rows(&project);
+                match forward {
+                    true => match_panel::next_chapter(now, &rows),
+                    false => match_panel::previous_chapter(now, &rows),
+                }
+            }) else {
+                return;
+            };
+            bus.borrow().send(Command::ScrubRelease { abs });
         }
     });
     window.on_open_match_setup({
@@ -699,6 +739,19 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             })
         })
     });
+}
+
+/// Where the game video is, as the source and offset a command that places
+/// something carries. Captured at the input event, as the bus contract
+/// requires, and mapped back through `locate`: reading the index and the
+/// offset separately would pair a new source with the old one's offset
+/// across a cross-source seek (spec S5). `None` with no project or no source.
+fn scan_source_position(position: &PositionHandle) -> Option<(usize, f64)> {
+    UI.with_borrow_mut(|ui| {
+        let project = ui.snapshot.as_ref()?.project.clone();
+        let abs = scan_abs(ui, &project, position);
+        (!project.source_videos.is_empty()).then(|| project.locate(abs))
+    })
 }
 
 /// Seeds the setup sheet from the project's scoreboard — or from a blank one
@@ -774,13 +827,33 @@ fn match_setup(w: &AppWindow) -> Option<ScoreboardConfig> {
 /// The Match panel's rows, and what its actions are gated on. The live score
 /// and clock aren't here: they follow the scan, so the tick renders them.
 fn show_match(w: &AppWindow, project: &Project) {
-    let rows: Vec<MatchRow> = match_panel::match_rows(project)
+    let rows = match_panel::match_rows(project);
+    // A chapter mark per row (C1): a goal in its team's colour, or the
+    // accent with no teams to take one from, and a start/stop in white.
+    let color = |c: Rgba| slint::Color::from_rgb_f32(c.r as f32, c.g as f32, c.b as f32);
+    let accent = w.get_accent_color();
+    let marks: Vec<Mark> = rows
+        .iter()
+        .map(|row| Mark {
+            at: row.abs as f32,
+            color: match (row.kind, &project.scoreboard) {
+                (MatchEventKind::HomeGoal, Some(c)) => color(c.home.primary_color),
+                (MatchEventKind::AwayGoal, Some(c)) => color(c.away.primary_color),
+                (MatchEventKind::HomeGoal | MatchEventKind::AwayGoal, None) => accent,
+                (MatchEventKind::StartStop, _) => slint::Color::from_rgb_u8(255, 255, 255),
+            },
+        })
+        .collect();
+    w.set_match_marks(ModelRc::new(VecModel::from(marks)));
+    w.set_match_goal_count(rows.iter().filter(|r| r.reel_span.is_some()).count() as i32);
+    let rows: Vec<MatchRow> = rows
         .into_iter()
         .map(|row| MatchRow {
             id: row.id.to_string().into(),
             time: row.time.into(),
             label: row.label.into(),
             role_less: row.role_less,
+            reel_span: row.reel_span.unwrap_or_default().into(),
         })
         .collect();
     w.set_match_rows(ModelRc::new(VecModel::from(rows)));
@@ -1527,6 +1600,9 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         w.set_selected_clip(SharedString::new());
     }
     w.set_clip_count(project.clips.len() as i32);
+    // Exactly when the sheet would have a row (spec R1): a project of goals
+    // and no clips has its reel to export.
+    w.set_can_export(!export_targets(project, None).is_empty());
     show_clips(w, project);
     let tags: Vec<TagRow> = tag_summaries(&project.clips)
         .into_iter()

@@ -5,7 +5,7 @@
 // commands and feeds bus events back in through the `in` properties.
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, TextEdit } from "std-widgets.slint";
-import { Scrubber } from "scrubber.slint";
+import { Mark, Scrubber } from "scrubber.slint";
 
 /// One row of the sidebar's Sources list.
 export struct SourceRow {
@@ -38,7 +38,8 @@ export struct TagRow {
 /// tag's, or the clip the sheet was opened on.
 export struct TargetRow {
     label: string,
-    /// "4 clips · 3:12", already formatted.
+    /// "4 clips · 3:12", or "3 goals · 1:48" for the reel, already
+    /// formatted.
     detail: string,
     /// Ticked to export. `src/main.rs` owns it — it holds the targets these
     /// rows stand for — so the sheet only reports a click.
@@ -68,6 +69,18 @@ export struct MatchRow {
     /// scoreboard ignores it until the format grows or the back-anchor goes
     /// off, so the row says so rather than looking like every other one.
     role-less: bool,
+    /// A goal's span in the reel, "−30 s / +6 s"; empty for anything but a
+    /// goal, whose row is the only one with the reel's buttons (spec R3).
+    reel-span: string,
+}
+
+/// A goal row's reel buttons (spec R3): set one end of the goal's span at the
+/// scan position, or put it back to the default.
+export enum ReelTrim {
+    start-here,
+    reset-start,
+    end-here,
+    reset-end,
 }
 
 /// What a tag key or one of the Match panel's buttons records (Phase 9 S4).
@@ -698,9 +711,12 @@ component MatchPanel inherits VerticalLayout {
     /// recording, and the panel doesn't act on the game video behind a
     /// preview.
     in property <bool> can-edit;
+    /// How many rows are goals, which are two lines tall: the list's height.
+    in property <int> goal-count;
     callback tag(MatchTag);
     callback seek(string);
     callback remove(string);
+    callback trim(string, ReelTrim);
     callback setup();
 
     padding: 12px;
@@ -777,49 +793,123 @@ component MatchPanel inherits VerticalLayout {
     // A height of its own, so a long match scrolls rather than pushing the
     // inspector out of the column.
     ListView {
-        height: min(112px, root.rows.length * 28px);
-        for row in root.rows: HorizontalLayout {
-            height: 28px;
-            spacing: 6px;
+        height: min(168px, (root.rows.length + root.goal-count) * 28px);
+        for row in root.rows: VerticalLayout {
+            HorizontalLayout {
+                height: 28px;
+                spacing: 6px;
 
-            Text {
-                text: row.time;
-                color: Palette.alternate-foreground;
-                font-family: "monospace";
-                font-size: 11px;
-                vertical-alignment: center;
-            }
-            Text {
-                text: row.label;
-                color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
-                font-size: 11px;
-                overflow: elide;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
-            VerticalLayout {
-                alignment: center;
-                Button {
-                    text: "→";
-                    accessible-label: "Seek";
-                    enabled: root.can-edit;
-                    clicked => { root.seek(row.id); }
+                Text {
+                    text: row.time;
+                    color: Palette.alternate-foreground;
+                    font-family: "monospace";
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: row.label;
+                    color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "→";
+                        accessible-label: "Seek";
+                        enabled: root.can-edit;
+                        clicked => { root.seek(row.id); }
 
-                    Tooltip {
-                        text: @markdown("Play the game video from here");
+                        Tooltip {
+                            text: @markdown("Play the game video from here");
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "×";
+                        accessible-label: "Delete";
+                        enabled: root.can-edit;
+                        clicked => { root.remove(row.id); }
+
+                        Tooltip {
+                            text: @markdown("Delete this event (undoable)");
+                        }
                     }
                 }
             }
-            VerticalLayout {
-                alignment: center;
-                Button {
-                    text: "×";
-                    accessible-label: "Delete";
-                    enabled: root.can-edit;
-                    clicked => { root.remove(row.id); }
+            // A goal's reel span (R3), on a line of its own: the column has
+            // no room for it beside the row. The buttons are glyphs, as the
+            // row's are, with their names in the tooltips.
+            if row.reel-span != "": HorizontalLayout {
+                height: 28px;
+                spacing: 4px;
 
-                    Tooltip {
-                        text: @markdown("Delete this event (undoable)");
+                Text {
+                    text: "Reel " + row.reel-span;
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "⇤";
+                        width: 28px;
+                        accessible-label: "Reel starts here";
+                        enabled: root.can-edit;
+                        clicked => { root.trim(row.id, ReelTrim.start-here); }
+
+                        Tooltip {
+                            text: @markdown("Reel starts here: the goal's entry begins at this frame");
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "↺";
+                        width: 28px;
+                        accessible-label: "Reset reel start";
+                        enabled: root.can-edit;
+                        clicked => { root.trim(row.id, ReelTrim.reset-start); }
+
+                        Tooltip {
+                            text: @markdown("Reset the reel start to the default");
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "⇥";
+                        width: 28px;
+                        accessible-label: "Reel ends here";
+                        enabled: root.can-edit;
+                        clicked => { root.trim(row.id, ReelTrim.end-here); }
+
+                        Tooltip {
+                            text: @markdown("Reel ends here: the goal's entry stops at this frame");
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "↺";
+                        width: 28px;
+                        accessible-label: "Reset reel end";
+                        enabled: root.can-edit;
+                        clicked => { root.trim(row.id, ReelTrim.reset-end); }
+
+                        Tooltip {
+                            text: @markdown("Reset the reel end to the default");
+                        }
                     }
                 }
             }
@@ -1449,6 +1539,9 @@ export component AppWindow inherits Window {
     in property <[ClipRow]> clips;
     /// All the project's clips, filtered or not.
     in property <int> clip-count;
+    /// The export sheet would have a row: a clip, or a goal for the reel
+    /// (spec R1). A project of goals and no clips can export its reel.
+    in property <bool> can-export;
     /// The selected clip's id, empty for none (Phase 3 C7). UI state only:
     /// `src/main.rs` sets it on the bus's `Select`, and clears it on project
     /// open and when its clip leaves the project.
@@ -1565,6 +1658,13 @@ export component AppWindow inherits Window {
     in property <string> match-clock;
     /// Every tagged event in match order.
     in property <[MatchRow]> match-rows;
+    in property <int> match-goal-count;
+    /// A tick on the scrubber per match event (spec C1), on the concat
+    /// timeline's scale.
+    in property <[Mark]> match-marks;
+    /// What a goal's mark is drawn in with no scoreboard, so no team colour:
+    /// read by `src/main.rs`, which builds the marks.
+    out property <color> accent-color: Palette.accent-background;
     /// Every period of the format is tagged, so the bus would refuse another
     /// start/stop: the action is off and the panel says why (S5).
     in property <bool> match-at-cap;
@@ -1656,6 +1756,11 @@ export component AppWindow inherits Window {
     callback tag-match-event(MatchTag);
     callback seek-match-event(string);
     callback delete-match-event(string);
+    /// A goal row's reel buttons (R3). The scan position is taken in
+    /// `src/main.rs` at the click, as a tag's is.
+    callback reel-trim(string, ReelTrim);
+    /// `]` (true) or `[`: the next or previous chapter (spec C1).
+    callback jump-chapter(bool);
     /// Seed the setup sheet's fields from the project and open it; the sheet
     /// is opened nowhere else, so the fields are never stale.
     callback open-match-setup();
@@ -1880,6 +1985,15 @@ export component AppWindow inherits Window {
         if (event.text == "," || event.text == ".") {
             if (pressed && !root.recording && !root.previewing && root.can-play) {
                 root.step-frame(event.text == ".");
+            }
+            return accept;
+        }
+        // The next or previous match event (C1), with a Match row's seek
+        // gate: the seek is a scrub release, which the bus refuses while
+        // recording, and it belongs to the game video behind a preview.
+        if (event.text == "[" || event.text == "]") {
+            if (pressed && !root.recording && !root.previewing && root.can-play) {
+                root.jump-chapter(event.text == "]");
             }
             return accept;
         }
@@ -2502,6 +2616,7 @@ export component AppWindow inherits Window {
                                 score: root.match-score;
                                 clock: root.match-clock;
                                 rows: root.match-rows;
+                                goal-count: root.match-goal-count;
                                 can-tag: root.can-tag;
                                 at-cap: root.match-at-cap;
                                 // The bus refuses a scrub and an edit while
@@ -2522,6 +2637,10 @@ export component AppWindow inherits Window {
                                 remove(id) => {
                                     keys.focus();
                                     root.delete-match-event(id);
+                                }
+                                trim(id, trim) => {
+                                    keys.focus();
+                                    root.reel-trim(id, trim);
                                 }
                                 setup => {
                                     keys.focus();
@@ -2546,6 +2665,9 @@ export component AppWindow inherits Window {
                         // Something to play, and not recording.
                         enabled: root.can-play && !root.recording;
                         maximum: max(root.total-seconds, 0.001);
+                        // The concat timeline's: a preview's scale is its
+                        // clip's, where they would mean nothing.
+                        marks: root.previewing ? [] : root.match-marks;
                         value <=> root.position-seconds;
                         moved(value) => { root.scrub-move(value); }
                         released(value) => { root.scrub-release(value); }
@@ -2632,14 +2754,14 @@ export component AppWindow inherits Window {
                             text: "Export…";
                             // Still on while a run is going: the sheet is
                             // where one is watched and cancelled from.
-                            enabled: root.has-project && root.clip-count > 0 && !root.recording && !root.previewing;
+                            enabled: root.has-project && root.can-export && !root.recording && !root.previewing;
                             clicked => {
                                 keys.focus();
                                 root.open-export();
                             }
 
                             Tooltip {
-                                text: @markdown("Export clips as videos");
+                                text: @markdown("Export clips, or the goals reel, as videos");
                             }
                         }
                         Button {

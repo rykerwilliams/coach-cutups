@@ -11,9 +11,19 @@
 
 import { Slider } from "std-widgets.slint";
 
+/// A tick over the track: a chapter (spec C1), at `at` on the scrubber's own
+/// scale.
+export struct Mark {
+    at: float,
+    color: color,
+}
+
 export component Scrubber {
     in property <bool> enabled;
     in property <float> maximum;
+    /// Drawn over the track, under the pointer: a click on a mark scrubs
+    /// there like anywhere else.
+    in property <[Mark]> marks;
     in-out property <float> value;
     /// A scrub is under way: from the press to its end, however it ends.
     out property <bool> scrubbing;
@@ -38,9 +48,10 @@ export component Scrubber {
     /// The value under `x`, on the Fluent slider's geometry: its 20px thumb's
     /// centre travels from one end of the track to the other.
     function value-at(x: length) -> float {
-        let thumb = 20px;
-        return clamp((x - thumb / 2) / max(root.width - thumb, 1px), 0, 1) * root.maximum;
+        return clamp((x - root.thumb / 2) / max(root.width - root.thumb, 1px), 0, 1) * root.maximum;
     }
+
+    property <length> thumb: 20px;
 
     function scrub-to(x: length) {
         root.value = value-at(x);
@@ -56,7 +67,17 @@ export component Scrubber {
         value: root.value;
     }
 
-    // Above the slider, so it takes every pointer event.
+    // `value-at`'s geometry turned round: a mark sits where a click would
+    // scrub to its value.
+    for mark in root.marks: Rectangle {
+        x: root.thumb / 2 + clamp(mark.at / max(root.maximum, 0.001), 0, 1) * (root.width - root.thumb) - self.width / 2;
+        y: (root.height - self.height) / 2;
+        width: 2px;
+        height: 12px;
+        background: mark.color;
+    }
+
+    // Above the slider and the marks, so it takes every pointer event.
     TouchArea {
         enabled: root.enabled;
         pointer-event(event) => {

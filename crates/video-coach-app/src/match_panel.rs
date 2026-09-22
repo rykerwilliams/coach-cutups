@@ -8,17 +8,28 @@
 
 use uuid::Uuid;
 use video_coach_core::project::Project;
+use video_coach_core::reel::{REEL_LEAD_IN, REEL_TAIL};
 use video_coach_core::scoreboard::{
-    format_clock, interpret, MatchEventKind, MatchFormat, PeriodRole, ScoreboardConfig,
-    ScoreboardState, TeamConfig,
+    format_clock, interpret, MatchEventKind, MatchEventRecord, MatchFormat, PeriodRole,
+    ScoreboardConfig, ScoreboardState, TeamConfig,
 };
 use video_coach_core::stroke::Rgba;
 
 use crate::format::format_hms;
 
-/// One row of the panel's event list.
+/// How near the playhead a chapter can be and still count as the one under
+/// it, which `[` and `]` step past, either side alike. A seek lands on a frame,
+/// not on the tag's exact instant, so a playhead sent to a chapter sits a hair
+/// either side of it — and a press there has to move on, not land again.
+pub const CHAPTER_TOLERANCE: f64 = 0.5;
+
+/// One row of the panel's event list, which is also a chapter (spec C1): the
+/// scrubber's marks and `[` / `]` are built from these rows.
 pub struct MatchRowText {
     pub id: Uuid,
+    pub kind: MatchEventKind,
+    /// Where it sits on the concat timeline, in seconds.
+    pub abs: f64,
     /// Where it sits on the concat timeline, already formatted.
     pub time: String,
     /// `"1H start"`, `"Home goal"`, …
@@ -29,6 +40,9 @@ pub struct MatchRowText {
     /// kept and turning the anchor off restores its role, so the row says so
     /// rather than looking like every other one.
     pub role_less: bool,
+    /// A goal's span in the reel, `"−30 s / +6 s"`: its trims, or the
+    /// defaults (spec R3). `None` for anything but a goal.
+    pub reel_span: Option<String>,
 }
 
 /// Every tagged event in match order — the order [`interpret`] walks, so a
@@ -63,9 +77,12 @@ pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
             };
             let row = MatchRowText {
                 id: m.id,
+                kind: m.kind,
+                abs: at,
                 time: format_hms(at),
                 label,
                 role_less,
+                reel_span: m.kind.is_goal().then(|| reel_span(m)),
             };
             (at, row)
         })
@@ -74,6 +91,43 @@ pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
     // `interpret` does.
     rows.sort_by(|a, b| a.0.total_cmp(&b.0));
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// `"−30 s / +6 s"`: how far the goal's reel entry runs either side of it,
+/// before the clamps (spec R2), which only the export sees.
+fn reel_span(goal: &MatchEventRecord) -> String {
+    // To the tenth, and whole seconds without one, since the defaults are
+    // whole and a trim set from a paused frame rarely is.
+    let seconds = |s: f64| {
+        let tenths = (s * 10.0).round() / 10.0;
+        match tenths.fract() == 0.0 {
+            true => format!("{tenths:.0}"),
+            false => format!("{tenths:.1}"),
+        }
+    };
+    format!(
+        "−{} s / +{} s",
+        seconds(goal.reel_lead_in.unwrap_or(REEL_LEAD_IN)),
+        seconds(goal.reel_tail.unwrap_or(REEL_TAIL))
+    )
+}
+
+/// Where `]` goes from `abs`: the first chapter more than
+/// [`CHAPTER_TOLERANCE`] after it. `rows` are in match order, as
+/// [`match_rows`] gives them.
+pub fn next_chapter(abs: f64, rows: &[MatchRowText]) -> Option<f64> {
+    rows.iter()
+        .map(|r| r.abs)
+        .find(|&at| at > abs + CHAPTER_TOLERANCE)
+}
+
+/// Where `[` goes from `abs`: the last chapter more than
+/// [`CHAPTER_TOLERANCE`] before it.
+pub fn previous_chapter(abs: f64, rows: &[MatchRowText]) -> Option<f64> {
+    rows.iter()
+        .rev()
+        .map(|r| r.abs)
+        .find(|&at| at < abs - CHAPTER_TOLERANCE)
 }
 
 /// The panel's live line: the score once the match has started, and the two
@@ -238,7 +292,7 @@ fn parse_count(text: &str, min: u32, max: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use video_coach_core::project::SourceRef;
-    use video_coach_core::scoreboard::ScoreboardContext;
+    use video_coach_core::scoreboard::{ReelEnd, ScoreboardContext};
 
     fn project() -> Project {
         let mut p = Project::new("p");
@@ -339,6 +393,63 @@ mod tests {
         p.append_match_event(MatchEventKind::StartStop, 0, 1.0);
         assert_eq!(labels(&p), ["Start/stop"]);
         assert!(!match_rows(&p).last().unwrap().role_less);
+    }
+
+    #[test]
+    fn a_goal_row_shows_its_reel_span() {
+        let mut p = project();
+        p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+        let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+        let spans = |p: &Project| -> Vec<Option<String>> {
+            match_rows(p).into_iter().map(|r| r.reel_span).collect()
+        };
+        // The defaults, and no span on a start/stop.
+        assert_eq!(spans(&p), [None, Some("−30 s / +6 s".to_string())]);
+        // One side trimmed: the other goes on following the default.
+        p.set_reel_trim(goal, ReelEnd::Start, Some((0, 88.0)))
+            .unwrap();
+        assert_eq!(spans(&p)[1].as_deref(), Some("−12 s / +6 s"));
+        p.set_reel_trim(goal, ReelEnd::End, Some((0, 104.5)))
+            .unwrap();
+        assert_eq!(spans(&p)[1].as_deref(), Some("−12 s / +4.5 s"));
+        p.set_reel_trim(goal, ReelEnd::Start, None).unwrap();
+        assert_eq!(spans(&p)[1].as_deref(), Some("−30 s / +4.5 s"));
+    }
+
+    #[test]
+    fn previous_and_next_chapter_skip_the_one_under_the_playhead() {
+        let mut p = project();
+        // The second source starts 600 s in.
+        p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+        p.append_match_event(MatchEventKind::StartStop, 0, 400.0);
+        p.append_match_event(MatchEventKind::AwayGoal, 1, 212.0);
+        p.append_match_event(MatchEventKind::StartStop, 1, 400.0);
+        let rows = match_rows(&p);
+        assert_eq!(
+            rows.iter().map(|r| r.abs).collect::<Vec<_>>(),
+            [100.0, 400.0, 812.0, 1000.0]
+        );
+
+        // The two ends: nothing before the first, nothing after the last.
+        assert_eq!(previous_chapter(100.0, &rows), None);
+        assert_eq!(previous_chapter(50.0, &rows), None);
+        assert_eq!(next_chapter(1000.0, &rows), None);
+        assert_eq!(next_chapter(1100.0, &rows), None);
+        assert_eq!(next_chapter(0.0, &rows), Some(100.0));
+        assert_eq!(previous_chapter(1100.0, &rows), Some(1000.0));
+
+        // Sitting on a chapter moves on to the next one either way.
+        assert_eq!(next_chapter(400.0, &rows), Some(812.0));
+        assert_eq!(previous_chapter(400.0, &rows), Some(100.0));
+        // And so does a hair either side of it (a seek lands on a frame, not
+        // on the tag's instant), in both directions.
+        assert_eq!(next_chapter(811.999, &rows), Some(1000.0));
+        assert_eq!(previous_chapter(811.999, &rows), Some(400.0));
+        assert_eq!(next_chapter(812.3, &rows), Some(1000.0));
+        assert_eq!(previous_chapter(812.3, &rows), Some(400.0));
+        // Past the tolerance, the one it has left is a chapter again.
+        assert_eq!(previous_chapter(812.6, &rows), Some(812.0));
+        assert_eq!(next_chapter(811.4, &rows), Some(812.0));
     }
 
     #[test]

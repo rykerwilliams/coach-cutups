@@ -9,13 +9,15 @@ use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition};
 
 slint::slint! {
-    import { Scrubber } from "ui/scrubber.slint";
+    import { Scrubber, Mark } from "ui/scrubber.slint";
+    export { Mark }
 
     export component TestWindow inherits Window {
         width: 400px;
         height: 40px;
         out property <bool> scrubbing: scrubber.scrubbing;
         in property <bool> enabled: true;
+        in property <[Mark]> marks;
         callback moved(float);
         callback released(float);
 
@@ -25,6 +27,7 @@ slint::slint! {
             height: 20px;
             enabled: root.enabled;
             maximum: 100;
+            marks: root.marks;
             moved(value) => { root.moved(value); }
             released(value) => { root.released(value); }
         }
@@ -141,4 +144,26 @@ fn disabling_mid_drag_ends_the_scrub() {
     rig.release(250.0);
     assert!(!rig.window.get_scrubbing());
     assert!(rig.released.borrow().is_empty());
+}
+
+/// The chapter marks are drawn over the track, but the pointer is the
+/// scrubber's: a click on a mark scrubs to it like a click anywhere else.
+#[test]
+fn a_click_on_a_mark_scrubs_through_it() {
+    let rig = Rig::new();
+    let mark = |at| Mark {
+        at,
+        color: slint::Color::from_rgb_u8(255, 255, 255),
+    };
+    rig.window
+        .set_marks(slint::ModelRc::new(slint::VecModel::from(vec![
+            mark(25.0),
+            mark(50.0),
+        ])));
+    // 50 is the middle of the track, where its mark sits.
+    rig.press(200.0);
+    rig.release(200.0);
+    assert!(!rig.window.get_scrubbing());
+    assert_eq!(*rig.moved.borrow(), [50.0]);
+    assert_eq!(*rig.released.borrow(), [50.0]);
 }
