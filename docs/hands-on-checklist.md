@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.2.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -137,6 +137,29 @@ Stopping a recording no longer transcribes on its own: you press **Transcribe** 
 - [ ] **Queue and cancel.** Press Transcribe on two clips. **Right:** the second one says "Queued". Press **Cancel**. **Right:** it stops at once and the queued one is dropped too. **Expected:** the laptop's CPU (and fan) stays busy for about 12 s afterwards. Say if that feels broken.
 - [ ] **[must work] Record while transcribing** [cam+mic]. Start a transcript, then press R while it's running. **Right:** recording starts immediately, with no freeze. After you stop, that clip's transcript starts again from the beginning.
 - [ ] **Edit and undo.** Change a word in a transcript, click away, then press Ctrl+Z. **Right:** it undoes *your* edit. The app writing the transcript is never an undo step. Relaunch. **Right:** your edited transcript is still there.
+
+## 11. Goals reel, chapters and highlights
+
+New in 0.2.0. The first save of an older project upgrades it, so it can no longer be opened by 0.1.x.
+
+- [ ] **[must work] Your old projects open.** Open a project made with 0.1.x and play it. **Right:** everything is where you left it. Save something, then look in the project folder. **Right:** `project.json.v7` sits beside `project.json` — that's the backup, and putting it back is the way to return to 0.1.x, losing anything changed since.
+- [ ] **[must work] Scrub lands.** On a Trace half, scrub to a few places. **Right:** the picture and the readout agree.
+- [ ] **Frame steps.** Paused, **.** and **,** move one frame forward and back, and the tenths in the readout follow. **Right:** while playing they do nothing.
+- [ ] **Fast scanning.** While playing, **L** speeds up (2× … 32×) and **J** slows down; the button beside Play does the same. **Right:** the readout shows the speed, the picture keeps up, the sound is muted above 1×, and a pause puts you back at 1× on the frame you were watching.
+- [ ] **The reel row.** With goals tagged, open **Export…**. **Right:** there's an **All goals** row reading "N goals · m:ss", unticked — you tick it when you want the reel. With no goals there's no row. In a project with goals and no clips, the Export… button still works.
+- [ ] **The reel file.** Tick **All goals** and export. In `All goals - <project>.mp4`, **right:** one piece per goal, about 36 seconds each, with the caption `2 / 5 | Home goal | 1-0`; the score on the board turns over on the goal's own frame; no webcam inset; game sound with no commentary. A highlight you placed during the build-up shows in that piece.
+- [ ] **Trims.** On a goal's row in the Match panel, park where you want the goal's clip to begin and click **⇤**, then park at the end and click **⇥**. **Right:** the span text updates, **↺** puts it back to −30 s / +6 s, a start *after* the goal is refused with a message, and Ctrl+Z undoes each one.
+- [ ] **[must work] Chapters.** Open the reel, and a multi-clip export, in VLC (Playback → Chapter). **Right:** one chapter per goal (or per clip), named with the caption's text. **Tell us** where these get watched — phone, TV, YouTube — so chapters can be aimed at that.
+- [ ] **Marks and jumps.** **Right:** the scrubber shows a tick per goal in the scoring team's colour, and a white one per period start and stop. **]** and **[** jump between them, and do nothing while recording.
+- [ ] **[must work] A highlight.** Press **H**, pause, and drag a box around a player. **Right:** a ring appears at their feet with a label pill. Then:
+  - type `7` in the selected row's label field: the pill reads `#7`;
+  - play a second on, pause and drag again; play from before the first key. **Right:** the ring glides from one box to the other;
+  - zoom in and pan. **Right:** the ring stays on the player and never spills into the black bars;
+  - check the same ring in a preview and in an exported video;
+  - drag while playing. **Right:** nothing is placed, and it says "Pause to place a highlight (Space)".
+- [ ] **While recording** [cam+mic]. Mid-take, pause, press **H** and ring a player. **Right:** it lands, and **Esc** leaves the tool without stopping the take.
+- [ ] **Edit and undo.** Try **Delete key here** (on and off a key frame), the row's delete, and recolouring from a pen swatch, pressing Ctrl+Z after each. **Right:** each undoes on its own. A source that a highlight uses can't be removed, and says why.
+- [ ] **Your call:** the ring's size and line thickness, whether the pill stays readable full-screen, and whether keys a second apart are close enough on a panning shot. (If they aren't, that's what the tracking phase is for.)
 
 ---
 
