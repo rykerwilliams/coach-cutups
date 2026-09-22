@@ -587,6 +587,31 @@ fn a_seek_into_a_gap_shows_the_frame_before_it() {
     exports_as(source, &[0.5, 0.5, 0.7], &[10, 10, 12]);
 }
 
+/// An anchor exactly on a frame boundary shows that frame, not the one before
+/// it. The 30 fps MP4 (timescale 3000, a two-frame edit list: the class of
+/// Trace's downloads) puts every third frame 1 ns after its boundary in stream
+/// time. A coach types round anchors, so this is the common case. Just off
+/// the boundary, the frame is the same.
+#[test]
+fn a_boundary_anchor_in_an_edit_listed_h264_shows_its_own_frame() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = counter_video(
+        &dir.path().join("src.mp4"),
+        640,
+        360,
+        30,
+        60,
+        CounterKind::H264Mp4BFrames,
+    );
+    // As the schedule computes them: anchor plus output time, in seconds.
+    let on: Vec<f64> = (0..6).map(|n| 1.0 + f64::from(n) / 30.0).collect();
+    let off: Vec<f64> = on.iter().map(|t| t + 0.004).collect();
+    let expected: Vec<u32> = (30..36).collect();
+    exports_as(source.clone(), &on, &expected);
+    exports_as(source, &off, &expected);
+}
+
 /// Past the video's end, where the audio runs on, the export shows the last
 /// frame: an accurate seek there finds no video at all.
 #[test]

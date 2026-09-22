@@ -707,3 +707,16 @@ Each entry: what, why deferred, when to revisit.
   something else is running — check whether the pump needs a higher priority or
   the preview a way to drop frames gracefully.
 
+70. **A heap-corruption abort once, tearing down whisper in the harness.** One
+  run of `crates/video-coach-harness/tests/transcribe.rs` died with glibc's
+  `corrupted size vs. prev_size` (SIGABRT); three reruns were green. The
+  Android branch (`claude/android-tablet-port`) records the same crash as its
+  BACKLOG #69, a whisper teardown crash.
+- **Why deferred:** seen once, not reproduced, and unrelated to the change it
+  surfaced under (the `frame_at` boundary fix).
+- **When to revisit:** soon if it recurs — heap corruption in a native library
+  can crash the real app mid-transcription, not just a test. Start from the
+  Android branch's findings, and try the harness under a memory checker
+  (`MALLOC_CHECK_=3`, or valgrind on the single test) to catch it at the write
+  rather than at the free.
+

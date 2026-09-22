@@ -16,6 +16,26 @@ use crate::player::{diagnostics, gl_bin, gl_caps, Diagnostics};
 /// GOP). Measured.
 const PULL_AHEAD: gst::ClockTime = gst::ClockTime::from_mseconds(500);
 
+/// How far after a target a frame may start and still count as "at" it:
+/// nanosecond rounding, which a strict comparison can't tell from a real gap.
+///
+/// Frame times reach us through integer conversions that each floor, so a
+/// frame meant to start exactly on a target can read back a few ns after it.
+/// Measured: an MP4 at timescale 3000 with a two-frame edit list (B-frames;
+/// what `mp4mux` writes at 30 fps, and what Trace's HLS downloads are) puts
+/// frame `i` at `floor((i+2)/30 s) - floor(2/30 s)` in stream time, 1 ns after
+/// `i/30 s`, so a round anchor showed the previous frame every third frame.
+///
+/// 1 µs is a thousand times that rounding and a four-thousandth of the
+/// shortest frame there is (4.2 ms at 240 fps), so it can only change the
+/// answer for a frame that starts within 1 µs of the target, which is that
+/// frame to any precision a video has. It is **not** meant to absorb a
+/// container's own coarser rounding (Matroska's millisecond timecodes store
+/// frame 2 at 30 fps at 67 ms): that is where the file says the frame
+/// starts, and absorbing it would pick a different frame than a strict
+/// reading of the file does.
+const SLACK: gst::ClockTime = gst::ClockTime::from_useconds(1);
+
 /// One decoded frame and its source time.
 struct Decoded {
     /// Holds a buffer with a PTS.
@@ -105,8 +125,9 @@ impl Decoder {
         })
     }
 
-    /// The last frame with stream time at or before `target` (or the first
-    /// frame, for a target before it; the last, for one past the end).
+    /// The last frame with stream time at or before `target` give or take
+    /// [`SLACK`] (or the first frame, for a target before it; the last, for
+    /// one past the end).
     ///
     /// Reuses the current frame while it still answers, pulls forward to a
     /// target up to [`PULL_AHEAD`] ahead, and seeks otherwise. It never seeks
@@ -117,13 +138,17 @@ impl Decoder {
         target: gst::ClockTime,
         watch: &Watch,
     ) -> Result<&gst::Sample, CompositeError> {
+        // The latest frame time that answers `target`. Every comparison uses
+        // it, so a frame that starts inside the slack is reused rather than
+        // seeked for again.
+        let reach = target + SLACK;
         // Past the end, the last frame answers every later target.
         let far = self
             .current
             .as_ref()
-            .is_none_or(|c| target < c.time || (!self.eos && target - c.time > PULL_AHEAD));
+            .is_none_or(|c| reach < c.time || (!self.eos && reach - c.time > PULL_AHEAD));
         if far {
-            self.seek(target)?;
+            self.seek(reach)?;
         }
         while !self.eos {
             if self.next.is_none() {
@@ -134,7 +159,7 @@ impl Decoder {
                 }
             }
             let next = self.next.as_ref().expect("pulled above");
-            if self.current.is_some() && next.time > target {
+            if self.current.is_some() && next.time > reach {
                 break;
             }
             self.current = self.next.take();
