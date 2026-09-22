@@ -551,9 +551,15 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
                         format_hms(row.seconds)
                     )
                     .into(),
-                    // The clip's row is the one that differs: it is ticked
-                    // when the sheet was opened on it, and only then.
-                    ticked: matches!(row.target, ExportTarget::Clip(_)) == only_clip,
+                    // The clip's row is ticked only when the sheet was
+                    // opened on it. The reel is never ticked by default: it
+                    // renders 36 s a goal, which is a long wait nobody asked
+                    // for on an ordinary export.
+                    ticked: match row.target {
+                        ExportTarget::Clip(_) => only_clip,
+                        ExportTarget::Reel => false,
+                        _ => !only_clip,
+                    },
                 }
             })
             .collect();

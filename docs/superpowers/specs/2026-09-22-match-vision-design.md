@@ -151,6 +151,7 @@ A plan with fewer than two entries gets no chapters.
 
 - One run, one progress model and one cancel serve every target, as today.
 - **The file name** follows spec E6: `<label> - <project>.mp4`.
+- **The row is not ticked by default** (the user, 2026-09-22): the reel renders about 36 s a goal, which an ordinary export should not pay for unasked. The coach ticks it.
 - **The Export… button is enabled whenever the sheet would have a row** (`export_targets` is not empty), not on "the project has clips". A project with goals and no clips, which every ground-truth project is, can export its reel.
 
 **R2. Each goal is one plan entry, with one `Play` segment.** The segment spans `[goal − lead_in, goal + tail]` on the goal's own source.
