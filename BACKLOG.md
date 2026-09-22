@@ -725,6 +725,14 @@ Each entry: what, why deferred, when to revisit.
   Android branch's findings, and try the harness under a memory checker
   (`MALLOC_CHECK_=3`, or valgrind on the single test) to catch it at the write
   rather than at the free.
+- **Update (2026-09-22, match-vision Task 1.2):** not whisper-only. The GL
+  export suites abort the same way (`corrupted size vs. prev_size`,
+  `malloc(): mismatching next->prev_size`): 2 of 20 runs of the media
+  `tests/export.rs` binary at 07312a2, 3 of 20 with Task 1.2, and once in the
+  harness's `tests/export.rs`. None under gdb (25 runs). No unsafe code was
+  added, so a race in GStreamer, Mesa or llvmpipe teardown is the lead. It is
+  now recurring, so it is due: `MALLOC_CHECK_=3` or valgrind on the media
+  export binary.
 
 71. **A possible thump at the start of every commentary recording.** The
   Android session's audio analyzer found that real Linux recordings open with

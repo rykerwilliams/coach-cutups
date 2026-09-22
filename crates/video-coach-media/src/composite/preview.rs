@@ -702,7 +702,7 @@ impl Composite {
         // moment is the output frame's own, and its stamp the frame's own.
         let mut overlay = overlays.render(
             &OverlayFrame {
-                clip,
+                clip: Some(clip),
                 record_time: n as f64 / f64::from(OUTPUT_FPS),
                 picture: self.picture,
                 text: &self.text,

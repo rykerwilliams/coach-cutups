@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 
 use crate::event::CommentaryEvent;
-use crate::plan::{compilation_plan, selected_clips, CompilationPlan, ExportTarget};
+use crate::plan::{compilation_plan, CompilationPlan, ExportTarget};
 use crate::project::Project;
 use crate::timeline::{PlaybackSegment, SegmentKind};
 use crate::zoom::{zoom_at, Zoom};
@@ -124,13 +124,16 @@ pub struct Compilation {
 /// entry emits exactly its `frames`, starting at its `start_frame`.
 pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compilation {
     let plan = compilation_plan(project, target);
-    let clips = selected_clips(project, target);
 
     let mut frames = Vec::with_capacity(plan.total_frames());
-    for (i, (entry, clip)) in plan.entries.iter().zip(clips).enumerate() {
-        debug_assert_eq!(entry.clip_id, clip.id, "the plan and the clips diverged");
+    for (i, entry) in plan.entries.iter().enumerate() {
         debug_assert_eq!(entry.start_frame, frames.len());
-        walk(&entry.segments, &clip.events, entry.frames, i, &mut frames);
+        // An entry with no clip has no events: identity zoom throughout.
+        let events = entry
+            .clip_id
+            .and_then(|id| project.clips.iter().find(|c| c.id == id))
+            .map_or(&[][..], |c| &c.events[..]);
+        walk(&entry.segments, events, entry.frames, i, &mut frames);
     }
 
     Compilation { frames, plan }

@@ -468,26 +468,34 @@ fn job(
     let recordings = open.folder.join(RECORDINGS_DIRNAME);
     let mut entries = Vec::with_capacity(compilation.plan.entries.len());
     for entry in &compilation.plan.entries {
-        let clip = open
-            .project
-            .clips
-            .iter()
-            .find(|c| c.id == entry.clip_id)
-            .expect("the plan's entries are the project's clips");
-        let name = clip_label(clip);
+        let clip = entry.clip_id.map(|id| {
+            open.project
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .expect("the plan's clips are the project's clips")
+        });
         if missing.get(entry.source_index).copied().unwrap_or(true) {
+            // An entry with no clip is game video alone, named by the target.
+            let whose =
+                clip.map_or_else(|| format!("{label}: a"), |c| format!("{}'s", clip_label(c)));
             return Err(refused(format!(
-                "{name}'s game video is missing; relink it first"
+                "{whose} game video is missing; relink it first"
             )));
         }
+        let Some(clip) = clip else {
+            entries.push(None);
+            continue;
+        };
+        let name = clip_label(clip);
         let recording = recordings.join(&clip.recording_filename);
         if !recording.exists() {
             return Err(refused(format!("{name}'s commentary recording is missing")));
         }
-        entries.push(EntryMedia {
+        entries.push(Some(EntryMedia {
             recording,
             clip: clip.clone(),
-        });
+        }));
     }
 
     let job = ExportJob {

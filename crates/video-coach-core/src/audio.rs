@@ -115,8 +115,12 @@ pub fn audio_regions(compilation: &Compilation, prefs: &Preferences) -> Vec<Regi
     for (i, entry) in compilation.plan.entries.iter().enumerate() {
         let end = entry.start_frame + entry.frames;
         game_regions(entry, i, prefs.preview_source_volume, &mut regions);
-        // One per entry: the recording runs from its own zero for the whole
-        // entry, freezes included.
+        // One per entry with a clip: the recording runs from its own zero for
+        // the whole entry, freezes included. An entry without one has no
+        // recording, so its only sound is the game's.
+        if entry.clip_id.is_none() {
+            continue;
+        }
         regions.extend(region(
             i,
             Track::Commentary,

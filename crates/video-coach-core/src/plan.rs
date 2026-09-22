@@ -30,10 +30,13 @@ pub enum ExportTarget {
     Clip(Uuid),
 }
 
-/// One clip's contribution to the output.
+/// One entry's contribution to the output: a clip's, or a stretch of game
+/// video with no clip behind it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanEntry {
-    pub clip_id: Uuid,
+    /// The clip this entry plays, or `None` for game video alone: no
+    /// drawings, no zoom, no picture-in-picture and no commentary.
+    pub clip_id: Option<Uuid>,
     /// Index into `Project::source_videos`. Every frame of this entry pulls
     /// from it, so [`crate::export::FrameSpec`] does not repeat it.
     pub source_index: usize,
@@ -91,10 +94,9 @@ impl CompilationPlan {
 
 /// The clips `target` covers, in stored order (Phase 3 spec C3).
 ///
-/// One definition of the selection: [`compilation_plan`] builds its entries
-/// from this, and [`crate::export::compilation_schedule`] pairs those entries
-/// back with their clips from it, so the two cannot disagree about which clips
-/// or which order.
+/// [`compilation_plan`] builds its entries from this; an entry names its clip
+/// by [`PlanEntry::clip_id`], so nothing downstream pairs entries with clips
+/// by position.
 pub(crate) fn selected_clips<'a>(project: &'a Project, target: &ExportTarget) -> Vec<&'a Clip> {
     project
         .clips
@@ -152,7 +154,7 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
         let frames = frame_count(segments.iter().map(|s| s.out_duration).sum());
 
         entries.push(PlanEntry {
-            clip_id: clip.id,
+            clip_id: Some(clip.id),
             source_index: clip.source_index,
             segments,
             start_frame,

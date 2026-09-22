@@ -68,7 +68,7 @@ fn clips_are_planned_in_stored_order() {
     ]);
     let plan = compilation_plan(&p, &ExportTarget::AllClips);
     let ids: Vec<_> = plan.entries.iter().map(|e| e.clip_id).collect();
-    let expect: Vec<_> = p.clips.iter().map(|c| c.id).collect();
+    let expect: Vec<_> = p.clips.iter().map(|c| Some(c.id)).collect();
     assert_eq!(ids, expect);
 }
 
@@ -184,7 +184,7 @@ fn entries_carry_their_clip_id_and_source() {
     });
 
     let plan = compilation_plan(&p, &ExportTarget::AllClips);
-    assert_eq!(plan.entries[0].clip_id, id);
+    assert_eq!(plan.entries[0].clip_id, Some(id));
     assert_eq!(plan.entries[0].source_index, 1);
 }
 

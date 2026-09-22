@@ -125,11 +125,11 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
     ExportJob {
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
-        entries: vec![EntryMedia {
+        entries: vec![Some(EntryMedia {
             // Unread: `show_pip` is off, so the pad takes the filler.
             recording: PathBuf::new(),
             clip,
-        }],
+        })],
         audio: Vec::new(),
         path,
         resolution: Resolution::R720,
@@ -336,7 +336,7 @@ fn fiducial(kind: CounterKind) {
         audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![src.path.clone()],
-        entries: vec![EntryMedia { recording, clip }],
+        entries: vec![Some(EntryMedia { recording, clip })],
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -438,9 +438,11 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         entries: clips
             .iter()
             .zip(recordings)
-            .map(|(clip, recording)| EntryMedia {
-                recording,
-                clip: clip.clone(),
+            .map(|(clip, recording)| {
+                Some(EntryMedia {
+                    recording,
+                    clip: clip.clone(),
+                })
             })
             .collect(),
         path: path.clone(),
@@ -755,7 +757,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
         ExportJob {
             compilation: one_entry(&clip, frames, "1 / 2 | Demo"),
             sources: vec![source],
-            entries: vec![EntryMedia { recording, clip }],
+            entries: vec![Some(EntryMedia { recording, clip })],
             audio: Vec::new(),
             path: path.clone(),
             resolution: Resolution::R720,
@@ -910,10 +912,10 @@ fn the_export_burns_in_the_scoreboard() {
     export(ExportJob {
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
-        entries: vec![EntryMedia {
+        entries: vec![Some(EntryMedia {
             recording: PathBuf::new(),
             clip,
-        }],
+        })],
         audio: Vec::new(),
         path: path.clone(),
         resolution: Resolution::R720,
@@ -972,7 +974,7 @@ fn sounded_job(
         audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![source],
-        entries: vec![EntryMedia { recording, clip }],
+        entries: vec![Some(EntryMedia { recording, clip })],
         path,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1133,6 +1135,71 @@ fn the_game_track_is_gated_to_play_and_the_mix_fades_in() {
     assert!(
         early < 0.3 * settled,
         "the mix opens at {early:.3} against {settled:.3} once settled: no fade"
+    );
+}
+
+/// An entry with no clip — a goals-reel entry — exports as game video alone:
+/// the game's sound, the filler where the inset would be, and every frame the
+/// plan counts.
+#[test]
+fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // 2 s of dark grey video, silent but for a burst starting at 1.000 s.
+    let source = fixtures::tone_video(
+        &dir.path().join("src.mkv"),
+        640,
+        360,
+        30,
+        60,
+        fixtures::Tone {
+            freq: 1000.0,
+            amplitude: 0.5,
+            window: Some((1.0, 1.05)),
+        },
+    );
+    // The plan of a clip over the whole source, with the clip taken away: its
+    // segments are what a reel entry's play segment looks like.
+    let mut compilation = fixtures::one_clip(&clip(0.0, 2.0, Vec::new()), 2.0);
+    compilation.plan.entries[0].clip_id = None;
+    let frames = compilation.plan.total_frames();
+    let path = dir.path().join("out.mp4");
+    export(ExportJob {
+        audio: audio_regions(&compilation, &Preferences::default()),
+        compilation,
+        sources: vec![source],
+        entries: vec![None],
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: None,
+    })
+    .unwrap();
+
+    duration_is_the_schedule_s(&path, frames);
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(out.len(), frames);
+    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 16.0 / 9.0);
+    let centre = (
+        (pip.x + pip.w / 2.0) as usize,
+        (pip.y + pip.h / 2.0) as usize,
+    );
+    assert_rgb(
+        out.last().expect("frames out"),
+        "where the PiP would be",
+        centre,
+        0x202020,
+    );
+
+    let samples = fixtures::decode_audio(&path);
+    let onset = samples
+        .iter()
+        .position(|v| v.abs() > 0.1)
+        .expect("the burst is somewhere in the file");
+    let at = onset as f64 / 48_000.0;
+    assert!(
+        (at - 1.0).abs() < 0.001,
+        "the burst decodes back at {at:.4} s, not 1.000"
     );
 }
 

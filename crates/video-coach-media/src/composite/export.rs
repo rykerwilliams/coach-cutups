@@ -70,8 +70,10 @@ pub struct ExportJob {
     /// decoder is opened per distinct index and lives for the whole run.
     /// A snapshot taken when the export starts.
     pub sources: Vec<PathBuf>,
-    /// One per `compilation.plan.entries`, in the same order.
-    pub entries: Vec<EntryMedia>,
+    /// One per `compilation.plan.entries`, in the same order: `None` exactly
+    /// for an entry with no clip (`PlanEntry::clip_id`), which gets the PiP
+    /// filler, no drawings and no commentary.
+    pub entries: Vec<Option<EntryMedia>>,
     /// The audio edit over the same compilation, from
     /// `video_coach_core::audio::audio_regions`: which span of which file is
     /// heard at each emitted sample, and how loud. Empty is a silent track,
@@ -278,7 +280,7 @@ fn export(
     let mut percent = 0;
     for (n, frame) in job.compilation.frames.iter().enumerate() {
         let entry = &plan.entries[frame.entry];
-        let media = &job.entries[frame.entry];
+        let media = job.entries[frame.entry].as_ref();
         if let std::collections::hash_map::Entry::Vacant(slot) = sources.entry(entry.source_index) {
             let source = job
                 .sources
@@ -295,7 +297,7 @@ fn export(
             let info = gst_video::VideoInfo::from_caps(&caps)
                 .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
             picture = fit_rect(&info, out_w, out_h);
-            pip = Pip::open(&media.clip, &media.recording, &gl, cancel, (out_w, out_h));
+            pip = Pip::open(media, &gl, cancel, (out_w, out_h));
             // Before the push, so the pad probes find it (see `Schedule`).
             schedule.set_layout(
                 frame.entry,
@@ -318,7 +320,7 @@ fn export(
         });
         let overlay = overlays.render(
             &OverlayFrame {
-                clip: &media.clip,
+                clip: media.map(|m| &m.clip),
                 record_time,
                 picture,
                 text: &entry.text,
@@ -408,16 +410,19 @@ impl Pip {
         }
     }
 
-    /// Opens `recording` for `clip`, or falls back to the filler, saying on
+    /// Opens the entry's recording, or falls back to the filler, saying on
     /// stderr why. A missing PiP is a smaller loss than a failed export of an
-    /// hour of video.
+    /// hour of video. An entry with no media, or a clip with `show_pip` off,
+    /// takes the filler silently.
     fn open(
-        clip: &Clip,
-        recording: &Path,
+        media: Option<&EntryMedia>,
         gl: &Gl,
         cancel: &AtomicBool,
         (out_w, out_h): (i32, i32),
     ) -> Pip {
+        let Some(EntryMedia { recording, clip }) = media else {
+            return Pip::filler();
+        };
         if !clip.show_pip {
             return Pip::filler();
         }
@@ -887,10 +892,10 @@ mod tests {
         let job = ExportJob {
             compilation: fixtures::one_entry(&clip, frames, ""),
             sources: vec![source],
-            entries: vec![EntryMedia {
+            entries: vec![Some(EntryMedia {
                 recording: dir.path().join("missing.mkv"),
                 clip,
-            }],
+            })],
             audio: Vec::new(),
             path: path.clone(),
             resolution: Resolution::R720,

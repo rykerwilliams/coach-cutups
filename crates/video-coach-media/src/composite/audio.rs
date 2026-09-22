@@ -105,7 +105,12 @@ impl Mixer {
                     .get(entries[region.entry].source_index)
                     .cloned()
                     .unwrap_or_default(),
-                Track::Commentary => job.entries[region.entry].recording.clone(),
+                // An entry with no clip has no recording: audio_regions gives
+                // it no commentary region, and one would be silence anyway.
+                Track::Commentary => job.entries[region.entry]
+                    .as_ref()
+                    .map(|media| media.recording.clone())
+                    .unwrap_or_default(),
             })
             .collect();
         let mut order: Vec<usize> = (0..job.audio.len()).collect();

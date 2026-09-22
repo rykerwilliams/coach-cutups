@@ -95,8 +95,9 @@ const FIT_PASSES: usize = 6;
 
 /// One frame's overlay: what to draw, and the spaces to draw it in.
 pub(crate) struct OverlayFrame<'a> {
-    /// The drawings' clip.
-    pub clip: &'a Clip,
+    /// The drawings' clip, or `None` for an entry with no clip, which draws
+    /// no strokes.
+    pub clip: Option<&'a Clip>,
     /// Where in the recording the frame sits, which is the clock stroke replay
     /// runs on.
     pub record_time: f64,
@@ -657,6 +658,9 @@ fn text_color(c: Rgba) -> TextColor {
 /// a stroke keeps the weight it was drawn with when the picture is
 /// pillarboxed (`core::layout::stroke_line_width`).
 fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
+    let Some(clip) = frame.clip else {
+        return;
+    };
     let (x0, y0, w, h) = frame.picture;
     let (x0, y0, w, h) = (f64::from(x0), f64::from(y0), f64::from(w), f64::from(h));
     let mut paint = Paint {
@@ -672,7 +676,7 @@ fn draw_strokes(pixmap: &mut PixmapMut, frame: &OverlayFrame) {
     };
     let edge = Color::from_rgba(0.0, 0.0, 0.0, STROKE_EDGE_ALPHA).expect("a valid colour");
 
-    for visible in visible_strokes(frame.clip, frame.record_time) {
+    for visible in visible_strokes(clip, frame.record_time) {
         let stroke = visible.stroke;
         let Some((first, rest)) = stroke.points[..visible.drawn_point_count].split_first() else {
             continue;
@@ -793,7 +797,7 @@ mod tests {
         gst::init().unwrap();
         let buffer = OverlayRenderer::new().render(
             &OverlayFrame {
-                clip,
+                clip: Some(clip),
                 record_time,
                 picture,
                 text,

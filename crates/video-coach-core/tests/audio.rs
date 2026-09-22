@@ -10,9 +10,11 @@ use video_coach_core::audio::{
     audio_regions, envelope, Region, Track, AUDIO_SAMPLE_RATE, PRIMING_SAMPLES, RAMP_SAMPLES,
 };
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::export::compilation_schedule;
-use video_coach_core::plan::ExportTarget;
+use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec};
+use video_coach_core::plan::{CompilationPlan, ExportTarget, PlanEntry};
 use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::timeline::{PlaybackSegment, SegmentKind};
+use video_coach_core::zoom::Zoom;
 
 /// Audio samples per output frame: 48000 / 30.
 const SPF: u64 = 1600;
@@ -113,6 +115,42 @@ fn a_playing_clip_is_one_game_region_and_one_commentary_region() {
     assert_eq!(mic.out_samples, game.out_samples);
     // The recording's own zero is the entry's record time zero.
     assert!(approx(mic.source_offset, PRIMING_SAMPLES as f64 / RATE));
+}
+
+/// An entry with no clip (a goals-reel entry) has no recording, so the game is
+/// all it plays.
+#[test]
+fn an_entry_without_a_clip_is_game_audio_only() {
+    let entry = PlanEntry {
+        clip_id: None,
+        source_index: 0,
+        segments: vec![PlaybackSegment {
+            kind: SegmentKind::Play,
+            source_start: 10.0,
+            out_duration: 2.0,
+        }],
+        start_frame: 0,
+        frames: 60,
+        text: String::new(),
+    };
+    let compilation = Compilation {
+        frames: (0..60)
+            .map(|n| FrameSpec {
+                entry: 0,
+                source_time: 10.0 + f64::from(n) / 30.0,
+                zoom: Zoom::IDENTITY,
+            })
+            .collect(),
+        plan: CompilationPlan {
+            entries: vec![entry],
+        },
+    };
+
+    let rs = audio_regions(&compilation, &Project::new("p").preferences);
+    assert_eq!(track(&rs, Track::Commentary), vec![]);
+    let game = track(&rs, Track::Game);
+    assert_eq!(game.len(), 1);
+    assert_eq!(game[0].out_samples, 0..60 * SPF - PRIMING_SAMPLES);
 }
 
 #[test]
