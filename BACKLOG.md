@@ -757,3 +757,14 @@ Each entry: what, why deferred, when to revisit.
   when a project opens. Capture `GST_DEBUG=*:3,playbin3:5,urisourcebin:5` on
   the failing run; check whether two loads were in flight at open.
 
+
+73. **`,` looks stuck across a timestamp gap longer than half a frame.** A back
+  step seeks to half a nominal frame before the shown frame's nominal start
+  (`step_target`, `player/mod.rs`). Where the file has a real gap there, the
+  ACCURATE seek lands on the frame after the gap — the frame already shown — so
+  the step does nothing and repeating it doesn't help.
+- **Why deferred:** MP4 game footage has no such gaps (Trace's irregular
+  29.997 fps drifts well under half a frame); only a VP8 WebM fixture does.
+  A fix needs a retry further back, or knowing the frame boundaries.
+- **When to revisit:** if a coach reports `,` stuck on some file, or when a
+  source with real gaps (a screen capture, a dropped-frame phone clip) is used.

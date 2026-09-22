@@ -28,7 +28,7 @@ use video_coach_app::bus::{
     TranscriptionState, WindowSize,
 };
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
-use video_coach_app::format::{finish_at, format_hms, sentence};
+use video_coach_app::format::{finish_at, format_hms, format_hms_tenths, sentence};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
@@ -352,6 +352,10 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         delta,
         host_ns: now_ns(),
     }));
+    window.on_step_frame({
+        let send = send(bus);
+        move |forward| send(Command::StepFrame { forward })
+    });
     window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
     window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
     window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
@@ -1792,7 +1796,13 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         // otherwise, and the readout and the scrubber never disagree about
         // which.
         w.set_total_seconds(total as f32);
-        w.set_readout(format!("{} / {}", format_hms(current), format_hms(total)).into());
+        // Tenths while paused, so a frame step shows; whole seconds while
+        // playing, so the digits don't flicker.
+        let now = match w.get_playing() {
+            true => format_hms(current),
+            false => format_hms_tenths(current),
+        };
+        w.set_readout(format!("{now} / {}", format_hms(total)).into());
         // The Match panel's live line (spec S4), from the same anchor. It
         // **freezes while a preview is open**: the transport is then record
         // time within one clip, and the preview's own scoreboard is already

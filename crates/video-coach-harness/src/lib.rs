@@ -304,6 +304,33 @@ impl Harness {
         self.bus.mailbox().take()
     }
 
+    /// Sends `seek`, a command that moves the paused scan player, and waits
+    /// for it to land: its target published, then settled, then its frame.
+    /// Returns the position the player reports then, and the frame it put up.
+    pub fn seek_and_settle(&mut self, seek: Command) -> (f64, Frame) {
+        let what = format!("{seek:?}");
+        self.take_frame();
+        self.send(seek);
+        self.wait_map(&format!("the target of {what}"), |e| {
+            matches!(
+                e,
+                Event::Position {
+                    target_abs: Some(_),
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        self.wait_settled();
+        let mut frame = None;
+        self.poll_until(&format!("the frame {what} lands on"), |h| {
+            frame = h.take_frame();
+            frame.is_some()
+        });
+        let reported = self.position_secs().expect("a settled position");
+        (reported, frame.expect("polled until some"))
+    }
+
     /// Seconds into the previewed clip, as the UI's tick reads them (spec
     /// P3's one position path). Meaningless with no preview open: the UI
     /// reads it only while one is.
@@ -385,7 +412,7 @@ pub const FRAME: f64 = 1.0 / 30.0;
 
 /// How far apart two frame times may be and still name the same frame: the
 /// decoder's `SLACK`, nanosecond rounding.
-const SAME_FRAME: f64 = 1e-6;
+pub const SAME_FRAME: f64 = 1e-6;
 
 /// Where one paused scrub landed ([`round_trip`]), in source seconds.
 #[derive(Debug, Clone, PartialEq)]
@@ -450,27 +477,8 @@ impl fmt::Display for Landing {
 pub fn round_trip(h: &mut Harness, source: &Path, targets: &[f64]) -> Vec<Landing> {
     let mut landed = Vec::new();
     for &target in targets {
-        h.take_frame();
-        h.send(Command::ScrubRelease { abs: target });
-        h.wait_map(&format!("a seek to {target}"), |e| {
-            matches!(
-                e,
-                Event::Position {
-                    target_abs: Some(_),
-                    ..
-                }
-            )
-            .then_some(())
-        });
-        h.wait_settled();
-        let mut frame = None;
-        h.poll_until(&format!("the frame at {target}"), |h| {
-            frame = h.take_frame();
-            frame.is_some()
-        });
-        let reported = h.position_secs().expect("a settled position");
-        let displayed = frame.map_or((None, None), |f| (f.stream_time, f.stream_end));
-        landed.push((target, reported, displayed));
+        let (reported, frame) = h.seek_and_settle(Command::ScrubRelease { abs: target });
+        landed.push((target, reported, (frame.stream_time, frame.stream_end)));
     }
     let reported: Vec<f64> = landed.iter().map(|&(_, r, _)| r).collect();
     let export = frame_times(source, &reported).expect("export's frame times");

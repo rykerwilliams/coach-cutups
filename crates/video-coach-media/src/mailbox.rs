@@ -72,11 +72,37 @@ impl Frame {
     }
 }
 
+/// Where the newest frame put in a mailbox ends, kept after it is taken: the
+/// frame on screen, for a one-frame step ([`FrameMailbox::shown`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Shown {
+    /// [`Frame::stream_end`]: the one time a seek never clips.
+    pub(crate) end: f64,
+    /// The stream's nominal frame duration, from its caps; 1/30 s where they
+    /// carry no rate (an HLS remux can read 0/1).
+    pub(crate) period: f64,
+}
+
+impl Shown {
+    fn of(frame: &Frame) -> Option<Shown> {
+        let fps = frame.info.fps();
+        let period = match fps.numer() > 0 && fps.denom() > 0 {
+            true => f64::from(fps.denom()) / f64::from(fps.numer()),
+            false => 1.0 / 30.0,
+        };
+        Some(Shown {
+            end: frame.stream_end?,
+            period,
+        })
+    }
+}
+
 type Redraw = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct MailboxInner {
     frame: Mutex<Option<Frame>>,
+    shown: Mutex<Option<Shown>>,
     redraw: Mutex<Option<Redraw>>,
 }
 
@@ -97,6 +123,20 @@ impl FrameMailbox {
         self.inner.frame.lock().unwrap().take()
     }
 
+    /// Where the newest frame put here ends, whether or not it was taken
+    /// since. `None` before the first, after [`FrameMailbox::clear`], or when
+    /// that frame carried no stream end.
+    pub(crate) fn shown(&self) -> Option<Shown> {
+        *self.inner.shown.lock().unwrap()
+    }
+
+    /// Empties the slot and forgets [`FrameMailbox::shown`]: nothing is on
+    /// screen any more.
+    pub(crate) fn clear(&self) {
+        self.take();
+        *self.inner.shown.lock().unwrap() = None;
+    }
+
     /// Called on the streaming thread after every new frame, e.g. to request
     /// a redraw. Replaces any earlier callback.
     pub fn set_redraw(&self, redraw: impl Fn() + Send + Sync + 'static) {
@@ -104,6 +144,7 @@ impl FrameMailbox {
     }
 
     pub(crate) fn put(&self, frame: Frame) {
+        *self.inner.shown.lock().unwrap() = Shown::of(&frame);
         *self.inner.frame.lock().unwrap() = Some(frame);
         // Cloned out so the callback never runs under the lock.
         let redraw = self.inner.redraw.lock().unwrap().clone();

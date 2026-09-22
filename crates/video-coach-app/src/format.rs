@@ -18,6 +18,18 @@ pub fn format_hms(seconds: f64) -> String {
     }
 }
 
+/// [`format_hms`] with tenths, `M:SS.t` or `H:MM:SS.t`, for the readout
+/// while paused: a frame step moves the tenths. Floored like it, so a frame
+/// at 12:34.99 never reads 12:35.0.
+pub fn format_hms_tenths(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "0:00.0".into();
+    }
+    // In integer tenths, so the floor can't disagree with `format_hms`'s.
+    let tenths = (seconds * 10.0).floor() as u64;
+    format!("{}.{}", format_hms((tenths / 10) as f64), tenths % 10)
+}
+
 /// When an export with `seconds_left` still to render ends, as the sheet's
 /// one line of estimate reads it: `"Finishes at 3:42 PM"` (spec E5, E8).
 ///
@@ -67,6 +79,18 @@ mod tests {
         assert_eq!(format_hms(3599.9), "59:59");
         assert_eq!(format_hms(3600.0), "1:00:00");
         assert_eq!(format_hms(1242.17), "20:42");
+    }
+
+    #[test]
+    fn format_hms_tenths_floors_like_format_hms() {
+        assert_eq!(format_hms_tenths(754.99), "12:34.9");
+        assert_eq!(format_hms_tenths(754.0), "12:34.0");
+        assert_eq!(format_hms_tenths(3723.45), "1:02:03.4");
+        assert_eq!(format_hms_tenths(0.05), "0:00.0");
+        assert_eq!(format_hms_tenths(0.0), "0:00.0");
+        assert_eq!(format_hms_tenths(-5.0), "0:00.0");
+        assert_eq!(format_hms_tenths(f64::NAN), "0:00.0");
+        assert_eq!(format_hms_tenths(f64::INFINITY), "0:00.0");
     }
 
     /// The clock's shape is the locale's, so both renderings are accepted:

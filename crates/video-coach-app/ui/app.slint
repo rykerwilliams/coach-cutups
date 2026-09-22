@@ -1602,6 +1602,8 @@ export component AppWindow inherits Window {
     callback toggle-play();
     /// Skip by this many seconds (negative is backwards).
     callback skip(float);
+    /// `,` and `.`: one frame back or forward, while paused.
+    callback step-frame(bool);
     callback scrub-move(float);
     callback scrub-release(float);
     /// R, Record or Stop: the bus starts a recording when idle, else stops
@@ -1856,6 +1858,14 @@ export component AppWindow inherits Window {
         if (event.text == Key.RightArrow || event.text == "d" || event.text == "D") {
             if (pressed) {
                 root.skip(event.modifiers.shift ? 10 : 3);
+            }
+            return accept;
+        }
+        // One frame while paused; the bus refuses it while playing. Held, it
+        // repeats, as the skips do.
+        if (event.text == "," || event.text == ".") {
+            if (pressed && !root.recording && !root.previewing && root.can-play) {
+                root.step-frame(event.text == ".");
             }
             return accept;
         }

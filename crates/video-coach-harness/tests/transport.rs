@@ -8,8 +8,11 @@
 use tempfile::TempDir;
 use video_coach_app::bus::{Command, Event};
 use video_coach_core::project::Project;
-use video_coach_harness::{round_trip, write_one_source_project, write_project, Harness, FRAME};
+use video_coach_harness::{
+    round_trip, write_one_source_project, write_project, Harness, FRAME, SAME_FRAME,
+};
 use video_coach_media::fixtures::{counter_video_with, CounterKind, CounterQuirks};
+use video_coach_media::frame_times;
 
 /// A project in `<tmp>/project` whose sources are 16:9 30 fps WebM fixtures
 /// of the given lengths in `<tmp>/media`, opened on a fresh bus that has
@@ -231,6 +234,104 @@ fn a_paused_scrub_shows_the_frame_export_picks() {
     for landing in round_trip(&mut h, &source, &targets) {
         landing.check();
     }
+    h.shutdown();
+}
+
+/// `,` and `.` step one frame while paused (plan Task 0.3), on the edit-listed
+/// MP4 whose stream times sit a nanosecond off round numbers. A forward step
+/// lands on the next frame's start; a step back lands inside the previous
+/// frame. Either way the position reported is the displayed frame's stream
+/// time, which is the frame export picks for it. Frames are told apart by
+/// their ends: a seek clips the frame it lands inside to its target.
+#[test]
+fn a_paused_step_moves_exactly_one_frame() {
+    gstreamer::init().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("project");
+    std::fs::create_dir(&folder).unwrap();
+    let source = counter_video_with(
+        &tmp.path().join("src.mp4"),
+        640,
+        360,
+        30,
+        300,
+        CounterKind::H264Mp4BFrames,
+        CounterQuirks::default(),
+    );
+    write_one_source_project(&folder, &source);
+
+    let mut h = Harness::new(&tmp.path().join("config"));
+    h.send(Command::OpenProject(folder));
+    h.wait_opened();
+    h.wait_settled();
+    let step = |forward| Command::StepFrame { forward };
+    let end = |frame: &video_coach_media::Frame| frame.stream_end.expect("a timed frame");
+
+    // Mid-frame, so the first frame shown is clipped and a step back can't
+    // take its start for the frame's own.
+    let (_, first) = h.seek_and_settle(Command::ScrubRelease { abs: 5.02 });
+    let start_end = end(&first);
+    let mut landed = Vec::new();
+    for (forward, n) in [(true, 1..=5), (false, 1..=5)] {
+        for i in n {
+            let (reported, frame) = h.seek_and_settle(step(forward));
+            let frames = if forward { i } else { 5 - i };
+            let expected = start_end + f64::from(frames) * FRAME;
+            eprintln!(
+                "{}: reported {reported:.6}, displayed {:?}..{:?}",
+                if forward { "." } else { "," },
+                frame.stream_time,
+                frame.stream_end
+            );
+            assert!(
+                (end(&frame) - expected).abs() <= SAME_FRAME,
+                "step {i} {} shows the frame ending at {}, not {expected}",
+                if forward { "forward" } else { "back" },
+                end(&frame)
+            );
+            let shown = frame.stream_time.expect("a timed frame");
+            assert!(
+                (reported - shown).abs() <= SAME_FRAME,
+                "reported {reported}, but the frame shown starts at {shown}"
+            );
+            landed.push((reported, end(&frame)));
+        }
+    }
+    // What P2 relies on: a key placed at the reported position is drawn on
+    // the frame the coach saw.
+    let reported: Vec<f64> = landed.iter().map(|&(r, _)| r).collect();
+    let export = frame_times(&source, &reported).expect("export's frame times");
+    for (&(reported, shown), export) in landed.iter().zip(export) {
+        assert!(
+            (shown - export.end).abs() <= SAME_FRAME,
+            "at {reported} export picks {export:?}, the scan player showed ..{shown}"
+        );
+    }
+
+    // Back from the first frame: nothing moves. Play is the barrier: the
+    // step was handled before it.
+    h.seek_and_settle(Command::ScrubRelease { abs: 0.0 });
+    let from = h.log().len();
+    h.send(step(false));
+    h.toggle_play();
+    wait_playing(&mut h, true);
+    // And while playing, nothing either. Pause is the barrier.
+    h.send(step(true));
+    h.toggle_play();
+    wait_playing(&mut h, false);
+    let seeks: Vec<&Event> = h.log()[from..]
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Position {
+                    target_abs: Some(_),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(seeks.is_empty(), "a step was taken: {seeks:#?}");
     h.shutdown();
 }
 

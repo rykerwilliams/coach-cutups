@@ -40,6 +40,8 @@ use crate::mailbox::FrameMailbox;
 pub enum Origin {
     Skip,
     Scrub,
+    /// A one-frame step.
+    Step,
     /// The bus itself: EOS advance, position restore, reloads.
     System,
 }
@@ -287,7 +289,29 @@ impl SourcePlayer {
             self.take_down(gst::State::Ready);
         }
         self.reset();
-        self.mailbox.take();
+        self.mailbox.clear();
+    }
+
+    /// Where a one-frame step from the frame on screen should seek, in source
+    /// seconds, accurately; `None` with no frame shown, or back from the
+    /// first. Meaningful only while paused and idle, with the player's own
+    /// frame up.
+    ///
+    /// Both directions work from the shown frame's **end**, which a seek never
+    /// clips, and never from its start, which it does: after a scrub the
+    /// start is the scrub's target, not the frame's. Forward seeks to that
+    /// end, which is the next frame's start (or, where timestamps overlap or
+    /// leave a gap, lands inside the next frame all the same). Back seeks
+    /// half a nominal frame before the shown frame's nominal start, the
+    /// middle of the previous frame, so the target holds on a stream whose
+    /// timestamps jitter by up to half a frame.
+    pub fn step_target(&self, forward: bool) -> Option<f64> {
+        let shown = self.mailbox.shown()?;
+        let target = match forward {
+            true => shown.end,
+            false => shown.end - 1.5 * shown.period,
+        };
+        (target >= 0.0).then_some(target)
     }
 
     /// Sets the volume from a linear slider value in `0..=1` (see [`gain`]).

@@ -128,6 +128,12 @@ pub enum Command {
     ScrubRelease {
         abs: f64,
     },
+    /// `,` and `.`: show the frame before or after the one on screen. Only
+    /// while the game video is paused and settled, with no preview open. Not
+    /// while recording: a paused take has no log entry replay could follow.
+    StepFrame {
+        forward: bool,
+    },
     /// Linear slider value in `0..=1`. Persisted to `scan_volume` only when
     /// `commit` is set (on slider release).
     SetVolume {
@@ -716,6 +722,7 @@ impl Bus {
             Command::Skip { delta, host_ns } => self.skip(delta, host_ns),
             Command::ScrubMove { abs } => self.scrub(abs, false),
             Command::ScrubRelease { abs } => self.scrub(abs, true),
+            Command::StepFrame { forward } => self.step_frame(forward),
             Command::SetVolume { value, commit } => self.set_volume(value, commit),
             Command::ToggleRecording { zoom } => self.toggle_recording(zoom),
             Command::StopRecording => self.stop_recording(),

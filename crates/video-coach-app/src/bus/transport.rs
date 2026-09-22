@@ -139,6 +139,35 @@ impl Bus {
         self.seek_abs(abs, release, Origin::Scrub);
     }
 
+    /// Shows the frame after the one on screen, or before it: only while
+    /// paused and settled, with no preview open, so the frame on screen is
+    /// the player's and is where it reports. It stays in its source, and
+    /// forward stops short of the end as every seek does. A step is a new
+    /// user context, like a scrub release, so it abandons a skip burst.
+    pub(super) fn step_frame(&mut self, forward: bool) {
+        if self.playing
+            || self.preview.is_some()
+            || !self.player.is_idle()
+            || !self.seekable()
+            || !self.loaded()
+        {
+            return;
+        }
+        let Some(target) = self.player.step_target(forward) else {
+            return;
+        };
+        let duration = self
+            .open
+            .as_ref()
+            .and_then(|open| open.project.source_videos.get(self.current))
+            .map_or(0.0, |s| s.duration_seconds);
+        if target > duration - END_MARGIN {
+            return;
+        }
+        self.reset_skip();
+        self.load(self.current, target, true, Origin::Step);
+    }
+
     /// The skip debounce fired: the burst is over.
     pub(super) fn skip_debounce_passed(&mut self) {
         let decision = self.skip.burst_ended();
