@@ -919,6 +919,17 @@ export struct LiveStroke {
     ink: color,
 }
 
+/// One player highlight on the live picture (spec H5), as
+/// `src/highlight_view.rs` builds it: the ring's commands and the pill's
+/// anchor, both in content-rect logical pixels.
+export struct LiveHighlight {
+    commands: string,
+    ink: color,
+    label: string,
+    label-x: length,
+    label-y: length,
+}
+
 /// One pass of a live telestration stroke (Phase 6 D5). Its `commands` are in
 /// the content rect's logical pixels, which `fit: preserve` takes as they
 /// are: it short-circuits before any bounding-box or stroke-width fitting, so
@@ -958,6 +969,58 @@ component StrokePath inherits Rectangle {
         // which is what the logged stroke carries and export burns in. `root`
         // is the content rect, by the 100% above.
         stroke-width: root.height * 0.005;
+    }
+}
+
+/// A player highlight's label on the live picture: a pill of the highlight's
+/// own colour (spec H4), centred on `anchor-x` and with its top at
+/// `anchor-y`.
+///
+/// **The two ends split the placement.** `highlight_view::live` chose the y —
+/// above the box, or below it where there is no room — using the same
+/// `1.5 × font-size` height and `0.03 × content-height` font as here, since
+/// it can't measure this pill. The x is clamped here, where the width the
+/// text came out at is finally known, so a ring at either edge keeps its
+/// number on the picture instead of half of it.
+component HighlightLabel inherits Rectangle {
+    in property <string> label;
+    in property <color> ink;
+    in property <length> anchor-x;
+    in property <length> anchor-y;
+    /// The content rect: the label scales with the picture's height, as the
+    /// pen and the ring do, so it reads the size export burns in, and its
+    /// width is what the pill is kept inside.
+    in property <length> content-width;
+    in property <length> content-height;
+
+    property <length> font-size: root.content-height * 0.03;
+
+    visible: root.label != "";
+    x: max(0px, min(root.anchor-x - self.width / 2, root.content-width - self.width));
+    y: root.anchor-y;
+    // The overlay's pill padding: `LABEL_PAD_RATIO` of the font size on each
+    // side of the line.
+    width: line.width + root.font-size * 0.7;
+    height: root.font-size * 1.5;
+    border-radius: self.height / 2;
+    background: root.ink;
+
+    line := Text {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.label;
+        font-size: root.font-size;
+        font-weight: 700;
+        // Black or white, whichever can be read on the pill: the swatch row
+        // runs from white to blue, so a fixed ink disappears at one end of
+        // it. The overlay's `label_ink`, with its relative-luminance weights
+        // -- whose sum is 1, so white's luminance is one channel of white,
+        // and the halfway mark can be written without knowing what scale a
+        // channel is on here.
+        color: root.ink.red * 0.2126 + root.ink.green * 0.7152 + root.ink.blue * 0.0722
+                > Colors.white.red / 2
+            ? #000000
+            : #ffffff;
     }
 }
 
@@ -1599,6 +1662,11 @@ export component AppWindow inherits Window {
     /// content-rect logical pixels. `src/main.rs` rebuilds it only when
     /// something changes (D5) — Slint re-parses a `Path` on every set.
     in property <[LiveStroke]> live-paths;
+    /// The player highlights showing on the picture now (spec H5), likewise
+    /// in content-rect pixels and likewise rebuilt only when they change.
+    /// They belong to the **footage**, not to a clip, so they show while
+    /// scanning as well as while recording.
+    in property <[LiveHighlight]> live-highlights;
     /// The stroke under the pen, likewise; empty when nothing is being drawn.
     in property <string> drawing-path;
     /// ... and its colour, the pen's when it went down.
@@ -2376,16 +2444,35 @@ export component AppWindow inherits Window {
                         height: player.content.height;
                         clip: true;
 
-                        // The live telestration layer (D5), above the picture
-                        // and clipped with it. Strokes are drawn where they
-                        // were made, on the zoomed picture as seen, so they
-                        // don't move with the zoom.
+                        // The live telestration layer (D5) and the player
+                        // highlights (H5), above the picture and clipped with
+                        // it. Strokes are drawn where they were made, on the
+                        // zoomed picture as seen, so they don't move with the
+                        // zoom; a ring is placed in the footage, so it does.
                         //
                         // Hidden while previewing (P6): the preview's texture
-                        // already has the clip's drawings rasterized into it,
-                        // and whatever is still on screen from scanning
-                        // belongs to the game video, not to the clip.
+                        // already has the clip's drawings and its rings
+                        // rasterized into it, and whatever is still on screen
+                        // from scanning belongs to the game video, not to the
+                        // clip.
                         if !root.previewing: Rectangle {
+                            // The player highlights (H5), **under** the
+                            // drawings, which is the layer order export
+                            // burns in. Every pill goes over every ring, so
+                            // one player's number is never cut in half by the
+                            // next player's ring.
+                            for ring in root.live-highlights: StrokePath {
+                                commands: ring.commands;
+                                ink: ring.ink;
+                            }
+                            for ring in root.live-highlights: HighlightLabel {
+                                label: ring.label;
+                                ink: ring.ink;
+                                anchor-x: ring.label-x;
+                                anchor-y: ring.label-y;
+                                content-width: parent.width;
+                                content-height: parent.height;
+                            }
                             for stroke in root.live-paths: StrokePath {
                                 commands: stroke.commands;
                                 ink: stroke.ink;

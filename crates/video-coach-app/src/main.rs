@@ -29,6 +29,7 @@ use video_coach_app::bus::{
 };
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
 use video_coach_app::format::{finish_at, format_hms, format_hms_tenths, sentence};
+use video_coach_app::highlight_view::{self, LiveHighlight as Ring};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
@@ -105,6 +106,11 @@ struct UiState {
     /// The content rect the window's `live-paths` were built for: their
     /// commands are in its pixels, so a resize has to rebuild them.
     paths_rect: (f64, f64),
+    /// The player highlights the window is drawing (spec H5), as the last
+    /// tick built them. Kept so the tick can set the model **only when it
+    /// changed**: Slint re-parses every path on every set, and this runs at
+    /// 30 Hz over a picture that usually has no highlight on it at all.
+    highlight_rings: Vec<Ring>,
     /// When the notice line clears, if one is up.
     notice_until: Option<Instant>,
     /// The previewed clip's duration while a preview is open. The transport
@@ -154,6 +160,7 @@ impl Default for UiState {
             drawing: None,
             pen: Pen::default(),
             paths_rect: (0.0, 0.0),
+            highlight_rings: Vec::new(),
             notice_until: None,
             preview_duration: None,
             export_targets: Vec::new(),
@@ -1344,6 +1351,18 @@ fn show_strokes(w: &AppWindow, ui: &mut UiState, rect: (f64, f64)) {
     w.set_live_paths(ModelRc::new(VecModel::from(paths)));
 }
 
+/// A live highlight as the window's struct. The ring's commands are already
+/// in the content rect's pixels, which is what the `Path` takes.
+fn slint_highlight(ring: &Ring) -> LiveHighlight {
+    LiveHighlight {
+        commands: ring.commands.as_str().into(),
+        ink: slint_color(ring.ink),
+        label: ring.label.as_str().into(),
+        label_x: ring.label_x as f32,
+        label_y: ring.label_y as f32,
+    }
+}
+
 /// The one place the pen changes, in the window and for the next stroke.
 fn set_pen(w: &AppWindow, pen: Pen) {
     UI.with_borrow_mut(|ui| ui.pen = pen);
@@ -1886,12 +1905,18 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         let total = ui
             .preview_duration
             .unwrap_or_else(|| project.total_source_duration());
+        // Where the game video is, unless a preview is open. Queried once a
+        // tick: the rings below are placed on the same frame the readout is.
+        let scan = ui
+            .preview_duration
+            .is_none()
+            .then(|| scan_abs(ui, &project, position));
         let current = if w.get_scrubbing() {
             f64::from(w.get_position_seconds())
         } else {
-            let abs = match ui.preview_duration.is_some() {
-                true => preview.seconds(),
-                false => scan_abs(ui, &project, position),
+            let abs = match scan {
+                Some(abs) => abs,
+                None => preview.seconds(),
             };
             let abs = abs.clamp(0.0, total.max(0.0));
             w.set_position_seconds(abs as f32);
@@ -1915,6 +1940,23 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
             _ => String::new(),
         };
         w.set_readout(format!("{now} / {}{speed}", format_hms(total)).into());
+        // The player highlights on the live picture (spec H5), from the same
+        // anchor as the Match panel's clock. Not while previewing: the
+        // preview's texture already carries its rings, and its transport is
+        // record time within one clip rather than a place in the footage.
+        let rings = match (scan, content) {
+            (Some(abs), Some((cw, ch))) => {
+                let (source_index, secs) = project.locate(abs);
+                highlight_view::live_highlights(&project, source_index, secs, ui.zoom, cw, ch)
+            }
+            _ => Vec::new(),
+        };
+        if ui.highlight_rings != rings {
+            w.set_live_highlights(ModelRc::new(VecModel::from(
+                rings.iter().map(slint_highlight).collect::<Vec<_>>(),
+            )));
+            ui.highlight_rings = rings;
+        }
         // The Match panel's live line (spec S4), from the same anchor. It
         // **freezes while a preview is open**: the transport is then record
         // time within one clip, and the preview's own scoreboard is already
