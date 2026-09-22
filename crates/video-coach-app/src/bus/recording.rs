@@ -114,7 +114,9 @@ impl Bus {
 
         self.generation += 1;
         let (tx, generation) = (self.tx.clone(), self.generation);
-        let started = Recorder::start(sources, &path, move |msg| {
+        // The last take's final frame must not open this one.
+        let _ = self.self_view.take();
+        let started = Recorder::start(sources, &path, self.self_view.clone(), move |msg| {
             // Fails only once the bus thread has exited.
             let _ = tx.send(Input::Recorder(generation, msg));
         });

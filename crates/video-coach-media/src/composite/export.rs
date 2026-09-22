@@ -922,4 +922,18 @@ mod tests {
         assert!(!path.exists());
         assert!(!part_path(&path).exists());
     }
+
+    /// Every export is the shape the live self-view places its inset in
+    /// (`layout::pip_rect_over_picture`).
+    #[test]
+    fn every_resolution_is_the_layout_s_output_aspect() {
+        for resolution in [Resolution::R720, Resolution::R1080, Resolution::R2160] {
+            let (w, h) = output_size(resolution);
+            assert!(
+                (f64::from(w) / f64::from(h) - video_coach_core::layout::OUTPUT_ASPECT).abs()
+                    < 1e-9,
+                "{resolution:?} is {w}×{h}"
+            );
+        }
+    }
 }

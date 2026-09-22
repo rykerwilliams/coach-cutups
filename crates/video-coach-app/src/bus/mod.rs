@@ -417,6 +417,8 @@ pub struct Bus {
     /// The one mailbox: the player and the preview both fill it, and the bus
     /// keeps only one of them PLAYING.
     mailbox: FrameMailbox,
+    /// The recording's live self-view: every recorder is given it.
+    self_view: FrameMailbox,
     /// Which sinks the player was built with, and with them which GL context
     /// a preview may composite on (spec P1).
     sinks: SinkKind,
@@ -512,6 +514,7 @@ impl Bus {
         video_coach_media::keep_pulsesink_out();
         let (tx, rx) = mpsc::channel();
         let mailbox = FrameMailbox::default();
+        let self_view = FrameMailbox::default();
         let preview_position = PreviewPosition::default();
         let player = SourcePlayer::new(sinks, mailbox.clone(), {
             let tx = tx.clone();
@@ -528,6 +531,7 @@ impl Bus {
             player,
             position: position.clone(),
             mailbox: mailbox.clone(),
+            self_view: self_view.clone(),
             sinks,
             gl: None,
             state,
@@ -562,6 +566,7 @@ impl Bus {
             tx,
             thread: Some(thread),
             mailbox,
+            self_view,
             position,
             preview_position,
         }
@@ -750,6 +755,7 @@ pub struct BusHandle {
     tx: mpsc::Sender<Input>,
     thread: Option<JoinHandle<()>>,
     mailbox: FrameMailbox,
+    self_view: FrameMailbox,
     position: PositionHandle,
     preview_position: PreviewPosition,
 }
@@ -763,6 +769,12 @@ impl BusHandle {
     /// Where the player's video sink delivers frames.
     pub fn mailbox(&self) -> &FrameMailbox {
         &self.mailbox
+    }
+
+    /// Where the recording's live self-view delivers its frames: small RGBA
+    /// frames in system memory, from the camera, while a recording runs.
+    pub fn self_view(&self) -> &FrameMailbox {
+        &self.self_view
     }
 
     /// Position queries on the running pipeline — the one direct pipeline

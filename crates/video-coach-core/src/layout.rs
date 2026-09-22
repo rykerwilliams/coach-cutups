@@ -85,6 +85,34 @@ pub fn pip_rect(out_w: f64, out_h: f64, cam_aspect: f64) -> Rect {
     }
 }
 
+/// The composite's output shape. Every export resolution and the clip
+/// preview are 16:9, and the source is letterboxed or pillarboxed into it.
+pub const OUTPUT_ASPECT: f64 = 16.0 / 9.0;
+
+/// Where the webcam inset lands **relative to the picture**, in whatever
+/// space `picture` is given in: [`pip_rect`] carried from output space into
+/// the picture's.
+///
+/// For the live self-view while recording: the UI draws the game video's
+/// picture (the content rect, at 1×), not the output frame, and the export
+/// fits that picture into a 16:9 frame before placing the inset in it. So the
+/// output frame here is the one the picture fits exactly, centred on it — the
+/// export's fit, inverted — and on a non-16:9 picture the inset reaches past
+/// the picture into where the export's bars would be, as it does there.
+pub fn pip_rect_over_picture(picture: Rect, cam_aspect: f64) -> Rect {
+    let (w, h) = if picture.w / picture.h >= OUTPUT_ASPECT {
+        (picture.w, picture.w / OUTPUT_ASPECT)
+    } else {
+        (picture.h * OUTPUT_ASPECT, picture.h)
+    };
+    let pip = pip_rect(w, h, cam_aspect);
+    Rect {
+        x: picture.x + (picture.w - w) / 2.0 + pip.x,
+        y: picture.y + (picture.h - h) / 2.0 + pip.y,
+        ..pip
+    }
+}
+
 // --------------------------------------------------------------- scoreboard
 //
 // The scoreboard's own ratios, deliberately **not** shared with the text bar's:

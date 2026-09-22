@@ -279,7 +279,7 @@ This fix applies whenever the user pauses, recording or not, so the plan lands i
 - **Level bar:**
   - the maximum over channels of peak dB from the `level` element, mapped from −60…0 dBFS onto the bar's width;
   - shows "Waiting for audio…" until the first level message arrives.
-- **No live camera preview** (macOS parity).
+- ~~**No live camera preview** (macOS parity).~~ **Reversed (2026-09-22), at the user's request:** a live self-view shows the camera while recording (and while starting, once frames flow), where the export's webcam inset goes (`core::layout::pip_rect_over_picture`), so the coach sees their framing and lighting before the take is over. It is a separate pipeline, started by `Recorder::start` before the recording's PLAYING (t0 is unchanged), fed from a buffer probe on the camera caps into a one-buffer leaky `appsrc`, so it can't stall, fail or finalize the recording; a self-view that fails is logged and the recording goes ahead (`capture/self_view.rs`). The UI accepts its frames only while recording and hides it after 1 s without one.
 - **Clips list:** the sidebar gains a **Clips** section below Sources, with each clip's name and duration (`format_hms`), ordered by `sort_index`. There is no selection or editing yet (Phase 3).
 - **Errors:** new `UserError` variants. They cover:
   - device missing (a notice; the recording still goes ahead);

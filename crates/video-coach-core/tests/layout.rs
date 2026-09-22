@@ -1,9 +1,15 @@
 //! The composite's layout ratios.
 
 use video_coach_core::layout::{
-    bar_rect, pip_rect, scoreboard_rects, stroke_line_width, Rect, BAR_HEIGHT_RATIO,
-    PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
+    bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects, stroke_line_width, Rect,
+    BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
 };
+
+fn close(a: Rect, b: Rect) -> bool {
+    [a.x - b.x, a.y - b.y, a.w - b.w, a.h - b.h]
+        .iter()
+        .all(|d| d.abs() < 1e-9)
+}
 
 #[test]
 fn the_pip_sits_above_the_text_bar_at_the_ratio_table_s_size() {
@@ -66,6 +72,67 @@ fn a_camera_of_another_aspect_changes_the_pip_s_height_only() {
     assert!((four_three.y + four_three.h - (wide.y + wide.h)).abs() < 1e-9);
     // The camera is neither stretched nor letterboxed inside the inset.
     assert!((four_three.w / four_three.h - 4.0 / 3.0).abs() < 1e-12);
+}
+
+/// A 4:3 picture is pillarboxed into the export's 16:9 frame: the 1440×1080
+/// picture sits 240 px in from the left of 1920×1080. Wherever the UI draws
+/// that picture, the inset lands on it where the export puts it — which is
+/// partly past the picture's right edge, over the bar.
+#[test]
+fn over_a_4_3_picture_the_inset_lands_where_the_export_puts_it() {
+    let export = pip_rect(1920.0, 1080.0, 16.0 / 9.0);
+    // The export's picture rect for a 4:3 source (media's `fit_rect`).
+    let (px, pw, ph) = (240.0, 1440.0, 1080.0);
+    // The same picture drawn at a third of the size, somewhere in the UI.
+    let (s, ox, oy) = (1.0 / 3.0, 100.0, 60.0);
+    let picture = Rect {
+        x: ox,
+        y: oy,
+        w: pw * s,
+        h: ph * s,
+    };
+    let r = pip_rect_over_picture(picture, 16.0 / 9.0);
+    assert!(close(
+        r,
+        Rect {
+            x: ox + (export.x - px) * s,
+            y: oy + export.y * s,
+            w: export.w * s,
+            h: export.h * s,
+        }
+    ));
+    assert!(r.x + r.w > picture.x + picture.w);
+    // 22% of the *output's* width, not the picture's.
+    assert!((r.w - PIP_WIDTH_RATIO * picture.h * 16.0 / 9.0).abs() < 1e-9);
+}
+
+/// A picture wider than 16:9 is letterboxed: the inset rises off the picture
+/// by the bottom bar's height. (A 16:9 picture is the output frame itself.)
+#[test]
+fn over_a_wide_picture_the_inset_is_placed_in_the_letterboxed_frame() {
+    let export = pip_rect(1920.0, 1080.0, 16.0 / 9.0);
+    let frame = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+    assert!(close(pip_rect_over_picture(frame, 16.0 / 9.0), export));
+    // 2.4:1 at 1920 wide: 800 tall, 140 from the top of 1920×1080.
+    let picture = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 800.0,
+    };
+    let r = pip_rect_over_picture(picture, 16.0 / 9.0);
+    assert!(close(
+        r,
+        Rect {
+            y: export.y - 140.0,
+            ..export
+        }
+    ));
 }
 
 #[test]

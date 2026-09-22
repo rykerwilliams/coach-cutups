@@ -6,6 +6,9 @@
 //! draws whichever is playing without knowing which that is. The bus
 //! guarantees only one of them is ever PLAYING, and empties the slot when it
 //! swaps them, so no frame of the one just stopped stays on screen.
+//!
+//! The recorder's live self-view has a second mailbox of its own, with small
+//! RGBA frames in system memory rather than GL textures.
 
 use std::sync::{Arc, Mutex};
 

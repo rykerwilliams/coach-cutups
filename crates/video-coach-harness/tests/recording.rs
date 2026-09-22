@@ -259,6 +259,25 @@ fn a_recording_makes_a_clip_where_the_player_was() {
     rig.h.shutdown();
 }
 
+/// The camera is shown live while recording, and only then.
+#[test]
+fn the_camera_is_shown_live_while_recording() {
+    let mut rig = Rig::open(&[("a.webm", 4)]);
+    assert!(rig.h.take_self_view().is_none());
+
+    rig.record();
+    rig.h
+        .poll_until("a self-view frame", |h| h.take_self_view().is_some());
+    rig.stop();
+
+    // Whatever was on its way at the stop is gone after a take, and nothing
+    // follows it.
+    rig.h.take_self_view();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(rig.h.take_self_view().is_none());
+    rig.h.shutdown();
+}
+
 /// A second R during start-up cancels.
 #[test]
 fn stopping_before_the_first_video_frame_leaves_no_clip_and_no_file() {

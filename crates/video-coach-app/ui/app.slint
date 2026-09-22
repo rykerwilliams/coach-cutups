@@ -1350,6 +1350,18 @@ export component AppWindow inherits Window {
     /// included), so the picture is never stretched. Only its shape matters.
     in property <float> frame-width: 16;
     in property <float> frame-height: 9;
+    /// The camera, live, while recording (set by `src/video.rs`), in square
+    /// pixels. Drawn where the export puts the webcam inset, so what the
+    /// coach sees is what viewers will.
+    in property <image> self-view;
+    /// Recording (or starting) with the camera's frames arriving. Cleared by
+    /// `src/main.rs` when they stop, so a self-view that failed or stalled
+    /// is hidden rather than frozen.
+    in property <bool> self-view-shown;
+    /// Where the webcam inset lands on the picture (`core::layout::
+    /// pip_rect_over_picture`), from the content rect and the camera's
+    /// aspect. Pure, like `place-picture`.
+    pure callback place-self-view(PictureRect, float) -> PictureRect;
 
     // --- Zoom (spec D9; the state and the math are on the Rust side) ---
 
@@ -2197,6 +2209,32 @@ export component AppWindow inherits Window {
                             transform-scale: player.shown-zoom.scale;
                             image-fit: fill;
                         }
+                    }
+
+                    // The live self-view, where the export's webcam inset
+                    // goes: over the picture, under the drawings (the
+                    // export's layer order), placed on the content rect so
+                    // the zoom doesn't move it. Outside the content clip,
+                    // since on a picture that isn't 16:9 the inset reaches
+                    // into the bars, as it does in the export. It takes no
+                    // input: a drag that starts on it draws, as the stroke
+                    // lands over the inset in the export too.
+                    if root.self-view-shown: Image {
+                        property <PictureRect> at: root.place-self-view(player.content, root.self-view.width / root.self-view.height);
+                        x: self.at.x;
+                        y: self.at.y;
+                        width: self.at.width;
+                        height: self.at.height;
+                        source: root.self-view;
+                        image-fit: fill;
+                    }
+
+                    Rectangle {
+                        x: player.content.x;
+                        y: player.content.y;
+                        width: player.content.width;
+                        height: player.content.height;
+                        clip: true;
 
                         // The live telestration layer (D5), above the picture
                         // and clipped with it. Strokes are drawn where they

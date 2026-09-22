@@ -4,6 +4,9 @@
 //! It is a second pipeline next to the `SourcePlayer`, and its messages reach
 //! the owner only through `on_message`, never through the player's message
 //! path (R1).
+//!
+//! The live self-view is a third pipeline, started with this one and fed
+//! from the camera's caps without being part of it (see `self_view.rs`).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +18,9 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 
 use super::devices::{choose_encoder, Camera, Input};
+use super::self_view;
 use crate::error_text;
+use crate::mailbox::FrameMailbox;
 
 /// Test sources' frame size: small, so x264 stays cheap on CI, where tests run
 /// in parallel.
@@ -69,6 +74,8 @@ pub struct Recorder {
     t0_ns: u64,
     /// Running time, in ns, of the latest buffer end at any mux pad.
     last_end: Arc<AtomicU64>,
+    /// The live self-view's pipeline, if it started.
+    self_view: Option<gst::Pipeline>,
 }
 
 type OnMessage = Arc<dyn Fn(RecorderMessage) + Send + Sync>;
@@ -79,15 +86,24 @@ impl Recorder {
     /// first frame).
     /// On Err the caller deletes `path` (filesink has created it).
     ///
+    /// The camera is shown live in `self_view` until the recording stops:
+    /// small RGBA frames in system memory, `FrameMailbox`'s latest-wins
+    /// handoff, from the camera's first frame, which may be before
+    /// `FirstVideo`. It can't disturb the recording: it only ever gets a
+    /// reference to a camera frame, through a queue that drops rather than
+    /// waits, in a pipeline of its own (`self_view.rs`). A self-view that
+    /// fails, to start or later, is logged, and the recording goes ahead.
+    ///
     /// `on_message` is called on GStreamer's threads.
     pub fn start(
         sources: CaptureSources,
         path: &Path,
+        self_view: FrameMailbox,
         on_message: impl Fn(RecorderMessage) + Send + Sync + 'static,
     ) -> Result<Recorder, String> {
         let on_message: OnMessage = Arc::new(on_message);
         let last_end = Arc::new(AtomicU64::new(0));
-        let pipeline = build(&sources, path, &on_message, &last_end)
+        let (pipeline, self_view) = build(&sources, path, self_view, &on_message, &last_end)
             .map_err(|e| format!("could not build the recording pipeline: {e}"))?;
 
         let bus = pipeline.bus().expect("a pipeline has a bus");
@@ -125,10 +141,14 @@ impl Recorder {
                     pipeline,
                     t0_ns: t0.nseconds(),
                     last_end,
+                    self_view,
                 })
             }
             (started, _) => {
                 let _ = pipeline.set_state(gst::State::Null);
+                if let Some(view) = &self_view {
+                    let _ = view.set_state(gst::State::Null);
+                }
                 Err(match bus.pop_filtered(&[gst::MessageType::Error]) {
                     Some(msg) => match msg.view() {
                         gst::MessageView::Error(err) => error_text(err),
@@ -154,6 +174,13 @@ impl Recorder {
         &self.pipeline
     }
 
+    /// The self-view's pipeline, if it started. For tests only (they stall
+    /// its consumer); not part of the API.
+    #[doc(hidden)]
+    pub fn self_view_pipeline(&self) -> Option<&gst::Pipeline> {
+        self.self_view.as_ref()
+    }
+
     /// EOS, wait ≤ timeout for EOS/ERROR on the pipeline's own bus, NULL.
     /// An ERROR already on the bus returns at once, unclean.
     pub fn stop(self, timeout: Duration) -> StopOutcome {
@@ -177,16 +204,24 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+        // Second: the camera, now stopped, pushes into it no more. Bounded by
+        // one frame's decode and scale, since nothing in it waits on anything
+        // else, and a sink blocked by a test is unblocked by the flush.
+        if let Some(view) = &self.self_view {
+            let _ = view.set_state(gst::State::Null);
+        }
     }
 }
 
-/// The R1 pipeline, in NULL, on the system clock.
+/// The R1 pipeline, in NULL, on the system clock, and its self-view, if that
+/// started.
 fn build(
     sources: &CaptureSources,
     path: &Path,
+    self_view: FrameMailbox,
     on_message: &OnMessage,
     last_end: &Arc<AtomicU64>,
-) -> Result<gst::Pipeline, glib::BoolError> {
+) -> Result<(gst::Pipeline, Option<gst::Pipeline>), glib::BoolError> {
     let pipeline = gst::Pipeline::new();
     // R5: t0 and every event's `host_ns` are on CLOCK_MONOTONIC. `pulsesrc`'s
     // clock was measured ~473,000 s off it.
@@ -323,7 +358,15 @@ fn build(
             first_video.then(|| on_message.clone()),
         );
     }
-    Ok(pipeline)
+    // Last, so nothing after it can fail and leave it running. A failure is
+    // the self-view's alone.
+    let camera = video_filter
+        .static_pad("src")
+        .expect("a capsfilter has a src pad");
+    let self_view = self_view::start(&camera, input, self_view)
+        .inspect_err(|e| eprintln!("recorder: the self-view failed: {e}"))
+        .ok();
+    Ok((pipeline, self_view))
 }
 
 /// Drops `src`'s buffers with PTS before `delay`. A live `videotestsrc`'s PTS

@@ -5,6 +5,10 @@
 //! pipeline leave NULL (the startup gate). Before each redraw it takes the
 //! newest frame from the mailbox and gives Slint the frame's texture to draw,
 //! with no copy. On teardown it waits for the bus to release the context.
+//!
+//! The recording's self-view comes the cheap way instead: small RGBA frames
+//! in system memory from a mailbox of its own, copied into a Slint image in
+//! the same place.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,6 +20,7 @@ use gstreamer_gl_egl as gst_gl_egl;
 use slint::ComponentHandle;
 
 use video_coach_app::bus::{BusHandle, Command};
+use video_coach_media::Frame;
 
 use crate::AppWindow;
 
@@ -73,6 +78,11 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
     bus.borrow().mailbox().set_redraw(move || {
         let _ = weak.upgrade_in_event_loop(|w| w.window().request_redraw());
     });
+    // Likewise from the self-view's thread.
+    let weak = window.as_weak();
+    bus.borrow().self_view().set_redraw(move || {
+        let _ = weak.upgrade_in_event_loop(|w| w.window().request_redraw());
+    });
 
     let weak = window.as_weak();
     let mut context: Option<gst_gl::GLContext> = None;
@@ -94,6 +104,17 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
             slint::RenderingState::BeforeRendering => {
                 if let Some(stats) = &mut stats {
                     stats.started = Some(Instant::now());
+                }
+                // Taken whether or not it is shown: outside a recording it
+                // can only be the last one's, arriving late.
+                let self_view = bus.borrow().self_view().take();
+                if let (Some(image), Some(w)) =
+                    (self_view.as_ref().and_then(rgba_image), weak.upgrade())
+                {
+                    if w.get_recording() {
+                        w.set_self_view(image);
+                        crate::self_view_arrived();
+                    }
                 }
                 let Some(context) = &context else {
                     return;
@@ -162,6 +183,27 @@ pub fn install(window: &AppWindow, bus: Rc<RefCell<BusHandle>>) {
             _ => {}
         })
         .expect("no rendering notifier: the renderer is not OpenGL (need skia-opengl)");
+}
+
+/// A self-view frame (RGBA in system memory) as a Slint image: one copy of
+/// about 0.5 MB at the self-view's 480 px, measured at 0.18 ms of the UI
+/// thread per frame (a buffer zeroed and then filled row by row cost 0.7 ms).
+///
+/// `None` for a padded layout, which the self-view's pipeline doesn't make:
+/// RGBA rows are tightly packed by default.
+fn rgba_image(frame: &Frame) -> Option<slint::Image> {
+    let (width, height) = (frame.info.width(), frame.info.height());
+    let row = width as usize * 4;
+    if usize::try_from(frame.info.stride()[0]).ok()? != row || frame.info.offset()[0] != 0 {
+        return None;
+    }
+    let map = frame.buffer.map_readable().ok()?;
+    let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        map.get(..row * height as usize)?,
+        width,
+        height,
+    );
+    Some(slint::Image::from_rgba8(pixels))
 }
 
 /// Wraps Slint's current EGL display and context for GStreamer. Fails loudly

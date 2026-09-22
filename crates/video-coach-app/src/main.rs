@@ -33,6 +33,7 @@ use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
+use video_coach_core::layout;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
@@ -54,6 +55,11 @@ slint::include_modules!();
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// How long a notice stays up.
 const NOTICE: Duration = Duration::from_secs(6);
+/// How long the self-view stays up without a new frame. It is hidden when
+/// its frames stop, rather than frozen on the last one: a failed or stalled
+/// self-view says nothing about the recording, and a frozen one would look
+/// like the camera's picture.
+const SELF_VIEW_QUIET: Duration = Duration::from_secs(1);
 /// What a drag over the picture says outside a recording, where it can only
 /// pan and at 1× visibly does nothing (`zoom_input::drawing_hint`).
 const DRAWING_HINT: &str = "Drawing works while recording — press R";
@@ -84,6 +90,8 @@ struct UiState {
     /// The recording's t0 on `now_ns()`'s clock, once its video started,
     /// for the elapsed-time readout.
     recording_t0: Option<u64>,
+    /// When the self-view's latest frame arrived, during this recording.
+    self_view_at: Option<Instant>,
     /// The drawings on screen, each with the `now_ns()` moment it auto-clears
     /// (Phase 6 spec D3) — the pen-up the logged rule counts from, on the
     /// same clock. Live, "now" only moves forward and a finished stroke is
@@ -141,6 +149,7 @@ impl Default for UiState {
             zoom: Zoom::IDENTITY,
             drag: None,
             recording_t0: None,
+            self_view_at: None,
             live_strokes: Vec::new(),
             drawing: None,
             pen: Pen::default(),
@@ -963,6 +972,25 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let notches: Vec<f32> = SNAP_NOTCHES.iter().map(|&n| n as f32).collect();
     window.set_zoom_notches(ModelRc::new(VecModel::from(notches)));
 
+    window.on_place_self_view(|content, cam_aspect| {
+        let picture = layout::Rect {
+            x: content.x.into(),
+            y: content.y.into(),
+            w: content.width.into(),
+            h: content.height.into(),
+        };
+        // Nothing to place on before the first layout, or with no picture.
+        if !(picture.w > 0.0 && picture.h > 0.0 && cam_aspect > 0.0) {
+            return PictureRect::default();
+        }
+        let r = layout::pip_rect_over_picture(picture, cam_aspect.into());
+        PictureRect {
+            x: r.x as f32,
+            y: r.y as f32,
+            width: r.w as f32,
+            height: r.h as f32,
+        }
+    });
     window.on_place_picture(|zoom, frame_w, frame_h, area_w, area_h| {
         let zoom = Zoom::new(zoom.scale.into(), zoom.pan_x.into(), zoom.pan_y.into());
         let Some(vp) = Viewport::new(frame_w.into(), frame_h.into(), area_w.into(), area_h.into())
@@ -1276,6 +1304,12 @@ fn on_event(w: &AppWindow, event: Event) {
                 ui.recording_t0 = match status {
                     RecordingStatus::Recording { t0_ns } => Some(t0_ns),
                     _ => None,
+                };
+                // The next recording's self-view waits for its own frames:
+                // `video.rs` accepts none outside a recording.
+                if status == RecordingStatus::Idle {
+                    ui.self_view_at = None;
+                    w.set_self_view(slint::Image::default());
                 }
             });
             w.set_recording_phase(match status {
@@ -1688,14 +1722,25 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
     Uuid::parse_str(&w.get_selected_clip()).ok()
 }
 
+/// The self-view drew a frame (`video.rs`).
+fn self_view_arrived() {
+    UI.with_borrow_mut(|ui| ui.self_view_at = Some(Instant::now()));
+}
+
 /// The 30 Hz readout and scrubber update (spec D8): the scrubber's own value
 /// while it's dragged, else the outstanding seek's target, else the player's
 /// position on the current source. Also the recording's elapsed time (R11),
-/// the notice's expiry, and the drawings' (Phase 6 D5, which reuses this
-/// timer rather than adding one).
+/// the notice's expiry, the drawings' (Phase 6 D5, which reuses this timer
+/// rather than adding one), and whether the self-view is still arriving.
 fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
     let content = content_size(w);
     UI.with_borrow_mut(|ui| {
+        w.set_self_view_shown(
+            w.get_recording()
+                && ui
+                    .self_view_at
+                    .is_some_and(|at| at.elapsed() < SELF_VIEW_QUIET),
+        );
         if let Some(rect) = content {
             let now_ns = now_ns();
             let before = ui.live_strokes.len();

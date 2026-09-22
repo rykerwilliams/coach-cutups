@@ -11,7 +11,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
-use video_coach_media::{now_ns, CaptureSources, Recorder, RecorderMessage};
+use gstreamer_video as gst_video;
+use video_coach_media::{now_ns, CaptureSources, FrameMailbox, Recorder, RecorderMessage};
 
 const FRAME: f64 = 1.0 / 30.0;
 
@@ -22,6 +23,8 @@ struct Recording {
     path: PathBuf,
     /// How long `Recorder::start` took.
     started_in: Duration,
+    /// Where the self-view's frames arrive.
+    self_view: FrameMailbox,
 }
 
 fn start(dir: &Path, video_delay: Duration) -> Recording {
@@ -29,16 +32,23 @@ fn start(dir: &Path, video_delay: Duration) -> Recording {
     let path = dir.join("rec.mkv");
     let (tx, messages) = mpsc::channel();
     let tx = Mutex::new(tx);
+    let self_view = FrameMailbox::default();
     let begun = Instant::now();
-    let recorder = Recorder::start(CaptureSources::Test { video_delay }, &path, move |msg| {
-        let _ = tx.lock().unwrap().send((now_ns(), msg));
-    })
+    let recorder = Recorder::start(
+        CaptureSources::Test { video_delay },
+        &path,
+        self_view.clone(),
+        move |msg| {
+            let _ = tx.lock().unwrap().send((now_ns(), msg));
+        },
+    )
     .unwrap();
     Recording {
         recorder,
         messages,
         path,
         started_in: begun.elapsed(),
+        self_view,
     }
 }
 
@@ -59,8 +69,9 @@ fn wait_for(
     None
 }
 
-/// The first video and audio PTS in the file, in seconds, read by demuxing it.
-fn first_pts(path: &Path) -> (Option<f64>, Option<f64>) {
+/// Every video and every audio PTS in the file, in seconds, in order, read
+/// by demuxing it.
+fn pts(path: &Path) -> (Vec<f64>, Vec<f64>) {
     let pipeline = gst::parse::launch(&format!(
         "filesrc location={} ! matroskademux name=demux",
         path.display()
@@ -68,11 +79,11 @@ fn first_pts(path: &Path) -> (Option<f64>, Option<f64>) {
     .unwrap()
     .downcast::<gst::Pipeline>()
     .unwrap();
-    let firsts: Arc<Mutex<(Option<f64>, Option<f64>)>> = Arc::default();
+    let pts: Arc<Mutex<(Vec<f64>, Vec<f64>)>> = Arc::default();
     let demux = pipeline.by_name("demux").unwrap();
     demux.connect_pad_added({
         let pipeline = pipeline.downgrade();
-        let firsts = firsts.clone();
+        let pts = pts.clone();
         move |_, pad| {
             let pipeline = pipeline.upgrade().unwrap();
             let sink = gst::ElementFactory::make("fakesink")
@@ -86,13 +97,12 @@ fn first_pts(path: &Path) -> (Option<f64>, Option<f64>) {
             sink.sync_state_with_parent().unwrap();
             pad.link(&sink.static_pad("sink").unwrap()).unwrap();
             let video = pad.name().starts_with("video");
-            let firsts = firsts.clone();
+            let pts = pts.clone();
             pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-                let pts = info.buffer().and_then(|b| b.pts()).map(|t| t.seconds_f64());
-                let mut firsts = firsts.lock().unwrap();
-                let slot = if video { &mut firsts.0 } else { &mut firsts.1 };
-                if slot.is_none() {
-                    *slot = pts;
+                if let Some(t) = info.buffer().and_then(|b| b.pts()) {
+                    let mut pts = pts.lock().unwrap();
+                    let list = if video { &mut pts.0 } else { &mut pts.1 };
+                    list.push(t.seconds_f64());
                 }
                 gst::PadProbeReturn::Ok
             });
@@ -105,8 +115,11 @@ fn first_pts(path: &Path) -> (Option<f64>, Option<f64>) {
     );
     pipeline.set_state(gst::State::Null).unwrap();
     assert_eq!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos));
-    let firsts = *firsts.lock().unwrap();
-    firsts
+    let (mut video, mut audio) = std::mem::take(&mut *pts.lock().unwrap());
+    // Decode order is not display order once B-frames are in.
+    video.sort_by(f64::total_cmp);
+    audio.sort_by(f64::total_cmp);
+    (video, audio)
 }
 
 #[test]
@@ -168,9 +181,9 @@ fn delayed_video_starts_at_its_running_time() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(rec.recorder.stop(Duration::from_secs(5)).clean);
 
-    let (video, audio) = first_pts(&rec.path);
-    let video = video.expect("the file has video");
-    let audio = audio.expect("the file has audio");
+    let (video, audio) = pts(&rec.path);
+    let video = *video.first().expect("the file has video");
+    let audio = *audio.first().expect("the file has audio");
     assert!((video - 0.5).abs() <= 0.040, "first video at {video} s");
     assert!(audio < 0.040, "first audio at {audio} s");
 }
@@ -212,4 +225,117 @@ fn stop_times_out_when_eos_never_arrives() {
         "stop took {took:?}"
     );
     assert!(outcome.duration > 0.0);
+}
+
+/// Records 2 s with a self-view that `stall` breaks as soon as its first
+/// frame is shown, and checks the recording is the one it would have been
+/// without a self-view: no recorder error, `stop` is prompt and clean, and
+/// the file holds every frame, with no gap, to the stop.
+///
+/// Run on a thread of its own, so a recording the self-view has stalled fails
+/// the test rather than hanging it: a camera thread stuck in the self-view
+/// never returns from the recorder's NULL.
+fn records_through_a_broken_self_view(stall: fn(&gst::Pipeline)) {
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = start(dir.path(), Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let frame = loop {
+            if let Some(frame) = rec.self_view.take() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "no self-view frame");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Small, RGBA, the camera's shape (320×180 from the test source).
+        assert_eq!(
+            (frame.info.width(), frame.info.height()),
+            (480, 270),
+            "{:?}",
+            frame.info
+        );
+        assert_eq!(frame.info.format(), gst_video::VideoFormat::Rgba);
+
+        let view = rec.recorder.self_view_pipeline().unwrap();
+        stall(view);
+        std::thread::sleep(Duration::from_secs(2));
+        // The leaky bound: a stalled self-view holds one frame, not two
+        // seconds of them.
+        let held: u64 = view
+            .by_name("self-view-src")
+            .unwrap()
+            .property("current-level-buffers");
+        let begun = Instant::now();
+        let outcome = rec.recorder.stop(Duration::from_secs(5));
+        let took = begun.elapsed();
+        let errors: Vec<_> = rec
+            .messages
+            .try_iter()
+            .filter(|(_, m)| matches!(m, RecorderMessage::Error(_)))
+            .collect();
+        let (pts, _) = pts(&rec.path);
+        let _ = done.send((held, outcome, took, errors, pts));
+    });
+    let (held, outcome, took, errors, pts) = match finished.recv_timeout(Duration::from_secs(20)) {
+        Ok(results) => results,
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the recording thread panicked"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the recording stalled: stop never returned")
+        }
+    };
+
+    assert!(held <= 1, "the stalled self-view holds {held} frames");
+    assert!(errors.is_empty(), "{errors:?}");
+
+    assert!(outcome.clean, "stop timed out");
+    assert!(took < Duration::from_secs(1), "stop took {took:?}");
+    let (first, last) = (pts[0], *pts.last().unwrap());
+    assert!(outcome.duration > 2.0, "{} s", outcome.duration);
+    assert!(
+        (last + FRAME - outcome.duration).abs() <= FRAME,
+        "the last frame is at {last} s of {} s",
+        outcome.duration
+    );
+    // Every frame of a steady 30 fps from the first to the last.
+    let expected = ((last - first) / FRAME).round() as usize + 1;
+    assert_eq!(pts.len(), expected, "frames from {first} s to {last} s");
+    let gap = pts.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+    assert!(gap < 1.5 * FRAME, "a {gap} s gap in the video");
+}
+
+/// The property the self-view must keep above all: a display that stops
+/// taking frames altogether (its sink's thread blocked for good) costs the
+/// recording nothing.
+#[test]
+fn a_self_view_that_stops_consuming_never_stalls_the_recording() {
+    records_through_a_broken_self_view(|view| {
+        sink_pad(view).add_probe(
+            gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
+            |_, _| gst::PadProbeReturn::Ok,
+        );
+    });
+}
+
+/// ... nor does one that fails: its source's next push returns an error, which
+/// stops its streaming and posts an ERROR. Neither reaches the recording.
+#[test]
+fn a_self_view_that_fails_never_ends_the_recording() {
+    records_through_a_broken_self_view(|view| {
+        view.by_name("self-view-src")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, |_, info| {
+                info.flow_res = Err(gst::FlowError::Error);
+                gst::PadProbeReturn::Handled
+            });
+    });
+}
+
+fn sink_pad(view: &gst::Pipeline) -> gst::Pad {
+    view.by_name("self-view-sink")
+        .unwrap()
+        .static_pad("sink")
+        .unwrap()
 }

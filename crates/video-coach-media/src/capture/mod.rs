@@ -1,9 +1,10 @@
 //! Commentary capture: device enumeration, the camera-mode and encoder
-//! choices (spec R2–R4), the recorder (R1, R6), and the one clock every
-//! recording timestamp is read from (R5).
+//! choices (spec R2–R4), the recorder (R1, R6) with its live self-view, and
+//! the one clock every recording timestamp is read from (R5).
 
 mod devices;
 mod recorder;
+mod self_view;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;

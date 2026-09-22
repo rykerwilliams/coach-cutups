@@ -17,7 +17,7 @@ use video_coach_app::bus::{
 };
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
-use video_coach_media::{fixtures, now_ns, probe, SinkKind, TranscribeKind};
+use video_coach_media::{fixtures, now_ns, probe, Frame, SinkKind, TranscribeKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -287,6 +287,12 @@ impl Harness {
     /// The pipeline's position in its current source, in seconds.
     pub fn position_secs(&self) -> Option<f64> {
         self.bus.position_handle().query_position()
+    }
+
+    /// Takes the recording's newest self-view frame, if one arrived since the
+    /// last take, as the UI's redraw does.
+    pub fn take_self_view(&self) -> Option<Frame> {
+        self.bus.self_view().take()
     }
 
     /// Seconds into the previewed clip, as the UI's tick reads them (spec
