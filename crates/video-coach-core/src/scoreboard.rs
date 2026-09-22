@@ -186,10 +186,12 @@ pub enum ReelTrimError {
     NotAGoal,
     #[error("the position is on a different video from the goal")]
     OtherSource,
-    #[error("the reel must start before the goal")]
-    StartNotBeforeGoal,
-    #[error("the reel must end after the goal")]
-    EndNotAfterGoal,
+    /// A start that isn't before the goal, or an end that isn't after it.
+    #[error("the reel must {} the goal", match .0 {
+        ReelEnd::Start => "start before",
+        ReelEnd::End => "end after",
+    })]
+    WrongSideOfGoal(ReelEnd),
 }
 
 // ---------------------------------------------------------- interpretation
@@ -578,18 +580,16 @@ impl Project {
                 return Err(ReelTrimError::OtherSource)
             }
             Some((_, at)) => {
-                let (seconds, error) = match end {
-                    ReelEnd::Start => (
-                        record.source_seconds - at,
-                        ReelTrimError::StartNotBeforeGoal,
-                    ),
-                    ReelEnd::End => (at - record.source_seconds, ReelTrimError::EndNotAfterGoal),
+                let s = match end {
+                    ReelEnd::Start => record.source_seconds - at,
+                    ReelEnd::End => at - record.source_seconds,
                 };
-                // A NaN position is refused too.
-                if seconds.is_nan() || seconds <= 0.0 {
-                    return Err(error);
+                // One check, false for a NaN position too.
+                if s > 0.0 {
+                    Some(s)
+                } else {
+                    return Err(ReelTrimError::WrongSideOfGoal(end));
                 }
-                Some(seconds)
             }
         };
         match end {

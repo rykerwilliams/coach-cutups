@@ -118,25 +118,6 @@ impl CompilationPlan {
     }
 }
 
-/// The clips `target` covers, in stored order (Phase 3 spec C3).
-///
-/// [`compilation_plan`] builds its entries from this; an entry names its clip
-/// by [`PlanEntry::clip_id`], so nothing downstream pairs entries with clips
-/// by position.
-pub(crate) fn selected_clips<'a>(project: &'a Project, target: &ExportTarget) -> Vec<&'a Clip> {
-    project
-        .clips
-        .iter()
-        .filter(|c| match target {
-            ExportTarget::AllClips => true,
-            ExportTarget::Tag(tag) => c.tags.iter().any(|t| t == tag),
-            ExportTarget::Clip(id) => c.id == *id,
-            // Built from the goals, not from clips.
-            ExportTarget::Reel => false,
-        })
-        .collect()
-}
-
 /// The bar's line for the `n`th of `total` clips, empty parts collapsed.
 fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
     [
@@ -153,7 +134,10 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 /// Build a plan for `target`.
 ///
 /// [`ExportTarget::Reel`] builds its entries from the goals
-/// ([`crate::reel`]); every other target from [`selected_clips`].
+/// ([`crate::reel`]); every other target from the clips it covers, in stored
+/// order (Phase 3 spec C3). An entry names its clip by
+/// [`PlanEntry::clip_id`], so nothing downstream pairs entries with clips by
+/// position.
 ///
 /// **`SourceRef::duration_seconds` is the single duration authority.** Phase 2's
 /// probe writes it back when a source is added or relinked, so there is nothing
@@ -167,12 +151,17 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 /// to cover any in-range position the clip visits at rate 1, so the segment
 /// builder never clamps a forward skip it should not have.
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
-    if *target == ExportTarget::Reel {
-        return CompilationPlan {
-            entries: crate::reel::reel_entries(project),
-        };
-    }
-    let clips = selected_clips(project, target);
+    let all = project.clips.iter();
+    let clips: Vec<&Clip> = match target {
+        ExportTarget::Reel => {
+            return CompilationPlan {
+                entries: crate::reel::reel_entries(project),
+            }
+        }
+        ExportTarget::AllClips => all.collect(),
+        ExportTarget::Tag(tag) => all.filter(|c| c.tags.contains(tag)).collect(),
+        ExportTarget::Clip(id) => all.filter(|c| c.id == *id).collect(),
+    };
     let count = clips.len();
 
     let mut entries = Vec::with_capacity(count);

@@ -4,7 +4,6 @@
 use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::{compilation_plan, CompilationPlan, ExportTarget};
 use video_coach_core::project::{Project, SourceRef};
-use video_coach_core::reel::{REEL_LEAD_IN, REEL_TAIL};
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::timeline::SegmentKind;
@@ -64,9 +63,9 @@ fn texts(plan: &CompilationPlan) -> Vec<&str> {
 
 #[test]
 fn a_goal_gets_thirty_seconds_before_and_six_after() {
-    assert_eq!((REEL_LEAD_IN, REEL_TAIL), (30.0, 6.0));
     let mut p = project(&[1000.0]);
     p.append_match_event(HOME, 0, 100.0);
+    assert_eq!(p.match_events[0].reel_span(), (30.0, 6.0));
 
     let plan = reel(&p);
     assert_eq!(spans(&plan), [(0, 70.0, 106.0)]);
@@ -146,6 +145,39 @@ fn one_side_of_a_trim_overrides_only_that_side() {
     p.set_reel_trim(b, ReelEnd::End, Some((0, 502.0))).unwrap();
 
     assert_eq!(spans(&reel(&p)), [(0, 95.0, 106.0), (0, 470.0, 502.0)]);
+}
+
+/// Only a file edited by hand stores a trim that isn't a positive, finite
+/// number of seconds: that side takes the default, and the other side keeps
+/// its trim.
+#[test]
+fn a_nonsense_stored_trim_falls_back_to_the_default() {
+    let mut p = project(&[1000.0]);
+    p.append_match_event(HOME, 0, 100.0);
+    for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+        p.match_events[0].reel_lead_in = Some(bad);
+        p.match_events[0].reel_tail = Some(2.0);
+        assert_eq!(p.match_events[0].reel_span(), (30.0, 2.0), "{bad}");
+        p.match_events[0].reel_lead_in = Some(4.0);
+        p.match_events[0].reel_tail = Some(bad);
+        assert_eq!(p.match_events[0].reel_span(), (4.0, 6.0), "{bad}");
+    }
+    assert_eq!(spans(&reel(&p)), [(0, 96.0, 106.0)]);
+}
+
+/// A goal past its source's end (a hand-edited file, or a duration that
+/// shrank on a relink) has nothing to play and gets no entry; one exactly at
+/// the end still gets its lead-in.
+#[test]
+fn a_goal_at_or_past_its_sources_end() {
+    let mut p = project(&[100.0]);
+    p.append_match_event(HOME, 0, 150.0);
+    assert!(reel(&p).entries.is_empty());
+
+    p.append_match_event(AWAY, 0, 100.0);
+    let plan = reel(&p);
+    assert_eq!(spans(&plan), [(0, 70.0, 100.0)]);
+    assert_eq!(texts(&plan), ["1 / 1 | Away goal"]);
 }
 
 #[test]

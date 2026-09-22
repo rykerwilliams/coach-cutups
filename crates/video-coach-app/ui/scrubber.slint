@@ -21,8 +21,8 @@ export struct Mark {
 export component Scrubber {
     in property <bool> enabled;
     in property <float> maximum;
-    /// Drawn over the track, under the pointer: a click on a mark scrubs
-    /// there like anywhere else.
+    /// Drawn on the track, under the thumb and the pointer: a click on a
+    /// mark scrubs there like anywhere else.
     in property <[Mark]> marks;
     in-out property <float> value;
     /// A scrub is under way: from the press to its end, however it ends.
@@ -53,9 +53,24 @@ export component Scrubber {
 
     property <length> thumb: 20px;
 
+    /// Where the value `at` is drawn: `value-at` turned round, so a mark sits
+    /// exactly where a click scrubs to its value.
+    public pure function mark-x(at: float) -> length {
+        return root.thumb / 2 + clamp(at / max(root.maximum, 0.001), 0, 1) * (root.width - root.thumb);
+    }
+
     function scrub-to(x: length) {
         root.value = value-at(x);
         root.moved(root.value);
+    }
+
+    // Before the slider, so its thumb paints over them.
+    for mark in root.marks: Rectangle {
+        x: root.mark-x(mark.at) - self.width / 2;
+        y: (root.height - self.height) / 2;
+        width: 2px;
+        height: 12px;
+        background: mark.color;
     }
 
     slider := Slider {
@@ -65,16 +80,6 @@ export component Scrubber {
         minimum: 0;
         maximum: root.maximum;
         value: root.value;
-    }
-
-    // `value-at`'s geometry turned round: a mark sits where a click would
-    // scrub to its value.
-    for mark in root.marks: Rectangle {
-        x: root.thumb / 2 + clamp(mark.at / max(root.maximum, 0.001), 0, 1) * (root.width - root.thumb) - self.width / 2;
-        y: (root.height - self.height) / 2;
-        width: 2px;
-        height: 12px;
-        background: mark.color;
     }
 
     // Above the slider and the marks, so it takes every pointer event.

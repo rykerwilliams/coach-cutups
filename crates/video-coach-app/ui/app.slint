@@ -685,6 +685,29 @@ component TagOverview inherits VerticalLayout {
     }
 }
 
+/// One of a goal row's reel buttons (spec R3): a glyph, as the row's other
+/// buttons are, with its name for screen readers and a tooltip.
+component ReelButton inherits VerticalLayout {
+    in property <string> text;
+    in property <string> name;
+    in property <styled-text> tip;
+    in property <bool> enabled;
+    callback clicked();
+
+    alignment: center;
+    Button {
+        text: root.text;
+        width: 28px;
+        accessible-label: root.name;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+
+        Tooltip {
+            text: root.tip;
+        }
+    }
+}
+
 /// The Match panel (Phase 9 S4), under the inspector's column: the live score
 /// and clock, the three tag actions the `z`, `x` and `v` keys also fire, and
 /// the tagged events in match order with a seek and a delete each.
@@ -711,8 +734,8 @@ component MatchPanel inherits VerticalLayout {
     /// recording, and the panel doesn't act on the game video behind a
     /// preview.
     in property <bool> can-edit;
-    /// How many rows are goals, which are two lines tall: the list's height.
-    in property <int> goal-count;
+    /// How many lines the list has, a goal's row being two: its height.
+    in property <int> lines;
     callback tag(MatchTag);
     callback seek(string);
     callback remove(string);
@@ -793,7 +816,7 @@ component MatchPanel inherits VerticalLayout {
     // A height of its own, so a long match scrolls rather than pushing the
     // inspector out of the column.
     ListView {
-        height: min(168px, (root.rows.length + root.goal-count) * 28px);
+        height: min(168px, root.lines * 28px);
         for row in root.rows: VerticalLayout {
             HorizontalLayout {
                 height: 28px;
@@ -856,61 +879,33 @@ component MatchPanel inherits VerticalLayout {
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: "⇤";
-                        width: 28px;
-                        accessible-label: "Reel starts here";
-                        enabled: root.can-edit;
-                        clicked => { root.trim(row.id, ReelTrim.start-here); }
-
-                        Tooltip {
-                            text: @markdown("Reel starts here: the goal's entry begins at this frame");
-                        }
-                    }
+                ReelButton {
+                    text: "⇤";
+                    name: "Reel starts here";
+                    tip: @markdown("Reel starts here: the goal's entry begins at this frame");
+                    enabled: root.can-edit;
+                    clicked => { root.trim(row.id, ReelTrim.start-here); }
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: "↺";
-                        width: 28px;
-                        accessible-label: "Reset reel start";
-                        enabled: root.can-edit;
-                        clicked => { root.trim(row.id, ReelTrim.reset-start); }
-
-                        Tooltip {
-                            text: @markdown("Reset the reel start to the default");
-                        }
-                    }
+                ReelButton {
+                    text: "↺";
+                    name: "Reset reel start";
+                    tip: @markdown("Reset the reel start to the default");
+                    enabled: root.can-edit;
+                    clicked => { root.trim(row.id, ReelTrim.reset-start); }
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: "⇥";
-                        width: 28px;
-                        accessible-label: "Reel ends here";
-                        enabled: root.can-edit;
-                        clicked => { root.trim(row.id, ReelTrim.end-here); }
-
-                        Tooltip {
-                            text: @markdown("Reel ends here: the goal's entry stops at this frame");
-                        }
-                    }
+                ReelButton {
+                    text: "⇥";
+                    name: "Reel ends here";
+                    tip: @markdown("Reel ends here: the goal's entry stops at this frame");
+                    enabled: root.can-edit;
+                    clicked => { root.trim(row.id, ReelTrim.end-here); }
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: "↺";
-                        width: 28px;
-                        accessible-label: "Reset reel end";
-                        enabled: root.can-edit;
-                        clicked => { root.trim(row.id, ReelTrim.reset-end); }
-
-                        Tooltip {
-                            text: @markdown("Reset the reel end to the default");
-                        }
-                    }
+                ReelButton {
+                    text: "↺";
+                    name: "Reset reel end";
+                    tip: @markdown("Reset the reel end to the default");
+                    enabled: root.can-edit;
+                    clicked => { root.trim(row.id, ReelTrim.reset-end); }
                 }
             }
         }
@@ -1658,13 +1653,12 @@ export component AppWindow inherits Window {
     in property <string> match-clock;
     /// Every tagged event in match order.
     in property <[MatchRow]> match-rows;
-    in property <int> match-goal-count;
+    /// The Match list's height in lines: a row each, and a second for a
+    /// goal's reel span.
+    in property <int> match-list-lines;
     /// A tick on the scrubber per match event (spec C1), on the concat
     /// timeline's scale.
     in property <[Mark]> match-marks;
-    /// What a goal's mark is drawn in with no scoreboard, so no team colour:
-    /// read by `src/main.rs`, which builds the marks.
-    out property <color> accent-color: Palette.accent-background;
     /// Every period of the format is tagged, so the bus would refuse another
     /// start/stop: the action is off and the panel says why (S5).
     in property <bool> match-at-cap;
@@ -2616,7 +2610,7 @@ export component AppWindow inherits Window {
                                 score: root.match-score;
                                 clock: root.match-clock;
                                 rows: root.match-rows;
-                                goal-count: root.match-goal-count;
+                                lines: root.match-list-lines;
                                 can-tag: root.can-tag;
                                 at-cap: root.match-at-cap;
                                 // The bus refuses a scrub and an edit while

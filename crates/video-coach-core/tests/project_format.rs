@@ -450,6 +450,27 @@ fn an_upgrade_keeps_the_old_file_once() {
     );
 }
 
+/// A crash mid-copy leaves the backup's temporary file behind, and no backup.
+/// The next save still makes the backup, from the file as it stands.
+#[test]
+fn a_stale_backup_temp_file_does_not_block_the_backup() {
+    let dir = TempDir::new().unwrap();
+    let mut v7 = serde_json::to_value(sample_project()).unwrap();
+    v7["formatVersion"] = json!(7);
+    write_raw(dir.path(), v7);
+    let original = std::fs::read(dir.path().join("project.json")).unwrap();
+    let stale = dir.path().join(".project.json.v7.tmp");
+    std::fs::write(&stale, b"{\"half\": ").unwrap();
+
+    let mut p = store::read(dir.path()).unwrap();
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("project.json.v7")).unwrap(),
+        original
+    );
+    assert!(!stale.exists(), "the temporary file is renamed away");
+}
+
 #[test]
 fn write_creates_the_recordings_directory() {
     let dir = TempDir::new().unwrap();

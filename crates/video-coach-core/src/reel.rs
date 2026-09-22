@@ -19,11 +19,28 @@ use crate::timeline::{PlaybackSegment, SegmentKind};
 /// youth move, and the coach trims it down, which is cheaper than finding
 /// footage that was cut off. **Never replace it with a guess that could be
 /// shorter**: a cut-off assist is the one failure the reel must not have.
-pub const REEL_LEAD_IN: f64 = 30.0;
+const REEL_LEAD_IN: f64 = 30.0;
 
 /// How long a goal's entry runs after the goal, unless its
 /// [`MatchEventRecord::reel_tail`] says otherwise.
-pub const REEL_TAIL: f64 = 6.0;
+const REEL_TAIL: f64 = 6.0;
+
+impl MatchEventRecord {
+    /// `(lead-in, tail)`: how long this goal's reel entry runs before and
+    /// after it, each its stored trim or the default. A stored trim that
+    /// isn't a positive, finite number of seconds (only a file edited by hand
+    /// has one) is ignored for the default, one side at a time.
+    pub fn reel_span(&self) -> (f64, f64) {
+        let or = |trim: Option<f64>, default| {
+            trim.filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(default)
+        };
+        (
+            or(self.reel_lead_in, REEL_LEAD_IN),
+            or(self.reel_tail, REEL_TAIL),
+        )
+    }
+}
 
 /// One entry's span of game video, before it is numbered.
 struct Span<'a> {
@@ -66,7 +83,8 @@ pub(crate) fn reel_entries(project: &Project) -> Vec<PlanEntry> {
             .get(goal.source_index)
             .map_or(f64::INFINITY, |s| s.duration_seconds);
         let at = goal.source_seconds;
-        let end = duration.min(at + goal.reel_tail.unwrap_or(REEL_TAIL));
+        let (lead_in, tail) = goal.reel_span();
+        let end = duration.min(at + tail);
 
         let prev_end = match spans.last_mut() {
             Some(prev) if prev.goal.source_index == goal.source_index => {
@@ -78,7 +96,7 @@ pub(crate) fn reel_entries(project: &Project) -> Vec<PlanEntry> {
             }
             _ => 0.0,
         };
-        let start = (at - goal.reel_lead_in.unwrap_or(REEL_LEAD_IN)).max(prev_end);
+        let start = (at - lead_in).max(prev_end);
         // Only a goal past its source's end (a file edited by hand, or a
         // duration that shrank on a relink) has nothing to play.
         if end > start {

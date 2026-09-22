@@ -7,10 +7,10 @@
 //! plan, one schedule, one progress model, one cancel.
 //!
 //! **Everything is refused up front, naming the clip** (or, for the reel, the
-//! goal). A missing game video or commentary recording fails the whole run
-//! before a frame is rendered, rather than an hour into one. Media itself only
-//! warns about either and degrades to a black inset or to silence, so this
-//! check is what makes the loss visible at all.
+//! game video's file). A missing game video or commentary recording fails the
+//! whole run before a frame is rendered, rather than an hour into one. Media
+//! itself only warns about either and degrades to a black inset or to silence,
+//! so this check is what makes the loss visible at all.
 //!
 //! **Progress is frames, and the whole run travels in every event.** The
 //! sheet renders the run it is handed, so it can't be left holding a state the
@@ -120,9 +120,11 @@ pub struct ExportTargetRow {
     pub target: ExportTarget,
     /// What the sheet calls it, and what names its file (spec E6).
     pub label: String,
-    /// How many plan entries it has: clips, or the reel's goals after
-    /// merging. Not a goal count — two goals can share an entry.
-    pub entries: usize,
+    /// What its row counts: the clips it covers, or the reel's goals, which
+    /// are not its entries, since two goals close together share one.
+    pub count: usize,
+    /// What [`ExportTargetRow::count`] counts, singular: `"clip"` or `"goal"`.
+    pub unit: &'static str,
     /// How long its output runs, from its frame count
     /// (`CompilationPlan::total_frames`).
     pub seconds: f64,
@@ -137,10 +139,15 @@ pub struct ExportTargetRow {
 pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTargetRow> {
     let row = |target: ExportTarget, label: String| {
         let plan = compilation_plan(project, &target);
+        let (count, unit) = match target {
+            ExportTarget::Reel => (reel_goals(project).len(), "goal"),
+            _ => (plan.entries.len(), "clip"),
+        };
         (!plan.entries.is_empty()).then(|| ExportTargetRow {
             target,
             label,
-            entries: plan.entries.len(),
+            count,
+            unit,
             seconds: plan.total_frames() as f64 / f64::from(OUTPUT_FPS),
         })
     };
@@ -216,7 +223,7 @@ impl Active {
                 let seconds = self.target_started.elapsed().as_secs_f64();
                 eprintln!(
                     "bus: exported {}: {} frames in {seconds:.1} s ({:.1} fps), \
-                     decoder {:?}, glupload caps {:?}, encoder {}, {}",
+                     decoder {:?}, glupload caps {:?}, encoder {}, chapters {:?}",
                     done.path.display(),
                     target.frames,
                     target.frames as f64 / seconds,
@@ -484,23 +491,19 @@ fn job(
                 .expect("the plan's clips are the project's clips")
         });
         if missing.get(entry.source_index).copied().unwrap_or(true) {
-            let whose = match clip {
-                Some(clip) => format!("{}'s", clip_label(clip)),
-                // A reel entry: named by the first goal on its source, which
-                // is the first goal of the first entry there, counted in the
-                // goals and never in the entries (two goals can share one).
+            let what = match clip {
+                Some(clip) => format!("{}'s game video", clip_label(clip)),
+                // A reel entry has no clip to name: the file names itself.
                 None => {
-                    let n = reel_goals(&open.project)
-                        .iter()
-                        .position(|g| g.source_index == entry.source_index)
-                        .expect("a reel entry is cut around a goal on its source")
-                        + 1;
-                    format!("goal {n}'s")
+                    let file = open
+                        .project
+                        .source_videos
+                        .get(entry.source_index)
+                        .map_or("a video", |s| s.display_name.as_str());
+                    format!("{file} (a goal's game video)")
                 }
             };
-            return Err(refused(format!(
-                "{whose} game video is missing; relink it first"
-            )));
+            return Err(refused(format!("{what} is missing; relink it first")));
         }
         let Some(clip) = clip else {
             entries.push(None);

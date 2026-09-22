@@ -8,7 +8,6 @@
 //! the same. The file's size and `mdat` are untouched, so no `stco` offset
 //! moves. Only `ffprobe` (and so mpv) and VLC read `chpl`.
 
-use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -24,37 +23,11 @@ const HEADER: u64 = 8;
 /// What [`splice`] did to the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChapterOutcome {
-    /// This many chapters are in the file.
+    /// This many chapters are in the file: 0 for a plan of fewer than two
+    /// entries, which has none.
     Written(usize),
-    /// The file is exactly as it was.
-    Skipped(SkipReason),
-}
-
-/// Why a file keeps no chapters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    /// There were none to write: a plan of fewer than two entries.
-    NoChapters,
-    /// The `free` box after `moov` can't take the box and still be a box
-    /// (a remainder of 1–7 bytes), or there is no `free` there at all.
-    NoRoom,
-    /// The muxer didn't honour the reserve and wrote `moov` at the end.
-    MoovAfterMdat,
-}
-
-impl fmt::Display for ChapterOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChapterOutcome::Written(n) => write!(f, "{n} chapters"),
-            ChapterOutcome::Skipped(SkipReason::NoChapters) => write!(f, "no chapters"),
-            ChapterOutcome::Skipped(SkipReason::NoRoom) => {
-                write!(f, "no chapters (no room left in the moov reserve)")
-            }
-            ChapterOutcome::Skipped(SkipReason::MoovAfterMdat) => {
-                write!(f, "no chapters (moov was written after mdat)")
-            }
-        }
-    }
+    /// The file is exactly as it was, for this reason.
+    Skipped(&'static str),
 }
 
 /// One box: where it starts, its header's length (8, or 16 for a 64-bit
@@ -123,13 +96,21 @@ fn walk(
     Ok(boxes)
 }
 
+/// The boxes in `bytes[from..to]`: [`walk`] over memory.
+fn walk_bytes(bytes: &[u8], from: u64, to: u64) -> io::Result<Vec<Box4>> {
+    walk(from, to, |at, out| {
+        out.copy_from_slice(&bytes[at as usize..at as usize + out.len()]);
+        Ok(())
+    })
+}
+
 /// Overwrites the size field of `b`, whose bytes start at `buf[0]`, with
 /// `size`.
-fn set_size(buf: &mut [u8], b: &Box4, size: u64) -> io::Result<()> {
+fn set_size(buf: &mut [u8], b: &Box4, size: u64) -> Result<(), &'static str> {
     if b.header == 16 {
         buf[8..16].copy_from_slice(&size.to_be_bytes());
     } else {
-        let size = u32::try_from(size).map_err(|_| invalid(format!("{size} bytes in a u32")))?;
+        let size = u32::try_from(size).map_err(|_| "a box outgrew its 32-bit size")?;
         buf[..4].copy_from_slice(&size.to_be_bytes());
     }
     Ok(())
@@ -167,11 +148,15 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 /// Writes `chapters` into the MP4 at `path` in place, keeping the first
-/// [`MAX_CHAPTERS`]. An error means the file may be half-written: `moov` is
-/// one positioned write, but a failed write can still leave part of it.
+/// [`MAX_CHAPTERS`].
+///
+/// **Chapters never cost an export.** Anything wrong with the file's layout,
+/// found before the write, is a skip that leaves the file as it was. Only
+/// opening the file, or the positioned write itself, is an error: a failed
+/// write can leave part of `moov` rewritten, and that file is corrupt.
 pub fn splice(path: &Path, chapters: &[(f64, &str)]) -> io::Result<ChapterOutcome> {
     if chapters.is_empty() {
-        return Ok(ChapterOutcome::Skipped(SkipReason::NoChapters));
+        return Ok(ChapterOutcome::Written(0));
     }
     if chapters.len() > MAX_CHAPTERS {
         eprintln!(
@@ -183,34 +168,53 @@ pub fn splice(path: &Path, chapters: &[(f64, &str)]) -> io::Result<ChapterOutcom
     let chapters = &chapters[..chapters.len().min(MAX_CHAPTERS)];
 
     let file = File::options().read(true).write(true).open(path)?;
-    let len = file.metadata()?.len();
-    let top = walk(0, len, |at, buf| file.read_exact_at(buf, at))?;
-    let Some(m) = top.iter().position(|b| &b.kind == b"moov") else {
-        return Err(invalid("no moov box".into()));
+    match layout(&file, chapters) {
+        Ok((at, moov)) => {
+            file.write_all_at(&moov, at)?;
+            Ok(ChapterOutcome::Written(chapters.len()))
+        }
+        Err(reason) => Ok(ChapterOutcome::Skipped(reason)),
+    }
+}
+
+/// Where `moov` starts, and its bytes with `chapters` spliced in, followed
+/// by what is left of the `free` after it; or why the file can't take them.
+fn layout(file: &File, chapters: &[(f64, &str)]) -> Result<(u64, Vec<u8>), &'static str> {
+    // A read error or a box that doesn't fit: the detail goes to stderr.
+    let unreadable = |e: io::Error| {
+        eprintln!("chapters: {e}");
+        "the file's boxes could not be read"
     };
+    let len = file.metadata().map_err(unreadable)?.len();
+    let top = walk(0, len, |at, buf| file.read_exact_at(buf, at)).map_err(unreadable)?;
+    let m = top
+        .iter()
+        .position(|b| &b.kind == b"moov")
+        .ok_or("there is no moov")?;
     if top[..m].iter().any(|b| &b.kind == b"mdat") {
-        return Ok(ChapterOutcome::Skipped(SkipReason::MoovAfterMdat));
+        return Err("moov was written after mdat");
     }
     let moov = top[m];
-    let Some(free) = top.get(m + 1).filter(|b| &b.kind == b"free").copied() else {
-        return Ok(ChapterOutcome::Skipped(SkipReason::NoRoom));
-    };
+    let free = top
+        .get(m + 1)
+        .filter(|b| &b.kind == b"free")
+        .copied()
+        .ok_or("no free box follows moov")?;
 
     let mut buf = vec![0u8; moov.size as usize];
-    file.read_exact_at(&mut buf, moov.start)?;
-    let children = walk(moov.header, moov.size, |at, out| {
-        out.copy_from_slice(&buf[at as usize..at as usize + out.len()]);
-        Ok(())
-    })?;
+    file.read_exact_at(&mut buf, moov.start)
+        .map_err(unreadable)?;
+    let children = walk_bytes(&buf, moov.header, moov.size).map_err(unreadable)?;
     let udta = children.iter().find(|b| &b.kind == b"udta").copied();
     let mut insert = chpl(chapters);
     if udta.is_none() {
         insert = boxed(b"udta", &insert);
     }
     let grow = insert.len() as u64;
+    // What is left of the `free` must be nothing or still a box.
     let rest = match free.size.checked_sub(grow) {
         Some(rest) if rest == 0 || rest >= HEADER => rest,
-        _ => return Ok(ChapterOutcome::Skipped(SkipReason::NoRoom)),
+        _ => return Err("no room left in the moov reserve"),
     };
 
     // `chpl` goes at the end of `udta`, or a new `udta` at the end of `moov`.
@@ -224,12 +228,11 @@ pub fn splice(path: &Path, chapters: &[(f64, &str)]) -> io::Result<ChapterOutcom
     // What is left of the `free` needs only its header: its payload is
     // never read.
     if rest > 0 {
-        let rest = u32::try_from(rest).map_err(|_| invalid(format!("a free of {rest} bytes")))?;
+        let rest = u32::try_from(rest).map_err(|_| "the free box is too big to shrink")?;
         buf.extend_from_slice(&rest.to_be_bytes());
         buf.extend_from_slice(b"free");
     }
-    file.write_all_at(&buf, moov.start)?;
-    Ok(ChapterOutcome::Written(chapters.len()))
+    Ok((moov.start, buf))
 }
 
 #[cfg(test)]
@@ -274,17 +277,22 @@ mod tests {
 
     /// The boxes in `bytes[from..to]`, as (type, start, size).
     fn boxes(bytes: &[u8], from: usize, to: usize) -> Vec<(String, usize, usize)> {
-        walk(from as u64, to as u64, |at, out| {
-            out.copy_from_slice(&bytes[at as usize..at as usize + out.len()]);
-            Ok(())
-        })
-        .unwrap()
-        .into_iter()
-        .map(|b| {
-            let kind = String::from_utf8_lossy(&b.kind).into_owned();
-            (kind, b.start as usize, b.size as usize)
-        })
-        .collect()
+        walk_bytes(bytes, from as u64, to as u64)
+            .unwrap()
+            .into_iter()
+            .map(|b| {
+                let kind = String::from_utf8_lossy(&b.kind).into_owned();
+                (kind, b.start as usize, b.size as usize)
+            })
+            .collect()
+    }
+
+    /// The top-level box types in `bytes`, in order.
+    fn kinds(bytes: &[u8]) -> Vec<String> {
+        boxes(bytes, 0, bytes.len())
+            .into_iter()
+            .map(|b| b.0)
+            .collect()
     }
 
     /// The `chpl` payload in `bytes`' `moov/udta`, decoded as
@@ -331,11 +339,7 @@ mod tests {
             read_chpl(&after),
             [(0, "1 / 2 | a".into()), (51_000_000, "2 / 2 | b".into())]
         );
-        let kinds: Vec<_> = boxes(&after, 0, after.len())
-            .into_iter()
-            .map(|b| b.0)
-            .collect();
-        assert_eq!(kinds, ["ftyp", "moov", "free", "mdat"]);
+        assert_eq!(kinds(&after), ["ftyp", "moov", "free", "mdat"]);
     }
 
     #[test]
@@ -353,11 +357,7 @@ mod tests {
         let (_dir, path, _) = file(&[moov(true), free(need), mdat()]);
         assert_eq!(splice(&path, &TWO).unwrap(), ChapterOutcome::Written(2));
         let after = std::fs::read(&path).unwrap();
-        let kinds: Vec<_> = boxes(&after, 0, after.len())
-            .into_iter()
-            .map(|b| b.0)
-            .collect();
-        assert_eq!(kinds, ["moov", "mdat"]);
+        assert_eq!(kinds(&after), ["moov", "mdat"]);
         assert_eq!(read_chpl(&after).len(), 2);
     }
 
@@ -369,7 +369,7 @@ mod tests {
             let (_dir, path, before) = file(&[moov(true), free(size), mdat()]);
             assert_eq!(
                 splice(&path, &TWO).unwrap(),
-                ChapterOutcome::Skipped(SkipReason::NoRoom),
+                ChapterOutcome::Skipped("no room left in the moov reserve"),
                 "a free of {size} for {need}"
             );
             assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -377,7 +377,7 @@ mod tests {
         let (_dir, path, before) = file(&[moov(true), mdat()]);
         assert_eq!(
             splice(&path, &TWO).unwrap(),
-            ChapterOutcome::Skipped(SkipReason::NoRoom)
+            ChapterOutcome::Skipped("no free box follows moov")
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
@@ -387,7 +387,7 @@ mod tests {
         let (_dir, path, before) = file(&[boxed(b"ftyp", b"isom"), mdat(), moov(true), free(400)]);
         assert_eq!(
             splice(&path, &TWO).unwrap(),
-            ChapterOutcome::Skipped(SkipReason::MoovAfterMdat)
+            ChapterOutcome::Skipped("moov was written after mdat")
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
@@ -401,21 +401,46 @@ mod tests {
         let (_dir, path, _) = file(&[moov(true), free(400), large(b"mdat", &[0xaa; 40]), to_end]);
         assert_eq!(splice(&path, &TWO).unwrap(), ChapterOutcome::Written(2));
         let after = std::fs::read(&path).unwrap();
-        let kinds: Vec<_> = boxes(&after, 0, after.len())
-            .into_iter()
-            .map(|b| b.0)
-            .collect();
-        assert_eq!(kinds, ["moov", "free", "mdat", "free"]);
+        assert_eq!(kinds(&after), ["moov", "free", "mdat", "free"]);
     }
 
     #[test]
     fn no_chapters_touch_nothing() {
         let (_dir, path, before) = file(&[moov(true), free(400), mdat()]);
-        assert_eq!(
-            splice(&path, &[]).unwrap(),
-            ChapterOutcome::Skipped(SkipReason::NoChapters)
-        );
+        assert_eq!(splice(&path, &[]).unwrap(), ChapterOutcome::Written(0));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A layout that can't be read is a skip, never an error: no moov, a
+    /// child that overruns moov, a top-level box that overruns the file.
+    #[test]
+    fn an_unreadable_layout_is_skipped_not_an_error() {
+        let mut overrun = moov(true);
+        // `mvhd` claims more than `moov` holds.
+        overrun[8..12].copy_from_slice(&500u32.to_be_bytes());
+        let mut cut = mdat();
+        cut[..4].copy_from_slice(&5000u32.to_be_bytes());
+        for (parts, reason) in [
+            (
+                vec![boxed(b"ftyp", b"isom"), free(400), mdat()],
+                "there is no moov",
+            ),
+            (
+                vec![overrun, free(400), mdat()],
+                "the file's boxes could not be read",
+            ),
+            (
+                vec![moov(true), free(400), cut],
+                "the file's boxes could not be read",
+            ),
+        ] {
+            let (_dir, path, before) = file(&parts);
+            assert_eq!(
+                splice(&path, &TWO).unwrap(),
+                ChapterOutcome::Skipped(reason)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 
     /// `chpl` counts in a `u8`: the first 255 are kept.

@@ -247,7 +247,10 @@ silently. If you need a media type in core, you need a different design.
 - **Every bump comes with a test that the oldest readable version still loads**
   (`project_format.rs::a_v7_file_loads_under_the_current_version`).
 - **The first save after an upgrade keeps `project.json.v<old>`**, once, never
-  overwritten, so the older build can still be gone back to.
+  overwritten, so the older build can still be gone back to. It is copied to a
+  temporary name and renamed, like `project.json` itself, so a failed copy
+  leaves no backup to block the next try; never a hard link (exFAT and FAT
+  have none).
 
 **Bus contract — caller-captured timestamps.** Any command that lands in the
 commentary event log carries its timestamp (and source-position anchor) as a
@@ -305,7 +308,7 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
 - **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
 - **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
-- **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. An I/O error fails the export; no room keeps the file without chapters, and `bus: exported …` says why.
+- **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. **Chapters never cost an export:** any layout problem found before the write (no room, no `moov`, a box that doesn't fit) keeps the file whole without chapters, and `bus: exported …` says why. Only an I/O error opening the file or in the positioned write itself fails it.
 - **`ffprobe` is the chapter test's reader** (`qtdemux` doesn't read `chpl`), so `ffmpeg` is a **test-only** build dependency: the test fails without it, never skips, and the `.deb` doesn't depend on it.
 
 **The match clock is the displayed frame's source time** (Phase 9).

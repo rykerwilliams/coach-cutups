@@ -631,18 +631,22 @@ fn a_reel_trim_refuses_a_position_on_another_source() {
 fn a_reel_trim_refuses_the_wrong_side_of_the_goal() {
     let mut p = project_with_sources(&[600.0]);
     let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
-    for at in [100.0, 101.0] {
+    for at in [100.0, 101.0, f64::NAN] {
         assert_eq!(
             p.set_reel_trim(goal, ReelEnd::Start, Some((0, at))),
-            Err(ReelTrimError::StartNotBeforeGoal)
+            Err(ReelTrimError::WrongSideOfGoal(ReelEnd::Start))
         );
     }
-    for at in [100.0, 99.0] {
+    for at in [100.0, 99.0, f64::NAN] {
         assert_eq!(
             p.set_reel_trim(goal, ReelEnd::End, Some((0, at))),
-            Err(ReelTrimError::EndNotAfterGoal)
+            Err(ReelTrimError::WrongSideOfGoal(ReelEnd::End))
         );
     }
+    assert_eq!(
+        ReelTrimError::WrongSideOfGoal(ReelEnd::End).to_string(),
+        "the reel must end after the goal"
+    );
     assert_eq!(trims(&p, goal), (None, None));
 }
 

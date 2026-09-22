@@ -8,7 +8,6 @@
 
 use uuid::Uuid;
 use video_coach_core::project::Project;
-use video_coach_core::reel::{REEL_LEAD_IN, REEL_TAIL};
 use video_coach_core::scoreboard::{
     format_clock, interpret, MatchEventKind, MatchEventRecord, MatchFormat, PeriodRole,
     ScoreboardConfig, ScoreboardState, TeamConfig,
@@ -24,7 +23,8 @@ use crate::format::format_hms;
 pub const CHAPTER_TOLERANCE: f64 = 0.5;
 
 /// One row of the panel's event list, which is also a chapter (spec C1): the
-/// scrubber's marks and `[` / `]` are built from these rows.
+/// scrubber's marks are built from these rows, and `[` / `]` from the same
+/// times ([`match_abs`]).
 pub struct MatchRowText {
     pub id: Uuid,
     pub kind: MatchEventKind,
@@ -105,28 +105,39 @@ fn reel_span(goal: &MatchEventRecord) -> String {
             false => format!("{tenths:.1}"),
         }
     };
-    format!(
-        "−{} s / +{} s",
-        seconds(goal.reel_lead_in.unwrap_or(REEL_LEAD_IN)),
-        seconds(goal.reel_tail.unwrap_or(REEL_TAIL))
-    )
+    let (lead_in, tail) = goal.reel_span();
+    format!("−{} s / +{} s", seconds(lead_in), seconds(tail))
+}
+
+/// Every match event's place on the concat timeline, in match order: the
+/// chapters `[` and `]` step through, the same times as [`match_rows`]'s.
+pub fn match_abs(project: &Project) -> Vec<f64> {
+    let mut abs: Vec<f64> = project
+        .match_events
+        .iter()
+        .map(|m| project.abs_seconds(m.source_index, m.source_seconds))
+        .collect();
+    abs.sort_by(f64::total_cmp);
+    abs
 }
 
 /// Where `]` goes from `abs`: the first chapter more than
-/// [`CHAPTER_TOLERANCE`] after it. `rows` are in match order, as
-/// [`match_rows`] gives them.
-pub fn next_chapter(abs: f64, rows: &[MatchRowText]) -> Option<f64> {
-    rows.iter()
-        .map(|r| r.abs)
+/// [`CHAPTER_TOLERANCE`] after it. `chapters` are in order, as
+/// [`match_abs`] gives them.
+pub fn next_chapter(abs: f64, chapters: &[f64]) -> Option<f64> {
+    chapters
+        .iter()
+        .copied()
         .find(|&at| at > abs + CHAPTER_TOLERANCE)
 }
 
 /// Where `[` goes from `abs`: the last chapter more than
 /// [`CHAPTER_TOLERANCE`] before it.
-pub fn previous_chapter(abs: f64, rows: &[MatchRowText]) -> Option<f64> {
-    rows.iter()
+pub fn previous_chapter(abs: f64, chapters: &[f64]) -> Option<f64> {
+    chapters
+        .iter()
         .rev()
-        .map(|r| r.abs)
+        .copied()
         .find(|&at| at < abs - CHAPTER_TOLERANCE)
 }
 
@@ -405,14 +416,9 @@ mod tests {
         };
         // The defaults, and no span on a start/stop.
         assert_eq!(spans(&p), [None, Some("−30 s / +6 s".to_string())]);
-        // One side trimmed: the other goes on following the default.
-        p.set_reel_trim(goal, ReelEnd::Start, Some((0, 88.0)))
-            .unwrap();
-        assert_eq!(spans(&p)[1].as_deref(), Some("−12 s / +6 s"));
+        // A fractional trim reads to the tenth.
         p.set_reel_trim(goal, ReelEnd::End, Some((0, 104.5)))
             .unwrap();
-        assert_eq!(spans(&p)[1].as_deref(), Some("−12 s / +4.5 s"));
-        p.set_reel_trim(goal, ReelEnd::Start, None).unwrap();
         assert_eq!(spans(&p)[1].as_deref(), Some("−30 s / +4.5 s"));
     }
 
@@ -424,10 +430,12 @@ mod tests {
         p.append_match_event(MatchEventKind::StartStop, 0, 400.0);
         p.append_match_event(MatchEventKind::AwayGoal, 1, 212.0);
         p.append_match_event(MatchEventKind::StartStop, 1, 400.0);
-        let rows = match_rows(&p);
+        let rows = match_abs(&p);
+        assert_eq!(rows, [100.0, 400.0, 812.0, 1000.0]);
         assert_eq!(
-            rows.iter().map(|r| r.abs).collect::<Vec<_>>(),
-            [100.0, 400.0, 812.0, 1000.0]
+            match_rows(&p).iter().map(|r| r.abs).collect::<Vec<_>>(),
+            rows,
+            "the chapters are the rows"
         );
 
         // The two ends: nothing before the first, nothing after the last.

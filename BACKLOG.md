@@ -783,3 +783,16 @@ Each entry: what, why deferred, when to revisit.
   A fix needs a retry further back, or knowing the frame boundaries.
 - **When to revisit:** if a coach reports `,` stuck on some file, or when a
   source with real gaps (a screen capture, a dropped-frame phone clip) is used.
+
+74. **A reel trim can be a silent no-op.** A goal merged into the previous reel
+  entry (at or before its end on the same source, spec R2) has its lead-in
+  ignored, and a lead-in that reaches back past the previous entry's end is
+  clamped to it, so setting either changes nothing in the export. The Match
+  panel still offers "Reel starts here" on that goal, and its row still shows
+  the stored span ("−12 s / +6 s") rather than what the reel will play.
+- **Why deferred:** disabling the button, or showing the clamped span, needs
+  the row to know the reel's merges and clamps, which only the plan computes;
+  the goals a coach tags are rarely close enough to merge. The stored trim is
+  kept, so it takes effect if the earlier goal is deleted or trimmed.
+- **When to revisit:** if a coach reports a trim that "does nothing", or when
+  the Match panel grows a view of the reel's actual entries.

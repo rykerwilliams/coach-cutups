@@ -168,8 +168,8 @@ pub fn read(project_dir: &Path) -> Result<Project, StoreError> {
 ///
 /// **The first save after an upgrade keeps the old file.** When `project` was
 /// read at an older version, `project.json` is first copied to
-/// `project.json.v<old>`, unless that file already exists: it is never
-/// overwritten, so it stays the file as the older build last wrote it, and
+/// `project.json.v<old>` (atomically, through a temporary file), unless that
+/// file already exists: it is never overwritten, so it stays the file as the older build last wrote it, and
 /// going back to that build stays possible (spec F1). Otherwise this save
 /// would lock it out with `TooNew`.
 pub fn write(project_dir: &Path, project: &mut Project) -> Result<(), StoreError> {
@@ -180,9 +180,15 @@ pub fn write(project_dir: &Path, project: &mut Project) -> Result<(), StoreError
 
     let path = project_dir.join(PROJECT_FILENAME);
     if project.format_version < CURRENT_FORMAT_VERSION {
-        let backup = project_dir.join(format!("{PROJECT_FILENAME}.v{}", project.format_version));
+        let name = format!("{PROJECT_FILENAME}.v{}", project.format_version);
+        let backup = project_dir.join(&name);
         if path.exists() && !backup.exists() {
-            std::fs::copy(&path, &backup)?;
+            // Copied beside it and renamed into place, like `project.json`
+            // below, so a copy cut short leaves no backup and the next save
+            // tries again. Never a hard link: exFAT and FAT have none.
+            let tmp = project_dir.join(format!(".{name}.tmp"));
+            std::fs::copy(&path, &tmp)?;
+            std::fs::rename(&tmp, &backup)?;
         }
     }
     project.format_version = CURRENT_FORMAT_VERSION;

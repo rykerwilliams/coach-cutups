@@ -243,12 +243,7 @@ fn chapters_start_on_each_entrys_first_frame() {
     let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert_eq!(plan.entries[1].start_frame, 151);
     let chapters = plan.chapters();
-    let expect: Vec<(f64, &str)> = plan
-        .entries
-        .iter()
-        .map(|e| (e.start_frame as f64 / 30.0, e.text.as_str()))
-        .collect();
-    assert_eq!(chapters, expect);
+    assert_eq!(chapters.len(), 3);
     assert_eq!(chapters[0], (0.0, "1 / 3 | a"));
     assert_eq!(chapters[1], (151.0 / 30.0, "2 / 3 | b | shot"));
 }

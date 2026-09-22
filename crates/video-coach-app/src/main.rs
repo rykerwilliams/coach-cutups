@@ -36,7 +36,6 @@ use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::layout;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
-use video_coach_core::reel::reel_goals;
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
@@ -542,16 +541,16 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         let rows: Vec<TargetRow> = targets
             .iter()
             .map(|row| {
-                // The reel counts its goals, not its entries: two goals close
-                // together share one.
-                let (count, noun) = match row.target {
-                    ExportTarget::Reel => (reel_goals(project).len(), "goal"),
-                    _ => (row.entries, "clip"),
-                };
-                let plural = if count == 1 { "" } else { "s" };
+                let plural = if row.count == 1 { "" } else { "s" };
                 TargetRow {
                     label: row.label.as_str().into(),
-                    detail: format!("{count} {noun}{plural} · {}", format_hms(row.seconds)).into(),
+                    detail: format!(
+                        "{} {}{plural} · {}",
+                        row.count,
+                        row.unit,
+                        format_hms(row.seconds)
+                    )
+                    .into(),
                     // The clip's row is the one that differs: it is ticked
                     // when the sheet was opened on it, and only then.
                     ticked: matches!(row.target, ExportTarget::Clip(_)) == only_clip,
@@ -662,12 +661,13 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                 ReelTrim::ResetEnd => (ReelEnd::End, false),
             };
             // `None` is a reset, so a set with no position sends nothing.
-            let at = match here {
-                true => match scan_source_position(&position) {
-                    Some(at) => Some(at),
-                    None => return,
-                },
-                false => None,
+            let at = if here {
+                let Some(at) = scan_source_position(&position) else {
+                    return;
+                };
+                Some(at)
+            } else {
+                None
             };
             bus.borrow().send(Command::SetReelTrim { goal, end, at });
         }
@@ -679,11 +679,17 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             let Some(abs) = UI.with_borrow_mut(|ui| {
                 let project = ui.snapshot.as_ref()?.project.clone();
                 let now = scan_abs(ui, &project, &position);
-                let rows = match_panel::match_rows(&project);
-                match forward {
-                    true => match_panel::next_chapter(now, &rows),
-                    false => match_panel::previous_chapter(now, &rows),
-                }
+                let chapters = match_panel::match_abs(&project);
+                let abs = if forward {
+                    match_panel::next_chapter(now, &chapters)
+                } else {
+                    match_panel::previous_chapter(now, &chapters)
+                }?;
+                // Where the seek is headed, before the bus says so: a second
+                // press that comes first steps on from here, not from the
+                // chapter this one is leaving.
+                ui.target_abs = Some(abs);
+                Some(abs)
             }) else {
                 return;
             };
@@ -824,14 +830,17 @@ fn match_setup(w: &AppWindow) -> Option<ScoreboardConfig> {
     })
 }
 
+/// A goal's scrubber mark when there is no scoreboard, so no team colour:
+/// amber, which reads against the track and against a start/stop's white.
+const GOAL_MARK: slint::Color = slint::Color::from_rgb_u8(0xf5, 0xb0, 0x00);
+
 /// The Match panel's rows, and what its actions are gated on. The live score
 /// and clock aren't here: they follow the scan, so the tick renders them.
 fn show_match(w: &AppWindow, project: &Project) {
     let rows = match_panel::match_rows(project);
-    // A chapter mark per row (C1): a goal in its team's colour, or the
-    // accent with no teams to take one from, and a start/stop in white.
+    // A chapter mark per row (C1): a goal in its team's colour, or one fixed
+    // goal colour with no teams to take one from, and a start/stop in white.
     let color = |c: Rgba| slint::Color::from_rgb_f32(c.r as f32, c.g as f32, c.b as f32);
-    let accent = w.get_accent_color();
     let marks: Vec<Mark> = rows
         .iter()
         .map(|row| Mark {
@@ -839,13 +848,15 @@ fn show_match(w: &AppWindow, project: &Project) {
             color: match (row.kind, &project.scoreboard) {
                 (MatchEventKind::HomeGoal, Some(c)) => color(c.home.primary_color),
                 (MatchEventKind::AwayGoal, Some(c)) => color(c.away.primary_color),
-                (MatchEventKind::HomeGoal | MatchEventKind::AwayGoal, None) => accent,
+                (MatchEventKind::HomeGoal | MatchEventKind::AwayGoal, None) => GOAL_MARK,
                 (MatchEventKind::StartStop, _) => slint::Color::from_rgb_u8(255, 255, 255),
             },
         })
         .collect();
     w.set_match_marks(ModelRc::new(VecModel::from(marks)));
-    w.set_match_goal_count(rows.iter().filter(|r| r.reel_span.is_some()).count() as i32);
+    // A goal's row has a second line for its reel span.
+    let goals = rows.iter().filter(|r| r.reel_span.is_some()).count();
+    w.set_match_list_lines((rows.len() + goals) as i32);
     let rows: Vec<MatchRow> = rows
         .into_iter()
         .map(|row| MatchRow {
@@ -1602,7 +1613,9 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     w.set_clip_count(project.clips.len() as i32);
     // Exactly when the sheet would have a row (spec R1): a project of goals
     // and no clips has its reel to export.
-    w.set_can_export(!export_targets(project, None).is_empty());
+    w.set_can_export(
+        !project.clips.is_empty() || project.match_events.iter().any(|m| m.kind.is_goal()),
+    );
     show_clips(w, project);
     let tags: Vec<TagRow> = tag_summaries(&project.clips)
         .into_iter()

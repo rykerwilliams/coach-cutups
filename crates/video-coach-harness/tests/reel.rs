@@ -135,7 +135,7 @@ fn the_all_goals_row_follows_the_goals() {
     assert_eq!(rows.len(), 1, "{rows:#?}");
     assert_eq!(rows[0].target, ExportTarget::Reel);
     assert_eq!(rows[0].label, "All goals");
-    assert_eq!(rows[0].entries, 1);
+    assert_eq!((rows[0].count, rows[0].unit), (1, "goal"));
     p.h.shutdown();
 }
 
@@ -189,10 +189,10 @@ fn a_source_move_purges_the_trim_history() {
     assert_eq!(saved(&p.folder).match_events, moved);
 }
 
-/// A reel entry has no clip to name, so the refusal names the goal, numbered
-/// in match order.
+/// A reel entry has no clip to name, so the refusal names the game video's
+/// file.
 #[test]
-fn a_missing_game_video_is_refused_naming_the_goal() {
+fn a_missing_game_video_is_refused_naming_the_file() {
     let mut p = Proj::open_with(&[("a.webm", 2), ("b.webm", 2)], |media| {
         std::fs::remove_file(media.join("b.webm")).unwrap();
     });
@@ -207,7 +207,7 @@ fn a_missing_game_video_is_refused_naming_the_goal() {
     });
     assert_eq!(
         p.h.wait_for_error(),
-        UserError::CantExport("goal 2's game video is missing; relink it first".into())
+        UserError::CantExport("b.webm (a goal's game video) is missing; relink it first".into())
     );
     p.h.shutdown();
 }

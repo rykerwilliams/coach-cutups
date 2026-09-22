@@ -21,6 +21,10 @@ slint::slint! {
         callback moved(float);
         callback released(float);
 
+        public pure function mark-x(at: float) -> length {
+            return scrubber.x + scrubber.mark-x(at);
+        }
+
         scrubber := Scrubber {
             y: 10px;
             width: 400px;
@@ -146,24 +150,31 @@ fn disabling_mid_drag_ends_the_scrub() {
     assert!(rig.released.borrow().is_empty());
 }
 
-/// The chapter marks are drawn over the track, but the pointer is the
-/// scrubber's: a click on a mark scrubs to it like a click anywhere else.
+/// A mark sits exactly where a click scrubs to its value, from end to end:
+/// the marks draw `value-at`'s geometry turned round, and a mark past the end
+/// is pinned there.
 #[test]
-fn a_click_on_a_mark_scrubs_through_it() {
+fn a_mark_sits_where_a_click_scrubs_to_its_value() {
     let rig = Rig::new();
-    let mark = |at| Mark {
-        at,
-        color: slint::Color::from_rgb_u8(255, 255, 255),
-    };
     rig.window
-        .set_marks(slint::ModelRc::new(slint::VecModel::from(vec![
-            mark(25.0),
-            mark(50.0),
-        ])));
-    // 50 is the middle of the track, where its mark sits.
-    rig.press(200.0);
-    rig.release(200.0);
-    assert!(!rig.window.get_scrubbing());
-    assert_eq!(*rig.moved.borrow(), [50.0]);
-    assert_eq!(*rig.released.borrow(), [50.0]);
+        .set_marks(slint::ModelRc::new(slint::VecModel::from(vec![Mark {
+            at: 25.0,
+            color: slint::Color::from_rgb_u8(255, 255, 255),
+        }])));
+    for at in [0.0, 25.0, 50.0, 100.0] {
+        let x = rig.window.invoke_mark_x(at);
+        rig.press(x);
+        rig.release(x);
+        let got = *rig.released.borrow().last().unwrap();
+        assert!((got - at).abs() < 1e-3, "a mark at {at} is at x {x}: {got}");
+    }
+    assert_eq!(
+        rig.window.invoke_mark_x(150.0),
+        rig.window.invoke_mark_x(100.0)
+    );
+    assert_eq!(
+        rig.window.invoke_mark_x(0.0),
+        10.0,
+        "the thumb's half-width in"
+    );
 }
