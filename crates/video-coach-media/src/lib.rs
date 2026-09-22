@@ -26,7 +26,9 @@ pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPositio
 pub use composite::Gl;
 pub use download::{download, Fetch};
 pub use mailbox::{Frame, FrameMailbox};
-pub use player::{Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer};
+pub use player::{
+    keep_pulsesink_out, Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
+};
 pub use probe::{probe, Probe, ProbeError};
 pub use transcribe::{
     TranscribeError, TranscribeKind, TranscribeMessage, Transcriber, WhisperModel,

@@ -51,7 +51,8 @@ step "3. Every software-path element exists"
 # gst-inspect-1.0 is for this check only: nothing in Depends pulls it.
 apt_install gstreamer1.0-tools
 # The elements the code names, found by grepping crates/*/src and keeping
-# what gst-inspect-1.0 knows. Left out: the VA elements (vah264lpenc,
+# what gst-inspect-1.0 knows, plus `alsasink`, which `autoaudiosink` picks
+# once `keep_pulsesink_out` has run. Left out: the VA elements (vah264lpenc,
 # vajpegdec), absent without /dev/dri and checked by hand; the test sources
 # and `fixtures.rs`'s encoders, which only tests use. The last five aren't
 # named: decodebin3 autoplugs them for game film (MP4, H.264/H.265) and for
@@ -59,7 +60,7 @@ apt_install gstreamer1.0-tools
 elements=(
     playbin3 decodebin3 filesrc filesink fakesink queue capsfilter
     appsrc appsink videoconvert audioconvert audioresample level
-    autoaudiosink
+    autoaudiosink alsasink
     glupload glcolorconvert gltransformation glvideomixer gldownload
     v4l2src pipewiresrc jpegdec x264enc opusenc matroskamux
     h264parse avenc_aac aacparse mp4mux

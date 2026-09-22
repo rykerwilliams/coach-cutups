@@ -5,6 +5,7 @@
 // commands and feeds bus events back in through the `in` properties.
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, Slider, TextEdit } from "std-widgets.slint";
+import { Scrubber } from "scrubber.slint";
 
 /// One row of the sidebar's Sources list.
 export struct SourceRow {
@@ -1373,16 +1374,9 @@ export component AppWindow inherits Window {
     /// The scrubber's value, concat seconds. Set by the 30 Hz timer except
     /// while `scrubbing`.
     in-out property <float> position-seconds;
-    /// A scrub drag is under way. Cleared if the scrubber is disabled
-    /// mid-drag, which never delivers its `released`.
-    out property <bool> scrubbing;
-    /// Scrubbing is possible: something to play, and not recording.
-    property <bool> can-scrub: root.can-play && !root.recording;
-    changed can-scrub => {
-        if (!self.can-scrub) {
-            self.scrubbing = false;
-        }
-    }
+    /// A scrub is under way, from its press to its end, however it ends
+    /// (see `scrubber.slint`).
+    out property <bool> scrubbing: scrubber.scrubbing;
     /// `current / total`.
     in property <string> readout: "0:00 / 0:00";
     /// Linear 0..1.
@@ -2426,19 +2420,13 @@ export component AppWindow inherits Window {
                     padding: 8px;
                     spacing: 4px;
 
-                    Slider {
-                        enabled: root.can-scrub;
-                        minimum: 0;
+                    scrubber := Scrubber {
+                        // Something to play, and not recording.
+                        enabled: root.can-play && !root.recording;
                         maximum: max(root.total-seconds, 0.001);
                         value <=> root.position-seconds;
-                        changed(value) => {
-                            root.scrubbing = true;
-                            root.scrub-move(value);
-                        }
-                        released(value) => {
-                            root.scrubbing = false;
-                            root.scrub-release(value);
-                        }
+                        moved(value) => { root.scrub-move(value); }
+                        released(value) => { root.scrub-release(value); }
                     }
 
                     HorizontalLayout {

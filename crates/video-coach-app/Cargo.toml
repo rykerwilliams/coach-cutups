@@ -36,6 +36,9 @@ slint-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Slint's headless backend, for the scrubber's pointer tests. Pinned with
+# Slint: it is one of Slint's own internal crates.
+i-slint-backend-testing = "=1.18.0"
 
 # The .deb (Phase 11 spec S2, S6). Build it with `packaging/build-deb.sh`, not
 # bare `cargo deb`: the script first generates the crate licence notices this
@@ -64,11 +67,14 @@ revision = ""
 # `dpkg-dev` on the build machine). The rest link nothing, so it can't see
 # them:
 # - the GStreamer plugin packages: every element the code names is in one;
+# - gstreamer1.0-alsa and pipewire-alsa: the speakers are `alsasink` on ALSA's
+#   default device, routed to PipeWire (`keep_pulsesink_out`). Without them
+#   `autoaudiosink` falls back to a silent fake sink;
 # - libxcursor1, libxi6, libxkbcommon-x11-0: winit dlopens them on X11, and
 #   without them the app doesn't start;
 # - libgstreamer1.0-0 (>= 1.24): 1.24 is what's tested, though `$auto` derives
 #   only >= 1.20. The two constraints on one package are legal; apt takes both.
-depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gstreamer1.0-gl, gstreamer1.0-pipewire, libxcursor1, libxi6, libxkbcommon-x11-0, libgstreamer1.0-0 (>= 1.24)"
+depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gstreamer1.0-gl, gstreamer1.0-pipewire, gstreamer1.0-alsa, pipewire-alsa, libxcursor1, libxi6, libxkbcommon-x11-0, libgstreamer1.0-0 (>= 1.24)"
 # The Intel VA driver for hardware decode (without one, export falls back to
 # software encoding), and zenity, which the file dialogs fall back to when the
 # desktop portal is missing.

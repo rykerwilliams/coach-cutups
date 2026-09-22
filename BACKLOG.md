@@ -672,3 +672,38 @@ Each entry: what, why deferred, when to revisit.
   follow-on `not-linked` error could beat the "no audio track" answer it
   follows. Reading the collection first makes a video-only file always
   report "no sound" (commit `bb17011`).
+
+67. **A frame-accurate scrub on a full Trace file lands 0.2–0.3 s off target.**
+  On a ~27-minute Trace half (H.264 repackaged from Trace's HLS web stream,
+  `encoder=dailymotion/hls.js`, irregular ~29.997 fps), scrub releases read back
+  812 → 811.70 and 568 → 568.19. A 70 s local stream-copy of the same footage
+  was within 9 ms except once (25 → 24.50).
+- **Why deferred:** found while fixing the play-after-scrub freeze, which it
+  isn't the cause of. It looks like the edit-list / gapped-file class CLAUDE.md
+  already warns about (stream time vs raw PTS; ACCURATE seeks in VFR files), and
+  deserves its own investigation rather than riding on that fix.
+- **When to revisit:** before the vision work, which will lean on exact
+  timestamps on exactly this footage — or sooner if the coach notices a scrub
+  landing visibly early or late.
+
+68. **The volume slider still uses Slint's stock slider.** A volume drag that
+  leaves the window on X11 ends with a cancel the stock `SliderBase` ignores
+  (it returns early for any button but the left), so the volume applies but its
+  `released` never fires and the value isn't persisted.
+- **Why deferred:** the same Slint behaviour froze the scrubber, which got a
+  custom `scrubber.slint`; the volume slider's failure is cosmetic by
+  comparison — the level changes, it just isn't remembered.
+- **When to revisit:** if the volume ever doesn't stick, or when the scrubber's
+  wrapper is generalised.
+
+69. **The preview can starve under heavy load from other programs.** While
+  measuring A/V sync, many preview runs delivered 4–80 frames in 50 s instead
+  of 1500, on both audio sinks and both source files, while another session's
+  GPU/CPU-heavy process was running (and occasionally without it). The preview's
+  Rust pump ran at the test's `nice 19` priority there.
+- **Why deferred:** seen only in tests at lowest priority under deliberate
+  contention; the clean runs were perfect (1500/1500 frames).
+- **When to revisit:** if the coach's preview ever stutters or freezes while
+  something else is running — check whether the pump needs a higher priority or
+  the preview a way to drop frames gracefully.
+

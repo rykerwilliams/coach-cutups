@@ -17,7 +17,7 @@ use crate::mailbox::{Frame, FrameMailbox};
 pub enum SinkKind {
     /// Production. Video is `glupload ! glcolorconvert ! appsink` with
     /// GL-memory RGBA 2D caps, the zero-copy display path; audio is
-    /// `autoaudiosink`. A player built with it stays in NULL until
+    /// `autoaudiosink`, which [`keep_pulsesink_out`] steers. A player built with it stays in NULL until
     /// [`SourcePlayer::set_gl_context`](super::SourcePlayer::set_gl_context).
     Gl,
     /// Headless tests. Video is a system-memory `appsink` (no GL, no
@@ -63,6 +63,26 @@ pub(super) fn video_sink(kind: SinkKind, mailbox: FrameMailbox) -> VideoSink {
                 glupload: Some(glupload),
             }
         }
+    }
+}
+
+/// Keeps `pulsesink` out of `autoaudiosink`'s choice, process-wide, so that
+/// on a desktop the speakers are `alsasink` on ALSA's default device — which
+/// on the PipeWire desktop this targets is PipeWire itself (`pipewire-alsa`).
+/// `autoaudiosink` keeps its fallback to a fake sink where nothing opens (CI).
+/// Idempotent; call it after `gst::init`.
+///
+/// **Why.** `pulsesink` against PipeWire 1.0's pulse server (Ubuntu 24.04's)
+/// wedges for good once flushing seeks come quickly while playing — a
+/// dragged scrubber, a held skip key. The server stops asking for audio (it
+/// logs `OVERFLOW`), the sink blocks with its ring buffer full, and the
+/// picture and the clock stop with it; pause and play don't restart it. A
+/// click, a toggle or a scrub while paused never did it. `pipewiresink` 1.0
+/// stalls the same way; `alsasink` doesn't. Measured on the reference
+/// laptop by `real_footage_keeps_playing_through_seeks_while_playing`.
+pub fn keep_pulsesink_out() {
+    if let Some(pulse) = gst::Registry::get().lookup_feature("pulsesink") {
+        pulse.set_rank(gst::Rank::NONE);
     }
 }
 

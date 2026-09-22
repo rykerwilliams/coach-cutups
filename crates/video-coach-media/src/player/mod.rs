@@ -29,8 +29,8 @@ use gstreamer::prelude::*;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl::prelude::*;
 
-pub use sink::SinkKind;
 pub(crate) use sink::{fill_mailbox, gl_bin, gl_caps};
+pub use sink::{keep_pulsesink_out, SinkKind};
 
 use crate::mailbox::FrameMailbox;
 

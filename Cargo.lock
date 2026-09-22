@@ -1930,6 +1930,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "i-slint-backend-testing"
+version = "1.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2890ef1b9bead9f327d358aa925b6136ebe6b119fe5e302f6f06ef23453fa25"
+dependencies = [
+ "cfg_aliases",
+ "i-slint-common",
+ "i-slint-core",
+ "vtable",
+]
+
+[[package]]
 name = "i-slint-backend-winit"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4864,6 +4876,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-gl",
  "gstreamer-gl-egl",
+ "i-slint-backend-testing",
  "rfd",
  "serde",
  "serde_json",
@@ -4892,6 +4905,8 @@ name = "video-coach-harness"
 version = "0.1.0"
 dependencies = [
  "gstreamer",
+ "gstreamer-gl",
+ "gstreamer-gl-egl",
  "serde_json",
  "tempfile",
  "uuid",

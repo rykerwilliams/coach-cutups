@@ -1,0 +1,79 @@
+// The transport's scrubber (spec D8): a std `Slider` for the looks, with the
+// pointer handled here instead.
+//
+// Slint 1.18's `Slider` never fires `released` when Slint cancels a drag
+// rather than ending it -- on X11, the moment a drag leaves the window: the
+// cancel comes with no button, and the slider ignores every event whose
+// button isn't the left one. A scrub that never releases leaves
+// `scrubbing` stuck: the readout and the scrubber stop following playback,
+// and the frame-accurate landing never comes. This TouchArea sees every end:
+// the pointer-up, and the cancel.
+
+import { Slider } from "std-widgets.slint";
+
+export component Scrubber {
+    in property <bool> enabled;
+    in property <float> maximum;
+    in-out property <float> value;
+    /// A scrub is under way: from the press to its end, however it ends.
+    out property <bool> scrubbing;
+    /// Every value the pointer reaches, the press's included.
+    callback moved(float);
+    /// Where a scrub ended: a pointer-up, or a cancelled drag, which lands
+    /// where it had got to. Not when disabled mid-drag: see below.
+    callback released(float);
+
+    min-height: slider.min-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+
+    /// Disabled mid-drag (a recording starting): the scrub just ends. The bus
+    /// refuses a scrub then, so there is nothing to release.
+    changed enabled => {
+        if (!self.enabled) {
+            self.scrubbing = false;
+        }
+    }
+
+    /// The value under `x`, on the Fluent slider's geometry: its 20px thumb's
+    /// centre travels from one end of the track to the other.
+    function value-at(x: length) -> float {
+        let thumb = 20px;
+        return clamp((x - thumb / 2) / max(root.width - thumb, 1px), 0, 1) * root.maximum;
+    }
+
+    function scrub-to(x: length) {
+        root.value = value-at(x);
+        root.moved(root.value);
+    }
+
+    slider := Slider {
+        width: 100%;
+        height: 100%;
+        enabled: root.enabled;
+        minimum: 0;
+        maximum: root.maximum;
+        value: root.value;
+    }
+
+    // Above the slider, so it takes every pointer event.
+    TouchArea {
+        enabled: root.enabled;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.scrubbing = true;
+                root.scrub-to(self.mouse-x);
+            } else if (root.scrubbing
+                && ((event.kind == PointerEventKind.up && event.button == PointerEventButton.left)
+                    || event.kind == PointerEventKind.cancel)) {
+                root.scrubbing = false;
+                root.released(root.value);
+            }
+        }
+        moved => {
+            if (root.scrubbing) {
+                root.scrub-to(self.mouse-x);
+            }
+        }
+    }
+}

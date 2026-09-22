@@ -199,3 +199,20 @@ fn the_position_survives_removing_an_earlier_source() {
     rig.settle_at(1, 1.2);
     rig.h.shutdown();
 }
+
+/// The bus keeps `pulsesink` out of `autoaudiosink`'s choice, which a burst of
+/// seeks while playing wedged on PipeWire 1.0's pulse server
+/// (`keep_pulsesink_out`; `real_footage.rs` reproduces it on real hardware).
+#[test]
+fn the_bus_keeps_pulsesink_out_of_the_speakers() {
+    use gstreamer::prelude::*;
+    gstreamer::init().unwrap();
+    let Some(pulse) = gstreamer::Registry::get().lookup_feature("pulsesink") else {
+        eprintln!("skipped: pulsesink is not installed (gstreamer1.0-pulseaudio)");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let h = video_coach_harness::Harness::new(&tmp.path().join("config"));
+    assert_eq!(pulse.rank(), gstreamer::Rank::NONE);
+    h.shutdown();
+}

@@ -7,7 +7,7 @@
 //! did **not** happen.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -65,9 +65,40 @@ impl Harness {
         capture: CaptureKind,
         transcribe: TranscribeKind,
     ) -> Self {
+        Self::spawn(config_dir, SinkKind::System, capture, transcribe)
+    }
+
+    /// A bus with the app's own sinks: the GL video sink on a surfaceless EGL
+    /// display, so hardware decoders hand it DMABufs as they do in the app,
+    /// and `autoaudiosink` — **real speakers**, so a test should turn the
+    /// volume down. Only for `#[ignore]`d tests on real hardware: CI has
+    /// neither.
+    pub fn production(config_dir: &Path) -> Self {
+        let h = Self::spawn(
+            config_dir,
+            SinkKind::Gl,
+            CaptureKind::Test {
+                video_delay: Duration::ZERO,
+            },
+            TranscribeKind::Test {
+                delay: Duration::ZERO,
+                text: String::new(),
+            },
+        );
+        let (display, context) = surfaceless_gl().clone();
+        h.send(Command::GlReady { display, context });
+        h
+    }
+
+    fn spawn(
+        config_dir: &Path,
+        sinks: SinkKind,
+        capture: CaptureKind,
+        transcribe: TranscribeKind,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let bus = Bus::spawn(
-            SinkKind::System,
+            sinks,
             capture,
             transcribe,
             StateFile::in_config_dir(config_dir),
@@ -273,6 +304,25 @@ impl Harness {
         self.log.extend(self.rx.try_iter());
         self.log.split_off(self.cursor)
     }
+}
+
+/// The process's one surfaceless EGL display and context, standing in for the
+/// UI's. One per process and never dropped, as `Gl::shared` explains:
+/// finalizing any surfaceless display terminates them all.
+fn surfaceless_gl() -> &'static (gstreamer_gl::GLDisplay, gstreamer_gl::GLContext) {
+    use gstreamer_gl::prelude::*;
+    static GL: OnceLock<(gstreamer_gl::GLDisplay, gstreamer_gl::GLContext)> = OnceLock::new();
+    GL.get_or_init(|| {
+        let display = gstreamer_gl_egl::GLDisplayEGL::new_surfaceless()
+            .expect("a surfaceless EGL display")
+            .upcast::<gstreamer_gl::GLDisplay>();
+        let context = {
+            let lock = display.object_lock();
+            gstreamer_gl::GLDisplay::create_context(&lock, None::<&gstreamer_gl::GLContext>)
+        }
+        .expect("an EGL context");
+        (display, context)
+    })
 }
 
 /// Writes a project to `folder` whose sources are 16:9 30 fps WebM fixtures

@@ -502,6 +502,8 @@ impl Bus {
         events: Box<dyn Fn(Event) + Send>,
     ) -> BusHandle {
         gst::init().expect("GStreamer failed to initialize");
+        // For the player's and the preview's `autoaudiosink`s.
+        video_coach_media::keep_pulsesink_out();
         let (tx, rx) = mpsc::channel();
         let mailbox = FrameMailbox::default();
         let preview_position = PreviewPosition::default();
