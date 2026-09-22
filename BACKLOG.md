@@ -759,10 +759,13 @@ Each entry: what, why deferred, when to revisit.
 
 
 73. **`,` looks stuck across a timestamp gap longer than half a frame.** A back
-  step seeks to half a nominal frame before the shown frame's nominal start
-  (`step_target`, `player/mod.rs`). Where the file has a real gap there, the
-  ACCURATE seek lands on the frame after the gap — the frame already shown — so
-  the step does nothing and repeating it doesn't help.
+  step seeks to half a nominal frame before the shown frame's start, nominal or
+  its own, whichever is earlier (`step_target`, `player/mod.rs`). Where the file
+  has a real gap there, the ACCURATE seek lands on the frame after the gap —
+  the frame already shown — so the step does nothing and repeating it doesn't
+  help. (A frame held long is left, since its own start is earlier; but after a
+  scrub lands inside one, its start is the scrub's target, so `,` creeps back
+  half a frame a press until it leaves it.)
 - **Why deferred:** MP4 game footage has no such gaps (Trace's irregular
   29.997 fps drifts well under half a frame); only a VP8 WebM fixture does.
   A fix needs a retry further back, or knowing the frame boundaries.

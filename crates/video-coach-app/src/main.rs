@@ -23,9 +23,9 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command, Event,
-    ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile, TargetState,
-    TranscriptionState, WindowSize,
+    self, export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command,
+    Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile,
+    TargetState, TranscriptionState, WindowSize,
 };
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
 use video_coach_app::format::{finish_at, format_hms, format_hms_tenths, sentence};
@@ -356,7 +356,16 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let send = send(bus);
         move |forward| send(Command::StepFrame { forward })
     });
-    window.on_set_scan_speed(cmd(bus, Command::SetScanSpeed));
+    window.on_step_scan_speed({
+        let send = send(bus);
+        move |step| {
+            send(Command::ScanSpeed(match step {
+                ScanStep::Faster => bus::ScanStep::Faster,
+                ScanStep::Slower => bus::ScanStep::Slower,
+                ScanStep::Cycle => bus::ScanStep::Cycle,
+            }))
+        }
+    });
     window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
     window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
     window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
@@ -1800,13 +1809,14 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
         w.set_total_seconds(total as f32);
         // Tenths while paused, so a frame step shows; whole seconds while
         // playing, so the digits don't flicker.
-        let now = match w.get_playing() {
-            true => format_hms(current),
-            false => format_hms_tenths(current),
+        let now = if w.get_playing() {
+            format_hms(current)
+        } else {
+            format_hms_tenths(current)
         };
-        // The speed above 1x (spec S1). Never a preview's: it plays at 1x.
+        // The speed above 1x (spec S1). Opening a preview returns it to 1x.
         let speed = match w.get_scan_speed() {
-            s if s > 1.0 && ui.preview_duration.is_none() => format!(" · {s}×"),
+            s if s > 1.0 => format!(" · {s}×"),
             _ => String::new(),
         };
         w.set_readout(format!("{now} / {}{speed}", format_hms(total)).into());

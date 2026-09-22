@@ -101,6 +101,11 @@ impl Bus {
 
         // Whatever was on screen stops first, and takes its frame with it.
         self.close_preview();
+        // Back to 1x without the pause's seek, which would preroll into the
+        // mailbox the preview shares; `close_preview` reloads the position.
+        if self.player.rate() != 1.0 {
+            self.store_rate(1.0);
+        }
         if self.playing {
             self.set_playing(false);
         }
@@ -169,7 +174,9 @@ impl Bus {
         };
         let stats = active.preview.stats();
         drop(active.preview);
-        self.mailbox.take();
+        // Forgets the shown frame too, which was the preview's, in its
+        // output time.
+        self.mailbox.clear();
         // The game video is paused, not unloaded, so re-requesting where it
         // already is restores the picture: the flushing seek prerolls its own
         // frame back into the emptied mailbox, which is also what releases

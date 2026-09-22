@@ -15,9 +15,7 @@ use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::Zoom;
-use video_coach_harness::{add_clips, write_project, Harness, ReadOnly};
-
-const FRAME: f64 = 1.0 / 30.0;
+use video_coach_harness::{add_clips, write_project, Harness, ReadOnly, FRAME};
 
 /// A project of 2-second fixture videos with clips on the given sources, as
 /// written.

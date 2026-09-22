@@ -197,6 +197,13 @@ impl Harness {
         })
     }
 
+    /// Waits for `ScanSpeed(speed)`, skipping any other speed before it.
+    pub fn wait_speed(&mut self, speed: f64) {
+        self.wait_map(&format!("ScanSpeed({speed})"), |e| {
+            matches!(e, Event::ScanSpeed(s) if *s == speed).then_some(())
+        });
+    }
+
     /// Waits for the next `Recording`.
     pub fn wait_recording(&mut self) -> RecordingStatus {
         self.wait_map("Recording", |e| match e {
@@ -305,6 +312,36 @@ impl Harness {
         self.bus.mailbox().take()
     }
 
+    /// Watches the **displayed** frames for `secs` of wall time from now, as
+    /// the UI's redraw takes them (the mailbox polled every 2 ms, faster than
+    /// any display takes them), receiving events meanwhile. Panics unless at
+    /// least two frames came.
+    pub fn watch_displayed(&mut self, secs: f64) -> Displayed {
+        let start = Instant::now();
+        // When each frame was taken, its stream time, and the position then.
+        let mut shown: Vec<(Instant, f64, f64)> = Vec::new();
+        while start.elapsed().as_secs_f64() < secs {
+            if let Some(frame) = self.take_frame() {
+                if let (Some(t), Some(position)) = (frame.stream_time, self.position_secs()) {
+                    shown.push((Instant::now(), t, position));
+                }
+            }
+            self.log.extend(self.rx.try_iter());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let [(t0, s0, _), .., (t1, s1, _)] = shown[..] else {
+            panic!("fewer than two frames shown in {secs} s");
+        };
+        let wall = (t1 - t0).as_secs_f64();
+        let lags: Vec<f64> = shown.iter().map(|&(_, t, p)| (p - t).abs()).collect();
+        Displayed {
+            fps: (shown.len() - 1) as f64 / wall,
+            rate: (s1 - s0) / wall,
+            mean_lag: lags.iter().sum::<f64>() / lags.len() as f64,
+            max_lag: lags.iter().copied().fold(0.0, f64::max),
+        }
+    }
+
     /// Sends `seek`, a command that moves the paused scan player, and waits
     /// for it to land: its target published, then settled, then its frame.
     /// Returns the position the player reports then, and the frame it put up.
@@ -407,6 +444,52 @@ pub fn write_one_source_project(folder: &Path, video: &Path) -> Project {
     project
 }
 
+/// [`write_one_source_project`], opened on `h` and settled, paused; with
+/// `muted`, the speakers muted, as a test on the production sinks needs.
+/// Returns what was written.
+pub fn open_one_source_project(
+    h: &mut Harness,
+    folder: &Path,
+    video: &Path,
+    muted: bool,
+) -> Project {
+    std::fs::create_dir_all(folder).expect("create the project folder");
+    let project = write_one_source_project(folder, video);
+    h.send(Command::OpenProject(folder.to_owned()));
+    h.wait_opened();
+    h.wait_settled();
+    if muted {
+        h.send(Command::SetVolume {
+            value: 0.0,
+            commit: false,
+        });
+    }
+    project
+}
+
+/// What [`Harness::watch_displayed`] saw.
+#[derive(Debug, Clone, Copy)]
+pub struct Displayed {
+    /// Frames taken per second of wall time.
+    pub fps: f64,
+    /// How fast their stream time ran against the wall clock: 4 at 4x.
+    pub rate: f64,
+    /// How far a frame's stream time was from the position reported as it
+    /// was taken, on average and at most.
+    pub mean_lag: f64,
+    pub max_lag: f64,
+}
+
+impl fmt::Display for Displayed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:>8.1} fps {:>7.2}x, lag mean {:.3} s, max {:.3} s",
+            self.fps, self.rate, self.mean_lag, self.max_lag
+        )
+    }
+}
+
 /// How far a scrub may land from its target: one frame at 30 fps. Fixed,
 /// never the source's own rate, which reads 0/1 on an HLS remux.
 pub const FRAME: f64 = 1.0 / 30.0;
@@ -415,86 +498,94 @@ pub const FRAME: f64 = 1.0 / 30.0;
 /// decoder's `SLACK`, nanosecond rounding.
 pub const SAME_FRAME: f64 = 1e-6;
 
-/// Where one paused scrub landed ([`round_trip`]), in source seconds.
+/// Where one paused seek landed ([`round_trip`], [`landings`]), in source
+/// seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Landing {
     pub target: f64,
     /// The player's position once the seek settled: what a tag made now
     /// would store.
     pub reported: f64,
-    /// The frame the scan player put up, as [`Frame::stream_time`] and
-    /// [`Frame::stream_end`]. Its start is clipped to the seek's target, so
-    /// only its end says which frame it is.
-    pub displayed: (Option<f64>, Option<f64>),
+    /// Where the frame the scan player put up ends ([`Frame::stream_end`]).
+    /// A seek clips its start to the target, so only its end says which
+    /// frame it is.
+    pub shown_end: f64,
     /// The frame export shows for `reported`, start to end in stream time.
     pub export: Range<f64>,
 }
 
 impl Landing {
     /// Asserts the round trip (spec H6): the scan player displays the frame
-    /// export picks for the position it reports, and that position is within
-    /// a [`FRAME`] of the target.
-    pub fn check(&self) {
-        let end = self
-            .displayed
-            .1
-            .unwrap_or_else(|| panic!("the displayed frame has no stream end: {self}"));
+    /// export picks for the position it reports.
+    pub fn check_export(&self) {
         assert!(
-            (end - self.export.end).abs() <= SAME_FRAME,
+            (self.shown_end - self.export.end).abs() <= SAME_FRAME,
             "the scan player shows a different frame than export picks: {self}"
         );
+    }
+
+    /// Asserts the position reported is within a [`FRAME`] of the target.
+    pub fn check_target(&self) {
         assert!(
             (self.reported - self.target).abs() <= FRAME,
-            "the scrub landed more than a frame off its target: {self}"
+            "the seek landed more than a frame off its target: {self}"
         );
     }
 }
 
 impl fmt::Display for Landing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let time = |t: Option<f64>| t.map_or_else(|| "none".to_owned(), |t| format!("{t:.4}"));
         write!(
             f,
-            "target {:.4}, reported {:.4} ({:+.4}), displayed {}..{}, export {:.4}..{:.4}",
+            "target {:.4}, reported {:.4} ({:+.4}), shown ..{:.4}, export {:.4}..{:.4}",
             self.target,
             self.reported,
             self.reported - self.target,
-            time(self.displayed.0),
-            time(self.displayed.1),
+            self.shown_end,
             self.export.start,
             self.export.end
         )
     }
 }
 
-/// Scrubs to each of `targets` while paused and records where it landed: the
-/// position the player reports once the seek settles, and the stream time of
-/// the frame it puts up. Then asks export's decoder, on `source`, which frame
-/// it shows for each reported position. Prints every landing; asserts
-/// nothing, so a caller can print a whole run before [`Landing::check`]ing it.
+/// Scrubs to each of `targets` while paused and records where it landed, as
+/// [`landings`]. Asserts nothing, so a caller can print a whole run before
+/// checking it.
 ///
 /// `h` has `source` open as its only source, paused, so a target is both
 /// concat and source seconds.
 pub fn round_trip(h: &mut Harness, source: &Path, targets: &[f64]) -> Vec<Landing> {
-    let mut landed = Vec::new();
-    for &target in targets {
-        let (reported, frame) = h.seek_and_settle(Command::ScrubRelease { abs: target });
-        landed.push((target, reported, (frame.stream_time, frame.stream_end)));
-    }
+    let landed: Vec<(f64, f64, f64)> = targets
+        .iter()
+        .map(|&target| {
+            let (reported, frame) = h.seek_and_settle(Command::ScrubRelease { abs: target });
+            (target, reported, shown_end(&frame))
+        })
+        .collect();
+    landings(source, &landed)
+}
+
+/// Where `frame` ends, which names it; panics if it has no end.
+pub fn shown_end(frame: &Frame) -> f64 {
+    frame
+        .stream_end
+        .unwrap_or_else(|| panic!("the frame shown has no stream end: {frame:?}"))
+}
+
+/// Each of `landed`, `(target, reported, shown_end)` as [`Landing`] names
+/// them, with the frame export's decoder, on `source`, shows for the
+/// reported position.
+pub fn landings(source: &Path, landed: &[(f64, f64, f64)]) -> Vec<Landing> {
     let reported: Vec<f64> = landed.iter().map(|&(_, r, _)| r).collect();
     let export = frame_times(source, &reported).expect("export's frame times");
     landed
-        .into_iter()
+        .iter()
         .zip(export)
-        .map(|((target, reported, displayed), export)| {
-            let landing = Landing {
-                target,
-                reported,
-                displayed,
-                export,
-            };
-            eprintln!("{landing}");
-            landing
+        .map(|(&(target, reported, shown_end), export)| Landing {
+            target,
+            reported,
+            shown_end,
+            export,
         })
         .collect()
 }

@@ -589,3 +589,28 @@ fn taking_the_pipeline_down_mid_load_never_deadlocks() {
         .recv_timeout(Duration::from_secs(60))
         .expect("a player deadlocked while being taken down mid-load");
 }
+
+/// Above 1x the sound is muted, and at 1x it is back (spec S4).
+#[test]
+fn a_fast_rate_mutes_the_sound() {
+    let mut rig = Rig::new();
+    let muted = |rig: &Rig| rig.player.pipeline.property::<bool>("mute");
+    rig.player.set_rate(4.0);
+    assert!(muted(&rig));
+    rig.player.set_rate(1.0);
+    assert!(!muted(&rig));
+}
+
+/// A step back aims half a nominal frame before the shown frame's nominal
+/// start, or before its own where that is earlier: a frame held longer than
+/// nominal (VFR) is left, not landed in again.
+#[test]
+fn a_step_back_aims_into_the_previous_frame() {
+    let p = FRAME;
+    let before = 5.0 - p / 2.0;
+    // Constant rate: clipped by a scrub to 5.02, or not.
+    assert!((step_back(5.02, 5.0 + p, p) - before).abs() < 1e-9);
+    assert!((step_back(5.0, 5.0 + p, p) - before).abs() < 1e-9);
+    // Held six frames, 5.0..5.2.
+    assert!((step_back(5.0, 5.2, p) - before).abs() < 1e-9);
+}

@@ -51,7 +51,7 @@ use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
 use video_coach_core::zoom::Zoom;
 
 use crate::mailbox::{stream_end, stream_time};
-use crate::player::{answer_need_context, seconds_to_clock};
+use crate::player::{answer_need_context, seconds, seconds_to_clock};
 
 /// How long any wait goes between checks of the cancel flag and errors.
 const POLL: gst::ClockTime = gst::ClockTime::from_mseconds(10);
@@ -202,7 +202,6 @@ pub fn frame_times(source: &Path, targets: &[f64]) -> Result<Vec<Range<f64>>, Co
         error: Arc::default(),
     };
     let mut decoder = decode::Decoder::start(source, &Gl::shared()?, &watch)?;
-    let seconds = |t: gst::ClockTime| t.nseconds() as f64 / 1e9;
     targets
         .iter()
         .map(|&target| {

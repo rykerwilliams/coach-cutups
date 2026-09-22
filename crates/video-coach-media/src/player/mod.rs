@@ -40,8 +40,6 @@ use crate::mailbox::FrameMailbox;
 pub enum Origin {
     Skip,
     Scrub,
-    /// A one-frame step.
-    Step,
     /// The bus itself: EOS advance, position restore, reloads.
     System,
 }
@@ -301,47 +299,51 @@ impl SourcePlayer {
     /// first. Meaningful only while paused and idle, with the player's own
     /// frame up.
     ///
-    /// Both directions work from the shown frame's **end**, which a seek never
-    /// clips, and never from its start, which it does: after a scrub the
-    /// start is the scrub's target, not the frame's. Forward seeks to that
-    /// end, which is the next frame's start (or, where timestamps overlap or
-    /// leave a gap, lands inside the next frame all the same). Back seeks
-    /// half a nominal frame before the shown frame's nominal start, the
-    /// middle of the previous frame, so the target holds on a stream whose
-    /// timestamps jitter by up to half a frame.
+    /// Forward seeks to the shown frame's **end**, which a seek never clips:
+    /// the next frame's start (or, where timestamps overlap or leave a gap,
+    /// inside the next frame all the same). Back seeks half a nominal frame
+    /// before the frame's start: its nominal start (end minus a period),
+    /// since after a scrub its start is the scrub's target, or its own start
+    /// where that is earlier, a frame held longer than nominal (VFR phone
+    /// footage). That is the middle of the previous frame, so the target holds
+    /// on a stream whose timestamps jitter by up to half a frame.
     pub fn step_target(&self, forward: bool) -> Option<f64> {
         let shown = self.mailbox.shown()?;
-        let target = match forward {
-            true => shown.end,
-            false => shown.end - 1.5 * shown.period,
+        let target = if forward {
+            shown.end
+        } else {
+            step_back(shown.start, shown.end, shown.period)
         };
         (target >= 0.0).then_some(target)
     }
 
-    /// Sets the playback rate, forward, 1 for normal speed. Every seek is
+    /// The middle of the frame on screen, from its start (or where a seek
+    /// clipped it to) to its end: an accurate seek there shows the same
+    /// frame, even where timestamps overlap (WebM's are whole milliseconds),
+    /// which its start alone doesn't. `None` with no frame shown. While fast
+    /// the picture trails the position (spec S5), so a pause stays on this
+    /// rather than on the position.
+    pub fn shown_secs(&self) -> Option<f64> {
+        self.mailbox
+            .shown()
+            .map(|shown| (shown.start + shown.end) / 2.0)
+    }
+
+    /// Sets the playback rate, forward, 1 for normal speed, and mutes the
+    /// sound above 1 (`TRICKMODE_NO_AUDIO` is only a hint). Every seek is
     /// issued at the rate stored when it is *issued*, so a scrub, a skip or
-    /// the next source keeps it. A seek still to be issued (a pending
-    /// request, or a load's) carries it; otherwise the player seeks
-    /// accurately to where it is heading, or is, so the picture never snaps
-    /// to a key frame. Above 1 the sound is muted: `TRICKMODE_NO_AUDIO` is
-    /// only a hint.
-    pub fn set_rate(&mut self, rate: f64) -> Vec<PlayerEvent> {
-        if rate == self.rate {
-            return Vec::new();
-        }
+    /// the next source keeps it, and so does a seek still to be issued
+    /// ([`SourcePlayer::seek_waiting`]). It issues no seek of its own: the
+    /// rate takes effect at the next one.
+    pub fn set_rate(&mut self, rate: f64) {
         self.rate = rate;
         self.pipeline.set_property("mute", rate != 1.0);
-        if self.pending.is_some() || matches!(self.flight, Flight::Loading(_)) {
-            return Vec::new();
-        }
-        let (Some(uri), Some(secs)) = (
-            self.loaded_uri.clone(),
-            self.target_secs()
-                .or_else(|| self.position_handle().query_position()),
-        ) else {
-            return Vec::new();
-        };
-        self.seek_to(&uri, secs, true, Origin::System)
+    }
+
+    /// Whether a seek is still to be issued, a pending request or a load's,
+    /// and so will be issued at the rate stored then.
+    pub fn seek_waiting(&self) -> bool {
+        self.pending.is_some() || matches!(self.flight, Flight::Loading(_))
     }
 
     /// The rate every seek is issued at (see [`SourcePlayer::set_rate`]).
@@ -660,10 +662,6 @@ pub(crate) fn answer_need_context(
     }
 }
 
-fn seconds(t: gst::ClockTime) -> f64 {
-    t.nseconds() as f64 / 1e9
-}
-
 /// A `volume` element's gain for a linear slider value in `0..=1`, mapped as
 /// `x³` (mpv's perceptual curve). The scan slider and the preview's
 /// commentary volume are both stored in that slider's space, so both come
@@ -682,4 +680,15 @@ pub(crate) fn gain(linear: f64) -> f64 {
 /// `f64::max` maps NaN to 0; an infinite target saturates and lands at the end.
 pub(crate) fn seconds_to_clock(secs: f64) -> gst::ClockTime {
     gst::ClockTime::from_nseconds((secs.max(0.0) * 1e9).round() as u64)
+}
+
+/// A step back from the frame shown from `start` to `end` (see
+/// [`SourcePlayer::step_target`]).
+fn step_back(start: f64, end: f64, period: f64) -> f64 {
+    start.min(end - period) - period / 2.0
+}
+
+/// A `ClockTime` in seconds.
+pub(crate) fn seconds(t: gst::ClockTime) -> f64 {
+    t.nseconds() as f64 / 1e9
 }

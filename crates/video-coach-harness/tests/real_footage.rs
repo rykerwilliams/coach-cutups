@@ -18,28 +18,17 @@
 //! locally and on a FUSE cloud mount. It plays the file on the speakers,
 //! muted; the file is only read.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use video_coach_app::bus::{Command, Event};
-use video_coach_harness::{round_trip, write_one_source_project, Harness, Landing};
+use video_coach_app::bus::{Command, Event, ScanStep};
+use video_coach_harness::{open_one_source_project, round_trip, Harness, Landing};
 
 /// The footage `COACH_FOOTAGE` names.
 fn footage() -> PathBuf {
     std::env::var_os("COACH_FOOTAGE")
         .expect("COACH_FOOTAGE names a real video file with an audio track")
         .into()
-}
-
-/// Opens `folder` on `h` paused, with the speakers muted.
-fn open_muted(h: &mut Harness, folder: &Path) {
-    h.send(Command::OpenProject(folder.to_owned()));
-    h.wait_opened();
-    h.wait_settled();
-    h.send(Command::SetVolume {
-        value: 0.0,
-        commit: false,
-    });
 }
 
 /// Waits `ms`, receiving events meanwhile.
@@ -76,16 +65,12 @@ fn real_footage_keeps_playing_through_seeks_while_playing() {
     gstreamer::init().unwrap();
     let footage = footage();
     let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("project");
-    std::fs::create_dir(&folder).unwrap();
-    let project = write_one_source_project(&folder, &footage);
+    let mut h = Harness::production(&tmp.path().join("config"));
+    let project = open_one_source_project(&mut h, &tmp.path().join("project"), &footage, true);
     assert!(
         project.source_videos[0].duration_seconds > 60.0,
         "needs a minute of footage"
     );
-
-    let mut h = Harness::production(&tmp.path().join("config"));
-    open_muted(&mut h, &folder);
 
     // A scrub while paused, played at once; then a pause and a play.
     h.send(Command::ScrubMove { abs: 20.0 });
@@ -129,35 +114,31 @@ fn real_footage_scrubs_land_on_the_frame_export_picks() {
     let footage = footage();
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("project");
-    std::fs::create_dir(&folder).unwrap();
-    let project = write_one_source_project(&folder, &footage);
-    let duration = project.source_videos[0].duration_seconds;
+    let duration = video_coach_media::probe(&footage)
+        .expect("probe the footage")
+        .duration_seconds;
     let targets: Vec<f64> = (0..20)
         .map(|i| (f64::from(i) + 0.5) * duration / 20.0)
         .collect();
 
-    let run = |mut h: Harness, sinks: &str| -> Vec<Landing> {
-        eprintln!("{sinks} sinks:");
-        open_muted(&mut h, &folder);
+    let run = |mut h: Harness| -> Vec<Landing> {
+        open_one_source_project(&mut h, &folder, &footage, true);
         let landed = round_trip(&mut h, &footage, &targets);
         h.shutdown();
         landed
     };
-    let system = run(Harness::new(&tmp.path().join("system")), "System");
-    let production = run(Harness::production(&tmp.path().join("app")), "production");
+    let system = run(Harness::new(&tmp.path().join("system")));
+    let production = run(Harness::production(&tmp.path().join("app")));
 
     // Per run: the reported position (off the target by), and the end of the
     // frame shown and of the frame export picks, which match when they are
     // the same frame.
     let cell = |l: &Landing| {
-        let shown = l
-            .displayed
-            .1
-            .map_or_else(|| "none".to_owned(), |t| format!("{t:.4}"));
         format!(
-            "{:>10.4} ({:+.4}) {shown:>10} {:>10.4}",
+            "{:>10.4} ({:+.4}) {:>10.4} {:>10.4}",
             l.reported,
             l.reported - l.target,
+            l.shown_end,
             l.export.end
         )
     };
@@ -175,17 +156,18 @@ fn real_footage_scrubs_land_on_the_frame_export_picks() {
         );
     }
     for landing in system.iter().chain(&production) {
-        landing.check();
+        landing.check_export();
+        landing.check_target();
     }
 }
 
 /// Fast scanning (spec S5) on real footage, on the app's own sinks: 5 s at
 /// each speed from a minute in, each timed from the settle of the seek that
-/// set it. Prints, per speed, the frames the sink put up per second (the
-/// mailbox polled every 2 ms, faster than any display takes them), how fast
-/// their stream time ran against the wall clock, and how far the frame shown
-/// was from the position reported. It is what chose decoding every frame at
-/// every speed over key frames only (the player's `seek`), and would say so
+/// set it. Prints, per speed, what [`Harness::watch_displayed`] saw: the
+/// frames the sink put up per second, how fast their stream time ran against
+/// the wall clock, and how far the frame shown was from the position
+/// reported. It measured decoding every frame against key frames only; the
+/// numbers are on the player's `seek` and in CLAUDE.md, and it would say so
 /// if 32x stopped keeping up. Asserts only that the picture moved at every
 /// speed.
 #[test]
@@ -194,53 +176,27 @@ fn real_footage_fast_scanning() {
     gstreamer::init().unwrap();
     let footage = footage();
     let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("project");
-    std::fs::create_dir(&folder).unwrap();
-    let project = write_one_source_project(&folder, &footage);
-    let duration = project.source_videos[0].duration_seconds;
-    // 5 s at each of 1+2+4+8+16+32 is 315 s of footage.
-    assert!(duration > 400.0, "needs seven minutes of footage");
-
     let mut h = Harness::production(&tmp.path().join("config"));
-    open_muted(&mut h, &folder);
+    let project = open_one_source_project(&mut h, &tmp.path().join("project"), &footage, true);
+    // 5 s at each of 1+2+4+8+16+32 is 315 s of footage.
+    assert!(
+        project.source_videos[0].duration_seconds > 400.0,
+        "needs seven minutes of footage"
+    );
+
     h.send(Command::ScrubRelease { abs: 60.0 });
     h.wait_settled();
     h.toggle_play();
     h.wait_playing();
-    eprintln!(
-        "{:>5} {:>8} {:>8} {:>9} {:>9}",
-        "speed", "fps", "rate", "mean lag", "max lag"
-    );
     for speed in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
         if speed > 1.0 {
-            h.send(Command::SetScanSpeed(speed));
-            h.wait_map("the speed", |e| {
-                matches!(e, Event::ScanSpeed(s) if *s == speed).then_some(())
-            });
+            h.send(Command::ScanSpeed(ScanStep::Faster));
+            h.wait_speed(speed);
             h.wait_settled();
         }
-        let start = Instant::now();
-        let mut shown: Vec<(Instant, f64, f64)> = Vec::new();
-        while start.elapsed() < Duration::from_secs(5) {
-            if let Some(frame) = h.take_frame() {
-                let now = Instant::now();
-                if let (Some(t), Some(position)) = (frame.stream_time, h.position_secs()) {
-                    shown.push((now, t, position));
-                }
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let (&(t0, s0, _), &(t1, s1, _)) = (shown.first().unwrap(), shown.last().unwrap());
-        let wall = (t1 - t0).as_secs_f64();
-        let lags: Vec<f64> = shown.iter().map(|&(_, t, p)| (p - t).abs()).collect();
-        let max_lag = lags.iter().cloned().fold(0.0, f64::max);
-        let mean_lag = lags.iter().sum::<f64>() / lags.len() as f64;
-        eprintln!(
-            "{speed:>4}x {:>8.1} {:>7.2}x {mean_lag:>8.3}s {max_lag:>8.3}s",
-            (shown.len() - 1) as f64 / wall,
-            (s1 - s0) / wall,
-        );
-        assert!(s1 > s0, "the picture stood still at {speed}x");
+        let seen = h.watch_displayed(5.0);
+        eprintln!("{speed:>4}x {seen}");
+        assert!(seen.rate > 0.0, "the picture stood still at {speed}x");
     }
     h.shutdown();
 }

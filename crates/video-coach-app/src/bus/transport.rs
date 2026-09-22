@@ -15,11 +15,24 @@ use video_coach_core::skip::SkipDecision;
 use video_coach_media::{Origin, PlayerEvent};
 
 use super::sources::END_MARGIN;
-use super::{Bus, Event, UserError};
+use super::{Bus, Event, ScanStep, UserError};
 
 /// The game video's speeds (spec S1). `J` and `L` step through them, and the
 /// speed button cycles them.
 const SCAN_SPEEDS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+/// The speed `step` moves to from `rate`: `Faster` and `Slower` stop at the
+/// ends, `Cycle` wraps from the fastest to 1x.
+fn next_speed(rate: f64, step: ScanStep) -> f64 {
+    let last = SCAN_SPEEDS.len() - 1;
+    let i = SCAN_SPEEDS.iter().position(|&s| s == rate).unwrap_or(0);
+    SCAN_SPEEDS[match step {
+        ScanStep::Faster => (i + 1).min(last),
+        ScanStep::Slower => i.saturating_sub(1),
+        ScanStep::Cycle if i == last => 0,
+        ScanStep::Cycle => i + 1,
+    }]
+}
 
 impl Bus {
     /// Play is refused (answered with `Playing(false)`) with no sources or
@@ -55,9 +68,9 @@ impl Bus {
     /// one of them PLAYING, so this is the single play state (spec P5).
     ///
     /// Every pause of the game video returns it to 1x (spec S3), after the
-    /// pause, so the seek that does it lands paused where it stopped. Only
-    /// when it was fast: at 1x a pause adds no seek, which would change its
-    /// settling and a recording's pause anchors.
+    /// pause, so the seek that does it lands paused. Only when it was fast:
+    /// at 1x a pause adds no seek, which would change its settling and a
+    /// recording's pause anchors.
     pub(super) fn set_playing(&mut self, playing: bool) {
         self.playing = playing;
         match &self.preview {
@@ -70,27 +83,47 @@ impl Bus {
         }
     }
 
-    /// Plays the game video at `speed` (spec S1): one of [`SCAN_SPEEDS`],
-    /// only while it plays, with no preview open. The recording guard in
-    /// `Bus::command` refuses it while recording (S2).
-    pub(super) fn set_scan_speed(&mut self, speed: f64) {
-        if !SCAN_SPEEDS.contains(&speed)
-            || !self.playing
-            || self.preview.is_some()
-            || self.player.rate() == speed
-        {
+    /// Plays the game video a speed faster or slower (spec S1), only while it
+    /// plays, with no preview open. The recording guard in `Bus::command`
+    /// refuses it while recording (S2).
+    pub(super) fn scan_speed(&mut self, step: ScanStep) {
+        if !self.playing || self.preview.is_some() {
             return;
         }
-        self.change_rate(speed);
+        let rate = next_speed(self.player.rate(), step);
+        if rate != self.player.rate() {
+            self.change_rate(rate);
+        }
     }
 
-    /// Sets the player's rate, which it carries into every seek from now,
-    /// and tells the UI. A skip burst's live target was worked out at the
-    /// old rate, so the burst is dropped.
+    /// Sets the player's rate and seeks at it, through `load` like every
+    /// seek: while playing, from where it is heading; after a pause, from
+    /// the frame on screen, which at 32x trails the position by up to 0.6 s
+    /// (spec S5), so the coach stays on the frame they paused on. A seek
+    /// still to be issued carries the rate, so none is added then: a pending
+    /// scrub or skip is never displaced.
     fn change_rate(&mut self, rate: f64) {
+        self.store_rate(rate);
+        if self.player.seek_waiting() || !self.seekable() || !self.loaded() {
+            return;
+        }
+        let secs = match self.player.target_secs() {
+            Some(target) => target,
+            None if !self.playing => self
+                .player
+                .shown_secs()
+                .unwrap_or_else(|| self.current_secs()),
+            None => self.current_secs(),
+        };
+        self.load(self.current, secs, true, Origin::System);
+    }
+
+    /// Stores the player's rate, which it carries into every seek from now,
+    /// and tells the UI, with no seek. A skip burst's live target was worked
+    /// out at the old rate, so the burst is dropped.
+    pub(super) fn store_rate(&mut self, rate: f64) {
         self.reset_skip();
-        let events = self.player.set_rate(rate);
-        self.player_events(events);
+        self.player.set_rate(rate);
         self.emit(Event::ScanSpeed(rate));
     }
 
@@ -201,7 +234,7 @@ impl Bus {
             return;
         }
         self.reset_skip();
-        self.load(self.current, target, true, Origin::Step);
+        self.load(self.current, target, true, Origin::Scrub);
     }
 
     /// The skip debounce fired: the burst is over.
@@ -402,5 +435,20 @@ impl Bus {
             source_index: self.current,
             target_abs,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_speeds_clamp_and_the_button_wraps() {
+        assert_eq!(next_speed(1.0, ScanStep::Slower), 1.0);
+        assert_eq!(next_speed(16.0, ScanStep::Faster), 32.0);
+        assert_eq!(next_speed(32.0, ScanStep::Faster), 32.0);
+        assert_eq!(next_speed(4.0, ScanStep::Slower), 2.0);
+        assert_eq!(next_speed(16.0, ScanStep::Cycle), 32.0);
+        assert_eq!(next_speed(32.0, ScanStep::Cycle), 1.0);
     }
 }

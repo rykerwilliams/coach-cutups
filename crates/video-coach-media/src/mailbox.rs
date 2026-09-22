@@ -16,6 +16,8 @@ use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
 
+use crate::player::seconds;
+
 /// One decoded frame: the buffer, the negotiated `VideoInfo` it is laid out
 /// by, which carries the pixel aspect ratio, and where it is in its stream.
 ///
@@ -25,12 +27,10 @@ use gstreamer_video as gst_video;
 pub struct Frame {
     pub buffer: gst::Buffer,
     pub info: gst_video::VideoInfo,
-    /// Seconds into the stream that produced it, from the sample's segment,
-    /// by the rule export picks its frames by ([`stream_time`]): a time
-    /// inside this frame, so export's decoder picks this frame for it. It is
-    /// the frame's start, except for the frame a seek lands inside: the
-    /// decoder clips that one to the seek's target. A preview's frame is in
-    /// output time. `None` without a PTS or a time segment.
+    /// Seconds into its stream ([`stream_time`], the rule export picks
+    /// frames by): the frame's start, or for the frame a seek lands inside,
+    /// the seek's target, which the decoder clips it to. `None` without a
+    /// PTS or a time segment.
     pub stream_time: Option<f64>,
     /// Where the frame ends, in the same time: which frame this is, even when
     /// its start was clipped. `None` without a duration too.
@@ -42,7 +42,6 @@ impl Frame {
     /// drawing context can wait for the producing pipeline to finish. System
     /// memory needs nothing.
     pub(crate) fn from_sample(sample: gst::Sample) -> Result<Frame, gst::FlowError> {
-        let seconds = |t: gst::ClockTime| t.nseconds() as f64 / 1e9;
         let (stream_time, stream_end) = (
             stream_time(&sample).map(seconds),
             stream_end(&sample).map(seconds),
@@ -72,10 +71,13 @@ impl Frame {
     }
 }
 
-/// Where the newest frame put in a mailbox ends, kept after it is taken: the
-/// frame on screen, for a one-frame step ([`FrameMailbox::shown`]).
+/// Where the newest frame put in a mailbox is, kept after it is taken: the
+/// frame on screen, for a one-frame step and for a pause at speed
+/// ([`FrameMailbox::shown`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Shown {
+    /// [`Frame::stream_time`]: inside the frame, clipped or not.
+    pub(crate) start: f64,
     /// [`Frame::stream_end`]: the one time a seek never clips.
     pub(crate) end: f64,
     /// The stream's nominal frame duration, from its caps; 1/30 s where they
@@ -86,11 +88,13 @@ pub(crate) struct Shown {
 impl Shown {
     fn of(frame: &Frame) -> Option<Shown> {
         let fps = frame.info.fps();
-        let period = match fps.numer() > 0 && fps.denom() > 0 {
-            true => f64::from(fps.denom()) / f64::from(fps.numer()),
-            false => 1.0 / 30.0,
+        let period = if fps.numer() > 0 && fps.denom() > 0 {
+            f64::from(fps.denom()) / f64::from(fps.numer())
+        } else {
+            1.0 / 30.0
         };
         Some(Shown {
+            start: frame.stream_time?,
             end: frame.stream_end?,
             period,
         })
@@ -123,16 +127,16 @@ impl FrameMailbox {
         self.inner.frame.lock().unwrap().take()
     }
 
-    /// Where the newest frame put here ends, whether or not it was taken
+    /// Where the newest frame put here is, whether or not it was taken
     /// since. `None` before the first, after [`FrameMailbox::clear`], or when
-    /// that frame carried no stream end.
+    /// that frame carried no stream time or end.
     pub(crate) fn shown(&self) -> Option<Shown> {
         *self.inner.shown.lock().unwrap()
     }
 
     /// Empties the slot and forgets [`FrameMailbox::shown`]: nothing is on
     /// screen any more.
-    pub(crate) fn clear(&self) {
+    pub fn clear(&self) {
         self.take();
         *self.inner.shown.lock().unwrap() = None;
     }

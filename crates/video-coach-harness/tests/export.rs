@@ -22,10 +22,8 @@ use video_coach_core::scoreboard::{MatchEventKind, MatchFormat, ScoreboardConfig
 use video_coach_core::store::{self, EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
-use video_coach_harness::{add_clips, write_project, Harness};
+use video_coach_harness::{add_clips, write_project, Harness, FRAME};
 use video_coach_media::fixtures;
-
-const FRAME: f64 = 1.0 / 30.0;
 
 /// A team colour as `0xRRGGBB`.
 fn rgb(c: u32) -> Rgba {

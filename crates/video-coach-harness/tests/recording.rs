@@ -16,10 +16,8 @@ use video_coach_core::store;
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::timeline;
 use video_coach_core::zoom::Zoom;
-use video_coach_harness::{write_project, Harness};
+use video_coach_harness::{write_project, Harness, FRAME};
 use video_coach_media::{fixtures, now_ns};
-
-const FRAME: f64 = 1.0 / 30.0;
 
 /// A camera slow enough to warm up that a test can act before its first
 /// frame.

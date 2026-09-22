@@ -78,6 +78,13 @@ export enum MatchTag {
 }
 
 /// The inspector's text fields, for `edit-clip`.
+/// Which way `J`, `L` and the speed button move the scan speed (spec S1).
+export enum ScanStep {
+    faster,
+    slower,
+    cycle,
+}
+
 export enum ClipField {
     name,
     tags,
@@ -1608,8 +1615,9 @@ export component AppWindow inherits Window {
     callback skip(float);
     /// `,` and `.`: one frame back or forward, while paused.
     callback step-frame(bool);
-    /// `J`, `L` and the speed button: this speed, while scanning.
-    callback set-scan-speed(float);
+    /// `J`, `L` and the speed button: a speed slower or faster, while
+    /// scanning.
+    callback step-scan-speed(ScanStep);
     callback scrub-move(float);
     callback scrub-release(float);
     /// R, Record or Stop: the bus starts a recording when idle, else stops
@@ -1879,9 +1887,7 @@ export component AppWindow inherits Window {
         // halves down to 1x. Not while recording or previewing, which are 1x.
         if (event.text == "j" || event.text == "J" || event.text == "l" || event.text == "L") {
             if (pressed && !event.repeat && root.can-scan-fast) {
-                root.set-scan-speed(event.text == "l" || event.text == "L"
-                    ? min(root.scan-speed * 2, 32)
-                    : max(root.scan-speed / 2, 1));
+                root.step-scan-speed(event.text == "l" || event.text == "L" ? ScanStep.faster : ScanStep.slower);
             }
             return accept;
         }
@@ -2570,7 +2576,7 @@ export component AppWindow inherits Window {
                             enabled: root.can-scan-fast;
                             min-width: 48px;
                             clicked => {
-                                root.set-scan-speed(root.scan-speed >= 32 ? 1 : root.scan-speed * 2);
+                                root.step-scan-speed(ScanStep.cycle);
                             }
 
                             Tooltip {

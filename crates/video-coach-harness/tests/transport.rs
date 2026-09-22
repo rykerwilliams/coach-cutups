@@ -5,14 +5,16 @@
 //! bus's latest published source index, and waited for by polling with a
 //! timeout. Fixtures are short so EOS tests play out in about a second.
 
+use std::path::{Path, PathBuf};
+
 use tempfile::TempDir;
-use video_coach_app::bus::{Command, Event};
+use video_coach_app::bus::{Command, Event, RecordingStatus, ScanStep};
 use video_coach_core::project::Project;
 use video_coach_harness::{
-    round_trip, write_one_source_project, write_project, Harness, FRAME, SAME_FRAME,
+    landings, open_one_source_project, round_trip, shown_end, write_project, Harness, FRAME,
+    SAME_FRAME,
 };
 use video_coach_media::fixtures::{counter_video_with, CounterKind, CounterQuirks};
-use video_coach_media::frame_times;
 
 /// A project in `<tmp>/project` whose sources are 16:9 30 fps WebM fixtures
 /// of the given lengths in `<tmp>/media`, opened on a fresh bus that has
@@ -202,6 +204,24 @@ fn the_position_survives_removing_an_earlier_source() {
     rig.h.shutdown();
 }
 
+/// The 10 s edit-listed MP4 whose stream times sit a nanosecond off round
+/// numbers, open on a fresh `Harness::new` and settled.
+fn open_edit_listed(tmp: &Path) -> (Harness, PathBuf) {
+    gstreamer::init().unwrap();
+    let source = counter_video_with(
+        &tmp.join("src.mp4"),
+        640,
+        360,
+        30,
+        300,
+        CounterKind::H264Mp4BFrames,
+        CounterQuirks::default(),
+    );
+    let mut h = Harness::new(&tmp.join("config"));
+    open_one_source_project(&mut h, &tmp.join("project"), &source, false);
+    (h, source)
+}
+
 /// A scrub released while paused shows the frame export picks for the
 /// position it reports, within a frame of its target (spec H6), on an
 /// edit-listed MP4: raw PTS runs two frames ahead of stream time there, the
@@ -209,103 +229,58 @@ fn the_position_survives_removing_an_earlier_source() {
 /// real footage.
 #[test]
 fn a_paused_scrub_shows_the_frame_export_picks() {
-    gstreamer::init().unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("project");
-    std::fs::create_dir(&folder).unwrap();
-    let source = counter_video_with(
-        &tmp.path().join("src.mp4"),
-        640,
-        360,
-        30,
-        300,
-        CounterKind::H264Mp4BFrames,
-        CounterQuirks::default(),
-    );
-    write_one_source_project(&folder, &source);
-
-    let mut h = Harness::new(&tmp.path().join("config"));
-    h.send(Command::OpenProject(folder));
-    h.wait_opened();
-    h.wait_settled();
+    let (mut h, source) = open_edit_listed(tmp.path());
     // 20 targets over 0.1..9.4 s at every phase of a frame, starting on a
     // boundary: 0.1 s is frame 3's, which stream time puts 1 ns later.
     let targets: Vec<f64> = (0..20).map(|i| 0.1 + f64::from(i) * 0.487).collect();
     for landing in round_trip(&mut h, &source, &targets) {
-        landing.check();
+        landing.check_export();
+        landing.check_target();
     }
     h.shutdown();
 }
 
-/// `,` and `.` step one frame while paused (plan Task 0.3), on the edit-listed
-/// MP4 whose stream times sit a nanosecond off round numbers. A forward step
+/// `,` and `.` step one frame while paused (plan Task 0.3). A forward step
 /// lands on the next frame's start; a step back lands inside the previous
 /// frame. Either way the position reported is the displayed frame's stream
 /// time, which is the frame export picks for it. Frames are told apart by
 /// their ends: a seek clips the frame it lands inside to its target.
 #[test]
 fn a_paused_step_moves_exactly_one_frame() {
-    gstreamer::init().unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("project");
-    std::fs::create_dir(&folder).unwrap();
-    let source = counter_video_with(
-        &tmp.path().join("src.mp4"),
-        640,
-        360,
-        30,
-        300,
-        CounterKind::H264Mp4BFrames,
-        CounterQuirks::default(),
-    );
-    write_one_source_project(&folder, &source);
-
-    let mut h = Harness::new(&tmp.path().join("config"));
-    h.send(Command::OpenProject(folder));
-    h.wait_opened();
-    h.wait_settled();
+    let (mut h, source) = open_edit_listed(tmp.path());
     let step = |forward| Command::StepFrame { forward };
-    let end = |frame: &video_coach_media::Frame| frame.stream_end.expect("a timed frame");
 
     // Mid-frame, so the first frame shown is clipped and a step back can't
     // take its start for the frame's own.
     let (_, first) = h.seek_and_settle(Command::ScrubRelease { abs: 5.02 });
-    let start_end = end(&first);
+    let start_end = shown_end(&first);
     let mut landed = Vec::new();
     for (forward, n) in [(true, 1..=5), (false, 1..=5)] {
         for i in n {
             let (reported, frame) = h.seek_and_settle(step(forward));
             let frames = if forward { i } else { 5 - i };
             let expected = start_end + f64::from(frames) * FRAME;
-            eprintln!(
-                "{}: reported {reported:.6}, displayed {:?}..{:?}",
-                if forward { "." } else { "," },
-                frame.stream_time,
-                frame.stream_end
-            );
             assert!(
-                (end(&frame) - expected).abs() <= SAME_FRAME,
+                (shown_end(&frame) - expected).abs() <= SAME_FRAME,
                 "step {i} {} shows the frame ending at {}, not {expected}",
                 if forward { "forward" } else { "back" },
-                end(&frame)
+                shown_end(&frame)
             );
             let shown = frame.stream_time.expect("a timed frame");
             assert!(
                 (reported - shown).abs() <= SAME_FRAME,
                 "reported {reported}, but the frame shown starts at {shown}"
             );
-            landed.push((reported, end(&frame)));
+            // A step has no target of its own: it lands where it reports.
+            landed.push((reported, reported, shown_end(&frame)));
         }
     }
     // What P2 relies on: a key placed at the reported position is drawn on
     // the frame the coach saw.
-    let reported: Vec<f64> = landed.iter().map(|&(r, _)| r).collect();
-    let export = frame_times(&source, &reported).expect("export's frame times");
-    for (&(reported, shown), export) in landed.iter().zip(export) {
-        assert!(
-            (shown - export.end).abs() <= SAME_FRAME,
-            "at {reported} export picks {export:?}, the scan player showed ..{shown}"
-        );
+    for landing in landings(&source, &landed) {
+        landing.check_export();
     }
 
     // Back from the first frame: nothing moves. Play is the barrier: the
@@ -338,10 +313,8 @@ fn a_paused_step_moves_exactly_one_frame() {
 /// A 60 s counter video with an audio track in `<tmp>/src.webm`, as the one
 /// source of a project in `<tmp>/project`, opened on `h` and settled, paused,
 /// with the speakers muted (the production sinks reach the real ones).
-fn open_minute(h: &mut Harness, tmp: &std::path::Path) {
+fn open_minute(h: &mut Harness, tmp: &Path) {
     gstreamer::init().unwrap();
-    let folder = tmp.join("project");
-    std::fs::create_dir(&folder).unwrap();
     let source = counter_video_with(
         &tmp.join("src.webm"),
         384,
@@ -351,57 +324,32 @@ fn open_minute(h: &mut Harness, tmp: &std::path::Path) {
         CounterKind::Vp8WebmWithAudio,
         CounterQuirks::default(),
     );
-    write_one_source_project(&folder, &source);
-    h.send(Command::OpenProject(folder));
-    h.wait_opened();
-    h.wait_settled();
-    h.send(Command::SetVolume {
-        value: 0.0,
-        commit: false,
-    });
-}
-
-/// Waits for `ScanSpeed(speed)`, skipping any other speed before it.
-fn wait_speed(h: &mut Harness, speed: f64) {
-    h.wait_map(&format!("ScanSpeed({speed})"), |e| {
-        matches!(e, Event::ScanSpeed(s) if *s == speed).then_some(())
-    });
-}
-
-/// Watches the **displayed** frames for `secs` of wall time from now, as the
-/// UI's redraw takes them: how fast their stream time runs against the wall
-/// clock, and the furthest any is from the position reported as it is taken.
-fn displayed_rate(h: &mut Harness, secs: f64) -> (f64, f64) {
-    let start = std::time::Instant::now();
-    let mut first = None;
-    let mut last = None;
-    let mut lag: f64 = 0.0;
-    h.poll_until("the displayed frames", |h| {
-        if let Some(shown) = h.take_frame().and_then(|f| f.stream_time) {
-            let now = std::time::Instant::now();
-            if let Some(position) = h.position_secs() {
-                lag = lag.max((position - shown).abs());
-            }
-            first.get_or_insert((now, shown));
-            last = Some((now, shown));
-        }
-        start.elapsed().as_secs_f64() >= secs
-    });
-    let ((t0, s0), (t1, s1)) = (first.expect("a frame"), last.expect("a frame"));
-    let rate = (s1 - s0) / (t1 - t0).as_secs_f64();
-    eprintln!("displayed {s0:.3} -> {s1:.3}: {rate:.2}x, lag at most {lag:.3} s");
-    (rate, lag)
+    open_one_source_project(h, &tmp.join("project"), &source, true);
 }
 
 /// Asserts the picture runs at `speed` for 2 s from now, and keeps up with
 /// the reported position.
 fn assert_displayed_speed(h: &mut Harness, speed: f64, after: &str) {
-    let (rate, lag) = displayed_rate(h, 2.0);
+    let seen = h.watch_displayed(2.0);
+    eprintln!("after {after}: {seen}");
     assert!(
-        (rate / speed - 1.0).abs() <= 0.25,
-        "after {after}, the picture runs at {rate:.2}x, not {speed}x"
+        (seen.rate / speed - 1.0).abs() <= 0.25,
+        "after {after}, the picture runs at {:.2}x, not {speed}x",
+        seen.rate
     );
-    assert!(lag <= 0.5, "after {after}, the picture lags {lag:.3} s");
+    assert!(
+        seen.max_lag <= 0.5,
+        "after {after}, the picture lags {:.3} s",
+        seen.max_lag
+    );
+}
+
+/// From 1x while playing, `L` twice: 4x, once its seek settles.
+fn four_times(h: &mut Harness) {
+    h.send(Command::ScanSpeed(ScanStep::Faster));
+    h.send(Command::ScanSpeed(ScanStep::Faster));
+    h.wait_speed(4.0);
+    h.wait_settled();
 }
 
 /// Plays at 4x and scrubs while fast, timing each from the seek that set it
@@ -409,9 +357,7 @@ fn assert_displayed_speed(h: &mut Harness, speed: f64, after: &str) {
 fn check_four_times(h: &mut Harness) {
     h.toggle_play();
     wait_playing(h, true);
-    h.send(Command::SetScanSpeed(4.0));
-    wait_speed(h, 4.0);
-    h.wait_settled();
+    four_times(h);
     assert_displayed_speed(h, 4.0, "4x");
 
     // A scrub keeps the speed: the seek carries the rate.
@@ -423,74 +369,55 @@ fn check_four_times(h: &mut Harness) {
 /// Fast scanning (plan Task 0.4, spec S): the displayed frame runs at the
 /// chosen speed and stays with the position, through a scrub; any pause
 /// returns to 1x, a recording's start included; and a speed is refused
-/// while paused, while recording, or outside 1x..32x.
+/// while paused or recording.
 #[test]
 fn fast_scanning_runs_at_the_chosen_speed() {
     let tmp = tempfile::tempdir().unwrap();
     let mut h = Harness::new(&tmp.path().join("config"));
     open_minute(&mut h, tmp.path());
-    let is_change = |e: &Event| {
-        matches!(
-            e,
-            Event::ScanSpeed(_)
-                | Event::Position {
-                    target_abs: Some(_),
-                    ..
-                }
-        )
-    };
 
     // Refused while paused: play is the barrier.
     let from = h.log().len();
-    h.send(Command::SetScanSpeed(4.0));
-    // Outside the set, while playing: the 2x after them is the barrier.
+    h.send(Command::ScanSpeed(ScanStep::Faster));
     h.toggle_play();
     wait_playing(&mut h, true);
-    for speed in [0.5, 3.0, 64.0, f64::NAN] {
-        h.send(Command::SetScanSpeed(speed));
-    }
-    h.send(Command::SetScanSpeed(2.0));
-    wait_speed(&mut h, 2.0);
-    let changes: Vec<&Event> = h.log()[from..].iter().filter(|e| is_change(e)).collect();
+    let speeds: Vec<&Event> = h.log()[from..]
+        .iter()
+        .filter(|e| matches!(e, Event::ScanSpeed(_)))
+        .collect();
     assert!(
-        matches!(changes[..], [Event::ScanSpeed(s), ..] if *s == 2.0),
-        "a refused speed changed something: {changes:#?}"
+        speeds.is_empty(),
+        "a speed was set while paused: {speeds:#?}"
     );
     h.toggle_play();
     wait_playing(&mut h, false);
-    wait_speed(&mut h, 1.0);
-    h.wait_settled();
 
     check_four_times(&mut h);
 
     // A pause returns to 1x, and the next play runs at 1x.
     h.toggle_play();
     wait_playing(&mut h, false);
-    wait_speed(&mut h, 1.0);
+    h.wait_speed(1.0);
     h.wait_settled();
     h.toggle_play();
     wait_playing(&mut h, true);
     assert_displayed_speed(&mut h, 1.0, "a pause and a play");
 
     // A recording's start pauses, and so returns to 1x (spec S2).
-    h.send(Command::SetScanSpeed(8.0));
-    wait_speed(&mut h, 8.0);
+    h.send(Command::ScanSpeed(ScanStep::Faster));
+    h.wait_speed(2.0);
     h.send(Command::ToggleRecording {
         zoom: video_coach_core::zoom::Zoom::IDENTITY,
     });
-    wait_speed(&mut h, 1.0);
+    h.wait_speed(1.0);
     h.wait_map("the recording", |e| {
-        matches!(
-            e,
-            Event::Recording(video_coach_app::bus::RecordingStatus::Recording { .. })
-        )
-        .then_some(())
+        matches!(e, Event::Recording(RecordingStatus::Recording { .. })).then_some(())
     });
     // And while recording, a speed is refused: pause is the barrier.
     h.toggle_play();
     wait_playing(&mut h, true);
     let from = h.log().len();
-    h.send(Command::SetScanSpeed(2.0));
+    h.send(Command::ScanSpeed(ScanStep::Faster));
     h.toggle_play();
     wait_playing(&mut h, false);
     let speeds: Vec<&Event> = h.log()[from..]
@@ -503,11 +430,7 @@ fn fast_scanning_runs_at_the_chosen_speed() {
     );
     h.send(Command::StopRecording);
     h.wait_map("the recording's end", |e| {
-        matches!(
-            e,
-            Event::Recording(video_coach_app::bus::RecordingStatus::Idle)
-        )
-        .then_some(())
+        matches!(e, Event::Recording(RecordingStatus::Idle)).then_some(())
     });
     h.shutdown();
 }
@@ -522,6 +445,88 @@ fn fast_scanning_runs_at_the_chosen_speed_on_the_apps_sinks() {
     open_minute(&mut h, tmp.path());
     check_four_times(&mut h);
     h.shutdown();
+}
+
+/// A pause at speed stays on the frame on screen (spec S3, S5), not on the
+/// position, which the picture trails while fast: the seek back to 1x goes
+/// to the frame shown. Within a frame, since the sink may put up one more
+/// between the frame taken here and the pause reaching the bus. Headless, the
+/// picture keeps within a frame of the position even at 32x, so this pins
+/// the rule; the lag it guards against needs real footage (CLAUDE.md).
+#[test]
+fn a_pause_at_speed_stays_on_the_frame_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(&tmp.path().join("config"));
+    open_minute(&mut h, tmp.path());
+    h.toggle_play();
+    wait_playing(&mut h, true);
+    four_times(&mut h);
+    h.watch_displayed(0.5);
+    let mut shown = None;
+    h.poll_until("a frame at 4x", |h| {
+        shown = h.take_frame();
+        shown.is_some()
+    });
+    h.toggle_play();
+    let paused_on = shown_end(&shown.expect("polled until some"));
+    wait_playing(&mut h, false);
+    h.wait_speed(1.0);
+    h.wait_settled();
+    let mut after = None;
+    h.poll_until("the frame the pause settles on", |h| {
+        after = h.take_frame();
+        after.is_some()
+    });
+    let after = shown_end(&after.expect("polled until some"));
+    // In frames, rounded: WebM's timestamps are whole milliseconds.
+    let moved = ((after - paused_on) / FRAME).round();
+    eprintln!("paused on ..{paused_on:.4}, settled on ..{after:.4}");
+    assert!(
+        moved == 0.0 || moved == 1.0,
+        "paused on the frame ending at {paused_on}, but settled {moved} frames on"
+    );
+    h.shutdown();
+}
+
+/// At speed, running into the next source keeps the speed: the load's seek
+/// carries the rate (spec S3). The end of the last source pauses, which
+/// returns to 1x.
+#[test]
+fn the_next_source_keeps_the_speed_and_the_end_returns_to_1x() {
+    let mut rig = Rig::open(&[("a.webm", 2), ("b.webm", 2)]);
+    let h = &mut rig.h;
+    h.toggle_play();
+    wait_playing(h, true);
+    four_times(h);
+    let from = h.log().len();
+    h.wait_map("the advance into b", |e| {
+        matches!(
+            e,
+            Event::Position {
+                source_index: 1,
+                ..
+            }
+        )
+        .then_some(())
+    });
+    let advanced = std::time::Instant::now();
+    wait_playing(h, false);
+    let played = advanced.elapsed().as_secs_f64();
+    let speeds: Vec<f64> = h.log()[from..]
+        .iter()
+        .filter_map(|e| match e {
+            Event::ScanSpeed(s) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        speeds.is_empty(),
+        "the speed changed before the end: {speeds:?}"
+    );
+    // 2 s of b at 4x is half a second.
+    assert!(played < 1.2, "b played for {played:.2} s: not at 4x");
+    h.wait_speed(1.0);
+    rig.h.shutdown();
 }
 
 /// The bus keeps `pulsesink` out of `autoaudiosink`'s choice, which a burst of

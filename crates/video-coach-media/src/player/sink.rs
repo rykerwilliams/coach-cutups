@@ -12,7 +12,9 @@ use gstreamer_video as gst_video;
 
 use crate::mailbox::{Frame, FrameMailbox};
 
-/// How late a frame may reach the scan sink and still be shown, in ns:
+/// How late a frame may reach the scan sink and still be shown, in ns. With
+/// `qos` a later one is dropped and the decoder told, so a slow decode (a
+/// fast scan, spec S5) shows fewer frames rather than falling behind. It is
 /// 20 ms, `GstVideoSink`'s own default. Less than a 30 fps frame, so at 1x a
 /// frame shown that late is still inside its own time on screen, and a
 /// momentary hiccup drops nothing; any later and it would be up while the
@@ -55,10 +57,6 @@ pub(super) fn video_sink(kind: SinkKind, mailbox: FrameMailbox) -> VideoSink {
         })
         .enable_last_sample(false)
         .max_buffers(1u32)
-        // Drops a frame that reaches the sink later than this, and tells the
-        // decoder upstream, which then skips frames of its own: a slow decode
-        // (a fast scan, spec S5) shows fewer frames rather than falling
-        // behind the position. MAX_LATENESS says why this much.
         .qos(true)
         .max_lateness(MAX_LATENESS)
         .build();

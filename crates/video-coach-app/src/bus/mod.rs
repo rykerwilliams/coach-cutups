@@ -49,6 +49,17 @@ pub use recording::{CaptureKind, RecordingStatus};
 pub use state::{StateFile, WindowSize};
 pub use transcribe::{whisper, whisper_model_override, Finish, Stage, TranscriptionState};
 
+/// Which way [`Command::ScanSpeed`] moves through the speeds (spec S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanStep {
+    /// `L`: double, up to 32x.
+    Faster,
+    /// `J`: halve, down to 1x.
+    Slower,
+    /// The speed button: double, and after 32x back to 1x.
+    Cycle,
+}
+
 /// What the UI asks the bus to do.
 #[derive(Debug)]
 pub enum Command {
@@ -134,11 +145,11 @@ pub enum Command {
     StepFrame {
         forward: bool,
     },
-    /// `J`, `L` and the speed button: play the game video at this speed, one
-    /// of 1, 2, 4, 8, 16 and 32 (spec S). Only while it plays, with no
-    /// preview open. Not while recording: the clip model, replay and export
-    /// are 1x. Any pause returns to 1x.
-    SetScanSpeed(f64),
+    /// `J`, `L` and the speed button: play the game video a speed slower or
+    /// faster (spec S). Only while it plays, with no preview open. Not while
+    /// recording: the clip model, replay and export are 1x. Any pause returns
+    /// to 1x.
+    ScanSpeed(ScanStep),
     /// Linear slider value in `0..=1`. Persisted to `scan_volume` only when
     /// `commit` is set (on slider release).
     SetVolume {
@@ -730,7 +741,7 @@ impl Bus {
             Command::ScrubMove { abs } => self.scrub(abs, false),
             Command::ScrubRelease { abs } => self.scrub(abs, true),
             Command::StepFrame { forward } => self.step_frame(forward),
-            Command::SetScanSpeed(speed) => self.set_scan_speed(speed),
+            Command::ScanSpeed(step) => self.scan_speed(step),
             Command::SetVolume { value, commit } => self.set_volume(value, commit),
             Command::ToggleRecording { zoom } => self.toggle_recording(zoom),
             Command::StopRecording => self.stop_recording(),
