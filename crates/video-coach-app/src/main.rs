@@ -241,8 +241,8 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         move || {
             let Some(w) = weak.upgrade() else { return };
             let send = send.clone();
-            let pick = Pick::Video {
-                title: "Add Source Video",
+            let pick = Pick::Videos {
+                title: "Add Source Videos",
             };
             pickers.open(&w, pick, move |path| send(Command::AddSource(path)));
         }

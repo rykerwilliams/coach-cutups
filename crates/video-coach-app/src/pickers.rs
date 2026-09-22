@@ -19,6 +19,10 @@ pub enum Pick {
     Video {
         title: &'static str,
     },
+    /// One or more video files at once: a game is often several camera files.
+    Videos {
+        title: &'static str,
+    },
 }
 
 /// Video extensions offered by default. Both cases: a portal's glob match
@@ -28,7 +32,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "MTS",
 ];
 
-/// Opens one picker at a time, answering with the chosen path.
+/// Opens one picker at a time, answering with each chosen path.
 #[derive(Clone, Default)]
 pub struct Pickers {
     /// A picker is up: further requests are ignored rather than stacked.
@@ -36,29 +40,47 @@ pub struct Pickers {
 }
 
 impl Pickers {
-    /// Shows the picker and, if the user chooses something, calls `then` with
-    /// it on the UI thread. Returns at once.
-    pub fn open(&self, window: &AppWindow, pick: Pick, then: impl FnOnce(PathBuf) + 'static) {
+    /// Shows the picker and calls `then` on the UI thread with each path the
+    /// user chose — at most once for a single pick, once per file for
+    /// [`Pick::Videos`], in file-name order. Returns at once.
+    ///
+    /// File-name order because a portal returns a multiple selection in no
+    /// promised order, and camera files are named by when they were shot, so
+    /// sorting them is what puts a game's halves in sequence.
+    pub fn open(&self, window: &AppWindow, pick: Pick, mut then: impl FnMut(PathBuf) + 'static) {
         if self.busy.replace(true) {
             return;
         }
         let dialog = AsyncFileDialog::new().set_parent(&window.window().window_handle());
         let busy = self.busy.clone();
+        let videos = |dialog: AsyncFileDialog, title| {
+            dialog
+                .set_title(title)
+                .add_filter("Video", VIDEO_EXTENSIONS)
+                .add_filter("All files", &["*"])
+        };
         let spawned = slint::spawn_local(async move {
-            let chosen = match pick {
-                Pick::ProjectFolder => dialog.set_title("Open Project Folder").pick_folder().await,
-                Pick::Video { title } => {
-                    dialog
-                        .set_title(title)
-                        .add_filter("Video", VIDEO_EXTENSIONS)
-                        .add_filter("All files", &["*"])
-                        .pick_file()
-                        .await
+            let chosen: Vec<_> = match pick {
+                Pick::ProjectFolder => dialog
+                    .set_title("Open Project Folder")
+                    .pick_folder()
+                    .await
+                    .into_iter()
+                    .collect(),
+                Pick::Video { title } => videos(dialog, title)
+                    .pick_file()
+                    .await
+                    .into_iter()
+                    .collect(),
+                Pick::Videos { title } => {
+                    videos(dialog, title).pick_files().await.unwrap_or_default()
                 }
             };
             busy.set(false);
-            if let Some(chosen) = chosen {
-                then(chosen.path().to_path_buf());
+            let mut paths: Vec<PathBuf> = chosen.iter().map(|c| c.path().to_path_buf()).collect();
+            paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            for path in paths {
+                then(path);
             }
         });
         if let Err(e) = spawned {
