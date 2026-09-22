@@ -541,10 +541,10 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         let rows: Vec<TargetRow> = targets
             .iter()
             .map(|row| {
-                let clips = if row.clips == 1 { "clip" } else { "clips" };
+                let clips = if row.entries == 1 { "clip" } else { "clips" };
                 TargetRow {
                     label: row.label.as_str().into(),
-                    detail: format!("{} {clips} · {}", row.clips, format_hms(row.seconds)).into(),
+                    detail: format!("{} {clips} · {}", row.entries, format_hms(row.seconds)).into(),
                     // The clip's row is the one that differs: it is ticked
                     // when the sheet was opened on it, and only then.
                     ticked: matches!(row.target, ExportTarget::Clip(_)) == only_clip,

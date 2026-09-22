@@ -31,7 +31,7 @@ use gstreamer_gl as gst_gl;
 use uuid::Uuid;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{AspectMismatch, Project, Quality, Resolution, SourceReferenced};
-use video_coach_core::scoreboard::{MatchEventKind, ScoreboardConfig};
+use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig};
 use video_coach_core::skip::SkipCoordinator;
 use video_coach_core::store::StoreError;
 use video_coach_core::stroke::Stroke;
@@ -113,6 +113,15 @@ pub enum Command {
         source_seconds: f64,
     },
     DeleteMatchEvent(Uuid),
+    /// Set one end of `goal`'s reel entry at `at`, the scan position captured
+    /// by the caller at the click as `(source_index, source_seconds)`, or
+    /// reset it to the default with `None` (match vision spec R3). An undo
+    /// step, as a tag is.
+    SetReelTrim {
+        goal: Uuid,
+        end: ReelEnd,
+        at: Option<(usize, f64)>,
+    },
     /// The teams, their colours, the match format and the back-anchor flag,
     /// from the setup sheet. A team without a name is refused.
     SetScoreboard(ScoreboardConfig),
@@ -355,12 +364,13 @@ pub enum UserError {
     #[error("can't preview: {0}")]
     CantPreview(String),
     /// A notice: a match command is refused out loud (spec S5) — a team
-    /// without a name, or a start/stop past the format's last period. Both
-    /// controls are already disabled where this can fire, so it is a backstop;
-    /// a modal for it could land over a live commentary take, where `v` is on
-    /// the recording allow-list, and swallow the transport keys.
+    /// without a name, a start/stop past the format's last period, or a reel
+    /// trim on the wrong side of its goal or on another video. A backstop, or
+    /// a slip of the scan position; a modal for it could land over a live
+    /// commentary take, where `v` is on the recording allow-list, and swallow
+    /// the transport keys.
     #[error("{0}")]
-    Scoreboard(&'static str),
+    Scoreboard(String),
     #[error("{0}")]
     Io(String),
 }
@@ -732,6 +742,7 @@ impl Bus {
                 source_seconds,
             } => self.tag_match_event(kind, source_index, source_seconds),
             Command::DeleteMatchEvent(id) => self.delete_match_event(id),
+            Command::SetReelTrim { goal, end, at } => self.set_reel_trim(goal, end, at),
             Command::SetScoreboard(config) => self.set_scoreboard(config),
             Command::TogglePlay {
                 host_ns,

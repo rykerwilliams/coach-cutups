@@ -4,7 +4,10 @@
 //! at the keypress like every other logged command: the bus never asks the
 //! player where it is, since queue delay would put the goal somewhere else.
 //!
-//! Each tag or delete is one undo step holding the **whole** event list. The
+//! A goal's reel trim (match vision spec R3) is set the same way, from the scan
+//! position captured at the click, and lives on the goal's record.
+//!
+//! Each tag, delete or trim is one undo step holding the **whole** event list. The
 //! list is a handful of records, and a snapshot needs no per-event inverse —
 //! but it does hold source indices, so a source move or removal purges it from
 //! both stacks (`clips::purge_history_for_source_change`).
@@ -20,7 +23,7 @@
 
 use uuid::Uuid;
 use video_coach_core::project::Project;
-use video_coach_core::scoreboard::{MatchEventKind, ScoreboardConfig};
+use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig};
 use video_coach_core::undo::UndoAction;
 
 use super::{Bus, Event, UserError};
@@ -44,7 +47,8 @@ impl Bus {
         if kind == MatchEventKind::StartStop && open.project.start_stops_at_cap() {
             return self.emit(Event::Error(UserError::Scoreboard(
                 "every period of this match format is already tagged; \
-                 change the format to tag more",
+                 change the format to tag more"
+                    .into(),
             )));
         }
         self.edit_match_events(|project| {
@@ -60,6 +64,20 @@ impl Bus {
         });
     }
 
+    /// Sets or resets one end of `goal`'s reel entry at the position the
+    /// caller captured (match vision spec R3). Core owns the rules; a refusal
+    /// changes nothing and is said out loud, since the position is wherever
+    /// the coach happened to be scanning.
+    pub(super) fn set_reel_trim(&mut self, goal: Uuid, end: ReelEnd, at: Option<(usize, f64)>) {
+        let mut refused = None;
+        self.edit_match_events(|project| {
+            refused = project.set_reel_trim(goal, end, at).err();
+        });
+        if let Some(e) = refused {
+            self.emit(Event::Error(UserError::Scoreboard(e.to_string())));
+        }
+    }
+
     /// Replaces the scoreboard's setup: both teams, the format and the
     /// back-anchor flag, which is setup rather than a command of its own.
     ///
@@ -69,7 +87,7 @@ impl Bus {
     pub(super) fn set_scoreboard(&mut self, config: ScoreboardConfig) {
         if config.home.name.trim().is_empty() || config.away.name.trim().is_empty() {
             return self.emit(Event::Error(UserError::Scoreboard(
-                "both teams need a name",
+                "both teams need a name".into(),
             )));
         }
         let Some(open) = &mut self.open else {

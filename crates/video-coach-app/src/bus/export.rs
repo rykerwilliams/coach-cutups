@@ -2,15 +2,15 @@
 //! targets, rendered one at a time by an [`Exporter`] on its own thread while
 //! the bus goes on.
 //!
-//! **One export path.** All clips, one tag's clips and a single clip are all
-//! [`ExportTarget`]s, each rendered as a compilation: one plan, one schedule,
-//! one progress model, one cancel.
+//! **One export path.** All clips, one tag's clips, a single clip and the
+//! goals reel are all [`ExportTarget`]s, each rendered as a compilation: one
+//! plan, one schedule, one progress model, one cancel.
 //!
-//! **Everything is refused up front, naming the clip.** A missing game video
-//! or commentary recording fails the whole run before a frame is rendered,
-//! rather than an hour into one. Media itself only warns about either and
-//! degrades to a black inset or to silence, so this check is what makes the
-//! loss visible at all.
+//! **Everything is refused up front, naming the clip** (or, for the reel, the
+//! goal). A missing game video or commentary recording fails the whole run
+//! before a frame is rendered, rather than an hour into one. Media itself only
+//! warns about either and degrades to a black inset or to silence, so this
+//! check is what makes the loss visible at all.
 //!
 //! **Progress is frames, and the whole run travels in every event.** The
 //! sheet renders the run it is handed, so it can't be left holding a state the
@@ -35,6 +35,7 @@ use video_coach_core::audio::audio_regions;
 use video_coach_core::export::{compilation_schedule, RateWindow, OUTPUT_FPS};
 use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::reel::reel_goals;
 use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
@@ -119,25 +120,27 @@ pub struct ExportTargetRow {
     pub target: ExportTarget,
     /// What the sheet calls it, and what names its file (spec E6).
     pub label: String,
-    /// How many clips it covers.
-    pub clips: usize,
+    /// How many plan entries it has: clips, or the reel's goals after
+    /// merging. Not a goal count — two goals can share an entry.
+    pub entries: usize,
     /// How long its output runs, from its frame count
     /// (`CompilationPlan::total_frames`).
     pub seconds: f64,
 }
 
-/// The sheet's targets: All clips, one row per tag, then `selected` if a clip
-/// is (spec E8).
+/// The sheet's targets: All clips, one row per tag, All goals, then `selected`
+/// if a clip is (spec E8, match vision spec R1).
 ///
-/// A target covering no clip is left out, since there is nothing to export in
-/// it — which is also what keeps an empty project's sheet empty.
+/// A target with no plan entry is left out, since there is nothing to export
+/// in it — which is also what keeps an empty project's sheet empty, and the
+/// reel's row away until there is a goal.
 pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTargetRow> {
     let row = |target: ExportTarget, label: String| {
         let plan = compilation_plan(project, &target);
         (!plan.entries.is_empty()).then(|| ExportTargetRow {
             target,
             label,
-            clips: plan.entries.len(),
+            entries: plan.entries.len(),
             seconds: plan.total_frames() as f64 / f64::from(OUTPUT_FPS),
         })
     };
@@ -147,6 +150,7 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
     for tag in tag_summaries(&project.clips) {
         rows.extend(row(ExportTarget::Tag(tag.tag.clone()), tag.tag));
     }
+    rows.extend(row(ExportTarget::Reel, REEL_LABEL.into()));
     if let Some(clip) = selected.and_then(|id| project.clips.iter().find(|c| c.id == id)) {
         rows.extend(row(
             ExportTarget::Clip(clip.id),
@@ -480,9 +484,20 @@ fn job(
                 .expect("the plan's clips are the project's clips")
         });
         if missing.get(entry.source_index).copied().unwrap_or(true) {
-            // An entry with no clip is game video alone, named by the target.
-            let whose =
-                clip.map_or_else(|| format!("{label}: a"), |c| format!("{}'s", clip_label(c)));
+            let whose = match clip {
+                Some(clip) => format!("{}'s", clip_label(clip)),
+                // A reel entry: named by the first goal on its source, which
+                // is the first goal of the first entry there, counted in the
+                // goals and never in the entries (two goals can share one).
+                None => {
+                    let n = reel_goals(&open.project)
+                        .iter()
+                        .position(|g| g.source_index == entry.source_index)
+                        .expect("a reel entry is cut around a goal on its source")
+                        + 1;
+                    format!("goal {n}'s")
+                }
+            };
             return Err(refused(format!(
                 "{whose} game video is missing; relink it first"
             )));

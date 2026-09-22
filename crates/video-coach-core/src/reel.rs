@@ -33,6 +33,22 @@ struct Span<'a> {
     end: f64,
 }
 
+/// Every goal the reel holds, in match order: what "goal n" and "N goals"
+/// count. Not the entries, which can be fewer, since a goal inside the
+/// previous entry makes none of its own.
+pub fn reel_goals(project: &Project) -> Vec<&MatchEventRecord> {
+    let mut goals: Vec<(f64, &MatchEventRecord)> = project
+        .match_events
+        .iter()
+        .filter(|m| m.kind.is_goal())
+        .map(|m| (project.abs_seconds(m.source_index, m.source_seconds), m))
+        .collect();
+    // Stable, so goals tagged at the same instant keep the order they were
+    // tagged in.
+    goals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    goals.into_iter().map(|(_, goal)| goal).collect()
+}
+
 /// The reel's entries: one per goal in match order, except that a goal
 /// already inside the previous entry extends it instead (spec R2).
 ///
@@ -40,18 +56,9 @@ struct Span<'a> {
 /// to that source and never starting before the previous entry on the same
 /// source ends, so two goals a minute apart don't replay the same footage.
 pub(crate) fn reel_entries(project: &Project) -> Vec<PlanEntry> {
-    // Match order. Stable, so goals tagged at the same instant keep the order
-    // they were tagged in.
-    let mut goals: Vec<(f64, &MatchEventRecord)> = project
-        .match_events
-        .iter()
-        .filter(|m| m.kind.is_goal())
-        .map(|m| (project.abs_seconds(m.source_index, m.source_seconds), m))
-        .collect();
-    goals.sort_by(|a, b| a.0.total_cmp(&b.0));
-
+    let goals = reel_goals(project);
     let mut spans: Vec<Span> = Vec::with_capacity(goals.len());
-    for (_, goal) in goals {
+    for goal in goals {
         // `Project::remove_source` refuses a source a goal is on, so this
         // fallback is for a malformed file only: it leaves the tail unclamped.
         let duration = project
