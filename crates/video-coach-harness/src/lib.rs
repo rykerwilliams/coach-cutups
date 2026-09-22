@@ -6,6 +6,8 @@
 //! [`Harness::shutdown`] as a barrier when they need to assert that something
 //! did **not** happen.
 
+use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
@@ -17,7 +19,7 @@ use video_coach_app::bus::{
 };
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::store;
-use video_coach_media::{fixtures, now_ns, probe, Frame, SinkKind, TranscribeKind};
+use video_coach_media::{fixtures, frame_times, now_ns, probe, Frame, SinkKind, TranscribeKind};
 
 /// Generous: waits normally finish in milliseconds.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -295,6 +297,13 @@ impl Harness {
         self.bus.self_view().take()
     }
 
+    /// Takes the scan player's newest frame, if one arrived since the last
+    /// take, as the UI's redraw does. A test that takes it leaves the UI's
+    /// slot empty, which only matters to a test drawing it too.
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.bus.mailbox().take()
+    }
+
     /// Seconds into the previewed clip, as the UI's tick reads them (spec
     /// P3's one position path). Meaningless with no preview open: the UI
     /// reads it only while one is.
@@ -353,6 +362,132 @@ pub fn write_project(folder: &Path, media: &Path, videos: &[(&str, u32)]) -> Pro
     }
     store::write(folder, &mut project).expect("write the fixture project");
     project
+}
+
+/// Writes a project to `folder` whose one source is `video`, stored by its
+/// absolute path, which `join` keeps as is. Returns what was written.
+pub fn write_one_source_project(folder: &Path, video: &Path) -> Project {
+    let p = probe(video).expect("probe the video");
+    let mut project = Project::new("Game");
+    project.source_videos.push(SourceRef {
+        relative_path: video.to_string_lossy().into_owned(),
+        display_name: "source".into(),
+        duration_seconds: p.duration_seconds,
+        display_aspect: p.display_aspect,
+    });
+    store::write(folder, &mut project).expect("write the one-source project");
+    project
+}
+
+/// How far a scrub may land from its target: one frame at 30 fps. Fixed,
+/// never the source's own rate, which reads 0/1 on an HLS remux.
+pub const FRAME: f64 = 1.0 / 30.0;
+
+/// How far apart two frame times may be and still name the same frame: the
+/// decoder's `SLACK`, nanosecond rounding.
+const SAME_FRAME: f64 = 1e-6;
+
+/// Where one paused scrub landed ([`round_trip`]), in source seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Landing {
+    pub target: f64,
+    /// The player's position once the seek settled: what a tag made now
+    /// would store.
+    pub reported: f64,
+    /// The frame the scan player put up, as [`Frame::stream_time`] and
+    /// [`Frame::stream_end`]. Its start is clipped to the seek's target, so
+    /// only its end says which frame it is.
+    pub displayed: (Option<f64>, Option<f64>),
+    /// The frame export shows for `reported`, start to end in stream time.
+    pub export: Range<f64>,
+}
+
+impl Landing {
+    /// Asserts the round trip (spec H6): the scan player displays the frame
+    /// export picks for the position it reports, and that position is within
+    /// a [`FRAME`] of the target.
+    pub fn check(&self) {
+        let end = self
+            .displayed
+            .1
+            .unwrap_or_else(|| panic!("the displayed frame has no stream end: {self}"));
+        assert!(
+            (end - self.export.end).abs() <= SAME_FRAME,
+            "the scan player shows a different frame than export picks: {self}"
+        );
+        assert!(
+            (self.reported - self.target).abs() <= FRAME,
+            "the scrub landed more than a frame off its target: {self}"
+        );
+    }
+}
+
+impl fmt::Display for Landing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let time = |t: Option<f64>| t.map_or_else(|| "none".to_owned(), |t| format!("{t:.4}"));
+        write!(
+            f,
+            "target {:.4}, reported {:.4} ({:+.4}), displayed {}..{}, export {:.4}..{:.4}",
+            self.target,
+            self.reported,
+            self.reported - self.target,
+            time(self.displayed.0),
+            time(self.displayed.1),
+            self.export.start,
+            self.export.end
+        )
+    }
+}
+
+/// Scrubs to each of `targets` while paused and records where it landed: the
+/// position the player reports once the seek settles, and the stream time of
+/// the frame it puts up. Then asks export's decoder, on `source`, which frame
+/// it shows for each reported position. Prints every landing; asserts
+/// nothing, so a caller can print a whole run before [`Landing::check`]ing it.
+///
+/// `h` has `source` open as its only source, paused, so a target is both
+/// concat and source seconds.
+pub fn round_trip(h: &mut Harness, source: &Path, targets: &[f64]) -> Vec<Landing> {
+    let mut landed = Vec::new();
+    for &target in targets {
+        h.take_frame();
+        h.send(Command::ScrubRelease { abs: target });
+        h.wait_map(&format!("a seek to {target}"), |e| {
+            matches!(
+                e,
+                Event::Position {
+                    target_abs: Some(_),
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        h.wait_settled();
+        let mut frame = None;
+        h.poll_until(&format!("the frame at {target}"), |h| {
+            frame = h.take_frame();
+            frame.is_some()
+        });
+        let reported = h.position_secs().expect("a settled position");
+        let displayed = frame.map_or((None, None), |f| (f.stream_time, f.stream_end));
+        landed.push((target, reported, displayed));
+    }
+    let reported: Vec<f64> = landed.iter().map(|&(_, r, _)| r).collect();
+    let export = frame_times(source, &reported).expect("export's frame times");
+    landed
+        .into_iter()
+        .zip(export)
+        .map(|((target, reported, displayed), export)| {
+            let landing = Landing {
+                target,
+                reported,
+                displayed,
+                export,
+            };
+            eprintln!("{landing}");
+            landing
+        })
+        .collect()
 }
 
 /// A clip on `source_index`, starting 0.5 s in, with a fresh recording

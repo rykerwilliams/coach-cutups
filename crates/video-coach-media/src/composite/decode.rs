@@ -8,6 +8,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use super::{CompositeError, Gl, Stopper, Watch, POLL};
+use crate::mailbox::stream_time;
 use crate::player::{diagnostics, gl_bin, gl_caps, Diagnostics};
 
 /// A target at most this far ahead of the current frame is reached by
@@ -40,9 +41,7 @@ const SLACK: gst::ClockTime = gst::ClockTime::from_useconds(1);
 struct Decoded {
     /// Holds a buffer with a PTS.
     sample: gst::Sample,
-    /// **Stream** time, not PTS: an MP4 edit list (B-frame delay) starts the
-    /// segment after 0, and raw PTS then runs two frames ahead of the time the
-    /// player shows, which is what the schedule's times are.
+    /// [`stream_time`], not PTS, which is what the schedule's times are.
     time: gst::ClockTime,
 }
 
@@ -196,21 +195,11 @@ impl Decoder {
     fn pull(&mut self, watch: &Watch) -> Result<Option<Decoded>, CompositeError> {
         loop {
             if let Some(sample) = self.appsink.try_pull_sample(POLL) {
-                let pts = sample.buffer().and_then(|b| b.pts()).ok_or_else(|| {
-                    CompositeError::Failed("a decoded frame has no timestamp".into())
+                let time = stream_time(&sample).ok_or_else(|| {
+                    CompositeError::Failed(
+                        "a decoded frame has no timestamp or time segment".into(),
+                    )
                 })?;
-                let segment = sample
-                    .segment()
-                    .and_then(|s| s.downcast_ref::<gst::ClockTime>())
-                    .ok_or_else(|| {
-                        CompositeError::Failed("a decoded frame has no time segment".into())
-                    })?;
-                // Negative only for a frame straddling the segment start,
-                // which then is the first frame: 0 orders it correctly.
-                let time = match segment.to_stream_time_full(pts) {
-                    Some(gst::Signed::Positive(t)) => t,
-                    _ => gst::ClockTime::ZERO,
-                };
                 return Ok(Some(Decoded { sample, time }));
             }
             if self.appsink.is_eos() {

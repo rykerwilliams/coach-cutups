@@ -8,9 +8,8 @@
 use tempfile::TempDir;
 use video_coach_app::bus::{Command, Event};
 use video_coach_core::project::Project;
-use video_coach_harness::{write_project, Harness};
-
-const FRAME: f64 = 1.0 / 30.0;
+use video_coach_harness::{round_trip, write_one_source_project, write_project, Harness, FRAME};
+use video_coach_media::fixtures::{counter_video_with, CounterKind, CounterQuirks};
 
 /// A project in `<tmp>/project` whose sources are 16:9 30 fps WebM fixtures
 /// of the given lengths in `<tmp>/media`, opened on a fresh bus that has
@@ -198,6 +197,41 @@ fn the_position_survives_removing_an_earlier_source() {
     rig.skips(&[0.5]);
     rig.settle_at(1, 1.2);
     rig.h.shutdown();
+}
+
+/// A scrub released while paused shows the frame export picks for the
+/// position it reports, within a frame of its target (spec H6), on an
+/// edit-listed MP4: raw PTS runs two frames ahead of stream time there, the
+/// trap both sides must avoid. `real_footage.rs` runs the same round trip on
+/// real footage.
+#[test]
+fn a_paused_scrub_shows_the_frame_export_picks() {
+    gstreamer::init().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("project");
+    std::fs::create_dir(&folder).unwrap();
+    let source = counter_video_with(
+        &tmp.path().join("src.mp4"),
+        640,
+        360,
+        30,
+        300,
+        CounterKind::H264Mp4BFrames,
+        CounterQuirks::default(),
+    );
+    write_one_source_project(&folder, &source);
+
+    let mut h = Harness::new(&tmp.path().join("config"));
+    h.send(Command::OpenProject(folder));
+    h.wait_opened();
+    h.wait_settled();
+    // 20 targets over 0.1..9.4 s at every phase of a frame, starting on a
+    // boundary: 0.1 s is frame 3's, which stream time puts 1 ns later.
+    let targets: Vec<f64> = (0..20).map(|i| 0.1 + f64::from(i) * 0.487).collect();
+    for landing in round_trip(&mut h, &source, &targets) {
+        landing.check();
+    }
+    h.shutdown();
 }
 
 /// The bus keeps `pulsesink` out of `autoaudiosink`'s choice, which a burst of

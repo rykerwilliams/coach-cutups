@@ -35,6 +35,8 @@ pub mod preview;
 #[cfg(test)]
 mod tests;
 
+use std::ops::Range;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +50,8 @@ use gstreamer_video as gst_video;
 use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
 use video_coach_core::zoom::Zoom;
 
-use crate::player::answer_need_context;
+use crate::mailbox::{stream_end, stream_time};
+use crate::player::{answer_need_context, seconds_to_clock};
 
 /// How long any wait goes between checks of the cancel flag and errors.
 const POLL: gst::ClockTime = gst::ClockTime::from_mseconds(10);
@@ -180,6 +183,37 @@ impl Gl {
             });
         eos
     }
+}
+
+/// For each of `targets` (seconds, in the order given), the frame export
+/// shows for it: [`Decoder::frame_at`]'s answer, on one decoder over `source`
+/// on [`Gl::shared`], as its start and end in stream time, in seconds.
+///
+/// **A diagnostic seam, like `fixtures`:** nothing in the app calls it. It
+/// reaches export's own choice of frame without running an export, so a test
+/// can hold it against the frame the scan player displays for the same
+/// position (spec H6).
+///
+/// [`Decoder::frame_at`]: decode::Decoder::frame_at
+pub fn frame_times(source: &Path, targets: &[f64]) -> Result<Vec<Range<f64>>, CompositeError> {
+    let cancel = AtomicBool::new(false);
+    let watch = Watch {
+        cancel: &cancel,
+        error: Arc::default(),
+    };
+    let mut decoder = decode::Decoder::start(source, &Gl::shared()?, &watch)?;
+    let seconds = |t: gst::ClockTime| t.nseconds() as f64 / 1e9;
+    targets
+        .iter()
+        .map(|&target| {
+            let sample = decoder.frame_at(seconds_to_clock(target), &watch)?;
+            let start = stream_time(sample).expect("the decoder keeps only timed frames");
+            let end = stream_end(sample).ok_or_else(|| {
+                CompositeError::Failed(format!("the frame at {target} s has no duration"))
+            })?;
+            Ok(seconds(start)..seconds(end))
+        })
+        .collect()
 }
 
 /// A pipeline taken to NULL when dropped, on every exit path.

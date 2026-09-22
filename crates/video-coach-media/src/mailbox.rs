@@ -16,8 +16,8 @@ use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use gstreamer_video as gst_video;
 
-/// One decoded frame: the buffer and the negotiated `VideoInfo` it is laid out
-/// by, which carries the pixel aspect ratio.
+/// One decoded frame: the buffer, the negotiated `VideoInfo` it is laid out
+/// by, which carries the pixel aspect ratio, and where it is in its stream.
 ///
 /// From a GL appsink the buffer is GL memory carrying a `GLSyncMeta` whose
 /// sync point is already set; wait on it before sampling the texture.
@@ -25,6 +25,16 @@ use gstreamer_video as gst_video;
 pub struct Frame {
     pub buffer: gst::Buffer,
     pub info: gst_video::VideoInfo,
+    /// Seconds into the stream that produced it, from the sample's segment,
+    /// by the rule export picks its frames by ([`stream_time`]): a time
+    /// inside this frame, so export's decoder picks this frame for it. It is
+    /// the frame's start, except for the frame a seek lands inside: the
+    /// decoder clips that one to the seek's target. A preview's frame is in
+    /// output time. `None` without a PTS or a time segment.
+    pub stream_time: Option<f64>,
+    /// Where the frame ends, in the same time: which frame this is, even when
+    /// its start was clipped. `None` without a duration too.
+    pub stream_end: Option<f64>,
 }
 
 impl Frame {
@@ -32,6 +42,11 @@ impl Frame {
     /// drawing context can wait for the producing pipeline to finish. System
     /// memory needs nothing.
     pub(crate) fn from_sample(sample: gst::Sample) -> Result<Frame, gst::FlowError> {
+        let seconds = |t: gst::ClockTime| t.nseconds() as f64 / 1e9;
+        let (stream_time, stream_end) = (
+            stream_time(&sample).map(seconds),
+            stream_end(&sample).map(seconds),
+        );
         let mut buffer = sample.buffer_owned().ok_or(gst::FlowError::Error)?;
         let info = sample
             .caps()
@@ -48,7 +63,12 @@ impl Frame {
                 gst_gl::GLSyncMeta::add(buffer.make_mut(), &context).set_sync_point(&context);
             }
         }
-        Ok(Frame { buffer, info })
+        Ok(Frame {
+            buffer,
+            info,
+            stream_time,
+            stream_end,
+        })
     }
 }
 
@@ -91,4 +111,32 @@ impl FrameMailbox {
             redraw();
         }
     }
+}
+
+/// `sample`'s **stream** time, not its PTS: an MP4 edit list (B-frame delay)
+/// starts the segment after 0, and raw PTS then runs two frames ahead of the
+/// time the player shows. `None` without a PTS or a time segment.
+///
+/// The one rule for "where is this frame": export's decoder picks frames by
+/// it and the scan player's frames carry it, so the two can be compared.
+pub(crate) fn stream_time(sample: &gst::Sample) -> Option<gst::ClockTime> {
+    to_stream_time(sample, sample.buffer()?.pts()?)
+}
+
+/// Where `sample`'s frame ends, in [`stream_time`]. A seek's clipping moves a
+/// frame's start and never its end, so this names the frame.
+pub(crate) fn stream_end(sample: &gst::Sample) -> Option<gst::ClockTime> {
+    let buffer = sample.buffer()?;
+    to_stream_time(sample, buffer.pts()? + buffer.duration()?)
+}
+
+/// Timestamp `t` in `sample`'s segment as stream time. A time before the
+/// segment's start (a frame straddling it) reads 0, which orders that frame
+/// correctly as the first.
+fn to_stream_time(sample: &gst::Sample, t: gst::ClockTime) -> Option<gst::ClockTime> {
+    let segment = sample.segment()?.downcast_ref::<gst::ClockTime>()?;
+    Some(match segment.to_stream_time_full(t) {
+        Some(gst::Signed::Positive(t)) => t,
+        _ => gst::ClockTime::ZERO,
+    })
 }

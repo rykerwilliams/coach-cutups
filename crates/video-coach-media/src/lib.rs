@@ -23,7 +23,7 @@ pub use composite::export::{
     EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
 };
 pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
-pub use composite::Gl;
+pub use composite::{frame_times, Gl};
 pub use download::{download, Fetch};
 pub use mailbox::{Frame, FrameMailbox};
 pub use player::{
