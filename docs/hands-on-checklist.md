@@ -8,22 +8,25 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Build and install the package.** In a terminal in the `coach-cutups` folder, run `packaging/build-deb.sh`, then `sudo apt install ./target/debian/coach-cuts_0.1.0_amd64.deb`. The `.deb` already in `target/debian/` is older than the last fix, so rebuild it. **Right:** apt finishes without errors.
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.1.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
 
 - [ ] **Create a project.** On first launch the window says "No project open". Click **Open Project…** and choose a new, empty folder. **Right:** the folder picker works, the project opens, and `project.json` appears in that folder. **Ctrl+O** opens the same picker.
 - [ ] **Reopen it.** Quit, then launch again from the menu. **Right:** the same project comes back on its own.
+- [ ] **Window size.** Resize the window, quit and relaunch. **Right:** it reopens at the size you left it. Then shrink it as small as it goes. **Right:** every button (including **Export…** and **Devices…**) and the colour swatches are still visible and clickable. The right-hand panel scrolls if it doesn't fit.
 
 ## 3. The game video: add it and scan it
 
 - [ ] **Add the game.** Click **Add Source Video…** and pick your game file. **Right:** it appears under Sources with its length, and the picture shows.
+- [ ] **Add several at once.** In a fresh project, click **Add Source Video…** and select both halves together (Ctrl-click or Shift-click). **Right:** both are added, in file-name order.
 - [ ] **[must work] Hardware decode.** Right after adding the video, run `grep "bus: loaded" ~/.xsession-errors | tail -1`. **Right:** the line contains `vah265dec` (or `vah264dec` for an H.264 file), `memory:DMABuf` and `egl`. Anything else (for example `avdec_…`, `SystemMemory` or `glx`) means playback is using the slow path, so send the line.
 - [ ] **Two videos as one game.** Add a second file, such as the second half. Drag it above or below the first to reorder, then play across the join. **Right:** playback carries straight on into the next file without hanging, and the readout and scrubber count the two as one timeline. The **×** beside a source removes it. It is greyed out, with a tooltip saying why, once a clip or match event uses that video.
 - [ ] *(Optional)* **Add a wrong-shaped video**, such as a portrait phone clip or one with a different aspect ratio. **Right:** it's refused with a message, not added.
 - [ ] **Play and skip.** **Space** plays and pauses. **←/→** (or **A/D**) skip 3 s and **Shift+←/→** skip 10 s. **Right:** each one does exactly that.
 - [ ] **Scrub.** Drag the scrubber. **Right:** the picture follows live while you drag, and stops exactly where you let go.
+- [ ] **[must work] Play after scrubbing.** While playing, drag the scrubber back and forth quickly a few times, let go, then press Space. **Right:** it plays, and the time readout (like `12:34 / 45:00`) counts up. Do the same while paused. (This is the bug you hit first time round.)
 - [ ] **Keys after sliders.** Drag the scrubber, then the **Volume** slider (which should change the game sound), then press Space and the arrows. **Right:** the keys still play and skip, and don't nudge the slider.
 - [ ] **Hold → while playing** for a couple of seconds, then let go. **Right:** the video jumps ahead steadily and settles without a visible jump backwards. Also tell us if holding the key feels laggy or overshoots.
 - [ ] **Zoom and pan.** Try each of these:
@@ -43,11 +46,13 @@ Work down the list in order. It follows a normal session: install, open a projec
   - Then a red **Recording** label appears with a running time.
   - The level bar moves when you talk.
   - The webcam light is on only while recording.
+  - **Your webcam shows live** in the picture's bottom-right corner within about a second, where the inset lands in the export. It disappears when you stop.
 
   Press **R** again to stop (**Esc** and the **Stop** button also stop). **Right:** a clip named like `1-00:12:34` (source number, then the game time where you started) appears under Clips. The button's tooltip reads "Record (R)", and "Stop recording (R or Esc)" while recording.
 - [ ] **Cancel and key repeat.** Press R, then press R again during "Preparing…". **Right:** it cancels and no clip appears. Holding R down doesn't flicker recording on and off.
 - [ ] **Listen to the start of a take.** Record a few seconds, then preview it with headphones on. **Right:** it starts cleanly. **Tell us** if you hear a thump, pop or click right at the start — an audio analyzer suggests there may be one.
 - [ ] **Clap test.** Start a take and clap once, clearly in view of the webcam. Keep this clip, because the preview and export checks use it.
+- [ ] **Live webcam view.** While recording, check the inset's colours look natural and it isn't stretched. Run `top` in a terminal during a take and **tell us** the `coach-cuts` CPU figure (we expect roughly 40–60% of one core in total). Then compare with the export: export a clip and check the inset sits in the same place you saw it while recording.
 - [ ] **Picture and lip sync.** Record in a normally lit room. Open the newest `.mkv` in the project's `recordings/` folder in a video player. **Right:** the picture is reasonably sharp, not blocky, and your lips match your voice.
 - [ ] *(Optional, needs a USB camera or mic)* **Unplug a device.** Choose it in Devices…, unplug it, then press R. **Right:** a notice line says it fell back to the default device, instead of the recording failing. Plug it back in, and it's picked again.
 - [ ] **Crash safety.** While recording, run `pkill -9 coach-cuts` in a terminal. **Right:** the newest `.mkv` in `recordings/` still plays up to the kill. **Expected:** after you relaunch, that take is *not* in the clip list. That's by design, not a bug.
@@ -57,11 +62,12 @@ Work down the list in order. It follows a normal session: install, open a projec
 Drawing only works while recording, so record a take for these.
 
 - [ ] **Draw.** Press and drag on the picture. **Right:** a red line follows the pointer closely. A single click leaves a dot.
+- [ ] **Pen colours.** Click each swatch at the bottom left (red, fluorescent yellow, neon green, blue, white, hot pink) and draw with it. **Right:** each line is that colour with a thin dark edge that keeps it readable on grass and kits. Quit and relaunch. **Right:** the colour you last picked is still chosen. Also try a drag that starts on your webcam inset. **Right:** it draws.
 - [ ] **Auto-clear.** With **Auto-clear** ticked (the default), a drawing fades 5 s after you lift. Untick it, and drawings stay until you click **Clear** or press **C**. Both also wipe a line you're halfway through.
 - [ ] **Navigation still works.** While recording, two-finger scroll still pans and Ctrl+scroll still zooms. Only dragging draws.
 - [ ] **Edges.** Drag off the edge of the picture. **Right:** the line runs along the edge and doesn't go into the black bars.
 - [ ] **Stop mid-line.** While still holding the button down, press R to stop. **Right:** the half-drawn line disappears and never shows up in the replay.
-- [ ] **Not recording.** Dragging pans and draws nothing, and **Clear** and **Auto-clear** are greyed out.
+- [ ] **Not recording.** Dragging pans and draws nothing, and **Clear** and **Auto-clear** are greyed out. **Right:** a drag shows the hint "Drawing works while recording — press R" next to the controls.
 
 ## 6. Clips: naming, tags, notes, undo
 
