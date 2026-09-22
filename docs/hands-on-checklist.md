@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.1.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.1.1_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -27,6 +27,9 @@ Work down the list in order. It follows a normal session: install, open a projec
 - [ ] **Play and skip.** **Space** plays and pauses. **←/→** (or **A/D**) skip 3 s and **Shift+←/→** skip 10 s. **Right:** each one does exactly that.
 - [ ] **Scrub.** Drag the scrubber. **Right:** the picture follows live while you drag, and stops exactly where you let go.
 - [ ] **[must work] Play after scrubbing.** While playing, drag the scrubber back and forth quickly a few times, let go, then press Space. **Right:** it plays, and the time readout (like `12:34 / 45:00`) counts up. Do the same while paused. (This is the bug you hit first time round.)
+- [ ] **Scrub lands where it says.** Pause, then scrub to a few places in a half. **Right:** the picture and the readout agree every time.
+- [ ] **Step one frame.** Pause, then press **.** a few times, then **,** a few times. **Right:** the readout shows tenths while paused (`12:34.5 / 27:10`) and they move with each press; each press moves the picture by exactly one frame; **,** brings you back to where you started.
+- [ ] **Fast scanning.** While playing, press **L** repeatedly: 2×, 4×, 8×, 16×, 32×. **J** goes back down. The speed button beside Play does the same, wrapping back to 1× after 32×. **Right:** the readout shows the speed (`· 8×`), the picture keeps moving even at 32× and stays with the readout, the sound is muted above 1×, and pressing Space pauses on the frame you saw. Play again starts at 1×. **R** while fast starts the recording at 1×. Also say whether 32× feels usable for finding a kick-off.
 - [ ] **Keys after sliders.** Drag the scrubber, then the **Volume** slider (which should change the game sound), then press Space and the arrows. **Right:** the keys still play and skip, and don't nudge the slider.
 - [ ] **Hold → while playing** for a couple of seconds, then let go. **Right:** the video jumps ahead steadily and settles without a visible jump backwards. Also tell us if holding the key feels laggy or overshoots.
 - [ ] **Zoom and pan.** Try each of these:
