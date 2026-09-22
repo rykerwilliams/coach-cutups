@@ -23,6 +23,7 @@
 
 use uuid::Uuid;
 
+use crate::highlight::PlayerHighlight;
 use crate::project::Clip;
 use crate::scoreboard::MatchEventRecord;
 
@@ -69,6 +70,13 @@ pub enum UndoAction {
     EditMatchEvents {
         before: Vec<MatchEventRecord>,
         after: Vec<MatchEventRecord>,
+    },
+    /// The whole player-highlight list around a key, an edit or a delete
+    /// (spec H3). A snapshot for [`EditMatchEvents`](Self::EditMatchEvents)'s
+    /// reason, and purged for the same one.
+    EditHighlights {
+        before: Vec<PlayerHighlight>,
+        after: Vec<PlayerHighlight>,
     },
 }
 
@@ -136,18 +144,24 @@ impl UndoController {
     ///   so restored later it would point at the wrong video. A delete on the
     ///   redo stack is left alone: that clip is live, was remapped, and is
     ///   re-snapshotted when redone;
-    /// - **every match-event snapshot, on either stack** (Phase 9 spec S5) —
-    ///   both sides of one are lists of records, neither of them live, so
-    ///   undoing *or* redoing would restore stale indices.
+    /// - **every match-event and player-highlight snapshot, on either stack**
+    ///   (Phase 9 spec S5, match-vision spec H3) — both sides of one are lists
+    ///   of records, neither of them live, so undoing *or* redoing would
+    ///   restore stale indices.
     ///
     /// A source add or relink needs none of this: neither permutes indices.
     #[must_use]
     pub fn purge_for_source_change(&mut self) -> Vec<Clip> {
-        let stale_events = |a: &UndoAction| matches!(a, UndoAction::EditMatchEvents { .. });
-        self.redo.retain(|a| !stale_events(a));
+        let stale_snapshot = |a: &UndoAction| {
+            matches!(
+                a,
+                UndoAction::EditMatchEvents { .. } | UndoAction::EditHighlights { .. }
+            )
+        };
+        self.redo.retain(|a| !stale_snapshot(a));
         let (deletes, kept) = std::mem::take(&mut self.undo)
             .into_iter()
-            .filter(|a| !stale_events(a))
+            .filter(|a| !stale_snapshot(a))
             .partition(|a| matches!(a, UndoAction::DeleteClip(_)));
         self.undo = kept;
         self.evict(deletes)

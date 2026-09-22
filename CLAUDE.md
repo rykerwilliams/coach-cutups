@@ -244,8 +244,8 @@ silently. If you need a media type in core, you need a different design.
   field-level `#[serde(default)]`**, which is exactly what an older file means. A
   new struct's fields get no default: a missing one is a malformed file. Never a
   field-level default on an `f64` or a `bool` (`project.rs`'s header).
-- **Every bump comes with a test that the oldest readable version still loads**
-  (`project_format.rs::a_v7_file_loads_under_the_current_version`).
+- **Every bump comes with a test that every readable version still loads**
+  (`project_format.rs::v7_and_v8_files_load_under_v9`).
 - **The first save after an upgrade keeps `project.json.v<old>`**, once, never
   overwritten, so the older build can still be gone back to. It is copied to a
   temporary name and renamed, like `project.json` itself, so a failed copy
@@ -338,6 +338,22 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The defaults are 30 s and 6 s** (`REEL_LEAD_IN`, `REEL_TAIL`), overridden per
   side by the goal's trim. Never replace them with a guess that could be
   shorter: a cut-off assist is the one failure the reel must not have.
+
+**Player highlights** (`video-coach-core/src/highlight.rs`, spec H).
+- **A highlight belongs to the footage, not to a clip.** It is stored on the
+  project (`Project.player_highlights`, v9) and keyed by `source_index` and the
+  **displayed frame's stream time** (`Frame.stream_time`), never by record time,
+  so it shows wherever that footage does — scanning, recording, a preview, every
+  clip export that crosses it, and the reel — and it freezes with the footage
+  through a commentary pause. Two keys on one frame are the same number, so a
+  key replaces another by exact equality and no tolerance is stored or needed.
+- **It is drawn from `highlight_shapes`**, the one piece of drawing geometry,
+  which maps source-normalized rects through `Zoom::transform` — the affine the
+  picture itself is drawn with. No new mapping function, in either the media
+  overlay or the live Slint layer. Strokes stay zoom-agnostic (they live in the
+  content rect); a highlight lives in source space and moves with the zoom.
+- **A highlight may be placed outside a recording**, while pen drawings stay
+  recording-only: a highlight describes the footage, a drawing the commentary.
 
 ### Reference implementation (`apple/`, not maintained)
 

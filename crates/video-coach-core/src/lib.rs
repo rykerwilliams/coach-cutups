@@ -9,6 +9,7 @@
 pub mod audio;
 pub mod event;
 pub mod export;
+pub mod highlight;
 pub mod layout;
 pub mod plan;
 pub mod project;

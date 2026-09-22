@@ -159,7 +159,7 @@ impl Bus {
         }
     }
 
-    /// Applies an edit, a reorder or a match-event snapshot for a redo
+    /// Applies an edit, a reorder or a match-event or highlight snapshot for a redo
     /// (`forward`) or an undo, saves it, and returns it to be filed. `None`
     /// (and nothing saved) for an edit of a clip that's gone, which eviction's
     /// purge makes unreachable. A delete moves a file, so `undo` and `redo`
@@ -186,6 +186,10 @@ impl Bus {
             // neither side can hold an index the project has moved on from.
             UndoAction::EditMatchEvents { before, after } => {
                 open.project.match_events = if forward { after } else { before }.clone();
+                self.project_changed();
+            }
+            UndoAction::EditHighlights { before, after } => {
+                open.project.player_highlights = if forward { after } else { before }.clone();
                 self.project_changed();
             }
             UndoAction::DeleteClip(_) => unreachable!("deletes aren't replayed"),

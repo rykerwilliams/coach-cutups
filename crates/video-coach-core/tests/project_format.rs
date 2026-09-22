@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
+use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
 use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
 use video_coach_core::recording::PendingClip;
 use video_coach_core::scoreboard::{
@@ -86,6 +87,34 @@ fn sample_project() -> Project {
         source_seconds: 600.0,
         reel_lead_in: Some(12.5),
         reel_tail: None,
+    });
+    p.player_highlights.push(PlayerHighlight {
+        id: Uuid::from_u128(2),
+        source_index: 0,
+        color: Rgba::RED,
+        label: "#7".into(),
+        keys: vec![
+            HighlightKey {
+                source_seconds: 600.0,
+                rect: NormRect {
+                    x: 0.1,
+                    y: 0.2,
+                    w: 0.05,
+                    h: 0.2,
+                },
+                tracked: false,
+            },
+            HighlightKey {
+                source_seconds: 601.0,
+                rect: NormRect {
+                    x: 0.15,
+                    y: 0.2,
+                    w: 0.05,
+                    h: 0.2,
+                },
+                tracked: false,
+            },
+        ],
     });
     p
 }
@@ -229,44 +258,63 @@ fn round_trips_through_the_store() {
     assert_eq!(store::read(dir.path()).unwrap(), p);
 }
 
-/// F1. The oldest version this build reads, as the build that wrote it last
-/// left it: a goal with no trim keys. Every bump keeps a test like this one.
+/// F1. Every version this build reads, as the build that wrote it last left
+/// it: a v7 goal with no trim keys, and a v8 one with them. Neither has
+/// highlights. Every bump keeps a test like this one.
 #[test]
-fn a_v7_file_loads_under_the_current_version() {
-    let dir = TempDir::new().unwrap();
-    write_raw(
-        dir.path(),
-        json!({
-            "formatVersion": 7,
-            "name": "x",
-            "sourceVideos": [{
-                "relativePath": "a.mp4",
-                "displayName": "a",
-                "durationSeconds": 2700.0,
-                "displayAspect": 1.5
-            }],
-            "clips": [],
-            "matchEvents": [{
-                "id": "00000000-0000-0000-0000-000000000001",
-                "kind": "homeGoal",
-                "sourceIndex": 0,
-                "sourceSeconds": 600.0
-            }]
-        }),
-    );
-    let mut p = store::read(dir.path()).expect("a v7 file loads");
-    assert_eq!(p.format_version, 7, "read keeps the version it found");
-    assert_eq!(p.match_events.len(), 1);
-    assert_eq!(
-        (p.match_events[0].reel_lead_in, p.match_events[0].reel_tail),
-        (None, None)
-    );
+fn v7_and_v8_files_load_under_v9() {
+    let goal = |version: u32| {
+        let mut goal = json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "kind": "homeGoal",
+            "sourceIndex": 0,
+            "sourceSeconds": 600.0
+        });
+        if version >= 8 {
+            goal["reelLeadIn"] = json!(12.5);
+            goal["reelTail"] = serde_json::Value::Null;
+        }
+        goal
+    };
+    for version in [7, 8] {
+        let dir = TempDir::new().unwrap();
+        write_raw(
+            dir.path(),
+            json!({
+                "formatVersion": version,
+                "name": "x",
+                "sourceVideos": [{
+                    "relativePath": "a.mp4",
+                    "displayName": "a",
+                    "durationSeconds": 2700.0,
+                    "displayAspect": 1.5
+                }],
+                "clips": [],
+                "matchEvents": [goal(version)]
+            }),
+        );
+        let mut p = store::read(dir.path()).expect("an older file loads");
+        assert_eq!(p.format_version, version, "read keeps the version it found");
+        assert_eq!(p.match_events.len(), 1);
+        let trims = (p.match_events[0].reel_lead_in, p.match_events[0].reel_tail);
+        assert_eq!(
+            trims,
+            if version >= 8 {
+                (Some(12.5), None)
+            } else {
+                (None, None)
+            }
+        );
+        // v9's addition: an older file simply has none.
+        assert!(p.player_highlights.is_empty());
 
-    store::write(dir.path(), &mut p).unwrap();
-    assert_eq!(
-        store::read(dir.path()).unwrap().format_version,
-        CURRENT_FORMAT_VERSION
-    );
+        store::write(dir.path(), &mut p).unwrap();
+        assert_eq!(
+            store::read(dir.path()).unwrap().format_version,
+            CURRENT_FORMAT_VERSION
+        );
+        assert!(dir.path().join(format!("project.json.v{version}")).exists());
+    }
 }
 
 /// v8. The trims are always written, `null` for the default, so there is one

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::event::CommentaryEvent;
+use crate::highlight::PlayerHighlight;
 use crate::recording::PendingClip;
 use crate::scoreboard::{MatchEventRecord, ScoreboardConfig};
 use crate::undo::ClipEdit;
@@ -107,11 +108,11 @@ pub struct SourceRef {
     pub display_aspect: f64,
 }
 
-/// [`Project::remove_source`] refused because a clip or match event still
-/// points at the source. Silently retargeting them would produce subtly wrong
-/// playback, so the user must delete them first.
+/// [`Project::remove_source`] refused because a clip, a match event or a
+/// player highlight still points at the source. Silently retargeting them
+/// would produce subtly wrong playback, so the user must delete them first.
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error("source {index} is still used by a clip or match event")]
+#[error("source {index} is still used by a clip, a match event or a highlight")]
 pub struct SourceReferenced {
     pub index: usize,
 }
@@ -187,6 +188,9 @@ pub struct Project {
     pub scoreboard: Option<ScoreboardConfig>,
     #[serde(default)]
     pub match_events: Vec<MatchEventRecord>,
+    /// v9. Rings on the footage, not on a clip — see [`crate::highlight`].
+    #[serde(default)]
+    pub player_highlights: Vec<PlayerHighlight>,
 }
 
 impl Project {
@@ -199,6 +203,7 @@ impl Project {
             preferences: Preferences::default(),
             scoreboard: None,
             match_events: Vec::new(),
+            player_highlights: Vec::new(),
         }
     }
 
@@ -256,7 +261,8 @@ impl Project {
         (last, self.source_videos[last].duration_seconds)
     }
 
-    /// True if any clip or match event points at source `index`.
+    /// True if any clip, match event or player highlight points at source
+    /// `index`.
     ///
     /// The UI disables a source's remove button on this; [`remove_source`]
     /// re-checks it. macOS counted clips only, so a match event could be left
@@ -266,15 +272,20 @@ impl Project {
     pub fn source_is_referenced(&self, index: usize) -> bool {
         self.clips.iter().any(|c| c.source_index == index)
             || self.match_events.iter().any(|m| m.source_index == index)
+            || self
+                .player_highlights
+                .iter()
+                .any(|h| h.source_index == index)
     }
 
-    /// Remove source `index`, keeping every clip and match event on its own
-    /// physical file.
+    /// Remove source `index`, keeping every clip, match event and player
+    /// highlight on its own physical file.
     ///
     /// Refuses while the source is referenced. On success every higher
-    /// `source_index` — in clips **and** match events (macOS remapped clips
-    /// only) — drops by one, and `current` (the player's source) goes through
-    /// the same remap: `None` means the current source was the one removed.
+    /// `source_index` — in clips, match events **and** highlights (macOS
+    /// remapped clips only) — drops by one, and `current` (the player's
+    /// source) goes through the same remap: `None` means the current source
+    /// was the one removed.
     ///
     /// # Panics
     ///
@@ -299,6 +310,9 @@ impl Project {
         self.match_events
             .iter_mut()
             .for_each(|m| shift(&mut m.source_index));
+        self.player_highlights
+            .iter_mut()
+            .for_each(|h| shift(&mut h.source_index));
         Ok(match current.cmp(&index) {
             std::cmp::Ordering::Less => Some(current),
             std::cmp::Ordering::Equal => None,
@@ -307,8 +321,8 @@ impl Project {
     }
 
     /// Move source `from` to position `to` (the `Vec::remove` + `Vec::insert`
-    /// convention) and remap clips, match events and `current` through the same
-    /// permutation, returning the new `current`.
+    /// convention) and remap clips, match events, player highlights and
+    /// `current` through the same permutation, returning the new `current`.
     ///
     /// A move is always a valid permutation, so there is nothing to refuse.
     /// macOS remapped clips only.
@@ -335,6 +349,9 @@ impl Project {
         }
         for m in &mut self.match_events {
             m.source_index = remap(m.source_index);
+        }
+        for h in &mut self.player_highlights {
+            h.source_index = remap(h.source_index);
         }
         remap(current)
     }

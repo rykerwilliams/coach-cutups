@@ -8,8 +8,10 @@
 
 use uuid::Uuid;
 
+use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
 use video_coach_core::project::Clip;
 use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
+use video_coach_core::stroke::Rgba;
 use video_coach_core::undo::{ClipEdit, UndoAction, UndoController, STACK_CAP};
 
 fn clip(id: Uuid) -> Clip {
@@ -57,6 +59,29 @@ fn match_events(source_index: usize) -> UndoAction {
             source_seconds: 1.0,
             reel_lead_in: None,
             reel_tail: None,
+        }],
+    }
+}
+
+/// A highlight key placed on source `source_index`, as the bus records one.
+fn highlights(source_index: usize) -> UndoAction {
+    UndoAction::EditHighlights {
+        before: Vec::new(),
+        after: vec![PlayerHighlight {
+            id: Uuid::new_v4(),
+            source_index,
+            color: Rgba::RED,
+            label: String::new(),
+            keys: vec![HighlightKey {
+                source_seconds: 1.0,
+                rect: NormRect {
+                    x: 0.1,
+                    y: 0.1,
+                    w: 0.1,
+                    h: 0.2,
+                },
+                tracked: false,
+            }],
         }],
     }
 }
@@ -278,20 +303,24 @@ fn a_source_change_leaves_a_redo_delete() {
 
 /// Phase 9: a match-event snapshot goes from **both** stacks, unlike a
 /// delete. Neither side of one is live, so undoing or redoing it would
-/// restore indices the permutation didn't reach (spec S5).
+/// restore indices the permutation didn't reach (spec S5). A player-highlight
+/// snapshot is the same shape and goes the same way (match-vision spec H3).
 #[test]
-fn a_source_change_purges_match_events_from_both_stacks() {
-    let mut c = UndoController::default();
-    let kept = edit();
-    let _ = c.push(kept.clone());
-    let _ = c.push(match_events(1));
-    let _ = c.push(match_events(2));
-    // One of the two goes to the redo stack, the other stays on the undo one.
-    undo(&mut c);
+fn a_source_change_purges_snapshots_from_both_stacks() {
+    for snapshot in [match_events as fn(usize) -> UndoAction, highlights] {
+        let mut c = UndoController::default();
+        let kept = edit();
+        let _ = c.push(kept.clone());
+        let _ = c.push(snapshot(1));
+        let _ = c.push(snapshot(2));
+        // One of the two goes to the redo stack, the other stays on the undo
+        // one.
+        undo(&mut c);
 
-    assert!(c.purge_for_source_change().is_empty());
-    assert_eq!(c.undo_stack(), [kept]);
-    assert!(c.redo_stack().is_empty());
+        assert!(c.purge_for_source_change().is_empty());
+        assert_eq!(c.undo_stack(), [kept]);
+        assert!(c.redo_stack().is_empty());
+    }
 }
 
 // ------------------------------------------------------------ clear

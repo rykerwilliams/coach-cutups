@@ -7,8 +7,10 @@
 
 use uuid::Uuid;
 
+use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
 use video_coach_core::project::{AspectMismatch, Clip, Project, SourceRef, SourceReferenced};
 use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
+use video_coach_core::stroke::Rgba;
 
 const WIDE: f64 = 16.0 / 9.0;
 
@@ -49,6 +51,25 @@ fn clip_on(source_index: usize) -> Clip {
     }
 }
 
+fn highlight_on(source_index: usize) -> PlayerHighlight {
+    PlayerHighlight {
+        id: Uuid::new_v4(),
+        source_index,
+        color: Rgba::RED,
+        label: String::new(),
+        keys: vec![HighlightKey {
+            source_seconds: 1.0,
+            rect: NormRect {
+                x: 0.1,
+                y: 0.1,
+                w: 0.1,
+                h: 0.2,
+            },
+            tracked: false,
+        }],
+    }
+}
+
 fn match_event_on(source_index: usize) -> MatchEventRecord {
     MatchEventRecord {
         id: Uuid::new_v4(),
@@ -60,15 +81,19 @@ fn match_event_on(source_index: usize) -> MatchEventRecord {
     }
 }
 
-/// The display name each clip's and match event's index resolves to — the
-/// "same physical file" invariant a remap must preserve.
-fn referenced_names(p: &Project) -> (Vec<String>, Vec<String>) {
+/// The display name each clip's, match event's and highlight's index resolves
+/// to — the "same physical file" invariant a remap must preserve.
+fn referenced_names(p: &Project) -> (Vec<String>, Vec<String>, Vec<String>) {
     let name = |i: usize| p.source_videos[i].display_name.clone();
     (
         p.clips.iter().map(|c| name(c.source_index)).collect(),
         p.match_events
             .iter()
             .map(|m| name(m.source_index))
+            .collect(),
+        p.player_highlights
+            .iter()
+            .map(|h| name(h.source_index))
             .collect(),
     )
 }
@@ -142,6 +167,9 @@ fn a_source_is_referenced_by_a_clip_or_a_match_event() {
     assert!(p.source_is_referenced(0));
     assert!(!p.source_is_referenced(1));
     assert!(p.source_is_referenced(2));
+
+    p.player_highlights.push(highlight_on(1));
+    assert!(p.source_is_referenced(1));
 }
 
 // ------------------------------------------------------------ remove_source
@@ -164,13 +192,24 @@ fn remove_refuses_a_source_used_by_a_match_event() {
     assert_eq!(p.source_videos.len(), 2);
 }
 
-/// Higher indices drop by one in clips **and** match events, so everything
-/// keeps pointing at the same physical file.
+/// A highlight belongs to the footage, so it holds its source open just as a
+/// clip or a match event does.
 #[test]
-fn remove_remaps_higher_indices_in_clips_and_match_events() {
+fn remove_refuses_a_source_used_by_a_highlight() {
+    let mut p = project(&[10.0, 10.0]);
+    p.player_highlights.push(highlight_on(0));
+    assert_eq!(p.remove_source(0, 1), Err(SourceReferenced { index: 0 }));
+    assert_eq!(p.source_videos.len(), 2);
+}
+
+/// Higher indices drop by one in clips, match events **and** highlights, so
+/// everything keeps pointing at the same physical file.
+#[test]
+fn remove_remaps_higher_indices_in_clips_match_events_and_highlights() {
     let mut p = project(&[10.0, 10.0, 10.0, 10.0]);
     p.clips = vec![clip_on(0), clip_on(2), clip_on(3)];
     p.match_events = vec![match_event_on(3), match_event_on(0)];
+    p.player_highlights = vec![highlight_on(2), highlight_on(0)];
     let before = referenced_names(&p);
 
     assert_eq!(p.remove_source(1, 3), Ok(Some(2)));
@@ -203,12 +242,13 @@ fn names(p: &Project) -> Vec<&str> {
         .collect()
 }
 
-/// Every index in `0..n` is referenced by one clip and one match event, so the
-/// whole permutation is checked, not just the moved source.
+/// Every index in `0..n` is referenced by one clip, one match event and one
+/// highlight, so the whole permutation is checked, not just the moved source.
 fn fully_referenced(n: usize) -> Project {
     let mut p = project(&vec![10.0; n]);
     p.clips = (0..n).map(clip_on).collect();
     p.match_events = (0..n).map(match_event_on).collect();
+    p.player_highlights = (0..n).map(highlight_on).collect();
     p
 }
 
