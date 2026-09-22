@@ -5,6 +5,7 @@
 //! See `docs/superpowers/specs/2026-09-19-linux-port-design.md`.
 
 pub mod capture;
+pub mod chapters;
 pub mod composite;
 mod download;
 #[cfg(any(test, feature = "fixtures"))]
@@ -19,6 +20,7 @@ pub use capture::{
     list_devices, now_ns, resolve_camera, resolve_mic, Camera, CaptureSources, Devices, Mic,
     Recorder, RecorderMessage, StopOutcome,
 };
+pub use chapters::ChapterOutcome;
 pub use composite::export::{
     EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
 };

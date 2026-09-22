@@ -33,6 +33,11 @@ libgl-dev
 cmake
 libclang-dev
 
+# Test-only: `ffprobe` reads exported chapters back (the `chpl` box, which
+# GStreamer's qtdemux doesn't read). Nothing links or ships it, and the .deb
+# doesn't depend on it.
+ffmpeg
+
 # The .deb: cargo-deb's `$auto` Depends is dpkg-shlibdeps, and without it
 # cargo-deb only warns.
 dpkg-dev

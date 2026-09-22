@@ -94,6 +94,28 @@ impl CompilationPlan {
     pub fn total_frames(&self) -> usize {
         self.entries.last().map_or(0, |e| e.start_frame + e.frames)
     }
+
+    /// The file's chapters: one per entry, `(start in seconds, title)`, titled
+    /// with the entry's text bar line. Empty for a plan of fewer than two
+    /// entries, where a chapter would only repeat the file.
+    ///
+    /// A chapter starts at `start_frame / OUTPUT_FPS`, never at a sum of
+    /// durations: per-entry quantization would put every later chapter up to
+    /// a frame per entry early.
+    pub fn chapters(&self) -> Vec<(f64, &str)> {
+        if self.entries.len() < 2 {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .map(|e| {
+                (
+                    e.start_frame as f64 / f64::from(OUTPUT_FPS),
+                    e.text.as_str(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// The clips `target` covers, in stored order (Phase 3 spec C3).

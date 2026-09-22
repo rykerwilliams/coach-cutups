@@ -212,13 +212,14 @@ impl Active {
                 let seconds = self.target_started.elapsed().as_secs_f64();
                 eprintln!(
                     "bus: exported {}: {} frames in {seconds:.1} s ({:.1} fps), \
-                     decoder {:?}, glupload caps {:?}, encoder {}",
+                     decoder {:?}, glupload caps {:?}, encoder {}, {}",
                     done.path.display(),
                     target.frames,
                     target.frames as f64 / seconds,
                     d.decoder,
                     d.glupload_caps,
-                    done.encoder
+                    done.encoder,
+                    done.chapters
                 );
                 TargetState::Done(done.path)
             }

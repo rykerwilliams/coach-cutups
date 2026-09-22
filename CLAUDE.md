@@ -305,6 +305,8 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
 - **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
 - **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
+- **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. An I/O error fails the export; no room keeps the file without chapters, and `bus: exported …` says why.
+- **`ffprobe` is the chapter test's reader** (`qtdemux` doesn't read `chpl`), so `ffmpeg` is a **test-only** build dependency: the test fails without it, never skips, and the `.deb` doesn't depend on it.
 
 **The match clock is the displayed frame's source time** (Phase 9).
 - **Never a per-clip constant.** `ScoreboardContext::state_at(entry.source_index,

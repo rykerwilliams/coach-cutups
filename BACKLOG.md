@@ -190,6 +190,10 @@ Each entry: what, why deferred, when to revisit.
   11 spec S7). It no longer makes either claim: it says the speech model
   downloads once, on first use, and that nothing leaves the machine after
   that; FFmpeg isn't mentioned (the package does depend on `gst-libav`).
+- **Note 2026-09-22:** `ffmpeg` is now a **test-only** build dependency
+  (`packaging/build-deps.txt`): `ffprobe` is the chapter test's independent
+  reader of the `chpl` box (match vision spec C3). Nothing links or ships it,
+  and the `.deb` still doesn't depend on it.
 
 ### 24. Linux packaging: AppImage vs Flatpak
 - **Why deferred:** Flatpak sandboxing complicates camera, microphone and

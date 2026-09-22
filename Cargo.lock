@@ -4926,6 +4926,7 @@ dependencies = [
  "gstreamer-gl-egl",
  "gstreamer-pbutils",
  "gstreamer-video",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tiny-skia 0.12.0",

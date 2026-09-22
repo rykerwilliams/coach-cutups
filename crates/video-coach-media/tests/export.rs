@@ -33,7 +33,9 @@ use video_coach_media::fixtures::{
     self, block_centre, counter_video, counter_video_with, decode_counters, one_entry,
     read_counter, CounterKind, CounterQuirks, COUNTER_BITS,
 };
-use video_coach_media::{EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
+use video_coach_media::{
+    ChapterOutcome, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
+};
 
 /// Far beyond any export here, even on a loaded llvmpipe runner; only a hang
 /// reaches it.
@@ -1278,4 +1280,108 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     assert_eq!(result, Err(ExportError::Cancelled));
     assert!(!dir.path().join("out.mp4.part").exists());
     assert_eq!(std::fs::read(&path).unwrap(), b"the previous export");
+}
+
+/// `path`'s chapters as `ffprobe` reads them: `(start in seconds, title)`.
+///
+/// `ffprobe` is the independent reader: GStreamer's `qtdemux` doesn't read
+/// `chpl`, and no released Rust MP4 crate parses it. Without it this fails,
+/// never skips: it is a test-only build dependency (`packaging/build-deps.txt`).
+fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_chapters", "-of", "json"])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
+            )
+        });
+    assert!(
+        out.status.success(),
+        "ffprobe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["chapters"]
+        .as_array()
+        .expect("a chapters array")
+        .iter()
+        .map(|c| {
+            (
+                c["start_time"].as_str().unwrap().parse().unwrap(),
+                c["tags"]["title"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A compilation gets a chapter per entry, titled with its bar line and
+/// starting on its first output frame, in a file that still decodes whole.
+///
+/// The entries are 0.51 s long, so each takes 16 frames rather than 15.3:
+/// a chapter placed by summing durations would drift by most of a frame per
+/// entry, well past the millisecond this allows.
+#[test]
+fn a_compilation_gets_a_chapter_per_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(dir.path(), CounterKind::H264Mp4BFrames);
+    let clips: Vec<Clip> = ["Build-up", "Café press", "Finish"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Clip {
+            name: name.into(),
+            sort_index: i as i64,
+            ..clip(i as f64, 0.51, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[f64::from(src.frames) / f64::from(src.fps)]);
+    let expected_counters: Vec<u32> = compilation
+        .frames
+        .iter()
+        .map(|f| oracle(f.source_time, src.fps, src.frames))
+        .collect();
+    let expected: Vec<(f64, String)> = compilation
+        .plan
+        .chapters()
+        .into_iter()
+        .map(|(at, title)| (at, title.to_owned()))
+        .collect();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(compilation.plan.entries[1].start_frame, 16);
+    let path = dir.path().join("out.mp4");
+    let done = export(ExportJob {
+        // A silent track, which is still `avenc_aac`'s.
+        audio: Vec::new(),
+        entries: clips
+            .into_iter()
+            .map(|clip| {
+                Some(EntryMedia {
+                    // Unread: `show_pip` is off and there is no audio edit.
+                    recording: PathBuf::new(),
+                    clip,
+                })
+            })
+            .collect(),
+        compilation,
+        sources: vec![src.path.clone()],
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: None,
+    })
+    .unwrap();
+    assert_eq!(done.chapters, ChapterOutcome::Written(3));
+
+    let got = ffprobe_chapters(&path);
+    assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");
+    for ((at, title), (want_at, want_title)) in got.iter().zip(&expected) {
+        assert_eq!(title, want_title);
+        assert!(
+            (at - want_at).abs() < 0.001,
+            "{title:?} starts at {at}, not {want_at}"
+        );
+    }
+    counters_match(&decode_counters(&path), &expected_counters);
+    duration_is_the_schedule_s(&path, expected_counters.len());
 }

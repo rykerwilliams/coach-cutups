@@ -231,3 +231,35 @@ fn the_text_line_counts_only_the_targets_clips() {
     assert_eq!(one.entries.len(), 1);
     assert_eq!(one.entries[0].text, "1 / 1 | b");
 }
+
+/// A chapter starts on its entry's first output frame, not at a sum of
+/// durations: a 5.01 s clip takes 151 frames, so the next starts at 151 / 30
+/// rather than 5.01.
+#[test]
+fn chapters_start_on_each_entrys_first_frame() {
+    let mut a = clip("a", 0, &[]);
+    a.recording_duration = 5.01;
+    let p = project_with(vec![a, clip("b", 1, &["shot"]), clip("c", 2, &[])]);
+    let plan = compilation_plan(&p, &ExportTarget::AllClips);
+    assert_eq!(plan.entries[1].start_frame, 151);
+    let chapters = plan.chapters();
+    let expect: Vec<(f64, &str)> = plan
+        .entries
+        .iter()
+        .map(|e| (e.start_frame as f64 / 30.0, e.text.as_str()))
+        .collect();
+    assert_eq!(chapters, expect);
+    assert_eq!(chapters[0], (0.0, "1 / 3 | a"));
+    assert_eq!(chapters[1], (151.0 / 30.0, "2 / 3 | b | shot"));
+}
+
+#[test]
+fn fewer_than_two_entries_get_no_chapters() {
+    let none = compilation_plan(&project_with(vec![]), &ExportTarget::AllClips);
+    assert!(none.chapters().is_empty());
+    let one = compilation_plan(
+        &project_with(vec![clip("a", 0, &[])]),
+        &ExportTarget::AllClips,
+    );
+    assert!(one.chapters().is_empty());
+}

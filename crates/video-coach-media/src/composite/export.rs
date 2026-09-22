@@ -49,6 +49,7 @@ use super::{
     overlay_branch, push_buffer, stamp, stamp_buffer, CompositeError, Gl, Layout, Schedule,
     Stopper, Watch, POLL, QUEUED,
 };
+use crate::chapters::{self, ChapterOutcome};
 use crate::overlay::{OverlayFrame, OverlayRenderer};
 use crate::player::{gl_caps, seconds_to_clock, Diagnostics};
 
@@ -126,6 +127,15 @@ pub struct ExportDone {
     /// it. Every source runs the same graph, so one of them says whether the
     /// run was zero-copy.
     pub diagnostics: Diagnostics,
+    /// Whether the file got its chapters, one per entry, or why not.
+    pub chapters: ChapterOutcome,
+}
+
+/// What the graph reports of a run that encoded every frame, before the file
+/// gets its chapters.
+struct Encoded {
+    encoder: String,
+    diagnostics: Diagnostics,
 }
 
 /// A running export. It owns its thread, and every GStreamer object it
@@ -222,7 +232,8 @@ fn part_path(path: &Path) -> PathBuf {
     PathBuf::from(part)
 }
 
-/// Exports to the `.part` file and renames it into place, or deletes it.
+/// Exports to the `.part` file, splices in its chapters and renames it into
+/// place, or deletes it.
 fn run(
     job: &ExportJob,
     cancel: &AtomicBool,
@@ -232,10 +243,20 @@ fn run(
     let part = part_path(&job.path);
     // The pipelines are NULL by the time `export` returns, so nothing holds
     // the file open.
-    let result = export(job, &part, cancel, inject, on_message).and_then(|done| {
-        std::fs::rename(&part, &job.path)
-            .map(|()| done)
-            .map_err(|e| ExportError::Failed(format!("could not move the export into place: {e}")))
+    let result = export(job, &part, cancel, inject, on_message).and_then(|encoded| {
+        // An I/O error here may leave a half-written `moov`, which is a
+        // corrupt file: it fails the export. A skip keeps the file whole.
+        let chapters = chapters::splice(&part, &job.compilation.plan.chapters())
+            .map_err(|e| ExportError::Failed(format!("could not write the chapters: {e}")))?;
+        std::fs::rename(&part, &job.path).map_err(|e| {
+            ExportError::Failed(format!("could not move the export into place: {e}"))
+        })?;
+        Ok(ExportDone {
+            path: job.path.clone(),
+            encoder: encoded.encoder,
+            diagnostics: encoded.diagnostics,
+            chapters,
+        })
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
@@ -249,7 +270,7 @@ fn export(
     cancel: &AtomicBool,
     inject: Option<&str>,
     on_message: &mut impl FnMut(ExportMessage),
-) -> Result<ExportDone, ExportError> {
+) -> Result<Encoded, ExportError> {
     let gl = Gl::shared()?;
     let watch = Watch {
         cancel,
@@ -348,8 +369,7 @@ fn export(
         }
     }
     encoder.finish(&watch)?;
-    Ok(ExportDone {
-        path: job.path.clone(),
+    Ok(Encoded {
         encoder: encoder.name().to_owned(),
         diagnostics: plan
             .entries
