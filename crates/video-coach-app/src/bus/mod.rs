@@ -231,6 +231,17 @@ pub enum Command {
     SetCamera(Option<String>),
     /// The project's preferred microphone, likewise.
     SetMic(Option<String>),
+    /// Make this image the project's avatar (avatar spec A2): decode it,
+    /// copy it into the project folder, save. A file that will not decode is
+    /// refused before anything is copied. Since the image **is** avatar mode
+    /// (B1), this is also what stops the camera being opened for a take —
+    /// which is why neither it nor [`Command::ClearAvatar`] is on the
+    /// recording allow-list.
+    SetAvatar(PathBuf),
+    /// Drop the avatar: clear the field, delete the project's **copy**, save.
+    /// The coach's original is untouched, and the project records on camera
+    /// again.
+    ClearAvatar,
 
     // Export (Phase 5 spec X4, Phase 8 spec E1).
     /// Render each target into `<project>/exports/`, one after another, in
@@ -390,6 +401,13 @@ pub enum UserError {
     NoCamera,
     #[error("recording failed: {0}")]
     RecordingFailed(String),
+    /// A notice: the image the coach picked for the avatar could not be
+    /// decoded, so nothing was copied and the project is as it was. A notice
+    /// rather than a modal because it refuses one click in a popover the
+    /// coach still has open — there is nothing to answer, and the next pick
+    /// is the answer.
+    #[error("that image couldn't be read, so it wasn't picked: {0}")]
+    Avatar(String),
     /// A notice: the chosen device is absent, and the recording goes ahead on
     /// the default one. The preference is kept.
     #[error("the chosen {what} isn't connected, so the default one is recording")]
@@ -423,7 +441,10 @@ impl UserError {
     pub fn is_notice(&self) -> bool {
         matches!(
             self,
-            UserError::DeviceFallback { .. } | UserError::StopNotClean | UserError::Scoreboard(_)
+            UserError::Avatar(_)
+                | UserError::DeviceFallback { .. }
+                | UserError::StopNotClean
+                | UserError::Scoreboard(_)
         )
     }
 }
@@ -820,6 +841,8 @@ impl Bus {
             Command::SetPen(pen) => self.state.set_pen(pen),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
+            Command::SetAvatar(path) => self.set_avatar(path),
+            Command::ClearAvatar => self.clear_avatar(),
             Command::Export {
                 targets,
                 resolution,

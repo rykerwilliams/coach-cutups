@@ -258,6 +258,32 @@ silently. If you need a media type in core, you need a different design.
   leaves no backup to block the next try; never a hard link (exFAT and FAT
   have none).
 
+**One avatar image per project, copied into the project folder.** It is
+`<project>/avatar.<ext>` beside `project.json`, and `Project.avatar` holds its
+**file name** — which *is* avatar mode (the format rules above).
+- **Picking one is decode, copy, save** (`bus/project.rs::set_avatar`): the file
+  is decoded first, so one that will not decode is refused before anything is
+  copied; the bytes are then copied through a temp file and a rename in the same
+  directory, as `store::write` writes `project.json`. Replacing one deletes
+  **exactly the file `Project.avatar` names**, never an `avatar.*` glob over a
+  folder the coach can also put files in. **Remove** deletes the project's copy
+  alone — the coach's original is theirs.
+- **`media::decode_still` is the one avatar decoder.** The pick validates with
+  it, the Devices popover's thumbnail draws with it, and `composite::avatar::
+  open` scales its output, so a file that passes the pick cannot fail in an
+  export and nothing has to keep a list of extensions in step. It runs
+  `decodebin3 ! videoflip video-direction=auto`, which is what keeps an
+  EXIF-rotated phone photo upright (`probe` *refuses* a rotated **source**
+  instead: there a timeline and a stored aspect are at stake). One sample is
+  pulled, so a multi-frame file yields its first frame and no error. The file
+  dialog offers PNG and JPEG; what is accepted is what decoded.
+- **GStreamer's `RGBA` is straight alpha and tiny-skia is premultiplied**, so
+  the copy into the avatar's pixmap multiplies R, G and B by A — a memcpy leaves
+  a cut-out PNG haloed. The pixmap is pre-scaled to `pip_rect` for the
+  **image's own** aspect (nothing is stretched or cropped to the inset) and
+  masked **once, at open time** to the circle inscribed in it, so the per-frame
+  draw is a plain blit.
+
 **Bus contract — caller-captured timestamps.** Any command that lands in the
 commentary event log carries its timestamp (and source-position anchor) as a
 field, captured at the input event on the UI thread, never assigned by the bus

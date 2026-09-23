@@ -241,6 +241,49 @@ pub fn audio_only(dir: &Path) -> PathBuf {
     )
 }
 
+/// Which codec a [`still_image`] is written in — the two an avatar may be
+/// (avatar spec A1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StillFormat {
+    Png,
+    Jpeg,
+}
+
+/// A one-frame `w`×`h` still at `dir/name`, opaque, in `format`. The avatar
+/// an image test picks.
+pub fn still_image(dir: &Path, name: &str, w: u32, h: u32, format: StillFormat) -> PathBuf {
+    let encoder = match format {
+        StillFormat::Png => "pngenc",
+        StillFormat::Jpeg => "jpegenc",
+    };
+    run(
+        &format!(
+            "videotestsrc num-buffers=1 \
+               ! video/x-raw,width={w},height={h},framerate=30/1 \
+               ! videoconvert ! {encoder} ! filesink name=out"
+        ),
+        &dir.join(name),
+    )
+}
+
+/// A `w`×`h` PNG at `dir/name`, uniformly **half-transparent white**, in
+/// straight alpha as every PNG is.
+///
+/// The one fixture that carries alpha: it is what proves the copy into the
+/// avatar's pixmap premultiplies, since a straight copy leaves its colour
+/// channels at full white rather than halving them with the alpha.
+pub fn translucent_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+    run(
+        &format!(
+            "videotestsrc num-buffers=1 pattern=white \
+               ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1 \
+               ! alpha alpha=0.5 ! videoconvert ! video/x-raw,format=RGBA \
+               ! pngenc ! filesink name=out"
+        ),
+        &dir.join(name),
+    )
+}
+
 /// The container and codecs of a [`counter_video`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CounterKind {

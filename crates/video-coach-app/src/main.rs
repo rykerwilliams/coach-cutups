@@ -17,7 +17,7 @@ mod video;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecModel};
 use uuid::Uuid;
@@ -46,7 +46,8 @@ use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{
-    list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, WhisperModel,
+    decode_still, list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, Still,
+    WhisperModel,
 };
 
 use pickers::{Pick, Pickers};
@@ -142,7 +143,18 @@ struct UiState {
     scoreboard: Option<ScoreboardContext>,
     /// The transcription queue (Phase 10 S5).
     transcription: Transcription,
+    /// What the Devices popover's avatar thumbnail was decoded from: the file
+    /// name, its length and its modification time. A project change that
+    /// didn't touch the image then costs a `stat` rather than a decode on the
+    /// UI thread, and one that replaced it under the same name still costs a
+    /// decode. `None` when there is no image, or its file has gone.
+    avatar_shown: Option<AvatarFile>,
 }
+
+/// Which file the avatar thumbnail stands for. Not the path: it is always
+/// the open project's folder, and the folder changing brings a project
+/// change with it.
+type AvatarFile = (String, u64, Option<SystemTime>);
 
 /// A drag in the H tool, from its press (spec H3).
 struct HighlightDrag {
@@ -194,6 +206,7 @@ impl Default for UiState {
             export_targets: Vec::new(),
             scoreboard: None,
             transcription: Transcription::default(),
+            avatar_shown: None,
         }
     }
 }
@@ -343,6 +356,21 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                 send(Command::RelinkSource(index, path))
             });
         }
+    });
+    window.on_choose_avatar({
+        let (weak, pickers, send) = (window.as_weak(), pickers.clone(), send(bus));
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let send = send.clone();
+            let pick = Pick::Image {
+                title: "Choose an Avatar Image",
+            };
+            pickers.open(&w, pick, move |path| send(Command::SetAvatar(path)));
+        }
+    });
+    window.on_remove_avatar({
+        let send = send(bus);
+        move || send(Command::ClearAvatar)
     });
     window.on_remove_source({
         let send = send(bus);
@@ -1956,6 +1984,7 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
     w.set_tag_rows(ModelRc::new(VecModel::from(tags)));
     show_match(w, project);
     show_highlights(w, project);
+    show_avatar(w, &snapshot);
     UI.with_borrow_mut(|ui| {
         // Rebuilt here and nowhere else: a source add, move, remove or
         // relink moves the offsets a context froze (spec S2), and every one
@@ -1964,6 +1993,72 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         ui.snapshot = Some(snapshot);
     });
     show_clip(w);
+}
+
+/// The Devices popover's Inset section (avatar spec G1): the project's avatar
+/// image, its name, and whether its file has gone.
+///
+/// The thumbnail comes from `media::decode_still` — the one avatar decoder,
+/// so the popover shows exactly the pixels an export will draw — but only
+/// when the file behind it has changed. This runs on the UI thread at every
+/// project change, and most of those have nothing to do with the image.
+fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
+    let clear = |w: &AppWindow, missing| {
+        w.set_avatar_missing(missing);
+        w.set_avatar_thumb(slint::Image::default());
+        UI.with_borrow_mut(|ui| ui.avatar_shown = None);
+    };
+    let Some(name) = snapshot.project.avatar.clone() else {
+        w.set_avatar_name(SharedString::new());
+        return clear(w, false);
+    };
+    w.set_avatar_name(name.as_str().into());
+    let path = snapshot.folder.join(&name);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return clear(w, true);
+    };
+    w.set_avatar_missing(false);
+    let file: AvatarFile = (name, meta.len(), meta.modified().ok());
+    if UI.with_borrow(|ui| ui.avatar_shown.as_ref() == Some(&file)) {
+        return;
+    }
+    match decode_still(&path) {
+        Ok(still) => {
+            w.set_avatar_thumb(thumbnail(&still));
+            UI.with_borrow_mut(|ui| ui.avatar_shown = Some(file));
+        }
+        Err(e) => {
+            // The pick decoded, so this is a file swapped under the project.
+            // The section still names it; there are simply no pixels to show.
+            eprintln!("ui: the avatar {} won't decode: {e}", path.display());
+            clear(w, false);
+        }
+    }
+}
+
+/// A decoded still as a Slint image, decimated to at most [`THUMB_MAX`] on a
+/// side.
+///
+/// Nearest-neighbour, and only ever downward: this is a 40 px thumbnail, and
+/// the only thing worth avoiding is uploading a phone photo's twelve
+/// megapixels as a texture to draw it.
+fn thumbnail(still: &Still) -> slint::Image {
+    /// The longest side the thumbnail is kept to, with room to spare for the
+    /// popover's 40 px box on a high-DPI screen.
+    const THUMB_MAX: u32 = 160;
+    let step = still.w.max(still.h).div_ceil(THUMB_MAX).max(1) as usize;
+    let (w, h) = (still.w as usize, still.h as usize);
+    let (tw, th) = (w.div_ceil(step), h.div_ceil(step));
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(tw as u32, th as u32);
+    let out = pixels.make_mut_bytes();
+    for y in 0..th {
+        for x in 0..tw {
+            let from = ((y * step) * w + x * step) * 4;
+            let to = (y * tw + x) * 4;
+            out[to..to + 4].copy_from_slice(&still.rgba[from..from + 4]);
+        }
+    }
+    slint::Image::from_rgba8(pixels)
 }
 
 /// The Clips list: all of `project`'s clips in stored order (C3), or those

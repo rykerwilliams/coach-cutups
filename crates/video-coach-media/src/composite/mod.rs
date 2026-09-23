@@ -29,6 +29,7 @@
 //! pipeline posted.
 
 pub(crate) mod audio;
+pub(crate) mod avatar;
 mod decode;
 pub mod export;
 pub mod preview;

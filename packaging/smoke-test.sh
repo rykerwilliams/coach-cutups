@@ -62,7 +62,7 @@ elements=(
     appsrc appsink videoconvert audioconvert audioresample level
     autoaudiosink alsasink
     glupload glcolorconvert gltransformation glvideomixer gldownload
-    v4l2src pipewiresrc jpegdec videoconvertscale x264enc opusenc matroskamux
+    v4l2src pipewiresrc jpegdec pngdec videoflip videoconvertscale x264enc opusenc matroskamux
     h264parse avenc_aac aacparse mp4mux
     souphttpsrc
     qtdemux matroskademux avdec_h264 avdec_h265 opusdec

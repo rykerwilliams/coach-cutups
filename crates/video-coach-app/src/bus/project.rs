@@ -1,14 +1,30 @@
 //! Project lifecycle (spec D6): read first, then commit folder and project
 //! together. macOS set the folder before reading, so after a refused open the
 //! next autosave wrote the old project over the file it had just refused.
+//!
+//! The project folder's own assets live here too: the avatar image, which is
+//! copied in, named in `project.json`, and deleted with the project's copy
+//! alone (avatar spec A2).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use video_coach_core::project::Project;
 use video_coach_core::store::{self, StoreError};
+use video_coach_media::decode_still;
 
 use super::{Bus, Event, Open, Snapshot, UserError};
+
+/// Deletes the project's copy of an avatar image. A copy that has already
+/// gone is not news: the field is what says there is one, and it is on its
+/// way out either way.
+fn remove_avatar_file(folder: &Path, name: &str) {
+    if let Err(e) = std::fs::remove_file(folder.join(name)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("bus: could not delete the project's {name}: {e}");
+        }
+    }
+}
 
 impl Bus {
     /// Opens `folder`, creating a project if it exists but has no
@@ -107,6 +123,62 @@ impl Bus {
         // state rather than the last one's.
         self.reset_transcription();
         self.ensure_loaded(0.0);
+    }
+
+    /// Makes `path` the project's avatar (spec A2): decode, copy, save.
+    ///
+    /// Decoding first is the whole validation — pixels out of
+    /// [`decode_still`] are proof the export will get pixels too — and it
+    /// happens **before** anything is copied, so a refused pick leaves the
+    /// project exactly as it was. The copy goes through a temp file and a
+    /// rename in the same directory, as `store::write` writes `project.json`:
+    /// a copy cut short leaves no avatar.
+    pub(super) fn set_avatar(&mut self, path: PathBuf) {
+        let Some(open) = &self.open else {
+            return eprintln!("bus: SetAvatar with no project open");
+        };
+        if let Err(e) = decode_still(&path) {
+            return self.emit(Event::Error(UserError::Avatar(e)));
+        }
+        // The stored name keeps the original extension, so the file opens in
+        // a file manager as what it is; the decoder sniffs regardless, which
+        // is why a file without one needs no guess.
+        let name = match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) => format!("avatar.{}", ext.to_ascii_lowercase()),
+            None => "avatar".to_owned(),
+        };
+        let folder = open.folder.clone();
+        let temp = folder.join(".avatar.tmp");
+        if let Err(e) =
+            std::fs::copy(&path, &temp).and_then(|_| std::fs::rename(&temp, folder.join(&name)))
+        {
+            let _ = std::fs::remove_file(&temp);
+            return self.emit(Event::Error(UserError::Io(format!(
+                "the image couldn't be copied into the project: {e}"
+            ))));
+        }
+        let Some(open) = &mut self.open else { return };
+        // Exactly the file the project named, never a `avatar.*` glob over a
+        // folder the coach can also put files in.
+        if let Some(old) = open.project.avatar.take().filter(|old| *old != name) {
+            remove_avatar_file(&folder, &old);
+        }
+        open.project.avatar = Some(name);
+        self.project_changed();
+    }
+
+    /// Drops the avatar: the field, then the project's **copy** of the image.
+    /// The coach's original is theirs.
+    pub(super) fn clear_avatar(&mut self) {
+        let Some(open) = &mut self.open else {
+            return eprintln!("bus: ClearAvatar with no project open");
+        };
+        let Some(old) = open.project.avatar.take() else {
+            return;
+        };
+        let folder = open.folder.clone();
+        remove_avatar_file(&folder, &old);
+        self.project_changed();
     }
 
     /// Saves the open project after a mutation and publishes the snapshot. A

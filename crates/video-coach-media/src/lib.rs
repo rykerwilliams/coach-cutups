@@ -21,6 +21,7 @@ pub use capture::{
     Recorder, RecorderMessage, StopOutcome,
 };
 pub use chapters::ChapterOutcome;
+pub use composite::avatar::{decode_still, Still};
 pub use composite::export::{
     EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
 };

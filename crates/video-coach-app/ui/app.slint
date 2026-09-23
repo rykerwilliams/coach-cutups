@@ -320,6 +320,69 @@ component DeviceList inherits VerticalLayout {
     }
 }
 
+/// The Devices popover's Inset section (avatar spec G1): the project's avatar
+/// image, or the camera when it has none.
+///
+/// There are no radio rows, because the image **is** the mode (B1): picking
+/// one is what makes a take record commentary without a camera, and removing
+/// it is what puts the camera back.
+component InsetSection inherits VerticalLayout {
+    /// The picked image, empty when there is none or its file has gone.
+    in property <image> thumb;
+    /// Its file name, empty when nothing is picked.
+    in property <string> name;
+    /// A name is stored but the file isn't beside `project.json` any more
+    /// (A4), so the coach finds out before a take rather than after an export.
+    in property <bool> missing;
+    callback choose();
+    callback remove();
+
+    spacing: 4px;
+
+    Text {
+        text: "Inset";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+
+        // Min and max, not `width`: a layout sets its children's size, and a
+        // plain `width` here is overwritten with the row's.
+        if root.name != "" && !root.missing: Image {
+            source: root.thumb;
+            min-width: 40px;
+            max-width: 40px;
+            min-height: 40px;
+            max-height: 40px;
+            image-fit: contain;
+        }
+        Text {
+            text: root.name == "" ? "Camera — no avatar picked"
+                : root.missing ? root.name + " is missing"
+                : root.name;
+            color: root.missing ? #ffcc00 : Palette.foreground;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            min-width: 0;
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+
+        Button {
+            text: "Choose…";
+            clicked => { root.choose(); }
+        }
+        if root.name != "": Button {
+            text: "Remove";
+            clicked => { root.remove(); }
+        }
+    }
+}
+
 /// A caption over one of the inspector's fields.
 component FieldLabel inherits Text {
     color: Palette.alternate-foreground;
@@ -1797,6 +1860,11 @@ export component AppWindow inherits Window {
     /// they're being looked up.
     in property <[DeviceRow]> cameras;
     in property <[DeviceRow]> mics;
+    /// The popover's Inset section: the project's avatar image, its file name
+    /// (empty for none), and whether that file has gone missing (avatar G1).
+    in property <image> avatar-thumb;
+    in property <string> avatar-name;
+    in property <bool> avatar-missing;
 
     // --- Drawing on the picture (Phase 6 D1, D5, D6) ---
 
@@ -1969,6 +2037,10 @@ export component AppWindow inherits Window {
     /// `node-name`, empty for the system default.
     callback choose-camera(string);
     callback choose-mic(string);
+    /// The popover's Choose… and Remove for the avatar image: pick a PNG or a
+    /// JPEG to copy into the project, or drop the one it has.
+    callback choose-avatar();
+    callback remove-avatar();
     /// Clips (Phase 3 C5), by id; `move-clip` takes list indices.
     callback jump-to-clip(string);
     callback delete-clip(string);
@@ -3359,6 +3431,13 @@ export component AppWindow inherits Window {
                                 title: "Microphone";
                                 rows: root.mics;
                                 chosen(node-name) => { root.choose-mic(node-name); }
+                            }
+                            InsetSection {
+                                thumb: root.avatar-thumb;
+                                name: root.avatar-name;
+                                missing: root.avatar-missing;
+                                choose() => { root.choose-avatar(); }
+                                remove() => { root.remove-avatar(); }
                             }
                         }
                     }

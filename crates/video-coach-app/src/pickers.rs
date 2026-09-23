@@ -23,6 +23,12 @@ pub enum Pick {
     Videos {
         title: &'static str,
     },
+    /// A still image for the avatar (avatar spec A1). The filter offers PNG
+    /// and JPEG; what is *accepted* is what `media::decode_still` decodes, so
+    /// a `.png` that is really something else is refused by the bus, not here.
+    Image {
+        title: &'static str,
+    },
 }
 
 /// Video extensions offered by default. Both cases: a portal's glob match
@@ -31,6 +37,9 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "MP4", "mov", "MOV", "m4v", "M4V", "mkv", "MKV", "webm", "WEBM", "avi", "AVI", "mts",
     "MTS",
 ];
+
+/// Avatar image extensions, both cases for the same reason.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "PNG", "jpg", "JPG", "jpeg", "JPEG"];
 
 /// Opens one picker at a time, answering with each chosen path.
 #[derive(Clone, Default)]
@@ -75,6 +84,14 @@ impl Pickers {
                 Pick::Videos { title } => {
                     videos(dialog, title).pick_files().await.unwrap_or_default()
                 }
+                Pick::Image { title } => dialog
+                    .set_title(title)
+                    .add_filter("Image", IMAGE_EXTENSIONS)
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+                    .await
+                    .into_iter()
+                    .collect(),
             };
             busy.set(false);
             let mut paths: Vec<PathBuf> = chosen.iter().map(|c| c.path().to_path_buf()).collect();
