@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.2.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.2.1_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -146,6 +146,8 @@ New in 0.2.0. The first save of an older project upgrades it, so it can no longe
 - [ ] **[must work] Scrub lands.** On a Trace half, scrub to a few places. **Right:** the picture and the readout agree.
 - [ ] **Frame steps.** Paused, **.** and **,** move one frame forward and back, and the tenths in the readout follow. **Right:** while playing they do nothing.
 - [ ] **Fast scanning.** While playing, **L** speeds up (2× … 32×) and **J** slows down; the button beside Play does the same. **Right:** the readout shows the speed, the picture keeps up, the sound is muted above 1×, and a pause puts you back at 1× on the frame you were watching.
+- [ ] **[must work] The whole match.** In **Export…**, tick **Whole match** and export. **Right:** both halves end to end, the clock and score burned in and correct throughout, game sound with no commentary, no webcam inset and no caption bar. In VLC (Playback → Chapter) the chapters read "Kick-off", "<your team> goal 1-0", "Half time", "Second half", "Full time".
+- [ ] **A reel per team.** **Right:** the sheet has a row per side that scored, named from Set up teams… ("<team> goals"), and an **All goals** row only when both scored. Each exports just that side's goals, numbered `1 / 3` within that reel.
 - [ ] **The reel row.** With goals tagged, open **Export…**. **Right:** there's an **All goals** row reading "N goals · m:ss", unticked — you tick it when you want the reel. With no goals there's no row. In a project with goals and no clips, the Export… button still works.
 - [ ] **The reel file.** Tick **All goals** and export. In `All goals - <project>.mp4`, **right:** one piece per goal, about 36 seconds each, with the caption `2 / 5 | Home goal | 1-0`; the score on the board turns over on the goal's own frame; no webcam inset; game sound with no commentary. A highlight you placed during the build-up shows in that piece.
 - [ ] **Trims.** On a goal's row in the Match panel, park where you want the goal's clip to begin and click **⇤**, then park at the end and click **⇥**. **Right:** the span text updates, **↺** puts it back to −30 s / +6 s, a start *after* the goal is refused with a message, and Ctrl+Z undoes each one.
