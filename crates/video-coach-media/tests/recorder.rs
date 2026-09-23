@@ -12,7 +12,9 @@ use gstreamer::prelude::*;
 use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 use gstreamer_video as gst_video;
-use video_coach_media::{now_ns, CaptureSources, FrameMailbox, Recorder, RecorderMessage};
+use video_coach_media::{
+    now_ns, probe, CaptureSources, FrameMailbox, ProbeError, Recorder, RecorderMessage,
+};
 
 const FRAME: f64 = 1.0 / 30.0;
 
@@ -27,7 +29,7 @@ struct Recording {
     self_view: FrameMailbox,
 }
 
-fn start(dir: &Path, video_delay: Duration) -> Recording {
+fn start(dir: &Path, video: Option<Duration>) -> Recording {
     gst::init().unwrap();
     let path = dir.join("rec.mkv");
     let (tx, messages) = mpsc::channel();
@@ -35,7 +37,7 @@ fn start(dir: &Path, video_delay: Duration) -> Recording {
     let self_view = FrameMailbox::default();
     let begun = Instant::now();
     let recorder = Recorder::start(
-        CaptureSources::Test { video_delay },
+        CaptureSources::Test { video },
         &path,
         self_view.clone(),
         move |msg| {
@@ -125,7 +127,7 @@ fn pts(path: &Path) -> (Vec<f64>, Vec<f64>) {
 #[test]
 fn records_h264_and_opus_with_the_file_duration() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::ZERO);
+    let rec = start(dir.path(), Some(Duration::ZERO));
     std::thread::sleep(Duration::from_secs(2));
     let outcome = rec.recorder.stop(Duration::from_secs(5));
     assert!(outcome.clean);
@@ -160,24 +162,24 @@ fn records_h264_and_opus_with_the_file_duration() {
     assert!(outcome.duration > 1.5, "{} s", outcome.duration);
 }
 
-/// A camera that warms up for 0.5 s: `start` returns at once, `FirstVideo`
+/// A camera that warms up for 0.5 s: `start` returns at once, `FirstBuffer`
 /// comes 0.5 s after t0, and in the file audio starts at time 0 and video at
 /// 0.5 s, since file time 0 is `base_time` (R5).
 #[test]
 fn delayed_video_starts_at_its_running_time() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::from_millis(500));
+    let rec = start(dir.path(), Some(Duration::from_millis(500)));
     assert!(
         rec.started_in < Duration::from_millis(200),
         "start took {:?}: it waited for PLAYING",
         rec.started_in
     );
     let (first_ns, _) = wait_for(&rec.messages, Duration::from_secs(3), |m| {
-        *m == RecorderMessage::FirstVideo
+        *m == RecorderMessage::FirstBuffer
     })
-    .expect("no FirstVideo");
+    .expect("no FirstBuffer");
     let first_at = (first_ns - rec.recorder.t0_ns()) as f64 / 1e9;
-    assert!((first_at - 0.5).abs() <= 0.1, "FirstVideo at {first_at} s");
+    assert!((first_at - 0.5).abs() <= 0.1, "FirstBuffer at {first_at} s");
     std::thread::sleep(Duration::from_millis(500));
     assert!(rec.recorder.stop(Duration::from_secs(5)).clean);
 
@@ -188,14 +190,76 @@ fn delayed_video_starts_at_its_running_time() {
     assert!(audio < 0.040, "first audio at {audio} s");
 }
 
+/// An avatar take (spec C1): no camera is opened, so the file has sound and
+/// nothing else, there is no self-view, and `FirstBuffer` comes from the one
+/// pad there is — the audio one.
+#[test]
+fn an_audio_only_recorder_writes_a_playable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = start(dir.path(), None);
+    assert!(rec.recorder.t0_ns() > 0);
+    assert!(
+        rec.recorder.self_view_pipeline().is_none(),
+        "no camera, so no self-view"
+    );
+    assert!(
+        wait_for(&rec.messages, Duration::from_secs(3), |m| {
+            *m == RecorderMessage::FirstBuffer
+        })
+        .is_some(),
+        "no FirstBuffer"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let outcome = rec.recorder.stop(Duration::from_secs(5));
+    assert!(outcome.clean);
+
+    assert_eq!(probe(&rec.path), Err(ProbeError::NoVideo));
+    let (video, audio) = pts(&rec.path);
+    assert!(video.is_empty(), "{} video buffers", video.len());
+    let last = *audio.last().expect("the file has audio");
+    // `duration` is the end of the last buffer at the mux pad, which is now
+    // the audio one; one Opus frame past its timestamp.
+    assert!(
+        outcome.duration >= last && outcome.duration - last < 0.1,
+        "stop said {} s, the last audio is at {last} s",
+        outcome.duration
+    );
+    assert!(outcome.duration > 0.5, "{} s", outcome.duration);
+}
+
+/// `level` carries a peak and an RMS, and the recorder passes both on: the
+/// meter draws the peak, the avatar pulses on the RMS (spec D1).
+#[test]
+fn the_level_message_carries_both_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = start(dir.path(), None);
+    // The test source ticks, so wait for a window one landed in: a silent
+    // window is no evidence about two numbers that are both far below the
+    // floor.
+    let (_, msg) = wait_for(
+        &rec.messages,
+        Duration::from_secs(5),
+        |m| matches!(m, RecorderMessage::Level { peak_db, .. } if *peak_db > -40.0),
+    )
+    .expect("no loud level message");
+    let RecorderMessage::Level { peak_db, rms_db } = msg else {
+        unreachable!("filtered to levels")
+    };
+    assert!(
+        peak_db.is_finite() && rms_db.is_finite(),
+        "peak {peak_db} dB, rms {rms_db} dB"
+    );
+    assert!(rms_db < peak_db, "peak {peak_db} dB, rms {rms_db} dB");
+}
+
 /// An EOS that never reaches the mux: `stop` gives up at its timeout, unclean,
 /// with what was written so far.
 #[test]
 fn stop_times_out_when_eos_never_arrives() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = start(dir.path(), Duration::ZERO);
+    let rec = start(dir.path(), Some(Duration::ZERO));
     assert!(wait_for(&rec.messages, Duration::from_secs(3), |m| {
-        *m == RecorderMessage::FirstVideo
+        *m == RecorderMessage::FirstBuffer
     })
     .is_some());
     std::thread::sleep(Duration::from_millis(300));
@@ -239,7 +303,7 @@ fn records_through_a_broken_self_view(stall: fn(&gst::Pipeline)) {
     let (done, finished) = mpsc::channel();
     std::thread::spawn(move || {
         let dir = tempfile::tempdir().unwrap();
-        let rec = start(dir.path(), Duration::ZERO);
+        let rec = start(dir.path(), Some(Duration::ZERO));
         let deadline = Instant::now() + Duration::from_secs(3);
         let frame = loop {
             if let Some(frame) = rec.self_view.take() {

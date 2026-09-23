@@ -217,7 +217,7 @@ fn a_recording_makes_a_clip_where_the_player_was() {
 
     let t0 = rig.record();
     rig.h.wait_map("a mic level", |e| match e {
-        Event::Level(db) => Some(*db),
+        Event::Level { peak_db, .. } => Some(*peak_db),
         _ => None,
     });
     // Let it run long enough that its duration means something.

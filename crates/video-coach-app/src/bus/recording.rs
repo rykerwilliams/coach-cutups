@@ -1,9 +1,10 @@
 //! Recording (Phase 4 spec R6): the one Active state, from Start to a clip.
 //!
-//! Active is flagged *starting* until the recorder's first video buffer
-//! reaches the muxer. Stopping before then (StopRecording, a recorder error,
-//! or the start timeout) aborts: no clip, and the file is deleted. Stopping
-//! after it always keeps the clip, even if finalizing didn't go cleanly.
+//! Active is flagged *starting* until the recorder's first buffer reaches the
+//! muxer — the camera's in a camera project, the microphone's in an avatar
+//! one. Stopping before then (StopRecording, a recorder error, or the start
+//! timeout) aborts: no clip, and the file is deleted. Stopping after it always
+//! keeps the clip, even if finalizing didn't go cleanly.
 //!
 //! The recorder's messages arrive as their own input, tagged here with the
 //! generation of the recording that produced them, and never reach the
@@ -24,7 +25,7 @@ use video_coach_media::{
 
 use super::{Bus, Event, Input, UserError};
 
-/// How long a recording may wait for its first video frame.
+/// How long a recording may wait for its first buffer.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a stop waits for the file to finalize.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,7 +44,8 @@ pub enum CaptureKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordingStatus {
     Idle,
-    /// Recording, but no video has arrived yet: stopping now aborts.
+    /// Recording, but nothing has reached the muxer yet: stopping now
+    /// aborts.
     Starting,
     /// `t0_ns` is the recording's time 0 on `now_ns()`'s clock, for the
     /// elapsed-time readout.
@@ -61,8 +63,8 @@ pub(super) struct Active {
     path: PathBuf,
     /// When it started, for [`START_TIMEOUT`].
     started: Instant,
-    /// The first video buffer reached the muxer: stopping keeps the clip.
-    video_seen: bool,
+    /// The first buffer reached the muxer: stopping keeps the clip.
+    media_seen: bool,
 }
 
 impl Bus {
@@ -134,7 +136,7 @@ impl Bus {
             recorder,
             path,
             started: Instant::now(),
-            video_seen: false,
+            media_seen: false,
         });
         self.emit(Event::Recording(RecordingStatus::Starting));
         // Recording always wins (Phase 10 spec S5): the transcript running
@@ -146,12 +148,12 @@ impl Bus {
         self.preempt_transcription();
     }
 
-    /// Stops the recording, keeping its clip, or aborts it if no video has
-    /// arrived. Nothing to do while idle.
+    /// Stops the recording, keeping its clip, or aborts it if nothing has
+    /// reached the muxer. Nothing to do while idle.
     pub(super) fn stop_recording(&mut self) {
         match &self.recording {
             None => {}
-            Some(active) if active.video_seen => self.finish_recording(),
+            Some(active) if active.media_seen => self.finish_recording(),
             Some(_) => self.abort_recording(),
         }
     }
@@ -164,12 +166,14 @@ impl Bus {
             return;
         };
         match msg {
-            RecorderMessage::FirstVideo => {
-                active.video_seen = true;
+            RecorderMessage::FirstBuffer => {
+                active.media_seen = true;
                 let t0_ns = active.recorder.t0_ns();
                 self.emit(Event::Recording(RecordingStatus::Recording { t0_ns }));
             }
-            RecorderMessage::Level { peak_db } => self.emit(Event::Level(peak_db)),
+            RecorderMessage::Level { peak_db, rms_db } => {
+                self.emit(Event::Level { peak_db, rms_db })
+            }
             RecorderMessage::Error(e) => {
                 eprintln!("bus: recorder error: {e}");
                 self.emit(Event::Error(UserError::RecordingFailed(e)));
@@ -178,18 +182,23 @@ impl Bus {
         }
     }
 
-    /// When a recording that has had no video gives up, if one is starting.
+    /// When a recording that has had no buffer gives up, if one is starting.
     pub(super) fn start_deadline(&self) -> Option<Instant> {
         self.recording
             .as_ref()
-            .filter(|active| !active.video_seen)
+            .filter(|active| !active.media_seen)
             .map(|active| active.started + START_TIMEOUT)
     }
 
-    /// No video by [`Bus::start_deadline`].
+    /// Nothing reached the muxer by [`Bus::start_deadline`]. A microphone
+    /// that never delivers is exactly as fatal as a camera that never does.
     pub(super) fn start_timed_out(&mut self) {
+        let silent = match self.avatar_mode() {
+            true => "no sound from the microphone",
+            false => "no video from the camera",
+        };
         self.emit(Event::Error(UserError::RecordingFailed(format!(
-            "no video from the camera within {} seconds",
+            "{silent} within {} seconds",
             START_TIMEOUT.as_secs()
         ))));
         self.abort_recording();
@@ -268,29 +277,50 @@ impl Bus {
         }
     }
 
+    /// The project's avatar image **is** avatar mode (spec B1): with one, a
+    /// take opens no camera.
+    fn avatar_mode(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.project.avatar.is_some())
+    }
+
     /// The recorder's sources. For devices: the preferred camera and mic if
     /// connected, else the defaults with a notice, keeping the preference
-    /// (R2).
+    /// (R2). In avatar mode, the mic alone.
     fn capture_sources(&self, preferences: &Preferences) -> Result<CaptureSources, UserError> {
+        let avatar = self.avatar_mode();
         if let CaptureKind::Test { video_delay } = self.capture {
-            return Ok(CaptureSources::Test { video_delay });
+            // Avatar mode is the project's, not the device path's: a test take
+            // must record the same shape of file the coach's would.
+            return Ok(CaptureSources::Test {
+                video: (!avatar).then_some(video_delay),
+            });
         }
         let devices = list_devices();
-        let (camera, camera_fell_back) =
-            resolve_camera(&devices.cameras, preferences.preferred_camera_id.as_deref())
-                .ok_or(UserError::NoCamera)?;
+        // In avatar mode `resolve_camera` is never called, so `NoCamera`
+        // cannot be raised and a machine with no camera records fine (C6).
+        let camera = match avatar {
+            true => None,
+            false => {
+                let (camera, fell_back) =
+                    resolve_camera(&devices.cameras, preferences.preferred_camera_id.as_deref())
+                        .ok_or(UserError::NoCamera)?;
+                if fell_back {
+                    self.emit(Event::Error(UserError::DeviceFallback { what: "camera" }));
+                }
+                Some(camera.clone())
+            }
+        };
         let (mic, mic_fell_back) =
             resolve_mic(&devices.mics, preferences.preferred_mic_id.as_deref());
-        if camera_fell_back {
-            self.emit(Event::Error(UserError::DeviceFallback { what: "camera" }));
-        }
         if mic_fell_back {
             self.emit(Event::Error(UserError::DeviceFallback {
                 what: "microphone",
             }));
         }
         Ok(CaptureSources::Devices {
-            camera: camera.clone(),
+            camera,
             mic: mic.map(str::to_owned),
         })
     }
@@ -319,7 +349,7 @@ impl Bus {
         self.transcribe_after_recording(clip_id);
     }
 
-    /// Drops a recording that never got video: no clip, no file.
+    /// Drops a recording that never got a buffer: no clip, no file.
     fn abort_recording(&mut self) {
         let Some(active) = self.recording.take() else {
             return;

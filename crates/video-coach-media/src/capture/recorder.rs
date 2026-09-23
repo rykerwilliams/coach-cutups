@@ -30,28 +30,38 @@ const TEST_HEIGHT: i32 = 180;
 const LEVEL_INTERVAL_NS: u64 = 100_000_000;
 /// How much encoded audio the queue after `opusenc` holds. The mux holds audio
 /// until the first video frame arrives, and a start gives up after 5 s
-/// without one (R6).
+/// without one (R6). With no video pad the mux holds nothing, so the queue
+/// never fills; it stays all the same, since removing it would mean two audio
+/// branches.
 const AUDIO_QUEUE_NS: u64 = 6_000_000_000;
 
-/// Where a recording's picture and sound come from.
+/// Where a recording's picture and sound come from. No picture on either arm
+/// is avatar mode (avatar spec C1): sound alone, and no camera is opened.
 #[derive(Debug, Clone)]
 pub enum CaptureSources {
     /// `v4l2src` on the camera's device path, and `pipewiresrc` on the mic's
     /// `node.name`, or PipeWire's default mic for `None`.
-    Devices { camera: Camera, mic: Option<String> },
-    /// `videotestsrc` and `audiotestsrc`, live. Video buffers before
-    /// `video_delay` (running time) are dropped, as a camera warming up.
-    Test { video_delay: Duration },
+    Devices {
+        camera: Option<Camera>,
+        mic: Option<String>,
+    },
+    /// `videotestsrc` and `audiotestsrc`, live. Video buffers before the
+    /// delay (running time) are dropped, as a camera warming up.
+    Test { video: Option<Duration> },
 }
 
 /// What a running recorder reports, on GStreamer's threads.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecorderMessage {
-    /// The first video buffer reached the muxer. Sent once.
-    FirstVideo,
-    /// The loudest channel's peak over the last 100 ms, in dB (silence reads
-    /// far below −60).
-    Level { peak_db: f64 },
+    /// The first buffer reached the muxer, so there is a file worth keeping.
+    /// Sent once, from the video pad where there is one and the audio pad
+    /// otherwise.
+    FirstBuffer,
+    /// The loudest channel's peak and RMS over the last 100 ms, in dB
+    /// (silence reads far below −60). The meter draws the peak; the avatar
+    /// pulses on the RMS, since speech's crest factor would peg a peak-driven
+    /// one (avatar spec D1).
+    Level { peak_db: f64, rms_db: f64 },
     /// An `ERROR` on the pipeline.
     Error(String),
 }
@@ -89,10 +99,12 @@ impl Recorder {
     /// The camera is shown live in `self_view` until the recording stops:
     /// small RGBA frames in system memory, `FrameMailbox`'s latest-wins
     /// handoff, from the camera's first frame, which may be before
-    /// `FirstVideo`. It can't disturb the recording: it only ever gets a
+    /// `FirstBuffer`. It can't disturb the recording: it only ever gets a
     /// reference to a camera frame, through a queue that drops rather than
     /// waits, in a pipeline of its own (`self_view.rs`). A self-view that
     /// fails, to start or later, is logged, and the recording goes ahead.
+    /// With no camera there is no self-view pipeline at all: what the corner
+    /// shows then is the app's business.
     ///
     /// `on_message` is called on GStreamer's threads.
     pub fn start(
@@ -117,8 +129,8 @@ impl Recorder {
                 }
                 gst::MessageView::Eos(_) => gst::BusSyncReply::Pass,
                 gst::MessageView::Element(el) => {
-                    if let Some(peak_db) = el.structure().and_then(level_peak) {
-                        on_message(RecorderMessage::Level { peak_db });
+                    if let Some((peak_db, rms_db)) = el.structure().and_then(level_dbs) {
+                        on_message(RecorderMessage::Level { peak_db, rms_db });
                     }
                     gst::BusSyncReply::Drop
                 }
@@ -129,7 +141,9 @@ impl Recorder {
 
         // Returns `Async`: the pipeline stays PAUSED with PLAYING pending
         // until every mux pad has data, which for video is the camera's first
-        // frame. `base_time` is fixed by now all the same.
+        // frame. `base_time` is fixed by now all the same. With no video pad
+        // it prerolls on the live mic and returns `NoPreroll` instead; both
+        // are `Ok`, which is all the match below asks.
         let started = pipeline.set_state(gst::State::Playing);
         let t0 = pipeline.base_time();
         match (started, t0) {
@@ -242,52 +256,7 @@ fn build(
     pipeline.add_many([&mux, &sink])?;
     mux.link(&sink)?;
 
-    // Video: source ! caps ! queue ! encode chain ! h264parse ! queue ! mux.
-    let (video_src, input, width, height) = match sources {
-        CaptureSources::Devices { camera, .. } => {
-            let src = gst::ElementFactory::make("v4l2src")
-                .property("device", &camera.v4l2_path)
-                .build()?;
-            // Without it the webcam fell to 7.5 fps in a dark room while its
-            // caps still said 30/1. A camera without the control warns and
-            // records anyway.
-            src.set_property_from_str("extra-controls", "c,exposure_dynamic_framerate=0");
-            (
-                src,
-                camera.mode.input,
-                camera.mode.width,
-                camera.mode.height,
-            )
-        }
-        CaptureSources::Test { video_delay } => {
-            let src = gst::ElementFactory::make("videotestsrc")
-                .property("is-live", true)
-                .build()?;
-            src.set_property_from_str("pattern", "ball");
-            drop_before(&src, *video_delay);
-            (src, Input::Raw, TEST_WIDTH, TEST_HEIGHT)
-        }
-    };
-    let video_caps = gst::Caps::builder(match input {
-        Input::Mjpeg => "image/jpeg",
-        Input::Raw => "video/x-raw",
-    })
-    .field("width", width)
-    .field("height", height)
-    .field("framerate", gst::Fraction::new(30, 1))
-    .build();
-    let video_filter = gst::ElementFactory::make("capsfilter")
-        .property("caps", video_caps)
-        .build()?;
-    let video_in = make("queue")?;
-    let parse = make("h264parse")?;
-    let video_out = make("queue")?;
-    pipeline.add_many([&video_src, &video_filter, &video_in, &parse, &video_out])?;
-    gst::Element::link_many([&video_src, &video_filter, &video_in])?;
-    let has = |f: &str| gst::ElementFactory::find(f).is_some();
-    let (head, tail) = choose_encoder(has, input).build(input, pipeline.upcast_ref())?;
-    gst::Element::link_many([&video_in, &head])?;
-    gst::Element::link_many([&tail, &parse, &video_out])?;
+    let video = build_video(&pipeline, sources)?;
 
     // Audio: source ! caps ! queue ! convert ! resample ! level ! opus ! queue ! mux.
     let audio_src = match sources {
@@ -340,10 +309,15 @@ fn build(
     pipeline.add_many(audio)?;
     gst::Element::link_many(audio)?;
 
-    for (queue, template, first_video) in [
-        (&video_out, "video_%u", true),
-        (&audio_out, "audio_%u", false),
-    ] {
+    // The video pad first where there is one, since `FirstBuffer` goes to the
+    // head of this list: the one pad that exists in avatar mode is the audio
+    // one, and the flag means what it always meant.
+    let mut branches: Vec<(&gst::Element, &str)> = Vec::new();
+    if let Some((queue, ..)) = &video {
+        branches.push((queue, "video_%u"));
+    }
+    branches.push((&audio_out, "audio_%u"));
+    for (nth, (queue, template)) in branches.into_iter().enumerate() {
         let pad = mux
             .request_pad_simple(template)
             .ok_or_else(|| glib::bool_error!("matroskamux has no {template} pad"))?;
@@ -355,18 +329,89 @@ fn build(
         track_end(
             &pad,
             last_end.clone(),
-            first_video.then(|| on_message.clone()),
+            (nth == 0).then(|| on_message.clone()),
         );
     }
     // Last, so nothing after it can fail and leave it running. A failure is
-    // the self-view's alone.
+    // the self-view's alone. With no camera there is nothing to show.
+    let self_view = video.and_then(|(_, camera, input)| {
+        self_view::start(&camera, input, self_view)
+            .inspect_err(|e| eprintln!("recorder: the self-view failed: {e}"))
+            .ok()
+    });
+    Ok((pipeline, self_view))
+}
+
+/// The video branch — source ! caps ! queue ! encode chain ! h264parse !
+/// queue — added to `pipeline` and linked. Returns the queue that feeds the
+/// mux, the capsfilter's src pad the self-view taps, and the camera's input
+/// format.
+///
+/// `None` in avatar mode (spec C1): no `v4l2src`, no encoder — so a machine
+/// with neither VA-API nor `x264enc` still records commentary — and no
+/// `video_%u` pad on the mux.
+fn build_video(
+    pipeline: &gst::Pipeline,
+    sources: &CaptureSources,
+) -> Result<Option<(gst::Element, gst::Pad, Input)>, glib::BoolError> {
+    let make = |factory: &str| gst::ElementFactory::make(factory).build();
+    let (video_src, input, width, height) = match sources {
+        CaptureSources::Devices {
+            camera: Some(camera),
+            ..
+        } => {
+            let src = gst::ElementFactory::make("v4l2src")
+                .property("device", &camera.v4l2_path)
+                .build()?;
+            // Without it the webcam fell to 7.5 fps in a dark room while its
+            // caps still said 30/1. A camera without the control warns and
+            // records anyway.
+            src.set_property_from_str("extra-controls", "c,exposure_dynamic_framerate=0");
+            (
+                src,
+                camera.mode.input,
+                camera.mode.width,
+                camera.mode.height,
+            )
+        }
+        CaptureSources::Test {
+            video: Some(video_delay),
+        } => {
+            let src = gst::ElementFactory::make("videotestsrc")
+                .property("is-live", true)
+                .build()?;
+            src.set_property_from_str("pattern", "ball");
+            drop_before(&src, *video_delay);
+            (src, Input::Raw, TEST_WIDTH, TEST_HEIGHT)
+        }
+        CaptureSources::Devices { camera: None, .. } | CaptureSources::Test { video: None } => {
+            return Ok(None)
+        }
+    };
+    let video_caps = gst::Caps::builder(match input {
+        Input::Mjpeg => "image/jpeg",
+        Input::Raw => "video/x-raw",
+    })
+    .field("width", width)
+    .field("height", height)
+    .field("framerate", gst::Fraction::new(30, 1))
+    .build();
+    let video_filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", video_caps)
+        .build()?;
+    let video_in = make("queue")?;
+    let parse = make("h264parse")?;
+    let video_out = make("queue")?;
+    pipeline.add_many([&video_src, &video_filter, &video_in, &parse, &video_out])?;
+    gst::Element::link_many([&video_src, &video_filter, &video_in])?;
+    let has = |f: &str| gst::ElementFactory::find(f).is_some();
+    let (head, tail) = choose_encoder(has, input).build(input, pipeline.upcast_ref())?;
+    gst::Element::link_many([&video_in, &head])?;
+    gst::Element::link_many([&tail, &parse, &video_out])?;
     let camera = video_filter
         .static_pad("src")
         .expect("a capsfilter has a src pad");
-    let self_view = self_view::start(&camera, input, self_view)
-        .inspect_err(|e| eprintln!("recorder: the self-view failed: {e}"))
-        .ok();
-    Ok((pipeline, self_view))
+    Ok(Some((video_out, camera, input)))
 }
 
 /// Drops `src`'s buffers with PTS before `delay`. A live `videotestsrc`'s PTS
@@ -387,7 +432,7 @@ fn drop_before(src: &gst::Element, delay: Duration) {
 }
 
 /// Tracks the latest buffer end reaching mux pad `pad`, in running time from
-/// its sticky SEGMENT, into `last_end`. With `first`, also sends `FirstVideo`
+/// its sticky SEGMENT, into `last_end`. With `first`, also sends `FirstBuffer`
 /// once.
 fn track_end(pad: &gst::Pad, last_end: Arc<AtomicU64>, first: Option<OnMessage>) {
     let sent = AtomicBool::new(false);
@@ -408,21 +453,26 @@ fn track_end(pad: &gst::Pad, last_end: Arc<AtomicU64>, first: Option<OnMessage>)
         }
         if let Some(on_message) = &first {
             if !sent.swap(true, Ordering::SeqCst) {
-                on_message(RecorderMessage::FirstVideo);
+                on_message(RecorderMessage::FirstBuffer);
             }
         }
         gst::PadProbeReturn::Ok
     });
 }
 
-/// The max over channels of a `level` message's `peak`, or `None` for any
-/// other element message. `peak` is a `GValueArray`.
-fn level_peak(s: &gst::StructureRef) -> Option<f64> {
+/// The max over channels of a `level` message's `peak` and of its `rms`, or
+/// `None` for any other element message. Both are `GValueArray`s.
+fn level_dbs(s: &gst::StructureRef) -> Option<(f64, f64)> {
     if s.name() != "level" {
         return None;
     }
-    let peaks = s.get::<glib::ValueArray>("peak").ok()?;
-    peaks
+    Some((loudest(s, "peak")?, loudest(s, "rms")?))
+}
+
+/// The max over channels of one of `level`'s dB arrays.
+fn loudest(s: &gst::StructureRef, field: &str) -> Option<f64> {
+    s.get::<glib::ValueArray>(field)
+        .ok()?
         .as_slice()
         .iter()
         .filter_map(|v| v.get::<f64>().ok())

@@ -1744,8 +1744,9 @@ fn on_event(w: &AppWindow, event: Event) {
                 w.set_recording_elapsed(format_hms(0.0).into());
             }
         }
-        // −60…0 dBFS across the bar (R11).
-        Event::Level(peak_db) => {
+        // −60…0 dBFS across the bar (R11). A meter shows peaks; the avatar's
+        // own curve is `rms_db`'s, over different thresholds.
+        Event::Level { peak_db, .. } => {
             // `max` then `min`, not `clamp`, which passes a NaN through: here
             // it reads as 0.
             #[allow(clippy::manual_clamp)]

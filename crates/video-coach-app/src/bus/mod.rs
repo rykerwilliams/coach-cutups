@@ -319,9 +319,13 @@ pub enum Event {
     /// The game video's speed (spec S): 1 after every pause.
     ScanSpeed(f64),
     Recording(RecordingStatus),
-    /// The microphone's loudest channel peak over the last 100 ms, in dB,
-    /// while a recording runs.
-    Level(f64),
+    /// The microphone's loudest channel over the last 100 ms, in dB, while a
+    /// recording runs. The meter draws `peak_db`; the avatar's live pulse
+    /// reads `rms_db` (avatar spec D1).
+    Level {
+        peak_db: f64,
+        rms_db: f64,
+    },
     /// The export run: every target, how far each has got, and the rate.
     /// Sent as each target's whole percent moves, and last with nothing left
     /// running.
@@ -376,8 +380,13 @@ pub enum UserError {
     /// Recording is refused: the project isn't ready for it.
     #[error("can't record: {0}")]
     CantRecord(&'static str),
-    /// Recording is refused: no camera meets R3's rule.
-    #[error("no camera with a 16:9, 30 fps mode up to 1280 wide was found")]
+    /// Recording is refused: no camera meets R3's rule. Only a camera project
+    /// can raise it, so the message names the way out rather than leaving the
+    /// coach stuck (avatar spec C6).
+    #[error(
+        "no camera with a 16:9, 30 fps mode up to 1280 wide was found — \
+         pick an avatar image in Devices to record without one"
+    )]
     NoCamera,
     #[error("recording failed: {0}")]
     RecordingFailed(String),

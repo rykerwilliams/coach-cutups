@@ -286,6 +286,9 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Clock:** the recorder always forces `SystemClock` (CLOCK_MONOTONIC). `pulsesrc`'s clock was measured days off.
 - **Time 0:** `matroskamux` writes running time as-is, so recording time 0 is the pipeline's `base_time`, read when `set_state(PLAYING)` returns. **Never wait for PLAYING:** the mux holds preroll until the camera's first frame.
 - **Event times:** `host_ns` comes from `video_coach_media::now_ns()`.
+- **An avatar project records audio only.** `Project.avatar.is_some()` is the mode, so no camera is opened, no `video_%u` pad is requested on the mux, no H.264 encoder is chosen (a machine with neither VA-API nor `x264enc` still records commentary) and there is no self-view pipeline. `CaptureSources`' video side is `Option` on **both** arms, and `capture_sources`' early return for `CaptureKind::Test` honours the mode too — a branch written only into the `Devices` arm would leave every test recording with video whatever the project said.
+- **`RecorderMessage::FirstBuffer` is the first-buffer gate** (not `FirstVideo`): a buffer reached the muxer, so there is a file worth keeping. It comes from the one pad there is — video where there is one, audio otherwise — and the start timeout says which was missing.
+- **The `level` element carries two numbers and the recorder passes both on.** The meter draws `peak_db`; the avatar pulses on `rms_db`, because speech's 10–14 dB crest factor would peg a peak-driven inset while the export barely moved.
 - **Tests:** they use injected test sources (`CaptureKind::Test`) and never the real camera or mic. See `docs/superpowers/specs/2026-09-19-linux-port-phase-4-design.md`.
 
 **Export runs one GL graph everywhere, on its own GL display.**
