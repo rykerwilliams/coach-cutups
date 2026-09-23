@@ -598,6 +598,7 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             };
             rows.set_row_data(index, TargetRow { ticked, ..row });
             w.set_export_any_ticked(rows.iter().any(|row| row.ticked));
+            w.set_export_whole_match_ticked(whole_match_ticked(rows.iter()));
         }
     });
     window.on_start_export({
@@ -703,8 +704,23 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         Some(ScoreboardMode::Track) => 2,
     });
     w.set_export_any_ticked(rows.iter().any(|row| row.ticked));
+    w.set_export_whole_match_ticked(whole_match_ticked(rows.iter().cloned()));
     w.set_export_targets(ModelRc::new(VecModel::from(rows)));
     w.set_export_sheet_open(true);
+}
+
+/// Whether the whole-match row is among the ticked ones.
+///
+/// It is the one target a run ever copies, so it is also the one whose
+/// effective mode can be "separate track" — which is what the sheet's line
+/// under the Scoreboard picker is about (spec M1).
+fn whole_match_ticked(rows: impl Iterator<Item = TargetRow>) -> bool {
+    UI.with_borrow(|ui| {
+        ui.export_targets
+            .iter()
+            .zip(rows)
+            .any(|(target, row)| row.ticked && matches!(target, ExportTarget::WholeMatch))
+    })
 }
 
 /// Preview (Phase 7 P6): the inspector's button and the clip menu's "Preview

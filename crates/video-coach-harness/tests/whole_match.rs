@@ -24,7 +24,7 @@ use video_coach_core::scoreboard::{
 use video_coach_core::store::{self, EXPORTS_DIRNAME};
 use video_coach_core::stroke::Rgba;
 use video_coach_harness::{add_clips, Harness};
-use video_coach_media::fixtures::{counter_video, CounterKind};
+use video_coach_media::fixtures::{counter_video, ffprobe, CounterKind};
 
 /// Every fixture's frame rate, which is also the output's.
 const FPS: u32 = 30;
@@ -171,28 +171,13 @@ fn outputs(exports: &Path) -> Vec<String> {
     names
 }
 
-/// `path`'s video packet count, as `ffprobe` reads it.
-///
-/// `ffprobe` is the independent reader: it counts the packets a decoder
-/// hides. Without it these tests fail, never skip — it is a test-only build
-/// dependency (`packaging/build-deps.txt`).
+/// `path`'s video packet count, as `ffprobe` reads it: the packets a decoder
+/// hides, which is what says the copy is packet for packet.
 fn video_packets(path: &Path) -> i64 {
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-of", "json"])
-        .args(["-select_streams", "v:0", "-show_streams", "-count_packets"])
-        .arg(path)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
-            )
-        });
-    assert!(
-        out.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+    let probe = ffprobe(
+        path,
+        &["-select_streams", "v:0", "-show_streams", "-count_packets"],
     );
-    let probe: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ffprobe wrote JSON");
     let packets = &probe["streams"][0]["nb_read_packets"];
     packets
         .as_i64()
@@ -259,13 +244,20 @@ fn the_default_mode_copies_the_whole_match_and_burns_a_clip() {
     m.h.shutdown();
 }
 
-/// Only the whole match carries a cue list (spec T1). A clip asked for on a
-/// separate track is still re-encoded — for its drawings, its inset and its
-/// zoom — with the board simply left out of the picture, and nothing beside
-/// it: it already says what it is in its own text bar.
+/// Only the whole match carries a cue list (spec T1), so a clip asked for on
+/// a separate track **burns the board in instead**: it re-encodes either way,
+/// for its drawings, its inset and its zoom, and the one thing the picker
+/// must never do is lose the board altogether. Nothing lands beside it — a
+/// clip already says what it is in its own text bar — and a `.srt` a coach
+/// put there themselves is left alone.
 #[test]
-fn a_clip_on_a_separate_track_gets_no_sidecar() {
+fn a_clip_on_a_separate_track_burns_the_board_in() {
     let mut m = Match::open_with(&[("first half", 640, 360, 30)], &[0.5]);
+    // A subtitle file the coach wrote themselves, at the name this clip
+    // exports to. No export of ours put it there, so none of ours removes it.
+    std::fs::create_dir_all(m.exports()).unwrap();
+    let theirs = m.exports().join("Lesson - Game.srt");
+    std::fs::write(&theirs, "1\n00:00:00,000 --> 00:00:01,000\nmine\n\n").unwrap();
     m.export(
         vec![ExportTarget::Clip(m.clip())],
         Some(ScoreboardMode::Track),
@@ -276,7 +268,14 @@ fn a_clip_on_a_separate_track_gets_no_sidecar() {
         "{:#?}",
         run.targets[0]
     );
-    assert_eq!(outputs(&m.exports()), ["Lesson - Game.mp4"]);
+    assert_eq!(
+        outputs(&m.exports()),
+        ["Lesson - Game.mp4", "Lesson - Game.srt"]
+    );
+    assert!(
+        std::fs::read_to_string(&theirs).unwrap().contains("mine"),
+        "the export took the coach's own subtitle file"
+    );
     m.h.shutdown();
 }
 

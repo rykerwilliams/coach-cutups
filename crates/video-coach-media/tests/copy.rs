@@ -3,9 +3,10 @@
 //!
 //! The sources are counter fixtures, so the joined file is read back frame by
 //! frame by the number each one shows: a copy that lost, duplicated or
-//! reordered a packet says so in that list. `ffprobe` is the independent
-//! reader for everything the decoder can't see — the `stsd`, the packet count
-//! and the chapters.
+//! reordered a packet says so in that list. `ffprobe`
+//! ([`fixtures::ffprobe`](video_coach_media::fixtures::ffprobe)) is the
+//! independent reader for everything the decoder can't see — the `stsd`, the
+//! packet count, the presentation times and the chapters.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -15,9 +16,9 @@ use gstreamer as gst;
 use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{compilation_schedule, Compilation};
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Project, Quality, Resolution, SourceRef};
+use video_coach_core::project::{Project, SourceRef};
 use video_coach_media::fixtures::{
-    counter_video_with, decode_counters, CounterKind, CounterQuirks,
+    counter_video_with, decode_counters, ffprobe, CounterKind, CounterQuirks,
 };
 use video_coach_media::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render};
 
@@ -39,11 +40,21 @@ struct Match {
 /// `sources` as `(name, width, height, frames)`, written as H.264 + AAC in
 /// MP4 — the shape a copy can join — and planned as one whole match.
 fn whole_match(dir: &Path, sources: &[(&str, u32, u32, u32)]) -> Match {
-    whole_match_with(dir, sources, CounterQuirks::default())
+    whole_match_with(
+        dir,
+        sources,
+        CounterKind::H264AacMp4,
+        CounterQuirks::default(),
+    )
 }
 
-/// [`whole_match`] with `quirks` on every source.
-fn whole_match_with(dir: &Path, sources: &[(&str, u32, u32, u32)], quirks: CounterQuirks) -> Match {
+/// [`whole_match`] of `kind`, with `quirks` on every source.
+fn whole_match_with(
+    dir: &Path,
+    sources: &[(&str, u32, u32, u32)],
+    kind: CounterKind,
+    quirks: CounterQuirks,
+) -> Match {
     gst::init().unwrap();
     let mut project = Project::new("Match");
     let files = sources
@@ -53,18 +64,14 @@ fn whole_match_with(dir: &Path, sources: &[(&str, u32, u32, u32)], quirks: Count
             project.source_videos.push(SourceRef {
                 relative_path: file.clone(),
                 display_name: name.into(),
+                // The **picture's** length, which is what a fixture's name
+                // says. A source whose sound runs past it then has a plan
+                // that disagrees with its file, which is the disagreement
+                // `a_later_source_starts_where_the_plan_says` is about.
                 duration_seconds: f64::from(frames) / f64::from(FPS),
                 display_aspect: f64::from(w) / f64::from(h),
             });
-            counter_video_with(
-                &dir.join(file),
-                w,
-                h,
-                FPS,
-                frames,
-                CounterKind::H264AacMp4,
-                quirks,
-            )
+            counter_video_with(&dir.join(file), w, h, FPS, frames, kind, quirks)
         })
         .collect();
     Match {
@@ -74,22 +81,14 @@ fn whole_match_with(dir: &Path, sources: &[(&str, u32, u32, u32)], quirks: Count
     }
 }
 
-/// A copy of `m` to `path`.
+/// A copy of `m` to `path`, with no scoreboard beside it.
 fn job(m: &Match, path: PathBuf) -> ExportJob {
     ExportJob {
-        entries: vec![None; m.compilation.plan.entries.len()],
         compilation: m.compilation.clone(),
         sources: m.files.clone(),
-        audio: Vec::new(),
         path,
-        cues: Vec::new(),
+        cues: Some(Vec::new()),
         render: Render::Copy,
-        // Both unread by a copy, which carries the sources' own pixels.
-        resolution: Resolution::R1080,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
     }
 }
 
@@ -122,30 +121,6 @@ fn copy(job: ExportJob) -> Result<ExportDone, ExportError> {
     copy_with(job, |_| {}, |_| {})
 }
 
-/// `path` read by `ffprobe`, as JSON.
-///
-/// `ffprobe` is the independent reader: it sees the `stsd` and the packets a
-/// decoder hides. Without it these tests fail, never skip — it is a test-only
-/// build dependency (`packaging/build-deps.txt`).
-fn ffprobe(path: &Path, args: &[&str]) -> serde_json::Value {
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-of", "json"])
-        .args(args)
-        .arg(path)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
-            )
-        });
-    assert!(
-        out.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).expect("ffprobe wrote JSON")
-}
-
 /// `path`'s video stream as `(codec, profile, width, height, packets)`.
 fn video_stream(path: &Path) -> (String, String, i64, i64, i64) {
     let probe = ffprobe(
@@ -167,6 +142,22 @@ fn video_stream(path: &Path) -> (String, String, i64, i64, i64) {
         number("height"),
         number("nb_read_packets"),
     )
+}
+
+/// Every video packet's presentation time in `path`, in the file's own order.
+fn video_pts(path: &Path) -> Vec<f64> {
+    ffprobe(path, &["-select_streams", "v:0", "-show_packets"])["packets"]
+        .as_array()
+        .expect("a packets array")
+        .iter()
+        .map(|p| {
+            p["pts_time"]
+                .as_str()
+                .expect("a packet presentation time")
+                .parse()
+                .expect("a presentation time in seconds")
+        })
+        .collect()
 }
 
 /// How long `path`'s `stream` (`v:0`, `a:0`) runs, in seconds.
@@ -191,6 +182,11 @@ fn chapters(path: &Path) -> Vec<(f64, String)> {
             )
         })
         .collect()
+}
+
+/// Every source's frames, in order: what the joined file must read back as.
+fn want(m: &Match) -> Vec<u32> {
+    m.frames.iter().flat_map(|&frames| 0..frames).collect()
 }
 
 /// Two sources joined: every frame of the first, then every frame of the
@@ -229,22 +225,21 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
 
     let path = dir.path().join("out.mp4");
     let done = copy(ExportJob {
-        cues: cues.clone(),
+        cues: Some(cues.clone()),
         ..job(&m, path.clone())
     })
     .unwrap();
     assert_eq!(done.encoder, "copy");
     assert_eq!(done.diagnostics, Default::default());
     assert!(
-        done.reserve_remaining.is_some_and(|left| left > 0.0),
-        "the moov reserve was never read back: {:?}",
+        done.reserve_remaining > 0.0,
+        "the moov reserve was never read back: {}",
         done.reserve_remaining
     );
 
-    let counters = decode_counters(&path);
-    let want: Vec<u32> = m.frames.iter().flat_map(|&frames| 0..frames).collect();
     assert_eq!(
-        counters, want,
+        decode_counters(&path),
+        want(&m),
         "the join lost, repeated or reordered frames"
     );
 
@@ -283,6 +278,71 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
     }
 }
 
+/// One source: the common project, where nothing is joined at all.
+///
+/// **The join is the code that doesn't run here**, and with a single entry
+/// `whole_match_chapters` gives no chapters either (spec E1), so the chapter
+/// splice is handed an empty list. The copy still earns its place: it is the
+/// file's own packets, with the scoreboard beside it.
+#[test]
+fn a_single_source_is_copied_with_no_chapters() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match(dir.path(), &[("the match", 640, 360, 45)]);
+    assert!(
+        m.compilation.plan.chapters.is_empty(),
+        "one source has no chapters to write"
+    );
+    let cues = vec![Cue {
+        start: 0.0,
+        end: 1.5,
+        text: "Rovers 0 - 0 Athletic · 00:00".into(),
+    }];
+    let path = dir.path().join("out.mp4");
+
+    let done = copy(ExportJob {
+        cues: Some(cues.clone()),
+        ..job(&m, path.clone())
+    })
+    .unwrap();
+
+    assert_eq!(decode_counters(&path), want(&m), "the copy lost frames");
+    assert_eq!(video_stream(&path).4, video_stream(&m.files[0]).4);
+    assert_eq!(done.sidecar, Some(dir.path().join("out.srt")));
+    assert!(chapters(&path).is_empty(), "a lone source got a chapter");
+}
+
+/// Sources with no sound at all: no audio pad is requested and the output has
+/// none (spec E4).
+///
+/// The muxer takes its pads once and for all before the first packet, so
+/// "there is no audio track" is a decision the gate makes and nothing after it
+/// can revisit — which is why it has a test of its own rather than riding on
+/// the sounded ones.
+#[test]
+fn sources_with_no_sound_are_copied_without_an_audio_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match_with(
+        dir.path(),
+        &[("first half", 640, 360, 60), ("second half", 640, 360, 45)],
+        CounterKind::H264Mp4BFrames,
+        CounterQuirks::default(),
+    );
+    let path = dir.path().join("out.mp4");
+
+    copy(job(&m, path.clone())).unwrap();
+
+    assert_eq!(
+        decode_counters(&path),
+        want(&m),
+        "the join lost, repeated or reordered frames"
+    );
+    let streams = ffprobe(&path, &["-show_streams"])["streams"]
+        .as_array()
+        .expect("a streams array")
+        .len();
+    assert_eq!(streams, 1, "the copy invented a track");
+}
+
 /// Sources whose sound stops three seconds short of their picture: the
 /// muxer needs sound the first file has run out of, and only the *next*
 /// file's demuxer can give it.
@@ -304,6 +364,7 @@ fn a_source_whose_sound_stops_early_is_copied() {
             ("first half", 640, 360, 120),
             ("second half", 640, 360, 120),
         ],
+        CounterKind::H264AacMp4,
         CounterQuirks {
             // Four seconds of picture, one of sound: three times the second
             // a `queue` holds, so no queue size could have hidden this.
@@ -315,10 +376,9 @@ fn a_source_whose_sound_stops_early_is_copied() {
 
     copy(job(&m, path.clone())).unwrap();
 
-    let counters = decode_counters(&path);
-    let want: Vec<u32> = m.frames.iter().flat_map(|&frames| 0..frames).collect();
     assert_eq!(
-        counters, want,
+        decode_counters(&path),
+        want(&m),
         "the join lost, repeated or reordered frames"
     );
 
@@ -335,29 +395,60 @@ fn a_source_whose_sound_stops_early_is_copied() {
     );
 }
 
-/// No cues: no sidecar, and whatever `.srt` was beside the old export is
-/// gone.
+/// A later source starts where the **plan** says it does, not where the last
+/// one's longest track happened to end.
 ///
-/// **This is the coach who deletes their scoreboard and exports again.**
-/// Without the removal their player auto-loads the old score over the new
-/// film, which looks like the export, not like a stale file.
+/// **Three placements have to agree**: the copy's, the chapters' and the
+/// cues'. The last two come from `start_frame / OUTPUT_FPS`, so the first does
+/// too. Here each source's sound runs a second past its picture, which is what
+/// ordinary camera footage does in miniature — and a copy that started the
+/// next source at the end of *everything* written would put it a second late,
+/// with its chapter and its score a second early.
 #[test]
-fn an_empty_cue_list_writes_no_sidecar_and_removes_a_stale_one() {
+fn a_later_source_starts_where_the_plan_says() {
     let dir = tempfile::tempdir().unwrap();
-    let m = whole_match(
+    let m = whole_match_with(
         dir.path(),
-        &[("first half", 640, 360, 30), ("second half", 640, 360, 30)],
+        &[("first half", 640, 360, 60), ("second half", 640, 360, 60)],
+        CounterKind::H264AacMp4,
+        CounterQuirks {
+            // A second of sound past the picture, on every source.
+            audio_tail: 30,
+            ..CounterQuirks::default()
+        },
     );
     let path = dir.path().join("out.mp4");
-    let sidecar = dir.path().join("out.srt");
-    std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
 
-    let done = copy(job(&m, path.clone())).unwrap();
-    assert_eq!(done.sidecar, None);
-    assert!(path.exists(), "the copy wrote no file");
+    copy(job(&m, path.clone())).unwrap();
+
+    assert_eq!(
+        decode_counters(&path),
+        want(&m),
+        "the join lost, repeated or reordered frames"
+    );
+    let start = f64::from(m.compilation.plan.entries[1].start_frame as u32) / f64::from(FPS);
+    let first = video_stream(&m.files[0]).4 as usize;
+    let pts = video_pts(&path);
     assert!(
-        !sidecar.exists(),
-        "the old scoreboard is still beside the new film"
+        pts.len() > first,
+        "the copy is short: {} packets",
+        pts.len()
+    );
+    // The lowest presentation time among the second source's packets: with
+    // B-frames they arrive in decode order, so the first one written is not
+    // necessarily the first one shown.
+    let second = pts[first..].iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        (second - start).abs() < 0.02,
+        "the second half starts at {second} s; the plan, its chapter and its \
+         cues say {start} s"
+    );
+    // And the sound the plan didn't account for is simply carried: four
+    // seconds of picture, and a tail that ends with the second half's own.
+    let (video, audio) = (stream_seconds(&path, "v:0"), stream_seconds(&path, "a:0"));
+    assert!(
+        (video - 4.0).abs() < 0.05 && (audio - 5.0).abs() < 0.1,
+        "the overlap left {video} s of picture against {audio} s of sound"
     );
 }
 
@@ -400,10 +491,10 @@ fn a_mismatched_pair_refuses_and_leaves_nothing() {
 
 /// Cancelling part-way: no file, no `.part`, and the run says so.
 ///
-/// **Two 30-second sources is what makes "part-way" mean it.** Uncancelled,
-/// this copy runs 0.149 s (measured) against the ~0.02 s the first progress
-/// report takes, so the cancel lands in the middle of the run rather than in
-/// a race with its end.
+/// **The copy is held where it is until the cancel has landed.** The first
+/// progress report blocks the copy thread until this one has set the flag, so
+/// the test measures the cancel rather than racing a copy that takes a
+/// seventh of a second.
 #[test]
 fn a_cancelled_copy_leaves_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -416,19 +507,60 @@ fn a_cancelled_copy_leaves_nothing() {
     );
     let path = dir.path().join("out.mp4");
 
-    let (seen, copied) = mpsc::channel();
+    let (report, reported) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
     let result = copy_with(
         job(&m, path.clone()),
-        move |p| {
-            let _ = seen.send(p);
+        {
+            let mut held = false;
+            move |frames| {
+                if !std::mem::replace(&mut held, true) {
+                    let _ = report.send(frames);
+                    let _ = resume.recv_timeout(TIMEOUT);
+                }
+            }
         },
         |exporter| {
-            // Err means the copy finished before it reported anything, which
-            // the assertion below reports.
-            let _ = copied.recv_timeout(TIMEOUT);
+            reported
+                .recv_timeout(TIMEOUT)
+                .expect("the copy reported its progress");
             exporter.cancel();
+            let _ = release.send(());
         },
     );
+    assert_eq!(result, Err(ExportError::Cancelled));
+    assert!(!path.exists(), "a cancelled copy left a file");
+    assert!(
+        !dir.path().join("out.mp4.part").exists(),
+        "a cancelled copy left its .part"
+    );
+}
+
+/// Cancelling while the headers are still being read: the same answer, and
+/// still nothing written.
+///
+/// **The `.part` doesn't exist yet at that point**, which is the whole design
+/// of the gate (spec L6) — so what this pins is that the header pass notices
+/// the flag at all, rather than reading four files out and only then asking.
+#[test]
+fn a_cancel_during_the_header_pass_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match(
+        dir.path(),
+        &[
+            ("first half", 640, 360, 30),
+            ("second half", 640, 360, 30),
+            ("third half", 640, 360, 30),
+            ("fourth half", 640, 360, 30),
+        ],
+    );
+    let path = dir.path().join("out.mp4");
+
+    // Cancelled before the copy thread can have read a header: the flag is
+    // set within microseconds of the run starting, and one file's header takes
+    // milliseconds.
+    let result = copy_with(job(&m, path.clone()), |_| {}, Exporter::cancel);
+
     assert_eq!(result, Err(ExportError::Cancelled));
     assert!(!path.exists(), "a cancelled copy left a file");
     assert!(

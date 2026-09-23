@@ -43,7 +43,7 @@ use video_coach_core::scoreboard::{team_name, ScoreboardContext};
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
 use video_coach_media::{
-    EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
+    Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
 };
 
 use super::{Bus, Event, Input, Open, UserError};
@@ -263,7 +263,7 @@ impl Active {
                 eprintln!(
                     "bus: exported {}: {} frames in {seconds:.1} s ({:.1} fps), \
                      decoder {:?}, glupload caps {:?}, encoder {}, chapters {:?}, \
-                     sidecar {:?}, moov reserve left {:?}",
+                     sidecar {:?}, moov reserve left {:.1} s",
                     done.path.display(),
                     target.frames,
                     target.frames as f64 / seconds,
@@ -531,11 +531,11 @@ impl Pickers {
 
 /// What the sheet's Scoreboard picker means for one target (spec M3).
 struct Carry {
-    /// Which renderer writes the file.
-    render: Render,
-    /// The scoreboard beside the file, or empty — which also clears a sidecar
-    /// an earlier export left there.
-    cues: Vec<Cue>,
+    /// Copy the sources' packets rather than re-encode them.
+    copy: bool,
+    /// The scoreboard beside the file: `None` for a target that carries no
+    /// sidecar at all, so nothing at that path is written **or removed**.
+    cues: Option<Vec<Cue>>,
     /// The board to burn into the picture, or `None`. Media reads this in one
     /// place, the per-frame overlay state, so `None` **is** "don't draw it" —
     /// there is no mode flag to carry into media at all.
@@ -543,7 +543,7 @@ struct Carry {
 }
 
 /// The whole of the mapping: the picker (or, for "Default", the target's own
-/// mode) into the two job fields that carry the board, and the renderer.
+/// mode) into the renderer and the two job fields that carry the board.
 ///
 /// `context` is the run's frozen [`ScoreboardContext`], `None` for a project
 /// with no scoreboard set up — which means no cues either, since there is
@@ -553,33 +553,69 @@ fn carry_scoreboard(
     picked: Option<ScoreboardMode>,
     compilation: &Compilation,
     context: Option<ScoreboardContext>,
+    sources: &[PathBuf],
 ) -> Carry {
+    // The board burned into the picture, which is what every target but a
+    // copied whole match does with it.
+    let burned = |context| Carry {
+        copy: false,
+        cues: Some(Vec::new()),
+        scoreboard: context,
+    };
+    // **Only the whole match can carry the board beside the file** (spec T1):
+    // a clip or a reel is drawn on, zoomed and captioned, so it re-encodes
+    // either way, and a subtitle line repeating its own text bar would be
+    // clutter. Asking for a separate track therefore burns it in rather than
+    // dropping it — the picker must never lose the board. And its cue slot is
+    // `None`: a `.srt` beside a clip is the coach's own file, and no export of
+    // ours put it there to remove.
+    if !matches!(target, ExportTarget::WholeMatch) {
+        return Carry {
+            cues: None,
+            ..burned(context)
+        };
+    }
     match picked.unwrap_or_else(|| default_scoreboard_mode(target)) {
-        ScoreboardMode::Burned => Carry {
-            render: Render::Encode,
-            cues: Vec::new(),
-            scoreboard: context,
-        },
-        // Only the whole match is copied, and only the whole match carries a
-        // cue list: a clip or a reel is drawn on, zoomed and captioned, so it
-        // re-encodes either way, and it already says what it is in its own
-        // text bar (spec T1, X1). The board simply isn't in it.
-        ScoreboardMode::Track => match target {
-            ExportTarget::WholeMatch => Carry {
-                render: Render::Copy,
-                cues: match &context {
+        ScoreboardMode::Burned => burned(context),
+        // **"Default" means the best available.** A project whose videos
+        // can't be joined — Matroska, HEVC, two halves recorded differently —
+        // is re-encoded with the board burned in, exactly as it was before
+        // this path existed, rather than refused at a gate the coach never
+        // asked to be held to. Asking for the track by hand still refuses,
+        // in media, naming the file and the way out (spec L6): there the
+        // coach chose the copy, and quietly spending an hour instead would be
+        // the worst available answer.
+        ScoreboardMode::Track => {
+            if picked.is_none() {
+                if let Err(why) = video_coach_media::can_copy(&copy_files(compilation, sources)) {
+                    eprintln!(
+                        "bus: the whole match can't be copied ({why}), \
+                         so it is re-encoded with the scoreboard burned in"
+                    );
+                    return burned(context);
+                }
+            }
+            Carry {
+                copy: true,
+                cues: Some(match &context {
                     Some(context) => scoreboard_cues(compilation, context),
                     None => Vec::new(),
-                },
+                }),
                 scoreboard: None,
-            },
-            _ => Carry {
-                render: Render::Encode,
-                cues: Vec::new(),
-                scoreboard: None,
-            },
-        },
+            }
+        }
     }
+}
+
+/// The files a copy of `compilation` would join, in entry order: what
+/// `composite::copy` reads from the same two fields of the job.
+fn copy_files(compilation: &Compilation, sources: &[PathBuf]) -> Vec<PathBuf> {
+    compilation
+        .plan
+        .entries
+        .iter()
+        .filter_map(|entry| sources.get(entry.source_index).cloned())
+        .collect()
 }
 
 /// The job that renders `target` as `label`, or why it can't run.
@@ -642,6 +678,12 @@ fn job(
         }));
     }
 
+    let sources: Vec<PathBuf> = open
+        .project
+        .source_videos
+        .iter()
+        .map(|s| open.folder.join(&s.relative_path))
+        .collect();
     let carry = carry_scoreboard(
         target,
         pickers.scoreboard,
@@ -649,31 +691,32 @@ fn job(
         // Frozen with the project as it is now: the run's own copy of the
         // events on the concat timeline (spec S2).
         ScoreboardContext::for_project(&open.project),
+        &sources,
     );
     let job = ExportJob {
-        audio: audio_regions(&compilation, &open.project.preferences),
+        render: match carry.copy {
+            true => Render::Copy,
+            false => Render::Encode(Encode {
+                audio: audio_regions(&compilation, &open.project.preferences),
+                entries,
+                resolution: pickers.resolution,
+                quality: pickers.quality,
+                scoreboard: carry.scoreboard,
+                highlights: open.project.player_highlights.clone(),
+                // The project's one image, snapshotted like everything else
+                // here: a pick or a removal while this run is going does not
+                // reach it (I6).
+                avatar: open
+                    .project
+                    .avatar
+                    .as_ref()
+                    .map(|file| open.folder.join(file)),
+            }),
+        },
         compilation,
-        entries,
-        sources: open
-            .project
-            .source_videos
-            .iter()
-            .map(|s| open.folder.join(&s.relative_path))
-            .collect(),
+        sources,
         path: exports.join(file_name(label, &open.project.name)),
         cues: carry.cues,
-        render: carry.render,
-        resolution: pickers.resolution,
-        quality: pickers.quality,
-        scoreboard: carry.scoreboard,
-        highlights: open.project.player_highlights.clone(),
-        // The project's one image, snapshotted like everything else here: a
-        // pick or a removal while this run is going does not reach it (I6).
-        avatar: open
-            .project
-            .avatar
-            .as_ref()
-            .map(|file| open.folder.join(file)),
     };
     Ok(job)
 }

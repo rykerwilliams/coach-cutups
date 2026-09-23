@@ -303,9 +303,9 @@ pub enum CounterKind {
     /// ahead of stream time: the trap that makes export use stream time.
     H264Mp4BFrames,
     /// [`CounterKind::H264Mp4BFrames`] with a **silent** AAC track sized to
-    /// the video, as the match footage a copy joins has: the shape the copy
-    /// graph's audio `concat` needs, and a separate kind rather than a flag
-    /// on the video-only one so no existing test's fixture changes shape.
+    /// the video: the shape of the match footage a copy joins, and a separate
+    /// kind rather than a flag on the video-only one so no existing test's
+    /// fixture changes shape.
     H264AacMp4,
 }
 
@@ -832,4 +832,34 @@ fn respond(mut stream: TcpStream, answer: Answer, delay: Duration) {
         }
         Answer::Status(status) => stream.write_all(head(status, 0).as_bytes()),
     };
+}
+
+/// `path` read by `ffprobe`, with `args` (`-select_streams`, `-show_streams`,
+/// `-show_chapters`, …), as JSON.
+///
+/// **The tests' independent reader.** It sees what a GStreamer decoder hides:
+/// the `stsd` a copy must not have rewritten, the packet count that says the
+/// join is packet for packet, and the `chpl` `qtdemux` doesn't read at all.
+///
+/// Like everything here it **panics** rather than skipping: `ffmpeg` is a
+/// test-only build dependency (`packaging/build-deps.txt`), and a test that
+/// quietly passed without its reader would assert nothing.
+pub fn ffprobe(path: &Path, args: &[&str]) -> serde_json::Value {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-of", "json"])
+        .args(args)
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
+            )
+        });
+    assert!(
+        out.status.success(),
+        "ffprobe failed on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("ffprobe wrote JSON")
 }

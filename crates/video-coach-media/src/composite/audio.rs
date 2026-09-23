@@ -39,7 +39,7 @@ use video_coach_core::audio::{
     envelope, Region, Track, AUDIO_SAMPLE_RATE, PRIMING_SAMPLES, SAMPLES_PER_FRAME,
 };
 
-use super::export::ExportJob;
+use super::export::{Encode, ExportJob};
 use super::{CompositeError, Stopper, Watch, POLL, QUEUED};
 use crate::player::seconds_to_clock;
 
@@ -91,10 +91,11 @@ pub(super) struct Mixer {
 }
 
 impl Mixer {
-    /// The mixer for `job`: its regions, resolved to the files they read.
-    pub(super) fn new(job: &ExportJob) -> Mixer {
+    /// The mixer for `job`: `encode`'s regions, resolved to the files they
+    /// read.
+    pub(super) fn new(job: &ExportJob, encode: &Encode) -> Mixer {
         let entries = &job.compilation.plan.entries;
-        let paths: Vec<PathBuf> = job
+        let paths: Vec<PathBuf> = encode
             .audio
             .iter()
             .map(|region| match region.track {
@@ -107,16 +108,16 @@ impl Mixer {
                     .unwrap_or_default(),
                 // An entry with no clip has no recording: audio_regions gives
                 // it no commentary region, and one would be silence anyway.
-                Track::Commentary => job.entries[region.entry]
+                Track::Commentary => encode.entries[region.entry]
                     .as_ref()
                     .map(|media| media.recording.clone())
                     .unwrap_or_default(),
             })
             .collect();
-        let mut order: Vec<usize> = (0..job.audio.len()).collect();
-        order.sort_by_key(|&i| job.audio[i].out_samples.start);
+        let mut order: Vec<usize> = (0..encode.audio.len()).collect();
+        order.sort_by_key(|&i| encode.audio[i].out_samples.start);
         Mixer {
-            regions: job.audio.clone(),
+            regions: encode.audio.clone(),
             paths,
             order,
             next: 0,

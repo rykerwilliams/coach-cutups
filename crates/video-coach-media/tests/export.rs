@@ -33,11 +33,12 @@ use video_coach_core::scoreboard::{
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
-    self, block_centre, counter_video, counter_video_with, decode_counters, one_entry,
+    self, block_centre, counter_video, counter_video_with, decode_counters, ffprobe, one_entry,
     read_counter, CounterKind, CounterQuirks, COUNTER_BITS,
 };
 use video_coach_media::{
-    ChapterOutcome, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
+    ChapterOutcome, Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage,
+    Exporter, Render,
 };
 
 /// Far beyond any export here, even on a loaded llvmpipe runner; only a hang
@@ -131,20 +132,21 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
     ExportJob {
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
-        entries: vec![Some(EntryMedia {
-            // Unread: `show_pip` is off, so the pad takes the filler.
-            recording: PathBuf::new(),
-            clip,
-        })],
-        audio: Vec::new(),
         path,
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![Some(EntryMedia {
+                // Unread: `show_pip` is off, so the pad takes the filler.
+                recording: PathBuf::new(),
+                clip,
+            })],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     }
 }
 
@@ -342,19 +344,21 @@ fn fiducial(kind: CounterKind) {
     let recording =
         fixtures::solid_video(&dir.path().join("rec.webm"), 320, 180, 30, 30, GREEN, true);
     let path = dir.path().join("out.mp4");
+    let audio = audio_regions(&compilation, &Preferences::default());
     let done = export(ExportJob {
-        audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![src.path.clone()],
-        entries: vec![Some(EntryMedia { recording, clip })],
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            audio,
+            entries: vec![Some(EntryMedia { recording, clip })],
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     })
     .unwrap();
     assert_eq!(done.path, path);
@@ -446,28 +450,30 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
     assert_eq!(frames.len(), 3 * per_entry as usize);
 
     let path = dir.path().join("out.mp4");
+    let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
-        audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![wide, narrow],
-        entries: clips
-            .iter()
-            .zip(recordings)
-            .map(|(clip, recording)| {
-                Some(EntryMedia {
-                    recording,
-                    clip: clip.clone(),
-                })
-            })
-            .collect(),
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            audio,
+            entries: clips
+                .iter()
+                .zip(recordings)
+                .map(|(clip, recording)| {
+                    Some(EntryMedia {
+                        recording,
+                        clip: clip.clone(),
+                    })
+                })
+                .collect(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     })
     .unwrap();
 
@@ -777,16 +783,17 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
         ExportJob {
             compilation: one_entry(&clip, frames, "1 / 2 | Demo"),
             sources: vec![source],
-            entries: vec![Some(EntryMedia { recording, clip })],
-            audio: Vec::new(),
             path: path.clone(),
-            cues: Vec::new(),
-            render: Render::Encode,
-            resolution: Resolution::R720,
-            quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
+            cues: None,
+            render: Render::Encode(Encode {
+                entries: vec![Some(EntryMedia { recording, clip })],
+                audio: Vec::new(),
+                resolution: Resolution::R720,
+                quality: Quality::Medium,
+                scoreboard: None,
+                highlights: Vec::new(),
+                avatar: None,
+            }),
         },
         path,
     )
@@ -936,19 +943,20 @@ fn the_export_burns_in_the_scoreboard() {
     export(ExportJob {
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
-        entries: vec![Some(EntryMedia {
-            recording: PathBuf::new(),
-            clip,
-        })],
-        audio: Vec::new(),
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: ScoreboardContext::for_project(&project),
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![Some(EntryMedia {
+                recording: PathBuf::new(),
+                clip,
+            })],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: ScoreboardContext::for_project(&project),
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     })
     .unwrap();
 
@@ -1054,16 +1062,17 @@ fn an_avatar_clip_pulses_in_the_export() {
     export(ExportJob {
         compilation,
         sources: vec![source],
-        entries: vec![Some(EntryMedia { recording, clip })],
-        audio: Vec::new(),
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: Some(avatar),
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![Some(EntryMedia { recording, clip })],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: Some(avatar),
+        }),
     })
     .unwrap();
 
@@ -1143,28 +1152,30 @@ fn an_avatar_and_a_camera_clip_export_together() {
     let per_entry = compilation.plan.entries[0].frames;
     let total = compilation.frames.len();
     let path = dir.path().join("out.mp4");
+    let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
-        audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![source],
-        entries: clips
-            .iter()
-            .zip([spoken, webcam])
-            .map(|(clip, recording)| {
-                Some(EntryMedia {
-                    recording,
-                    clip: clip.clone(),
-                })
-            })
-            .collect(),
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: Some(avatar),
+        cues: None,
+        render: Render::Encode(Encode {
+            audio,
+            entries: clips
+                .iter()
+                .zip([spoken, webcam])
+                .map(|(clip, recording)| {
+                    Some(EntryMedia {
+                        recording,
+                        clip: clip.clone(),
+                    })
+                })
+                .collect(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: Some(avatar),
+        }),
     })
     .unwrap();
 
@@ -1221,16 +1232,17 @@ fn avatar_export(
     export(ExportJob {
         compilation,
         sources: vec![source],
-        entries: vec![Some(EntryMedia { recording, clip })],
-        audio: Vec::new(),
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: Some(avatar),
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![Some(EntryMedia { recording, clip })],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: Some(avatar),
+        }),
     })
     .unwrap();
     let out = fixtures::decode_rgb(&path);
@@ -1292,19 +1304,21 @@ fn sounded_job(
     path: PathBuf,
 ) -> ExportJob {
     let compilation = fixtures::one_clip(&clip, source_duration);
+    let audio = audio_regions(&compilation, &Preferences::default());
     ExportJob {
-        audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![source],
-        entries: vec![Some(EntryMedia { recording, clip })],
         path,
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            audio,
+            entries: vec![Some(EntryMedia { recording, clip })],
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     }
 }
 
@@ -1490,19 +1504,21 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
     compilation.plan.entries[0].clip_id = None;
     let frames = compilation.plan.total_frames();
     let path = dir.path().join("out.mp4");
+    let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
-        audio: audio_regions(&compilation, &Preferences::default()),
         compilation,
         sources: vec![source],
-        entries: vec![None],
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: None,
+        render: Render::Encode(Encode {
+            audio,
+            entries: vec![None],
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     })
     .unwrap();
 
@@ -1590,7 +1606,12 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let mut stopped = false;
     let result = export_with(
-        job(src.path, frames, path.clone()),
+        ExportJob {
+            // A target that carries a sidecar, so the cancel is what leaves
+            // the old one alone rather than the job never having one.
+            cues: Some(Vec::new()),
+            ..job(src.path, frames, path.clone())
+        },
         move |frames_done| {
             // A third of the 60 frames.
             if frames_done >= 20 && !stopped {
@@ -1617,26 +1638,10 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
 
 /// `path`'s chapters as `ffprobe` reads them: `(start in seconds, title)`.
 ///
-/// `ffprobe` is the independent reader: GStreamer's `qtdemux` doesn't read
-/// `chpl`, and no released Rust MP4 crate parses it. Without it this fails,
-/// never skips: it is a test-only build dependency (`packaging/build-deps.txt`).
+/// The independent reader, because GStreamer's `qtdemux` doesn't read `chpl`
+/// and no released Rust MP4 crate parses it.
 fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-show_chapters", "-of", "json"])
-        .arg(path)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
-            )
-        });
-    assert!(
-        out.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    json["chapters"]
+    ffprobe(path, &["-show_chapters"])["chapters"]
         .as_array()
         .expect("a chapters array")
         .iter()
@@ -1656,9 +1661,9 @@ fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
 /// a chapter placed by summing durations would drift by most of a frame per
 /// entry, well past the millisecond this allows.
 ///
-/// **It also carries no cues, and so clears the sidecar** — the case the copy
-/// tests can't reach, and the one a coach hits by switching the scoreboard
-/// picker back to burned in and exporting over the same file.
+/// **It also carries an empty cue slot, and so clears the sidecar** — the
+/// encoded path's half of the rule, and the one a coach hits by switching the
+/// scoreboard picker back to burned in and exporting over the same file.
 #[test]
 fn a_compilation_gets_a_chapter_per_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -1685,28 +1690,29 @@ fn a_compilation_gets_a_chapter_per_entry() {
     let sidecar = dir.path().join("out.srt");
     std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
     let done = export(ExportJob {
-        // A silent track, which is still `avenc_aac`'s.
-        audio: Vec::new(),
-        entries: clips
-            .into_iter()
-            .map(|clip| {
-                Some(EntryMedia {
-                    // Unread: `show_pip` is off and there is no audio edit.
-                    recording: PathBuf::new(),
-                    clip,
-                })
-            })
-            .collect(),
         compilation,
         sources: vec![src.path.clone()],
         path: path.clone(),
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution: Resolution::R720,
-        quality: Quality::Medium,
-        scoreboard: None,
-        highlights: Vec::new(),
-        avatar: None,
+        cues: Some(Vec::new()),
+        render: Render::Encode(Encode {
+            // A silent track, which is still `avenc_aac`'s.
+            audio: Vec::new(),
+            entries: clips
+                .into_iter()
+                .map(|clip| {
+                    Some(EntryMedia {
+                        // Unread: `show_pip` is off and there is no audio edit.
+                        recording: PathBuf::new(),
+                        clip,
+                    })
+                })
+                .collect(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
     })
     .unwrap();
     assert_eq!(done.chapters, ChapterOutcome::Written(3));

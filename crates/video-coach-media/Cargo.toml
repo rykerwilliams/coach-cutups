@@ -15,13 +15,15 @@ gstreamer-gl-egl.workspace = true
 gstreamer-pbutils.workspace = true
 gstreamer-video.workspace = true
 cosmic-text.workspace = true
+# `fixtures` only: reading `ffprobe -of json` back in tests.
+serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
 tiny-skia.workspace = true
 whisper-rs.workspace = true
 
 [features]
 # The synthetic media in `fixtures`, for tests here and in the harness.
-fixtures = []
+fixtures = ["dep:serde_json"]
 
 [dev-dependencies]
 # Itself with `fixtures`, for the integration tests in `tests/`.

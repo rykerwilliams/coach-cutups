@@ -54,7 +54,7 @@ use super::{
 };
 use crate::chapters::{self, ChapterOutcome};
 use crate::overlay::{OverlayFrame, OverlayRenderer};
-use crate::player::{gl_caps, seconds_to_clock, Diagnostics};
+use crate::player::{gl_caps, seconds, seconds_to_clock, Diagnostics};
 
 /// Where the PiP's filler lands: one transparent pixel, so the rect is only
 /// something for `glvideomixer` to scale nothing into.
@@ -67,25 +67,28 @@ pub type ExportError = CompositeError;
 /// **Which renderer writes the file, not which mode the app is in.** The bus
 /// decides from the target and the scoreboard picker (spec M3, X1); media only
 /// branches on it, once, at the top of [`run`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Everything only one of them reads travels inside it, so a job can't carry a
+/// resolution for a run that copies or a cue list drawn by an encoder.
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one of these is built per export target and moved once, onto the \
+              export thread; boxing it would buy nothing and cost every caller \
+              a `Box::new`"
+)]
 pub enum Render {
     /// The composite graph: every frame decoded, drawn on and encoded.
-    Encode,
+    Encode(Encode),
     /// The stream copy ([`copy`](super::copy)): the sources' own packets
     /// joined, which only the whole match in track mode may ask for.
     Copy,
 }
 
-/// What to export: one compilation, and the files its entries read.
+/// What only the encoded export reads: the pixels it composites, the sound it
+/// mixes, and what it writes them as.
 #[derive(Debug, Clone)]
-pub struct ExportJob {
-    /// Every output frame and the plan they came from
-    /// (`video_coach_core::export::compilation_schedule`).
-    pub compilation: Compilation,
-    /// The project's game videos, indexed by `PlanEntry::source_index`: one
-    /// decoder is opened per distinct index and lives for the whole run.
-    /// A snapshot taken when the export starts.
-    pub sources: Vec<PathBuf>,
+pub struct Encode {
     /// One per `compilation.plan.entries`, in the same order: `None` exactly
     /// for an entry with no clip (`PlanEntry::clip_id`), which gets the PiP
     /// filler, no drawings and no commentary.
@@ -95,23 +98,12 @@ pub struct ExportJob {
     /// heard at each emitted sample, and how loud. Empty is a silent track,
     /// which is still a track — the muxer needs one either way.
     pub audio: Vec<Region>,
-    /// The output file. Written as `<path>.part` and renamed on success, so a
-    /// failed export never touches a file already there.
-    pub path: PathBuf,
-    /// The scoreboard as lines of text against output time, for the sidecar
-    /// beside the file (spec T1). Built by the bus from the same
-    /// `ScoreboardContext` the burned board reads; **empty means no sidecar**,
-    /// which also removes a stale one (see [`write_sidecar`]).
-    pub cues: Vec<Cue>,
-    /// Which renderer writes it. [`Render::Copy`] ignores `resolution`,
-    /// `quality`, `entries`, `audio`, `scoreboard`, `highlights` and `avatar`:
-    /// a copy carries the sources' own packets and nothing drawn (spec N).
-    pub render: Render,
     pub resolution: Resolution,
     pub quality: Quality,
     /// The match clock and score to burn in, or `None` when the project has no
-    /// scoreboard configured. Built once by the bus, and **never reused across
-    /// a source add, move, remove or relink** — see [`ScoreboardContext`].
+    /// scoreboard configured, or carries it beside the file instead. Built
+    /// once by the bus, and **never reused across a source add, move, remove
+    /// or relink** — see [`ScoreboardContext`].
     pub scoreboard: Option<ScoreboardContext>,
     /// The project's player highlights, a snapshot taken when the run starts.
     /// They belong to the footage rather than to a clip (spec H1), so an entry
@@ -121,6 +113,29 @@ pub struct ExportJob {
     /// camera. One image for the project, so one path for the run: every
     /// entry whose clip `shows_avatar` draws this one (spec A1, I6).
     pub avatar: Option<PathBuf>,
+}
+
+/// What to export: one compilation, the files its entries read, and the
+/// renderer that writes it.
+#[derive(Debug, Clone)]
+pub struct ExportJob {
+    /// Every output frame and the plan they came from
+    /// (`video_coach_core::export::compilation_schedule`).
+    pub compilation: Compilation,
+    /// The project's game videos, indexed by `PlanEntry::source_index`: one
+    /// decoder is opened per distinct index and lives for the whole run.
+    /// A snapshot taken when the export starts.
+    pub sources: Vec<PathBuf>,
+    /// The output file. Written as `<path>.part` and renamed on success, so a
+    /// failed export never touches a file already there.
+    pub path: PathBuf,
+    /// The scoreboard beside the file, as lines of text against output time
+    /// (spec T1): `Some(cues)` writes them, `Some(empty)` writes none **and
+    /// clears a stale one**, and `None` is a target that never carries a
+    /// sidecar and so leaves the path alone (see [`write_sidecar`]).
+    pub cues: Option<Vec<Cue>>,
+    /// Which renderer writes it, and everything only that one reads.
+    pub render: Render,
 }
 
 /// What one entry needs beside its `PlanEntry`, which carries the edit but
@@ -166,12 +181,9 @@ pub struct ExportDone {
     /// carried no cues, or the write failed, which is reported and never
     /// fatal.
     pub sidecar: Option<PathBuf>,
-    /// What was left of the `moov` reserve at EOS, in seconds of the muxer's
-    /// own accounting, for the log line (spec L4, E7). The standing check that
-    /// the margin is still ample on a longer match — a number in the log
-    /// instead of a multi-gigabyte test. `None` from the encoded path, which
-    /// doesn't read it.
-    pub reserve_remaining: Option<f64>,
+    /// What was left of the `moov` reserve at EOS, for the log line: see
+    /// [`reserve_remaining`].
+    pub reserve_remaining: f64,
 }
 
 /// A running export. It owns its thread, and every GStreamer object it
@@ -201,11 +213,13 @@ impl Exporter {
         inject: Option<&'static str>,
     ) -> Exporter {
         debug_assert!(!job.compilation.frames.is_empty(), "an export needs frames");
-        debug_assert_eq!(
-            job.entries.len(),
-            job.compilation.plan.entries.len(),
-            "every plan entry needs its files"
-        );
+        if let Render::Encode(encode) = &job.render {
+            debug_assert_eq!(
+                encode.entries.len(),
+                job.compilation.plan.entries.len(),
+                "every plan entry needs its files"
+            );
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("export".into())
@@ -317,7 +331,21 @@ fn part_path(path: &Path) -> PathBuf {
 pub(super) struct Rendered {
     pub(super) encoder: String,
     pub(super) diagnostics: Diagnostics,
-    pub(super) reserve_remaining: Option<f64>,
+    pub(super) reserve_remaining: f64,
+}
+
+/// What `mux` has left of the `moov` space [`reserved_duration`] asked for, in
+/// seconds of its own accounting (spec L4, E7); `0.0` while it has accounted
+/// for none of it.
+///
+/// **Read on both paths**, because both reserve by the same formula and both
+/// need the room for the same chapter splice: the standing check that the
+/// margin is still ample on a longer match is a number in the log, not a
+/// multi-gigabyte test.
+pub(super) fn reserve_remaining(mux: &gst::Element) -> f64 {
+    gst::ClockTime::try_from(mux.property::<u64>("reserved-duration-remaining"))
+        .map(seconds)
+        .unwrap_or(0.0)
 }
 
 /// Writes the `.part` file with the renderer `job` asks for, chapters it and
@@ -335,8 +363,8 @@ fn run(
     let part = part_path(&job.path);
     // The pipelines are NULL by the time either renderer returns, so nothing
     // holds the file open.
-    let result = match job.render {
-        Render::Encode => export(job, &part, cancel, inject, on_message),
+    let result = match &job.render {
+        Render::Encode(encode) => export(job, encode, &part, cancel, inject, on_message),
         Render::Copy => super::copy::copy(job, &part, cancel, on_message),
     }
     .and_then(|rendered| finish(job, &part, rendered));
@@ -373,24 +401,21 @@ fn finish(job: &ExportJob, part: &Path, rendered: Rendered) -> Result<ExportDone
 }
 
 /// The scoreboard beside the finished file: `job.cues` as SRT at
-/// `<output>.srt`, or — with no cues — nothing at that path at all.
+/// `<output>.srt` (spec T6).
 ///
-/// **The path is the output's own,** so the run's name cleaning and its
-/// `" (2)"` de-duplication carry, and the matching basename is what makes a
-/// player load it without being asked (spec T6).
+/// **Writing and removing are one step**, and only for a target that carries a
+/// sidecar at all: the file that belongs beside *this* output is this string,
+/// or nothing. Otherwise a coach exports with a scoreboard, deletes it,
+/// exports again, and their player plays the old score over the new film. A
+/// target that never writes one leaves the path alone, because a `.srt` beside
+/// a clip is the coach's own file and no export's business.
 ///
-/// **Writing and removing are one step:** the file that belongs beside this
-/// output is this string, or nothing. Otherwise a coach exports with a
-/// scoreboard, deletes it, exports again, and their player plays the old
-/// score over the new film.
-///
-/// **A failure is reported, never fatal.** A good MP4 is not thrown away
-/// because a text file could not be written. It runs only after the rename,
-/// so a cancelled or failed run neither writes nor removes anything: the last
-/// good export keeps its own sidecar.
+/// **A failure is reported, never fatal.** It runs only after the rename, so a
+/// cancelled or failed run neither writes nor removes anything.
 fn write_sidecar(job: &ExportJob) -> Option<PathBuf> {
+    let cues = job.cues.as_ref()?;
     let path = job.path.with_extension("srt");
-    if job.cues.is_empty() {
+    if cues.is_empty() {
         match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!(
                 "export: could not remove the old scoreboard {}: {e}",
@@ -400,7 +425,7 @@ fn write_sidecar(job: &ExportJob) -> Option<PathBuf> {
         }
         return None;
     }
-    match std::fs::write(&path, cues_to_srt(&job.cues)) {
+    match std::fs::write(&path, cues_to_srt(cues)) {
         Ok(()) => Some(path),
         Err(e) => {
             eprintln!(
@@ -414,6 +439,7 @@ fn write_sidecar(job: &ExportJob) -> Option<PathBuf> {
 
 fn export(
     job: &ExportJob,
+    encode: &Encode,
     part: &Path,
     cancel: &AtomicBool,
     inject: Option<&str>,
@@ -424,7 +450,7 @@ fn export(
         cancel,
         error: Arc::default(),
     };
-    let (out_w, out_h) = output_size(job.resolution);
+    let (out_w, out_h) = output_size(encode.resolution);
     let plan = &job.compilation.plan;
     // The avatar and its pulse, before anything is pushed: one decode and one
     // upload for the run, and one pass over each avatar entry's commentary
@@ -432,18 +458,19 @@ fn export(
     // neither belongs beside `Pip::open`, which runs inside the loop. And both
     // only when an entry asks for one: an avatar project exporting a
     // compilation of camera clips decodes nothing and reports nothing.
-    let avatar = job
+    let avatar = encode
         .avatar
         .as_deref()
         .filter(|_| {
-            job.entries
+            encode
+                .entries
                 .iter()
                 .flatten()
                 .any(|media| media.clip.shows_avatar())
         })
         .and_then(|path| AvatarInset::open(path, &gl, &watch, (out_w, out_h)));
     let levels = match avatar {
-        Some(_) => pulse_levels(job, cancel),
+        Some(_) => pulse_levels(job, encode, cancel),
         None => vec![1.0; job.compilation.frames.len()],
     };
     let schedule = Schedule::new(job.compilation.frames.clone(), levels, plan.entries.len());
@@ -452,12 +479,12 @@ fn export(
     // compilation normally walks one match video over and over, and reopening
     // it per entry would cost a preroll each time.
     let mut sources: HashMap<usize, Decoder> = HashMap::new();
-    let mut mixer = Mixer::new(job);
+    let mut mixer = Mixer::new(job, encode);
     let mut overlays = OverlayRenderer::new();
     // Before any decoding: the encode side depends on nothing the pump
     // produces, so a missing encoder is reported in the moment the run starts
     // rather than after the first source has been opened and seeked.
-    let encoder = Encoder::start(part, &schedule, job, &gl, inject, &watch)?;
+    let encoder = Encoder::start(part, &schedule, job, encode, &gl, inject, &watch)?;
     // The entry the layout and the caps are currently for, and its PiP, which
     // is opened and closed with it.
     let mut laid_out: Option<usize> = None;
@@ -469,7 +496,7 @@ fn export(
     let mut percent = 0;
     for (n, frame) in job.compilation.frames.iter().enumerate() {
         let entry = &plan.entries[frame.entry];
-        let media = job.entries[frame.entry].as_ref();
+        let media = encode.entries[frame.entry].as_ref();
         if let std::collections::hash_map::Entry::Vacant(slot) = sources.entry(entry.source_index) {
             let source = job
                 .sources
@@ -503,7 +530,7 @@ fn export(
         // **The displayed frame's source time**, not a per-clip constant plus
         // the record time: that sum is exactly the macOS bug that put the
         // match clock ahead of the footage after every pause (BACKLOG #27).
-        let scoreboard = job.scoreboard.as_ref().and_then(|context| {
+        let scoreboard = encode.scoreboard.as_ref().and_then(|context| {
             let state = context.state_at(entry.source_index, frame.source_time)?;
             Some((context.config(), state))
         });
@@ -511,7 +538,7 @@ fn export(
         // frame's source time too, and mapped through that frame's own zoom.
         // Core owns the geometry; the overlay only draws what comes back.
         let highlights = highlight_shapes(
-            &job.highlights,
+            &encode.highlights,
             entry.source_index,
             frame.source_time,
             frame.zoom,
@@ -550,6 +577,7 @@ fn export(
     }
     encoder.finish(&watch)?;
     let name = encoder.name();
+    let reserve = reserve_remaining(&encoder.mux);
     // To NULL, so the muxer's file is closed before `run` chapters it.
     drop(encoder);
     Ok(Rendered {
@@ -560,7 +588,7 @@ fn export(
             .and_then(|e| sources.get(&e.source_index))
             .map(Decoder::diagnostics)
             .unwrap_or_default(),
-        reserve_remaining: None,
+        reserve_remaining: reserve,
     })
 }
 
@@ -889,9 +917,9 @@ impl AvatarInset {
 /// Called only once the image has opened: an entry that will take the filler
 /// must keep its level at 1.0, since scaling a 1×1 filler rect would round it
 /// away.
-fn pulse_levels(job: &ExportJob, cancel: &AtomicBool) -> Vec<f64> {
+fn pulse_levels(job: &ExportJob, encode: &Encode, cancel: &AtomicBool) -> Vec<f64> {
     let mut levels = vec![1.0; job.compilation.frames.len()];
-    for (entry, media) in job.compilation.plan.entries.iter().zip(&job.entries) {
+    for (entry, media) in job.compilation.plan.entries.iter().zip(&encode.entries) {
         let Some(media) = media.as_ref().filter(|m| m.clip.shows_avatar()) else {
             continue;
         };
@@ -950,6 +978,8 @@ struct Frame<'a> {
 struct Encoder {
     /// Held to go to NULL with the encoder.
     _pipeline: Stopper,
+    /// The muxer, for the `moov` reserve it has left at EOS (spec L4, E7).
+    mux: gst::Element,
     /// The pumped source frames: pad 0.
     src: gst_app::AppSrc,
     /// The picture-in-picture: pad 1.
@@ -976,12 +1006,13 @@ impl Encoder {
         part: &Path,
         schedule: &Arc<Schedule>,
         job: &ExportJob,
+        encode: &Encode,
         gl: &Gl,
         inject: Option<&str>,
         watch: &Watch,
     ) -> Result<Encoder, ExportError> {
-        let (out_w, out_h) = output_size(job.resolution);
-        let (name, settings) = encoders(job.quality)
+        let (out_w, out_h) = output_size(encode.resolution);
+        let (name, settings) = encoders(encode.quality)
             .into_iter()
             .find(|(name, _)| gst::ElementFactory::find(name).is_some())
             .ok_or_else(|| {
@@ -1056,7 +1087,8 @@ impl Encoder {
         install_overlay_pad(&mix, out_w, out_h);
         install_zoom(&by_name("zoom"), &schedule.frames);
 
-        by_name("mux").set_property(
+        let mux = by_name("mux");
+        mux.set_property(
             "reserved-max-duration",
             reserved_duration(job.compilation.frames.len()),
         );
@@ -1071,6 +1103,7 @@ impl Encoder {
         }
         Ok(Encoder {
             _pipeline: pipeline,
+            mux,
             src,
             pip,
             overlay,
@@ -1249,19 +1282,20 @@ mod tests {
         let job = ExportJob {
             compilation: fixtures::one_entry(&clip, frames, ""),
             sources: vec![source],
-            entries: vec![Some(EntryMedia {
-                recording: dir.path().join("missing.mkv"),
-                clip,
-            })],
-            audio: Vec::new(),
             path: path.clone(),
-            cues: Vec::new(),
-            render: Render::Encode,
-            resolution: Resolution::R720,
-            quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
+            cues: None,
+            render: Render::Encode(Encode {
+                entries: vec![Some(EntryMedia {
+                    recording: dir.path().join("missing.mkv"),
+                    clip,
+                })],
+                audio: Vec::new(),
+                resolution: Resolution::R720,
+                quality: Quality::Medium,
+                scoreboard: None,
+                highlights: Vec::new(),
+                avatar: None,
+            }),
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();

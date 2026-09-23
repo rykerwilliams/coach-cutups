@@ -1327,6 +1327,9 @@ component ExportSheet inherits Rectangle {
     /// How the scoreboard is carried: 0 Default (the target's own), 1 burned
     /// into the picture, 2 a separate track (spec M1).
     in-out property <int> scoreboard;
+    /// The whole match is ticked, and so the run may copy rather than
+    /// re-encode. `src/main.rs` owns it, beside the ticks themselves.
+    in property <bool> whole-match-ticked;
     callback tick(int, bool);
     callback start();
     callback cancel();
@@ -1398,10 +1401,13 @@ component ExportSheet inherits Rectangle {
                 enabled: !root.exporting;
                 current-index <=> root.scoreboard;
             }
-            // The only place the trade is spelled out, and only where it is
-            // being made (spec M1, N).
-            if root.scoreboard == 2: Text {
-                text: "Copied, not re-encoded; highlights and drawings can't ride a copy.";
+            // The only place the trade is spelled out, and it follows the
+            // **effective** mode rather than the picked one: the whole match
+            // is copied on Default too, and a coach told nothing has taken
+            // the trade without being asked (spec M1, N). Only the whole
+            // match is ever copied, so only its tick matters here.
+            if root.whole-match-ticked && root.scoreboard != 1: Text {
+                text: "The whole match is copied, not re-encoded: player highlights and pen drawings can't ride a copy.";
                 color: Palette.alternate-foreground;
                 font-size: 11px;
                 wrap: word-wrap;
@@ -1986,6 +1992,9 @@ export component AppWindow inherits Window {
     in-out property <int> export-resolution;
     in-out property <int> export-quality;
     in-out property <int> export-scoreboard;
+    /// Whether the whole-match row is ticked, which is what decides whether
+    /// the Scoreboard picker's explanatory line applies.
+    in property <bool> export-whole-match-ticked;
     /// The run in progress, and when it finishes; both from the bus's events,
     /// so a closed sheet reopens on the run it left.
     in property <[RunRow]> export-run;
@@ -3515,6 +3524,7 @@ export component AppWindow inherits Window {
                 resolution <=> root.export-resolution;
                 quality <=> root.export-quality;
                 scoreboard <=> root.export-scoreboard;
+                whole-match-ticked: root.export-whole-match-ticked;
                 tick(index, ticked) => { root.tick-target(index, ticked); }
                 start => { root.start-export(); }
                 cancel => { root.cancel-export(); }

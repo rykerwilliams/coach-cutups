@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{export_targets, Command, Event, TargetState, UserError};
-use video_coach_core::plan::{compilation_plan, ExportTarget, ScoreboardMode};
+use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Project, Quality, Resolution};
 use video_coach_core::reel::ReelSide;
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
 use video_coach_core::store::{self, EXPORTS_DIRNAME};
 use video_coach_core::stroke::Rgba;
 use video_coach_harness::{write_project, Harness};
-use video_coach_media::fixtures;
+use video_coach_media::fixtures::{self, ffprobe};
 
 /// A project called `Game` of fixture videos (name, seconds) and no clips,
 /// opened on a fresh bus.
@@ -253,10 +253,13 @@ fn the_whole_match_exports_with_the_matchs_own_chapters() {
         targets: vec![ExportTarget::WholeMatch],
         resolution: Resolution::R720,
         quality: Quality::Low,
-        // Burned in, which is the encoded path: these fixtures are WebM, and
-        // the copy Default would pick joins H.264 in MP4 alone (spec E2).
-        // The copy's own chapters are `media/tests/copy.rs`.
-        scoreboard: Some(ScoreboardMode::Burned),
+        // **Default, on WebM sources.** The copy Default reaches for joins
+        // H.264 in MP4 alone (spec E2), so this is also where the fallback is
+        // pinned: the board is burned in and the match re-encoded, as it was
+        // before the copy existed, rather than the export failing at a gate
+        // the coach never asked for. The copy's own chapters are
+        // `media/tests/copy.rs`.
+        scoreboard: None,
     });
     let done = p.h.wait_map("the run's outcome", |e| match e {
         Event::Export(run) if !run.is_running() => Some(run.clone()),
@@ -294,26 +297,10 @@ fn the_whole_match_exports_with_the_matchs_own_chapters() {
 
 /// `path`'s chapters as `ffprobe` reads them: `(start in seconds, title)`.
 ///
-/// `ffprobe` is the independent reader: GStreamer's `qtdemux` doesn't read
-/// `chpl`, and no released Rust MP4 crate parses it. Without it this fails,
-/// never skips: it is a test-only build dependency (`packaging/build-deps.txt`).
+/// The independent reader, because GStreamer's `qtdemux` doesn't read `chpl`
+/// and no released Rust MP4 crate parses it.
 fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-show_chapters", "-of", "json"])
-        .arg(path)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
-            )
-        });
-    assert!(
-        out.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    json["chapters"]
+    ffprobe(path, &["-show_chapters"])["chapters"]
         .as_array()
         .expect("a chapters array")
         .iter()

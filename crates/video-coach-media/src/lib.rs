@@ -22,8 +22,9 @@ pub use capture::{
 };
 pub use chapters::ChapterOutcome;
 pub use composite::avatar::{decode_still, drawn as avatar_drawn, Drawn, Still};
+pub use composite::copy::can_copy;
 pub use composite::export::{
-    EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
+    Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
 };
 pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPosition, PreviewStats};
 pub use composite::{frame_times, Gl};

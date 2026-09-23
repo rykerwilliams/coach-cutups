@@ -30,7 +30,7 @@
 
 pub(crate) mod audio;
 pub(crate) mod avatar;
-mod copy;
+pub(crate) mod copy;
 mod decode;
 pub mod export;
 pub mod preview;
@@ -155,10 +155,9 @@ impl Gl {
         Ok(Gl { display, context })
     }
 
-    /// Answers `pipeline`'s GL context requests with this display and
-    /// context, records its first `ERROR` in `watch`, and returns a flag set
-    /// at its `EOS`. `watched` sees every other message, on GStreamer's
-    /// threads. Every message is then dropped, so nothing piles up.
+    /// [`watch_bus`], plus answering `pipeline`'s GL context requests with
+    /// this display and context. `watched` sees every message neither of them
+    /// took.
     fn install(
         &self,
         pipeline: &gst::Pipeline,
@@ -166,27 +165,46 @@ impl Gl {
         watched: impl Fn(&gst::Message) + Send + Sync + 'static,
     ) -> Arc<AtomicBool> {
         let (display, context) = (self.display.clone(), self.context.clone());
-        let (error, eos) = (watch.error.clone(), Arc::new(AtomicBool::new(false)));
-        let flag = eos.clone();
-        pipeline
-            .bus()
-            .expect("a pipeline has a bus")
-            .set_sync_handler(move |_, msg| {
-                match msg.view() {
-                    gst::MessageView::NeedContext(need) => {
-                        answer_need_context(msg, need, &display, &context);
-                    }
-                    gst::MessageView::Error(err) => {
-                        let mut error = error.lock().expect("the error slot isn't poisoned");
-                        error.get_or_insert_with(|| crate::error_text(err));
-                    }
-                    gst::MessageView::Eos(_) => flag.store(true, Ordering::SeqCst),
-                    _ => watched(msg),
-                }
-                gst::BusSyncReply::Drop
-            });
-        eos
+        watch_bus(pipeline, watch, move |msg| match msg.view() {
+            gst::MessageView::NeedContext(need) => {
+                answer_need_context(msg, need, &display, &context);
+            }
+            _ => watched(msg),
+        })
     }
+}
+
+/// Records `pipeline`'s first `ERROR` in `watch` and returns a flag set at its
+/// `EOS`. `watched` sees every other message, on GStreamer's threads. Every
+/// message is then dropped, so nothing piles up.
+///
+/// **Every composite pipeline is watched through here**, the GL ones by way of
+/// [`Gl::install`]: the error slot a wait re-raises from is filled in one
+/// place, so a pipeline that posts an error can never be one nothing was
+/// listening to.
+#[must_use = "a pipeline that is taken to PLAYING ends at the EOS this reports"]
+fn watch_bus(
+    pipeline: &gst::Pipeline,
+    watch: &Watch,
+    watched: impl Fn(&gst::Message) + Send + Sync + 'static,
+) -> Arc<AtomicBool> {
+    let (error, eos) = (watch.error.clone(), Arc::new(AtomicBool::new(false)));
+    let flag = eos.clone();
+    pipeline
+        .bus()
+        .expect("a pipeline has a bus")
+        .set_sync_handler(move |_, msg| {
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    let mut error = error.lock().expect("the error slot isn't poisoned");
+                    error.get_or_insert_with(|| crate::error_text(err));
+                }
+                gst::MessageView::Eos(_) => flag.store(true, Ordering::SeqCst),
+                _ => watched(msg),
+            }
+            gst::BusSyncReply::Drop
+        });
+    eos
 }
 
 /// For each of `targets` (seconds, in the order given), the frame export
