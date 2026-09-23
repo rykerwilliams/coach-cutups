@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-22
 **Spec:** `docs/superpowers/specs/2026-09-22-avatar-recording-design.md` (decisions A–I). It proceeds on the defaults for Q1, Q3, Q4 and Q5; Q2 is settled by construction (the image is the mode).
-**Status:** Planned. Nothing built.
+**Status:** Built and shipped in 0.3.0 (`5f0d7e7`). Tasks 1-5 done; Task 4 moved to the GL inset pad after its entry-gate measurement refused the overlay route. Review applied (`f09e9f4`), checklist section 12 written. Q1's constants (growth 1.10, 60 ms attack, 220 ms release) await the user's verdict on a real take.
 
 **Scope.** The whole feature, in 6 tasks: format and maths, the camera-less recorder, the image, the render, the live corner, closeout. It needs no measurement it cannot take in the first minute of Task 4, and nothing here waits on the user.
 
