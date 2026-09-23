@@ -573,6 +573,13 @@ fn job(
         // events on the concat timeline (spec S2).
         scoreboard: ScoreboardContext::for_project(&open.project),
         highlights: open.project.player_highlights.clone(),
+        // The project's one image, snapshotted like everything else here: a
+        // pick or a removal while this run is going does not reach it (I6).
+        avatar: open
+            .project
+            .avatar
+            .as_ref()
+            .map(|file| open.folder.join(file)),
     };
     Ok(job)
 }

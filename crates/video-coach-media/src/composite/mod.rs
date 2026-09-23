@@ -48,7 +48,9 @@ use gstreamer_app as gst_app;
 use gstreamer_gl as gst_gl;
 use gstreamer_gl_egl as gst_gl_egl;
 use gstreamer_video as gst_video;
+use video_coach_core::avatar::avatar_rect;
 use video_coach_core::export::{FrameSpec, OUTPUT_FPS};
+use video_coach_core::layout::Rect as LayoutRect;
 use video_coach_core::zoom::Zoom;
 
 use crate::mailbox::{stream_end, stream_time};
@@ -275,8 +277,22 @@ fn install_overlay_pad(mix: &gst::Element, out_w: i32, out_h: i32) -> gst::Pad {
         .static_pad("sink_2")
         .expect("requested in the launch string");
     place(&pad, (0, 0, out_w, out_h), 2);
-    pad.set_property_from_str("blend-function-src-rgb", "one");
+    premultiplied_over(&pad);
     pad
+}
+
+/// Tells `pad` that the pixels reaching it are **premultiplied**: the source
+/// blend function becomes `one` rather than `src-alpha`, which is
+/// premultiplied-over for free on the GPU (the destination function already
+/// defaults to `one-minus-src-alpha`).
+///
+/// Both raster pads take it, because both carry a tiny-skia pixmap: the
+/// overlay's layer, and the avatar on the inset pad (spec E4). On the inset
+/// pad it costs a webcam nothing — at `a = 255` the two functions are the same
+/// multiplier, and the transparent filler is zero under either — so the pad
+/// carries one blend function for a whole run however its entries are mixed.
+fn premultiplied_over(pad: &gst::Pad) {
+    pad.set_property_from_str("blend-function-src-rgb", "one");
 }
 
 /// Waits until `appsrc` has room for another buffer, in [`POLL`]/5 steps.
@@ -345,14 +361,21 @@ fn frame_index(t: gst::ClockTime) -> u64 {
         / gst::ClockTime::SECOND.nseconds()
 }
 
+/// A mixer pad's rect in output pixels, `(x, y, width, height)`: what
+/// [`place`] takes, and the one place a sub-pixel `core::layout::Rect` is
+/// rounded to (see [`rounded`]).
+type PadRect = (i32, i32, i32, i32);
+
 /// One entry's mixer geometry, in output pixels.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Layout {
     /// The source's letterboxed picture rect: the base pad's.
-    picture: (i32, i32, i32, i32),
-    /// The webcam inset: the PiP pad's. A 1×1 rect while the entry has no
-    /// PiP, which is where its transparent filler lands, invisibly.
-    pip: (i32, i32, i32, i32),
+    picture: PadRect,
+    /// The inset: the PiP pad's, at full size. A 1×1 rect while the entry has
+    /// no inset at all, which is where its transparent filler lands,
+    /// invisibly; an avatar entry's is its image's own `pip_rect`, which
+    /// [`Schedule::inset`] then scales per frame with the pulse.
+    pip: PadRect,
 }
 
 /// What every PTS-keyed probe looks up: output frame `n`'s zoom, and the
@@ -371,6 +394,14 @@ struct Layout {
 struct Schedule {
     /// Shared with [`install_zoom`], which needs the frames and nothing else.
     frames: Arc<[FrameSpec]>,
+    /// The avatar's pulse: one level per output frame, and `1.0` wherever
+    /// nothing pulses (see [`pulsed`]).
+    ///
+    /// Per **frame**, where the layouts are per entry, because that is what
+    /// the pulse is. It is built in job setup from each avatar entry's own
+    /// commentary, beside the audio edit's regions: reading a whole file's
+    /// sound between two pushed frames would stall the pump (spec D5).
+    levels: Arc<[f64]>,
     /// One per plan entry, written by the pump and read on GStreamer's
     /// threads.
     layouts: Mutex<Vec<Layout>>,
@@ -378,9 +409,11 @@ struct Schedule {
 
 impl Schedule {
     /// A schedule of `frames` over `entries` entries, with no geometry yet.
-    fn new(frames: Vec<FrameSpec>, entries: usize) -> Arc<Schedule> {
+    fn new(frames: Vec<FrameSpec>, levels: Vec<f64>, entries: usize) -> Arc<Schedule> {
+        debug_assert_eq!(frames.len(), levels.len(), "one pulse level per frame");
         Arc::new(Schedule {
             frames: frames.into(),
+            levels: levels.into(),
             layouts: Mutex::new(vec![Layout::default(); entries]),
         })
     }
@@ -406,25 +439,77 @@ impl Schedule {
         let entry = self.spec(pts)?.entry;
         self.locked().get(entry).copied()
     }
+
+    /// The base pad's rect for the frame at `pts`: its entry's picture.
+    fn picture(&self, pts: gst::ClockTime) -> Option<PadRect> {
+        Some(self.layout(pts)?.picture)
+    }
+
+    /// The inset pad's rect for the frame at `pts`: its entry's inset, sized
+    /// by that frame's pulse.
+    fn inset(&self, pts: gst::ClockTime) -> Option<PadRect> {
+        let pip = self.layout(pts)?.pip;
+        // Past the table -- which nothing shipping reaches, since it is one
+        // level per frame of the run -- the inset stands still at full size,
+        // which is what every frame without an avatar does anyway.
+        let level = self
+            .levels
+            .get(frame_index(pts) as usize)
+            .copied()
+            .unwrap_or(1.0);
+        Some(pulsed(pip, level))
+    }
+}
+
+/// A sub-pixel layout rect as a mixer pad takes it. The pad is the one place
+/// the layout is rounded, so the same ratios land the same way at 720p and at
+/// 1080p (`core::layout::Rect`).
+fn rounded(rect: LayoutRect) -> PadRect {
+    (
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        rect.w.round() as i32,
+        rect.h.round() as i32,
+    )
+}
+
+/// The inset pad's rect for a frame whose avatar pulse reads `level`: `rect`
+/// scaled about its centre by `core::avatar`'s curve.
+///
+/// **Exactly `rect` at `level == 1.0`**, which is every frame that has no
+/// avatar — a camera entry, an entry with no inset at all, a reel piece. So
+/// the pulse costs those frames nothing, not even a rounding, and neither tail
+/// needs a branch that the other could get wrong.
+fn pulsed(rect: PadRect, level: f64) -> PadRect {
+    let (x, y, w, h) = rect;
+    rounded(avatar_rect(
+        LayoutRect {
+            x: f64::from(x),
+            y: f64::from(y),
+            w: f64::from(w),
+            h: f64::from(h),
+        },
+        level,
+    ))
 }
 
 /// Places `pad` where the frame's entry says as each buffer arrives, keyed on
-/// its PTS (see [`Schedule`]). `rect` picks which of the entry's rects is
+/// its PTS (see [`Schedule`]). `rect` picks which of the schedule's rects is
 /// this pad's; `zorder` is fixed for the run.
 fn install_geometry(
     pad: &gst::Pad,
     schedule: &Arc<Schedule>,
     zorder: u32,
-    rect: fn(&Layout) -> (i32, i32, i32, i32),
+    rect: fn(&Schedule, gst::ClockTime) -> Option<PadRect>,
 ) {
     let schedule = schedule.clone();
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
-        if let Some(layout) = info
+        if let Some(placed) = info
             .buffer()
             .and_then(|b| b.pts())
-            .and_then(|pts| schedule.layout(pts))
+            .and_then(|pts| rect(&schedule, pts))
         {
-            place(pad, rect(&layout), zorder);
+            place(pad, placed, zorder);
         }
         gst::PadProbeReturn::Ok
     });
@@ -511,7 +596,7 @@ fn display_aspect(info: &gst_video::VideoInfo) -> f64 {
 ///
 /// The overlay pad takes this same rect, so drawings land on the picture
 /// rather than across the bars (spec P4).
-fn fit_rect(info: &gst_video::VideoInfo, out_w: i32, out_h: i32) -> (i32, i32, i32, i32) {
+fn fit_rect(info: &gst_video::VideoInfo, out_w: i32, out_h: i32) -> PadRect {
     let aspect = display_aspect(info);
     let (ow, oh) = (f64::from(out_w), f64::from(out_h));
     let (w, h) = if aspect >= ow / oh {
@@ -523,7 +608,7 @@ fn fit_rect(info: &gst_video::VideoInfo, out_w: i32, out_h: i32) -> (i32, i32, i
 }
 
 /// Places `pad` at `(x, y, w, h)` in the mixer's output, at `zorder`.
-fn place(pad: &gst::Pad, (x, y, w, h): (i32, i32, i32, i32), zorder: u32) {
+fn place(pad: &gst::Pad, (x, y, w, h): PadRect, zorder: u32) {
     pad.set_property("xpos", x);
     pad.set_property("ypos", y);
     pad.set_property("width", w);

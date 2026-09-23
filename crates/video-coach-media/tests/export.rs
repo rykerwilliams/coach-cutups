@@ -141,6 +141,7 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     }
 }
 
@@ -348,6 +349,7 @@ fn fiducial(kind: CounterKind) {
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     })
     .unwrap();
     assert_eq!(done.path, path);
@@ -458,6 +460,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     })
     .unwrap();
 
@@ -774,6 +777,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             quality: Quality::Medium,
             scoreboard: None,
             highlights: Vec::new(),
+            avatar: None,
         },
         path,
     )
@@ -933,6 +937,7 @@ fn the_export_burns_in_the_scoreboard() {
         quality: Quality::Medium,
         scoreboard: ScoreboardContext::for_project(&project),
         highlights: Vec::new(),
+        avatar: None,
     })
     .unwrap();
 
@@ -972,6 +977,258 @@ fn show_pip_off_leaves_the_inset_empty_and_the_export_running() {
     assert_rgb(frame, "the picture", (300, 200), BLUE);
 }
 
+const RED: u32 = 0x00ff_0000;
+
+/// How wide the avatar is across the inset's centre row, in pixels.
+///
+/// The avatar is one flat red and every source here is blue, so the count of
+/// red pixels along that row is the drawn circle's diameter — which is the
+/// pulse, and nothing else. It scans a little either side of `pip` so a circle
+/// that grew past its rect would be counted rather than clipped.
+fn avatar_width(frame: &fixtures::RgbFrame, pip: &LayoutRect) -> usize {
+    let y = (pip.y + pip.h / 2.0) as usize;
+    let red = |x: usize| {
+        let px = frame.at(x, y);
+        i32::from(px[0]) - i32::from(px[2]) > 80
+    };
+    ((pip.x as usize - 16)..(pip.x + pip.w) as usize + 16)
+        .filter(|&x| red(x))
+        .count()
+}
+
+/// The avatar rides the inset pad and **the commentary sizes it**: the image
+/// spans `pip_rect` while the coach is talking and settles to
+/// `1 / PULSE_GROWTH` of it when they stop (spec E1, E3).
+///
+/// The recording is loud for its first second and silent for its second, so
+/// one export carries both ends of the pulse and the same frames prove it
+/// never exceeds the rect a webcam would have had (spec I4).
+#[test]
+fn an_avatar_clip_pulses_in_the_export() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 60, BLUE, false);
+    // An avatar take's own file has no video track. This one has one and it is
+    // never opened: `shows_avatar` takes the pad before the probe would.
+    let recording = fixtures::tone_video(
+        &dir.path().join("rec.mkv"),
+        64,
+        64,
+        30,
+        60,
+        fixtures::Tone {
+            freq: 440.0,
+            amplitude: 0.9,
+            window: Some((0.0, 1.0)),
+        },
+    );
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let clip = Clip {
+        show_pip: true,
+        inset: Inset::Avatar,
+        ..clip(0.0, 2.0, Vec::new())
+    };
+    let frames: Vec<FrameSpec> = (0..60)
+        .map(|_| FrameSpec {
+            entry: 0,
+            source_time: 0.5,
+            zoom: Zoom::IDENTITY,
+        })
+        .collect();
+    let path = dir.path().join("out.mp4");
+    let compilation = one_entry(&clip, frames, "");
+    let total = compilation.frames.len();
+    export(ExportJob {
+        compilation,
+        sources: vec![source],
+        entries: vec![Some(EntryMedia { recording, clip })],
+        audio: Vec::new(),
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: None,
+        highlights: Vec::new(),
+        avatar: Some(avatar),
+    })
+    .unwrap();
+
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(out.len(), total, "one output frame per schedule frame");
+    // A square image, so the inset is the square `pip_rect` and the circle
+    // inscribed in it spans the whole of it at full size.
+    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    // Frame 25 is 0.83 s in, well inside the tone; frame 59 is 0.97 s after
+    // it stopped, which is four release constants.
+    let loud = avatar_width(&out[25], &pip);
+    let quiet = avatar_width(&out[59], &pip);
+    let full = pip.w.round() as usize;
+    let rest = (pip.w / video_coach_core::avatar::PULSE_GROWTH).round() as usize;
+    let near = |got: usize, want: usize| got.abs_diff(want) <= 10;
+    assert!(
+        near(loud, full),
+        "the avatar is {loud} px wide while the coach talks, not {full}"
+    );
+    assert!(
+        near(quiet, rest),
+        "the avatar is {quiet} px wide in the silence, not {rest}"
+    );
+    assert!(
+        loud > quiet + 15,
+        "the avatar does not pulse: {loud} px loud against {quiet} px quiet"
+    );
+    // And it is centred where a webcam's inset would be, never wider.
+    let centre = (
+        (pip.x + pip.w / 2.0) as usize,
+        (pip.y + pip.h / 2.0) as usize,
+    );
+    assert_rgb(&out[25], "the avatar", centre, RED);
+    assert_rgb(&out[59], "the resting avatar", centre, RED);
+    assert!(loud <= full + 2, "the avatar is wider than the inset rect");
+}
+
+/// One compilation, an avatar entry and then a camera one: the inset pad
+/// carries the avatar's texture and then the recording's frames, a caps change
+/// on a pad whose caps **feature** never changes (spec I2, E2). A
+/// system-memory avatar would break the second entry's `glupload` here.
+#[test]
+fn an_avatar_and_a_camera_clip_export_together() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 90, BLUE, false);
+    let spoken = fixtures::tone_video(
+        &dir.path().join("spoken.mkv"),
+        64,
+        64,
+        30,
+        30,
+        fixtures::Tone {
+            freq: 440.0,
+            amplitude: 0.9,
+            window: None,
+        },
+    );
+    let webcam = fixtures::solid_video(&dir.path().join("cam.webm"), 640, 360, 30, 30, GREEN, true);
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let seconds = 0.6;
+    let clips: Vec<Clip> = [Inset::Avatar, Inset::Camera]
+        .into_iter()
+        .map(|inset| Clip {
+            id: Uuid::new_v4(),
+            show_pip: true,
+            inset,
+            ..clip(0.0, seconds, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[3.0]);
+    let per_entry = compilation.plan.entries[0].frames;
+    let total = compilation.frames.len();
+    let path = dir.path().join("out.mp4");
+    export(ExportJob {
+        audio: audio_regions(&compilation, &Preferences::default()),
+        compilation,
+        sources: vec![source],
+        entries: clips
+            .iter()
+            .zip([spoken, webcam])
+            .map(|(clip, recording)| {
+                Some(EntryMedia {
+                    recording,
+                    clip: clip.clone(),
+                })
+            })
+            .collect(),
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: None,
+        highlights: Vec::new(),
+        avatar: Some(avatar),
+    })
+    .unwrap();
+
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(out.len(), total, "one output frame per schedule frame");
+    // The avatar's inset is square and the webcam's is 16:9, so each entry's
+    // own centre is the honest place to read it.
+    let at = |aspect: f64| {
+        let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), aspect);
+        (
+            (pip.x + pip.w / 2.0) as usize,
+            (pip.y + pip.h / 2.0) as usize,
+        )
+    };
+    assert_rgb(
+        &out[per_entry / 2],
+        "the avatar entry's inset",
+        at(1.0),
+        RED,
+    );
+    assert_rgb(
+        &out[per_entry + per_entry / 2],
+        "the camera entry's inset",
+        at(16.0 / 9.0),
+        GREEN,
+    );
+}
+
+/// The avatar image having gone under the project costs the inset and not the
+/// run (spec A4): the pad takes the filler, and the export produces its file.
+#[test]
+fn a_missing_avatar_image_costs_the_inset_not_the_run() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 30, BLUE, false);
+    let clip = Clip {
+        show_pip: true,
+        inset: Inset::Avatar,
+        ..clip(0.0, 0.4, Vec::new())
+    };
+    let frames: Vec<FrameSpec> = (0..12)
+        .map(|_| FrameSpec {
+            entry: 0,
+            source_time: 0.5,
+            zoom: Zoom::IDENTITY,
+        })
+        .collect();
+    let path = dir.path().join("out.mp4");
+    let compilation = one_entry(&clip, frames, "");
+    let total = compilation.frames.len();
+    export(ExportJob {
+        compilation,
+        sources: vec![source],
+        entries: vec![Some(EntryMedia {
+            recording: dir.path().join("rec.mkv"),
+            clip,
+        })],
+        audio: Vec::new(),
+        path: path.clone(),
+        resolution: Resolution::R720,
+        quality: Quality::Medium,
+        scoreboard: None,
+        highlights: Vec::new(),
+        avatar: Some(dir.path().join("gone.png")),
+    })
+    .unwrap();
+
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(
+        out.len(),
+        total,
+        "the export lost frames to a missing image"
+    );
+    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    let centre = (
+        (pip.x + pip.w / 2.0) as usize,
+        (pip.y + pip.h / 2.0) as usize,
+    );
+    assert_rgb(
+        out.last().expect("frames out"),
+        "the empty inset",
+        centre,
+        BLUE,
+    );
+}
+
 /// A one-clip export of `clip` from `source`, with its sound: the audio edit
 /// core derives from the same compilation, at the default volumes.
 fn sounded_job(
@@ -992,6 +1249,7 @@ fn sounded_job(
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     }
 }
 
@@ -1187,6 +1445,7 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     })
     .unwrap();
 
@@ -1377,6 +1636,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
+        avatar: None,
     })
     .unwrap();
     assert_eq!(done.chapters, ChapterOutcome::Written(3));

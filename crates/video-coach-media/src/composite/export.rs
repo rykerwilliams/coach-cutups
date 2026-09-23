@@ -4,7 +4,8 @@
 //! ```text
 //! pad 0, z 0: the pumped source frame through `gltransformation` (zoom), at
 //!             that entry's fit rect
-//! pad 1, z 1: the entry's webcam recording, at the PiP rect
+//! pad 1, z 1: the entry's inset -- its webcam recording, or the project's
+//!             avatar, at the PiP rect (the avatar's scaled by the pulse)
 //! pad 2, z 2: the overlay -- drawings, the text bar and the scoreboard --
 //!             at the output size
 //! ```
@@ -17,7 +18,7 @@
 //! receives one produced no output at all and backed the base `appsrc` up,
 //! with no error (measured), so an entry with the PiP off, or with a recording
 //! that can't be read, pushes a 1×1 transparent pixel instead — in GL memory,
-//! like the recording's own frames (see [`Filler`]).
+//! like the recording's own frames (see [`Texture`]).
 //!
 //! **Caps may change from the pushing thread; geometry may not.** Every
 //! `appsrc` takes a mid-stream caps change and it lands on exactly the right
@@ -46,9 +47,9 @@ use video_coach_core::scoreboard::ScoreboardContext;
 use super::audio::Mixer;
 use super::decode::Decoder;
 use super::{
-    audio, fit_rect, frame_time, head, install_geometry, install_overlay_pad, install_zoom,
-    overlay_branch, push_buffer, stamp, stamp_buffer, CompositeError, Gl, Layout, Schedule,
-    Stopper, Watch, POLL, QUEUED,
+    audio, avatar, fit_rect, frame_time, head, install_geometry, install_overlay_pad, install_zoom,
+    overlay_branch, premultiplied_over, push_buffer, rounded, stamp, stamp_buffer, CompositeError,
+    Gl, Layout, PadRect, Schedule, Stopper, Watch, POLL, QUEUED,
 };
 use crate::chapters::{self, ChapterOutcome};
 use crate::overlay::{OverlayFrame, OverlayRenderer};
@@ -56,7 +57,7 @@ use crate::player::{gl_caps, seconds_to_clock, Diagnostics};
 
 /// Where the PiP's filler lands: one transparent pixel, so the rect is only
 /// something for `glvideomixer` to scale nothing into.
-const FILLER_RECT: (i32, i32, i32, i32) = (0, 0, 1, 1);
+const FILLER_RECT: PadRect = (0, 0, 1, 1);
 
 /// Why an export produced no file. The composite's error under export's name,
 /// which the bus and the UI have always used.
@@ -94,6 +95,10 @@ pub struct ExportJob {
     /// They belong to the footage rather than to a clip (spec H1), so an entry
     /// with no clip — a reel piece — gets them too.
     pub highlights: Vec<PlayerHighlight>,
+    /// The project's avatar image, or `None` for a project that records on
+    /// camera. One image for the project, so one path for the run: every
+    /// entry whose clip `shows_avatar` draws this one (spec A1, I6).
+    pub avatar: Option<PathBuf>,
 }
 
 /// What one entry needs beside its `PlanEntry`, which carries the edit but
@@ -266,7 +271,25 @@ fn export(
     };
     let (out_w, out_h) = output_size(job.resolution);
     let plan = &job.compilation.plan;
-    let schedule = Schedule::new(job.compilation.frames.clone(), plan.entries.len());
+    // The avatar and its pulse, before anything is pushed: one decode and one
+    // upload for the run, and one pass over each avatar entry's commentary
+    // (spec D5, E2). Both belong here, beside the audio edit's regions, and
+    // neither belongs beside `Pip::open`, which runs inside the loop. And both
+    // only when an entry asks for one: an avatar project exporting a
+    // compilation of camera clips decodes nothing and reports nothing.
+    let avatar = job
+        .entries
+        .iter()
+        .flatten()
+        .any(|media| media.clip.shows_avatar())
+        .then_some(job.avatar.as_deref())
+        .flatten()
+        .and_then(|path| AvatarInset::open(path, &gl, &watch, (out_w, out_h)));
+    let levels = match avatar {
+        Some(_) => pulse_levels(job, cancel),
+        None => vec![1.0; job.compilation.frames.len()],
+    };
+    let schedule = Schedule::new(job.compilation.frames.clone(), levels, plan.entries.len());
 
     // One decoder per distinct source, alive for the whole compilation: a
     // compilation normally walks one match video over and over, and reopening
@@ -306,7 +329,7 @@ fn export(
             let info = gst_video::VideoInfo::from_caps(&caps)
                 .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
             picture = fit_rect(&info, out_w, out_h);
-            pip = Pip::open(media, &gl, cancel, (out_w, out_h));
+            pip = Pip::open(media, avatar.as_ref(), &gl, cancel, (out_w, out_h));
             // Before the push, so the pad probes find it (see `Schedule`).
             schedule.set_layout(
                 frame.entry,
@@ -417,39 +440,58 @@ fn set_caps(appsrc: &gst_app::AppSrc, caps: &gst::Caps) {
     }
 }
 
-/// One entry's picture-in-picture: its recording's decoder and where it lands.
+/// One entry's inset: what the pad carries for it, and where that lands.
 ///
 /// The pad is fed every frame whatever happens here, because an unfed pad
-/// stalls the whole export (measured). `show_pip` off, a recording that isn't
-/// there, one with no video, one that stops decoding mid-entry: each of them
-/// ends up pushing the 1×1 transparent filler, and the export goes on.
+/// stalls the whole export (measured). `show_pip` off, an avatar whose image
+/// is gone, a recording that isn't there, one with no video, one that stops
+/// decoding mid-entry: each of them ends up pushing the 1×1 transparent filler,
+/// and the export goes on.
 struct Pip {
-    /// `None` means the filler.
-    decoder: Option<Decoder>,
+    source: Source,
     /// The recording's own errors, kept off the export's [`Watch`]: a
     /// recording that gives up costs the inset, not the run.
     errors: Arc<Mutex<Option<String>>>,
-    /// The pad's rect, from the recording's **probed** display aspect — never
-    /// from the pushed caps, whose 1×1 filler would make the inset square.
-    rect: (i32, i32, i32, i32),
+    /// The pad's rect at full size, from the recording's **probed** display
+    /// aspect or the avatar image's — never from the pushed caps, whose 1×1
+    /// filler would make the inset square. The pulse scales it per frame, in
+    /// the pad's own probe (`Schedule::inset`).
+    rect: PadRect,
+}
+
+/// What the inset pad carries for an entry.
+enum Source {
+    /// The entry's webcam recording, decoded frame by frame.
+    Camera(Decoder),
+    /// The project's avatar: the one texture the run uploaded, re-stamped
+    /// every frame, sized by the pulse in the pad's rect (spec E2, E3).
+    Avatar(Texture),
+    /// Nothing to show: the 1×1 transparent filler, every frame.
+    Empty,
 }
 
 impl Pip {
     /// No inset: the pad takes the filler for every frame of the entry.
     fn filler() -> Pip {
         Pip {
-            decoder: None,
+            source: Source::Empty,
             errors: Arc::default(),
             rect: FILLER_RECT,
         }
     }
 
-    /// Opens the entry's recording, or falls back to the filler, saying on
-    /// stderr why. A missing PiP is a smaller loss than a failed export of an
-    /// hour of video. An entry with no media, or a clip with `show_pip` off,
-    /// takes the filler silently.
+    /// What this entry's inset is, from the two predicates `core` states it in
+    /// (spec B3, E5) — **before the probe**, which would call an avatar
+    /// recording's missing video track a missing picture-in-picture.
+    ///
+    /// A webcam recording that will not open falls back to the filler, saying
+    /// on stderr why: a missing inset is a smaller loss than a failed export of
+    /// an hour of video. An entry with no media, a clip with `show_pip` off and
+    /// an avatar whose image is gone take the filler silently — the image was
+    /// reported once for the run, by [`AvatarInset::open`].
     fn open(
         media: Option<&EntryMedia>,
+        avatar: Option<&AvatarInset>,
         gl: &Gl,
         cancel: &AtomicBool,
         (out_w, out_h): (i32, i32),
@@ -457,7 +499,18 @@ impl Pip {
         let Some(EntryMedia { recording, clip }) = media else {
             return Pip::filler();
         };
-        if !clip.show_pip {
+        if clip.shows_avatar() {
+            return match avatar {
+                Some(avatar) => Pip {
+                    // A reference to the run's one texture, not a copy of it.
+                    source: Source::Avatar(avatar.texture.clone()),
+                    errors: Arc::default(),
+                    rect: avatar.rect,
+                },
+                None => Pip::filler(),
+            };
+        }
+        if !clip.shows_camera_pip() {
             return Pip::filler();
         }
         let refuse = |why: String| {
@@ -479,21 +532,11 @@ impl Pip {
             error: errors.clone(),
         };
         match Decoder::start(recording, gl, &watch) {
-            Ok(decoder) => {
-                let rect = pip_rect(f64::from(out_w), f64::from(out_h), aspect);
-                Pip {
-                    decoder: Some(decoder),
-                    errors,
-                    // The mixer pad is the one place the sub-pixel layout is
-                    // rounded.
-                    rect: (
-                        rect.x.round() as i32,
-                        rect.y.round() as i32,
-                        rect.w.round() as i32,
-                        rect.h.round() as i32,
-                    ),
-                }
-            }
+            Ok(decoder) => Pip {
+                source: Source::Camera(decoder),
+                errors,
+                rect: rounded(pip_rect(f64::from(out_w), f64::from(out_h), aspect)),
+            },
             Err(e) => refuse(e.to_string()),
         }
     }
@@ -510,18 +553,19 @@ impl Pip {
         n: u64,
         record_time: f64,
         cancel: &AtomicBool,
-        filler: &Filler,
+        filler: &Texture,
     ) -> (gst::Buffer, gst::Caps) {
+        if let Source::Avatar(texture) = &self.source {
+            // The same texture every frame; only the pad's rect moves.
+            return texture.stamped(n);
+        }
         if let Some(decoded) = self.decode(n, record_time, cancel) {
             return decoded;
         }
         // Whatever went wrong won't get better: the rest of the entry takes
         // the filler rather than retrying the recording once a frame.
-        self.decoder = None;
-        // A reference to the one texture, not a copy of it.
-        let mut buffer = filler.buffer.copy();
-        stamp_buffer(&mut buffer, n);
-        (buffer, filler.caps.clone())
+        self.source = Source::Empty;
+        filler.stamped(n)
     }
 
     /// The recording's frame at `record_time`, or `None` once there is no
@@ -533,7 +577,9 @@ impl Pip {
         cancel: &AtomicBool,
     ) -> Option<(gst::Buffer, gst::Caps)> {
         let errors = self.errors.clone();
-        let decoder = self.decoder.as_mut()?;
+        let Source::Camera(decoder) = &mut self.source else {
+            return None;
+        };
         let watch = Watch {
             cancel,
             error: errors,
@@ -553,34 +599,62 @@ impl Pip {
     }
 }
 
-/// The PiP pad's stand-in: one 1×1 transparent RGBA frame **in GL memory**,
-/// uploaded once and re-stamped for every frame with no inset. The pad scales
-/// it to whatever rect it has, and a transparent pixel is invisible however
-/// big (measured).
+/// One still RGBA image **in GL memory**, uploaded once and re-stamped for
+/// every frame that shows it: the inset pad's 1×1 transparent filler
+/// ([`Texture::filler`]), and the project's avatar ([`AvatarInset`]). The pad
+/// scales it to whatever rect it has — a transparent pixel is invisible
+/// however big (measured), and the avatar's rect is the pulse.
 ///
 /// **It has to be GL memory, because the pad's caps feature may not change.**
 /// The recording decodes to GL, so a system-memory filler made the branch's
 /// `glupload` take GL frames and then a system-memory one, which it refuses
 /// ("Failed to upload buffer"): any target whose first entry has no inset and
 /// whose second has one died there (reproduced). Uploaded here, the pad
-/// carries GL memory from the first frame to the last, and only the size
-/// changes — which GL to GL takes.
-struct Filler {
+/// carries GL memory from the first frame to the last, and only the caps
+/// change — which GL to GL takes. A mixed avatar-and-camera compilation is
+/// that same case (spec I2).
+///
+/// **Premultiplied, like the overlay's layer**: the pixels come from a
+/// tiny-skia pixmap and the pad is told so (`premultiplied_over`, spec E4).
+#[derive(Clone)]
+struct Texture {
     buffer: gst::Buffer,
     caps: gst::Caps,
 }
 
-impl Filler {
-    /// Uploads the pixel on `gl`, through a pipeline of its own that is gone
-    /// by the time this returns. The texture outlives it: the buffer holds it,
-    /// and `gl`'s context is the process's ([`Gl::shared`]).
-    fn new(gl: &Gl, watch: &Watch) -> Result<Filler, ExportError> {
+impl Texture {
+    /// The inset pad's stand-in: one transparent pixel.
+    fn filler(gl: &Gl, watch: &Watch) -> Result<Texture, ExportError> {
+        Texture::upload(gl, watch, 1, 1, vec![0; 4])
+    }
+
+    /// This texture as output frame `n`, with the caps it must be pushed
+    /// under: a new buffer header over the **same texture**, never a copy of
+    /// the pixels.
+    fn stamped(&self, n: u64) -> (gst::Buffer, gst::Caps) {
+        let mut buffer = self.buffer.copy();
+        stamp_buffer(&mut buffer, n);
+        (buffer, self.caps.clone())
+    }
+
+    /// Uploads `rgba` (`w`×`h`, tightly packed) on `gl`, through a pipeline of
+    /// its own that is gone by the time this returns. The texture outlives it:
+    /// the buffer holds it, and `gl`'s context is the process's
+    /// ([`Gl::shared`]).
+    fn upload(
+        gl: &Gl,
+        watch: &Watch,
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    ) -> Result<Texture, ExportError> {
+        debug_assert_eq!(rgba.len(), (w * h * 4) as usize, "tightly packed RGBA");
         let pipeline = gst::parse::launch(&format!(
             "appsrc name=src format=time is-live=false block=false \
-               caps=video/x-raw,format=RGBA,width=1,height=1,framerate={OUTPUT_FPS}/1 \
+               caps=video/x-raw,format=RGBA,width={w},height={h},framerate={OUTPUT_FPS}/1 \
              ! glupload ! glcolorconvert ! appsink name=out sync=false"
         ))
-        .map_err(|e| ExportError::Failed(format!("could not build the filler graph: {e}")))?
+        .map_err(|e| ExportError::Failed(format!("could not build the upload graph: {e}")))?
         .downcast::<gst::Pipeline>()
         .expect("a multi-element launch string yields a pipeline");
         let by_name = |n: &str| pipeline.by_name(n).expect("named in the launch string");
@@ -594,32 +668,97 @@ impl Filler {
         gl.install(&pipeline, watch, |_| {});
         let pipeline = Stopper(pipeline);
         if pipeline.set_state(gst::State::Playing).is_err() {
-            return Err(watch.failure("could not start the filler graph"));
+            return Err(watch.failure("could not start the upload graph"));
         }
 
-        let mut buffer = gst::Buffer::from_slice([0u8; 4]);
+        let mut buffer = gst::Buffer::from_mut_slice(rgba);
         stamp_buffer(&mut buffer, 0);
         src.push_buffer(buffer)
-            .map_err(|e| watch.failure(format!("pushing the filler pixel: {e:?}")))?;
+            .map_err(|e| watch.failure(format!("uploading a {w}x{h} still: {e:?}")))?;
         let _ = src.end_of_stream();
         loop {
             watch.check()?;
             if let Some(sample) = sink.try_pull_sample(POLL) {
                 let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) else {
                     return Err(ExportError::Failed(
-                        "the filler pixel came back bare".into(),
+                        "an uploaded still came back bare".into(),
                     ));
                 };
-                return Ok(Filler {
+                return Ok(Texture {
                     buffer: buffer.copy(),
                     caps: caps.to_owned(),
                 });
             }
             if sink.is_eos() {
-                return Err(watch.failure("the filler pixel did not upload"));
+                return Err(watch.failure(format!("a {w}x{h} still did not upload")));
             }
         }
     }
+}
+
+/// The project's avatar, ready for the inset pad: one texture for the whole
+/// run, and the rect it fills at its loudest.
+struct AvatarInset {
+    texture: Texture,
+    /// `layout::pip_rect` for the **image's** aspect, so a tall portrait gets
+    /// a tall inset in the same column a webcam's would have (spec A3). The
+    /// pulse scales it per frame (`Schedule::inset`).
+    rect: PadRect,
+}
+
+impl AvatarInset {
+    /// Decodes, pre-scales and uploads the project's avatar, or says on stderr
+    /// why there is none.
+    ///
+    /// **Once for the run, and a failure costs the inset rather than the
+    /// export** (spec A4) — one line, not one per entry. An image that has
+    /// gone under the project is exactly as fatal as a picture-in-picture that
+    /// will not open, which is to say not at all: the entries that wanted it
+    /// take the filler and the file is written.
+    fn open(
+        path: &Path,
+        gl: &Gl,
+        watch: &Watch,
+        (out_w, out_h): (i32, i32),
+    ) -> Option<AvatarInset> {
+        let refuse = |why: String| {
+            eprintln!("export: no avatar from {}: {why}", path.display());
+            None
+        };
+        let avatar = match avatar::open(path, f64::from(out_w), f64::from(out_h)) {
+            Ok(avatar) => avatar,
+            Err(e) => return refuse(e),
+        };
+        let (w, h) = (avatar.image.width(), avatar.image.height());
+        match Texture::upload(gl, watch, w, h, avatar.image.data().to_vec()) {
+            Ok(texture) => Some(AvatarInset {
+                texture,
+                rect: rounded(avatar.rect),
+            }),
+            Err(e) => refuse(e.to_string()),
+        }
+    }
+}
+
+/// One pulse level per output frame of the run: an avatar entry's from its own
+/// commentary, and `1.0` everywhere else — which `pulsed` maps to exactly the
+/// inset rect, so nothing but an avatar moves (spec E3).
+///
+/// Called only once the image has opened: an entry that will take the filler
+/// must keep its level at 1.0, since scaling a 1×1 filler rect would round it
+/// away.
+fn pulse_levels(job: &ExportJob, cancel: &AtomicBool) -> Vec<f64> {
+    let mut levels = vec![1.0; job.compilation.frames.len()];
+    for (entry, media) in job.compilation.plan.entries.iter().zip(&job.entries) {
+        let Some(media) = media.as_ref().filter(|m| m.clip.shows_avatar()) else {
+            continue;
+        };
+        let table = avatar::pulse_table(&media.recording, entry.frames, cancel);
+        for (slot, level) in levels.iter_mut().skip(entry.start_frame).zip(table) {
+            *slot = level;
+        }
+    }
+    levels
 }
 
 /// The H.264 encoders export can use, in preference order, with their
@@ -666,7 +805,7 @@ struct Encoder {
     /// The mixed sound, straight into the muxer's AAC branch.
     audio: gst_app::AppSrc,
     /// What the PiP pad takes whenever there is no inset to show.
-    filler: Filler,
+    filler: Texture,
     name: &'static str,
     /// Set when the file is complete.
     eos: Arc<AtomicBool>,
@@ -704,7 +843,7 @@ impl Encoder {
                 "no AAC encoder: install gstreamer1.0-libav (avenc_aac)".into(),
             ));
         }
-        let filler = Filler::new(gl, watch)?;
+        let filler = Texture::filler(gl, watch)?;
         let inject = inject.map(|i| format!("{i} ! ")).unwrap_or_default();
         // The readback before the encoder is required, and so is the queue.
         //
@@ -750,11 +889,16 @@ impl Encoder {
             mix.static_pad(name)
                 .expect("requested in the launch string")
         };
-        // The base and the PiP move with the entry, so their rects come from
-        // the schedule keyed on each buffer's PTS. The overlay is the whole
-        // output frame for the whole run.
-        install_geometry(&mix_pad("sink_0"), schedule, 0, |l| l.picture);
-        install_geometry(&mix_pad("sink_1"), schedule, 1, |l| l.pip);
+        // The base and the inset move with the entry — and the inset with the
+        // pulse besides — so their rects come from the schedule keyed on each
+        // buffer's PTS. The overlay is the whole output frame for the whole
+        // run.
+        install_geometry(&mix_pad("sink_0"), schedule, 0, Schedule::picture);
+        let inset_pad = mix_pad("sink_1");
+        install_geometry(&inset_pad, schedule, 1, Schedule::inset);
+        // The avatar reaching this pad is a premultiplied pixmap; a webcam
+        // frame and the filler blend the same either way (spec E4).
+        premultiplied_over(&inset_pad);
         install_overlay_pad(&mix, out_w, out_h);
         install_zoom(&by_name("zoom"), &schedule.frames);
 
@@ -938,6 +1082,7 @@ mod tests {
             quality: Quality::Medium,
             scoreboard: None,
             highlights: Vec::new(),
+            avatar: None,
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();

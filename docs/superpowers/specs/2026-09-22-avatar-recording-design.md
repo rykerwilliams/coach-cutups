@@ -1,7 +1,7 @@
 # Avatar recording: a picture that talks instead of a webcam
 
 **Date:** 2026-09-22
-**Status:** Reviewed (simplify + correctness applied). The user decided, 2026-09-22: one image per project; a smoothed pulse with the voice; **it pulses live in the corner while recording *and* is rendered from the recorded audio in previews and exports**; the camera is never opened in avatar mode; and the avatar rests slightly smaller than the webcam inset, reaching exactly the inset at its loudest. Open questions at the end; the plan proceeds on each one's default unless the user says otherwise.
+**Status:** Reviewed (simplify + correctness applied). **Section E was rewritten on 2026-09-22 after its own measurement refused it** (E1): the avatar is drawn on the GL inset pad, not in the tiny-skia overlay. The user decided, 2026-09-22: one image per project; a smoothed pulse with the voice; **it pulses live in the corner while recording *and* is rendered from the recorded audio in previews and exports**; the camera is never opened in avatar mode; and the avatar rests slightly smaller than the webcam inset, reaching exactly the inset at its loudest. Open questions at the end; the plan proceeds on each one's default unless the user says otherwise.
 **Builds on:** Phase 4 (the recorder, the self-view, the recording lifecycle), Phase 7 (the composite, the overlay, the PiP pad, `layout.rs`), Phase 8 (the export graph, the audio mix), Phase 10 (the 16 kHz `Reader`), Match Vision F (the format-bump rules)
 **Evidence:**
 
@@ -47,7 +47,7 @@ One thing is explicitly out of scope: any change to how clips, drawings, zoom, t
 - `Project.avatar: Option<String>` holds its **file name**, not a path. `None` means no image has been picked, which is also what "record on camera" means (B1). Storing the name rather than a fixed constant keeps the original extension, which is what lets the file be opened by a file manager and named back to the decoder without a sniff.
 - **Why a copy and not a reference:** a project already refuses to lose data to a moved file for its own writable assets. Sources are referenced and have a relink flow (`SourceRef.relative_path`, `project.rs:96-109`); the avatar has no relink flow and does not deserve one. Copying makes the project folder self-contained, which is also what makes it safe to move between machines.
 - **Formats: PNG and JPEG, and nothing else.** Not "whatever GStreamer happens to have": the set has to be one the pick-time check, the render and the corner all agree on, and `pngdec` and `jpegdec` are already runtime dependencies (`jpegdec` is in the self-view chain, `crates/video-coach-media/src/capture/self_view.rs:135-140`), so nothing joins `packaging/build-deps.txt` or the smoke test's element list. The pick is refused by **what decoded**, not by the extension: a `.png` that is really a TIFF is refused because the decode says so.
-- **Transparency is kept.** The overlay layer is premultiplied RGBA and the mixer pad is already told so (`crates/video-coach-media/src/overlay.rs:26-31`), so a cut-out PNG floats over the picture with no plate behind it. See A3 on what that means for the copy into the pixmap.
+- **Transparency is kept.** The inset's mixer pad blends premultiplied RGBA (E4), the way the overlay's already does (`crates/video-coach-media/src/overlay.rs:26-31`), so a cut-out PNG floats over the picture with no plate behind it. See A3 on what that means for the copy into the pixmap.
 
 **A2. Picking one is: decode, copy, save. Removing one is: clear, delete.**
 
@@ -70,8 +70,8 @@ Replacing the image replaces it for the whole project, including clips already r
 
 ```rust
 pub(super) struct Avatar {
-    /// Pre-scaled to the run's largest drawn size, so the per-frame blit is
-    /// never an upscale and barely a downscale. **Premultiplied** (see below).
+    /// Pre-scaled to the run's largest drawn size, so the pad's per-frame
+    /// scale is never an upscale. **Premultiplied** (see below).
     image: tiny_skia::Pixmap,
     /// `layout::pip_rect(out_w, out_h, <the image's display aspect>)`: the
     /// inset's footprint at its loudest. The aspect is not stored separately
@@ -93,7 +93,7 @@ pub fn decode_still(path: &Path) -> Result<Still, String>;   // { w, h, rgba: Ve
 - The pipeline is `filesrc ! decodebin3 ! videoflip video-direction=auto ! videoconvert ! video/x-raw,format=RGBA,pixel-aspect-ratio=1/1 ! appsink`, with a bounded wait, **one sample pulled** and the pipeline set to NULL. `decodebin3`, never `decodebin` (CLAUDE.md).
   - **`videoflip video-direction=auto`** reads the `image-orientation` tag, which is where a phone's EXIF rotation ends up. Without it a portrait photo taken on a phone draws sideways. Note that `probe.rs` *refuses* rotated video for sources (`ProbeError::Rotated`, `crates/video-coach-media/src/probe.rs:32-33`); an avatar is a still, there is no timeline to worry about, and rotating it is right.
   - **One sample pulled** is also the rule for a multi-frame file: an animated PNG, or a file that decodes to several frames, yields its **first** frame and the pipeline stops. No animation, and no error either.
-- **The copy into the pixmap premultiplies.** tiny-skia stores premultiplied pixels; GStreamer's `RGBA` means straight alpha (`overlay.rs:26-31` says exactly this about the layer). A memcpy would leave a cut-out PNG's soft edges too bright and haloed — every partly transparent pixel drawn at its full colour. The copy multiplies each of R, G and B by A/255. Nothing else in `overlay.rs` demultiplies, and nothing here should either: the mixer pad is already configured for premultiplied.
+- **The copy into the pixmap premultiplies.** tiny-skia stores premultiplied pixels; GStreamer's `RGBA` means straight alpha (`overlay.rs:26-31` says exactly this about the overlay layer). A memcpy would leave a cut-out PNG's soft edges too bright and haloed — every partly transparent pixel drawn at its full colour. The copy multiplies each of R, G and B by A/255. Nothing demultiplies on the way out either: the inset's mixer pad is told to blend premultiplied instead (E4).
 - The sample is copied into a `Pixmap` at native size, then scaled **once** into a `Pixmap` of `pip_rect(out_w, out_h, aspect)` rounded up. Everything after that reads the small one.
 - **Why not add an image crate to media:** media is the GStreamer crate and the decoders are already there. `video-coach-core` of course gets nothing: it declares no media dependency, not even an image crate (CLAUDE.md, `crates/video-coach-core/Cargo.toml:9-13`).
 - **The aspect is the image's.** `pip_rect(out_w, out_h, cam_aspect)` takes a display aspect and sizes the inset from it (`crates/video-coach-core/src/layout.rs:76-86`); an avatar hands it the image's aspect where a webcam hands it the camera's. So a tall portrait avatar gets a tall inset in the same 22%-of-width column, and `layout.rs` needs no new constant.
@@ -107,8 +107,8 @@ pub fn decode_still(path: &Path) -> Result<Still, String>;   // { w, h, rgba: Ve
 **A5. The avatar is drawn as a circle** (the user, 2026-09-22: "the image would be like my gravatar"). A square portrait is the normal case, so:
 
 - The image is **fitted** inside the inset keeping its own shape — a square shows whole, nothing is stretched — and then masked to a circle inscribed in that fitted box.
-- The mask is built once, with the pre-scaled pixmap, not per frame: it is the same `tiny_skia::Mask` machinery the overlay already memoizes for the picture rect.
-- The pulse scales the circle, so it breathes around its own centre.
+- The mask is built once, with the pre-scaled pixmap, not per frame: it is the same `tiny_skia::Mask` machinery the overlay already memoizes for the picture rect. The pixels the pad is handed are already round.
+- The pulse scales the circle — on the GPU, as the pad's rect (E3) — so it breathes around its own centre.
 - A transparent cut-out still works; it is simply masked too, which costs it nothing in the middle of the frame.
 
 ### B. A project setting, a per-clip fact
@@ -340,47 +340,71 @@ So the live meter drives the corner and nothing else, and the file drives every 
 **D5. Where each is computed.**
 
 - **Rendered, in media, on the job's own thread:** `composite/avatar.rs::pulse_table(recording, frames, cancel) -> Vec<f64>`, which calls the reader and then core's `pulse`.
-  **Both tails build their tables in job setup, not in the frame loop.** Export builds one per avatar entry **before the first frame is pushed**, beside `Mixer::new(job)` (`composite/export.rs:275`) where `core::audio`'s regions are already resolved for the whole run; preview builds its one when the job starts. An earlier draft put the call beside `Pip::open` — which is *inside* the frame loop, run lazily at each entry change (`export.rs:309`) — and a whole-file audio decode there would stall the pump thread mid-run, holding the appsrc and the encoder behind it.
+  **Both tails build their tables in job setup, not in the frame loop.** Export builds one per avatar entry **before the first frame is pushed**, beside `Mixer::new(job)` (`composite/export.rs:275`) where `core::audio`'s regions are already resolved for the whole run, and lays them into the `Schedule`'s one level per output frame (E3); preview builds its one when the job starts. An earlier draft put the call beside `Pip::open` — which is *inside* the frame loop, run lazily at each entry change (`export.rs:309`) — and a whole-file audio decode there would stall the pump thread mid-run, holding the appsrc and the encoder behind it.
 - **Live, in the app:** one `f64` of state on the UI struct, stepped by `avatar::smooth(previous, level_from_db(rms_db), 0.1)` on each `Event::Level`, and read by the placement callback (G2).
 - Core never sees a file and never sees a pixel; media and the app never decide a number.
 
-### E. Rendering: the overlay draws it, not the GL PiP pad
+### E. Rendering: the GL inset pad draws it, not the overlay
 
-**E1. The decision.** The avatar is drawn into the existing tiny-skia overlay layer, under the strokes and the bar, at the same point in `OverlayRenderer::draw` where the layer order is already decided (`overlay.rs:316-333`).
+**E1. The decision, and the measurement that took it.** The avatar rides the **`glvideomixer` pad the webcam inset already uses** — pad 1 in both tails — as one texture re-stamped per frame, sized by the pulse in the pad's own PTS-keyed probe. The tiny-skia overlay draws nothing.
 
-| | Overlay (chosen) | GL PiP pad |
-|---|---|---|
-| Per-frame CPU at 1080p | **measured before the code is written** (E4) | ~0 |
-| Preview and export parity | Free: `overlay.rs::draw` is the one shared drawer | Two code paths — export pushes PiP buffers from its pump, preview plays the recording's video pad natively (`composite/preview.rs:8-10, 562-566`), and an avatar has no video pad, so preview needs a third appsrc and a per-frame push |
-| The pulse | A rect passed per frame into a function already called per frame | A **per-frame** pad rect, where `Layout` is per **entry** today (`composite/mod.rs:349-355, 392-396`). Needs a per-frame level threaded into the PTS-keyed probe — the probe discipline itself is non-negotiable, since a rect set from the pushing thread lands up to 4 frames early [measured, Phase 8 E2] |
-| Caps risk | None | A new GL texture on a pad that also carries the 1×1 filler. The filler is GL **precisely because** a system-memory buffer on that pad breaks `glupload` mid-run (`export.rs:556-567`, reproduced) |
-| New code | One draw step, one `OverlayFrame` field | An upload, a per-frame level table in `Schedule`, a preview appsrc and branch |
+This reverses an earlier draft of this section, which put the avatar in the overlay layer and made the rendering task open with a measurement. **The measurement was taken, and it closed the question the other way.** One `tiny_skia::PixmapMut::draw_pixmap` of a pre-scaled 423×317 inset into a 1920×1080 pixmap, bilinear, on the reference laptop:
 
-**Why this does not break CLAUDE.md's pixel split.** The rule is that GStreamer owns every **full-frame** pixel operation on the GPU and Rust owns the vector overlay layer, and it exists because full-frame resampling in Rust costs 37.56 ms a frame against 3.62 ms for vectors [measured, the compositing spike, lines 16 and 39]. The avatar is an inset of about 133k pixels, 6% of a 1080p frame, and it is the only raster element in a layer that is otherwise vector. It is the same class of thing as the text bar's plate, not the same class as the base image.
+| | Per frame at 1080p |
+|---|---|
+| The blit at rest (`× 1/PULSE_GROWTH`) | **4.20 ms** [measured] |
+| The blit at full size (`× 1.00`) | **4.84 ms** [measured] |
+| **The whole overlay today** — strokes, bar, scoreboard | **3.2 ms** [measured, Phase 8] |
 
-**E2. What is drawn.**
+The blit alone costs **more than the entire overlay layer**, and preview runs at 30.005 fps with no margin (CLAUDE.md). The cost is not the copy: the same blit unscaled reads ~2.0 ms and nearest-neighbour under the scale ~1.7 ms. `tiny_skia` has no sprite fast path — every `draw_pixmap` is a pattern-shaded `fill_rect`, so a scaled inset is a quarter-megapixel of general shading on the CPU, every frame. No amount of tuning the pulse's range changes that.
 
-- `OverlayFrame` (`overlay.rs:106-132`) gains `avatar: Option<(&tiny_skia::Pixmap, LayoutRect)>` — the pre-scaled premultiplied image and the rect `avatar_rect(avatar.rect, level)` for this frame. `None` for every frame that has no avatar: every camera clip, every clip with `show_pip` off, and every reel and whole-match entry (`clip: None`).
-- The draw is one `draw_pixmap` with a scale transform and bilinear filtering, in **output space**, like the bar and the scoreboard. It is not mapped through the zoom and it is not in the picture rect: the inset is chrome, which is the rule `layout.rs` states for the PiP (`layout.rs:16-19`).
-- It goes **after** `draw_highlights` and **before** the bar's background, so the layer order stays what it is today: the coach's pen over the inset, the bar's words over the pen, the scoreboard over everything (`overlay.rs:316-333`). A stroke drawn over the inset lands over it, exactly as it does over a webcam.
-- Nothing is drawn behind it. A transparent PNG floats (A1, A3); a rectangular photo fills its rect.
+The measurement is committed as the `#[ignore]`d `the_avatar_blit_costs` in `crates/video-coach-media/tests/avatar.rs`, with a whole-frame `Pixmap::fill` beside it as the calibration against the compositing spike's machine (0.75 ms here against the spike's 0.61, so the 3.2 ms yardstick is the right one). Re-running it on a busier machine while this section was rewritten read 4.30 and 4.92 ms, with the calibration at 0.83 — the same answer, which is the point of taking it twice.
 
-**E3. The GL PiP pad still runs, and still takes the filler.**
+**So the fallback this section named becomes the design.** It is also what CLAUDE.md asks for without the measurement: "GStreamer owns every full-frame pixel operation, on the GPU. Rust owns the edit … and the vector overlay layer only." An inset raster is a pixel operation; the pad that scales and blends it on the GPU is where it belongs. What the earlier draft bought — one shared draw step — the composite already has in a different place: **one mixer pad, laid out by one function, fed by both tails.**
 
-`Pip::open` returns `Pip::filler()` when `!clip.shows_camera_pip()`, checked **before** the probe (`export.rs:451-475`). Two reasons:
+What it costs, and where each cost is paid:
 
-- The probe on a video-less Matroska returns `ProbeError::NoVideo` (`probe.rs:30-31`) and `refuse` prints a line per entry. Checking the predicate first keeps stderr honest: "no picture-in-picture" is not what happened.
-- The pad is then fed the 1×1 GL filler every frame, which is the path `show_pip: false` already takes, and which is why an export mixing an avatar clip and a camera clip cannot hit the caps-feature trap: the pad carries GL memory from the first frame to the last, and only its size changes (`export.rs:556-567`).
+| | Where |
+|---|---|
+| An upload | Once per run, the way the 1×1 filler is already uploaded (E2) |
+| A per-frame level table on the run | `Schedule`, beside the zoom and the pad rects it already keys by PTS (E3) |
+| A preview appsrc and a branch | `preview.rs` (F), since an avatar recording has no video pad to play |
 
-**E4. One measurement, taken before the rendering task commits to this.**
+**E2. One texture, one push per frame, no copy.**
 
-The plan's rendering task opens with a microbenchmark and nothing else:
+- **Export.** The image is decoded and pre-scaled once (A3), then **uploaded once** into GL memory for the whole run — the same `appsrc ! glupload ! glcolorconvert ! appsink` hop the 1×1 filler already takes (`export.rs:556-622`), which generalizes to "a still RGBA image in GL memory" and serves both. Each frame of an avatar entry pushes `buffer.copy()` — a new buffer header over the **same texture**, exactly what the filler and every held source frame already do (`export.rs:520-524`, `composite/mod.rs:318-327`) — re-stamped `n/30`. No pixels are touched per frame on either side of the bus.
+- **It must be GL, not system memory.** The pad carries the recording's GL frames on a camera entry and the GL filler elsewhere, and **the pad's caps feature may not change mid-run**: a system-memory buffer after a GL one makes the branch's `glupload` refuse ("Failed to upload buffer"), which is reproduced and is the whole reason the filler is GL (`export.rs:560-567`). A mixed compilation (I2) is exactly that case.
+- **Preview** has a pad of its own to build, so it pushes the pre-scaled pixmap as plain RGBA through its own `glupload`, the way the overlay branch does (`composite/mod.rs:259-268`). Nothing else shares that pad in a preview — one preview is one clip, so the pad is either the recording's video or the avatar's appsrc, decided when the graph is built.
+- **The pad is fed every frame either way.** An unfed mixer pad produces no output at all and backs the whole run up, with no error [measured, Phase 8]. The avatar's pad is pushed from the same loop as the base and the overlay, under the same `wait_for_room`, and goes EOS with them at the end of a preview's schedule.
 
-> `tiny_skia::PixmapMut::draw_pixmap` of a pre-scaled inset-sized pixmap into a 1920×1080 `PixmapMut`, with bilinear filtering, at the two ends of the range — a scale of `1.0 / PULSE_GROWTH` (rest) and of `1.00` (full) — timed over enough iterations to be stable, against the **3.2 ms** the whole overlay costs today.
+**E3. The pulse is the pad's rect, set in the probe that already exists.**
 
-That is the number that decides. If the blit is a small fraction of 3.2 ms, the overlay is the answer and the task proceeds. **If it is not, the GL PiP pad is the fallback** (E1's right column), and the task stops and says so rather than shipping a slow frame.
+`Layout` is per **entry**, but the mixer pads have been placed per **frame** since Phase 8: `install_geometry` reads the entry's rect out of the `Schedule` keyed on each buffer's PTS, because a rect set from the pushing thread lands up to `QUEUED` frames early [measured, Phase 8 E2]. That is the machinery the pulse needs, and it is already load-bearing.
 
-An earlier draft instead specified a gated `Exporter` benchmark plus a fully costed fallback design. Both are replaced by the line above: a full export benchmark measures the encoder and the GPU as much as the blit, and costing a fallback in advance is design work for a branch that one number probably closes. **The estimate that draft carried (1.5–2.6 ms) should be ignored:** it scaled the compositing spike's 2.58 ms webcam figure, which is a *resample of a 640×480 source into the inset rect* (spike line 17) — a different operation from a near-1:1 blit of a pixmap already at the inset's size. The real number is likely 3–5× smaller, which is exactly why it is measured rather than argued.
+- `Schedule` gains **one level per output frame of the run**, an `Arc<[f64]>` built in job setup (D5) beside the zoom it already holds.
+- The inset pad's probe asks for `avatar_rect(entry.pip, levels[n])` instead of `entry.pip`.
+- **The level is `1.0` everywhere that does not pulse** — every camera entry, every filler entry, every frame past the table. `avatar_rect` is written so that `level == 1.0` returns `pip` *exactly* (`core/src/avatar.rs:109-122`), so a camera entry's pad lands on the integers it lands on today, and nothing branches to make it so. Together with E4's blend function — the same multiplier on an opaque frame — a camera export is the export it is today.
+- Preview places its avatar pad from the same shared helper, on its own `BUFFER` probe. One function turns a rect and a level into a pad rect, so the two tails cannot disagree.
+
+**E4. Alpha: premultiplied, and the pad is told.**
+
+The avatar is masked to a circle (A5), so the inset's edge and every cut-out PNG's soft pixels are partly transparent, and the blend is visible rather than academic.
+
+- `composite::avatar::open` produces a **premultiplied** pixmap, because tiny-skia stores premultiplied pixels and the copy in from GStreamer's straight-alpha `RGBA` multiplies (A3).
+- GStreamer's `RGBA` caps mean *straight* alpha, and `glvideomixer`'s pad defaults to `blend-function-src-rgb=src-alpha` — which would halve every colour channel a second time, the haloed-cut-out failure in reverse.
+- So **the inset pad is set to `blend-function-src-rgb=one`**, which is premultiplied-over for free on the GPU. It is exactly what the overlay pad has carried since Phase 8 for exactly this reason (`overlay.rs:26-31`, `composite/mod.rs:273-280`), and the convention is now one convention for both raster pads rather than two.
+- **The pad carries it for the whole run, camera entries included, and that is safe:** an opaque frame has `a = 255`, where `src-alpha` and `one` are the same multiplier, and the filler is `(0, 0, 0, 0)`, where both are zero. There is nothing to switch and nothing to get wrong at an entry join.
+- Scaling is then correct too: bilinear sampling of premultiplied pixels is the right operation, and the pad scales the avatar on every frame of the pulse.
+
+**E5. A camera clip never goes near any of it, and the filler still runs.**
+
+`Pip::open` branches on `core`'s two predicates, **before** the probe (B3, `export.rs:451-475`):
+
+- `clip.shows_avatar()` → the run's uploaded texture at `pip_rect` for the image's aspect, or — if the image is missing or would not decode — the filler, with one line on stderr for the run rather than one per entry (A4).
+- `clip.shows_camera_pip()` → the recording, probed and decoded, exactly as today.
+- Neither → the 1×1 GL filler, as `show_pip: false` already does.
+
+Checking the predicates first is also what keeps stderr honest: the probe on a video-less Matroska returns `ProbeError::NoVideo` (`probe.rs:30-31`), and "no picture-in-picture" is not what happened to an avatar clip.
 
 ### F. Preview and export parity
 
@@ -389,8 +413,10 @@ They share one composite (CLAUDE.md, `composite/`), and the avatar keeps that tr
 - **Both** resolve the avatar image from `open.folder.join(project.avatar)` on the bus, as a snapshot on the job, like `highlights` and `scoreboard` already are (`export.rs:60-98`, `preview.rs:83-108`). `ExportJob` and `PreviewJob` each gain `avatar: Option<PathBuf>`.
 - **Both** call `avatar::open` once for the run, at the run's own output size — 1920×1080 for export, 1280×720 for preview (`preview.rs:75-76`). The ratios in `layout.rs` do the rest, which is what that module exists for.
 - **Both** build their pulse tables in job setup (D5) and index them by `frame − entry.start_frame`.
-- **Both** hand the same `OverlayFrame.avatar` to the same `OverlayRenderer::render`.
-- **Preview must not request, place or link the PiP pad for an avatar clip.** All three sites take `clip.shows_camera_pip()` (B3). An avatar recording has no video pad, and **an unfed mixer pad stalls everything** [measured, Phase 8 E2].
+- **Both** put the avatar on **mixer pad 1**, at `avatar_rect(pip, level)`, from one shared helper on a PTS-keyed probe (E3).
+- **Where they differ is how the pad is fed, and that is the recording's doing.** Export pumps every pad, so the avatar is one more buffer beside the recording's and the filler's — and must be GL, because that pad also carries both of those (E2). Preview plays the recording **natively** for the PiP and the commentary audio, so an avatar clip gives it no video pad to play: it gets an `appsrc` branch of its own, pushed from the same pump loop as the base and the overlay, through its own `glupload`.
+- **Preview must not request, place or link the recording's PiP branch for an avatar clip.** All three sites take `clip.shows_camera_pip()` (B3) — the launch string's branch, the pad's placement, and `decodebin3`'s pad-added link. An avatar recording has no video pad, and **an unfed mixer pad stalls everything** [measured, Phase 8 E2]; a linked pad that never produces would be the same stall from the other end.
+- **The avatar's appsrc is a pumped pad like the other two**, so it takes their rules with it: `stream-type=seekable` with the same `seek-data` callback, `wait_for_room` before the cursor's lock, an EOS at the end of the schedule, and `repeat-after-eos` on its mixer pad so the held last frame still shows the inset.
 
 The consequence is the property that matters: what the coach checks in the preview is what the file gets, at a different size.
 
@@ -440,7 +466,7 @@ Two fields, not three: `Preferences.avatar_for_new_recordings` is deleted (B1).
 
 **I1. An avatar clip's recording played by an older build.** It can't open the project (H), and if it could, the audio-only recording gets the filler and no inset.
 
-**I2. An avatar clip beside a camera clip in one compilation.** The PiP pad carries GL for the camera entries and the 1×1 GL filler for the avatar entries — a size change on a pad whose caps feature never changes, which is the case the filler was made GL for (`export.rs:556-567`). The overlay carries the avatar on the avatar entries only. Both are per-entry decisions taken where every other per-entry decision is taken (`export.rs:304-320`).
+**I2. An avatar clip beside a camera clip in one compilation.** The inset pad carries the recording's GL frames on the camera entries and the avatar's GL texture on the avatar entries — a caps change on a pad whose caps **feature** never changes, which is the case the filler was made GL for (`export.rs:556-567`) and exactly why the avatar is uploaded rather than pushed from system memory (E2). Which it is, is a per-entry decision taken where every other per-entry decision is taken (`export.rs:304-320`), and the pad's blend function is the same for both (E4).
 
 **I3. A silent take.** Every window's RMS is at or below the floor, `s` stays 0, every level is 0, and the avatar sits still at `1/1.10` of the inset. Correct and quiet.
 
@@ -450,7 +476,7 @@ Two fields, not three: `Preferences.avatar_for_new_recordings` is deleted (B1).
 
 **I6. The avatar image is replaced mid-project.** Every avatar clip renders with the new image from the next preview or export. That follows from "one avatar image per project". A running export keeps the image it opened, because the job carries a snapshot (F).
 
-**I7. Reel and whole-match entries.** `clip_id: None`, so no clip, no `inset`, no commentary and no inset at all — the existing filler path (Match Vision R4, W2). The avatar is a property of a commentary take, and those entries have none.
+**I7. Reel and whole-match entries.** `clip_id: None`, so no clip, no `inset`, no commentary and no inset at all — the existing filler path (Match Vision R4, W2). Their pulse level stays 1.0, which leaves the filler's 1×1 rect the 1×1 rect it is. The avatar is a property of a commentary take, and those entries have none.
 
 **I8. A huge image.** It is decoded at native size once per job, which is a transient RGBA frame, then scaled down and released. A real avatar is a few megabytes. Bounding the decode by pixels is in Deferred.
 
@@ -461,7 +487,7 @@ Two fields, not three: `Preferences.avatar_for_new_recordings` is deleted (B1).
 | Crate | Contents |
 |---|---|
 | `video-coach-core` | `Inset`, `Clip::shows_camera_pip` / `shows_avatar`, `Project.avatar`, the v10 bump, the amended `project.rs` module comment. `avatar.rs`: `level_from_db`, `smooth`, `pulse` (samples in, one level per output frame out), `avatar_rect`, and the constants. **No new dependency** — the audit still lists exactly `serde`, `serde_json`, `thiserror`, `uuid`. |
-| `video-coach-media` | The camera-less recorder branch and `CaptureSources`' optional video, on both arms. `level_dbs` (peak **and** rms). `decode_still`, the one avatar decoder. `composite/avatar.rs`: the pre-scaled premultiplied `Pixmap`, and the pulse table via the existing `Reader`. The avatar draw step in `overlay.rs`. `Pip::open`'s predicate; preview's three PiP sites. A still-image fixture. |
+| `video-coach-media` | The camera-less recorder branch and `CaptureSources`' optional video, on both arms. `level_dbs` (peak **and** rms). `decode_still`, the one avatar decoder. `composite/avatar.rs`: the pre-scaled premultiplied `Pixmap`, and the pulse table via the existing `Reader`. The inset pad in both tails: export's upload and `Pip` branch, preview's appsrc branch, the per-frame level in `Schedule`, the pad's premultiplied blend. `Pip::open`'s predicates; preview's three PiP sites. A still-image fixture. **The overlay is untouched.** |
 | `video-coach-app` | Bus: avatar mode in `capture_sources` (both capture kinds), the camera refusal's new wording, picking, copying and removing the image, `avatar` on both jobs. UI: the Devices popover's Inset section, the pulsing corner during a take, the inspector's label. |
 | `video-coach-harness` | An avatar take end to end: record with test sources, get a clip, export it. |
 
@@ -482,11 +508,11 @@ Core touches no pixel and no file. Media hands it a slice of `f32` and a `Rect`;
   - **Premultiplication:** a still with a half-transparent region, decoded and opened, has `pixmap` bytes whose colour channels are scaled by alpha — drawn over white it reads as the blend, not as the full colour.
   - The recorder with `CaptureSources::Test { video: None }` writes a playable Matroska with an audio track and **no** video track; `t0_ns > 0`; `StopOutcome.duration` matches the audio; `self_view_pipeline()` is `None`; `FirstBuffer` arrives.
   - `level_dbs` returns both fields, and on a loud tone `peak_db > rms_db`.
-  - Export of a one-entry avatar compilation: the inset's pixels land inside `pip_rect` on a loud frame and inside a strictly smaller rect on a silent frame, read back with `fixtures::decode_rgb`. Properties, not golden images, as in Phase 9.
-  - **One** mixed compilation, avatar-then-camera: the asserted frame count, no stall. (The reverse order exercises the same pad through the same filler; running it both ways tests the test.)
+  - Export of a one-entry avatar compilation whose commentary is loud for its first half and silent for its second: the inset spans `pip_rect` on a loud frame and a strictly smaller concentric rect on a quiet one, measured as the circle's width across the inset's centre row and read back with `fixtures::decode_rgb`. Properties, not golden images, as in Phase 9. It never exceeds `pip_rect` (I4), and the run's frame count is `plan.total_frames()`.
+  - **One** mixed compilation, avatar-then-camera: the asserted frame count, no stall, each entry's own inset. That is the caps change on the inset pad (I2) — the case that used to fail the export outright.
   - An avatar clip whose image file is gone exports with no inset and no failure.
-  - Preview of an avatar clip runs and does not stall (the unrequested PiP pad).
-  - The `draw_pixmap` measurement of E4, recorded in the commit message rather than asserted in a test.
+  - Preview of an avatar clip runs, does not stall, and shows the inset — the three `show_pip` sites and the new appsrc branch in one.
+  - The `draw_pixmap` measurement of E1, kept as an `#[ignore]`d test rather than deleted with the design it refused.
 - **Harness:**
   - Record in an avatar project with `CaptureKind::Test`, get a clip with `inset == Avatar` and an audio-only recording, export it end to end.
   - Record in a camera project with `CaptureKind::Test`: the clip is `Inset::Camera` and the recording has video. (Together these prove the `Test` arm honours the mode — C1.)
@@ -497,7 +523,7 @@ Core touches no pixel and no file. Media hands it a slice of `f32` and a `Rect`;
 
 ## Risks
 
-1. **The overlay blit costs more than the measurement predicts.** E4 takes the number before any of it is built, and the GL pad is the fallback.
+1. ~~**The overlay blit costs more than the measurement predicts.**~~ **Closed by measurement:** it does, by more than the whole overlay's budget, and the design moved to the GL inset pad (E1). What is left of the risk is the pad's own cost, which is a scale and a blend the mixer already does for the webcam on every frame of every camera clip.
 2. **The pulse constants are a guess.** They are named `const`s in core with no stored copy, so retuning them changes every render and nothing in any file. Q1.
 3. **The live and rendered estimators disagree visibly.** They share the thresholds, the filter and the constants, but not the rate or the exact measure (10 Hz element RMS against 30 Hz frame RMS). The coach sees them minutes apart, so a small difference is invisible; a large one would mean a bug in one of them, and the manual check above is where it shows.
 4. **A very large image decodes large before it is scaled.** A pathological JPEG could decode to a few hundred MB transiently. Bounding the decode by pixels is in Deferred.

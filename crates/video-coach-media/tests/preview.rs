@@ -49,6 +49,7 @@ const TOLERANCE: i32 = 32;
 
 const BLUE: u32 = 0x0000_00ff;
 const GREEN: u32 = 0x0000_ff00;
+const RED: u32 = 0x00ff_0000;
 
 /// A clip with `events`, `duration` seconds of commentary from the source's
 /// start, and no zoom or skips: output frame `n` is source frame `n`.
@@ -108,6 +109,18 @@ struct Running {
 
 impl Running {
     fn start(source: PathBuf, recording: PathBuf, clip: Clip, source_duration: f64) -> Running {
+        Running::start_with(source, recording, clip, source_duration, None)
+    }
+
+    /// [`Running::start`] with the project's avatar image, which only a clip
+    /// whose inset is the avatar reads.
+    fn start_with(
+        source: PathBuf,
+        recording: PathBuf,
+        clip: Clip,
+        source_duration: f64,
+        avatar: Option<PathBuf>,
+    ) -> Running {
         gst::init().unwrap();
         let compilation = fixtures::one_clip(&clip, source_duration);
         assert!(
@@ -122,6 +135,7 @@ impl Running {
             commentary_volume: 0.0,
             scoreboard: None,
             highlights: Vec::new(),
+            avatar,
         };
         let mailbox = FrameMailbox::default();
         let position = PreviewPosition::default();
@@ -430,4 +444,51 @@ fn a_seek_while_the_tail_drains_keeps_the_preview_running() {
     // than failing with "the preview stopped composing frames".
     running.poll_frame("the seek to take", |n| n < total / 2.0);
     running.poll_frame("the schedule a second time", |n| n >= total - 1.0);
+}
+
+/// An avatar clip previews: the inset pad is fed by the avatar's own appsrc,
+/// not by the recording's video pad — which an avatar take's file does not
+/// have.
+///
+/// All three readings of `show_pip` have to agree with the clip's inset here,
+/// or the preview never finishes: a pad requested and never fed stalls the
+/// mixer, and a video pad linked to a queue nobody feeds stalls the branch.
+/// The image is round in its box, as it is in an export.
+#[test]
+fn an_avatar_clip_previews_without_stalling() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 90, BLUE, false);
+    // Sound alone, as an avatar take records (spec B4): no video track for a
+    // PiP branch to want.
+    let recording = fixtures::audio_only(dir.path());
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let clip = Clip {
+        inset: Inset::Avatar,
+        ..clip(1.0, true, Vec::new())
+    };
+
+    let running = Running::start_with(source, recording, clip, 3.0, Some(avatar));
+    running.play_out();
+    let picture = running.settled_picture();
+
+    // And a scrub reaches every pumped appsrc, the avatar's included: one that
+    // refused the seek would leave it pending and retried for ever.
+    running.preview.seek(0.0);
+    running.preview.set_playing(true);
+    running.poll_frame("the schedule a second time", |n| n >= FPS - 1.0);
+    drop(running);
+
+    // A square image, so the inset is the square `pip_rect`.
+    let pip = pip_rect(OUT_W as f64, OUT_H as f64, 1.0);
+    let centre = (
+        (pip.x + pip.w / 2.0) as usize,
+        (pip.y + pip.h / 2.0) as usize,
+    );
+    picture.assert_rgb("the avatar", centre, RED);
+    picture.assert_rgb(
+        "the corner of the avatar's box",
+        ((pip.x + 4.0) as usize, (pip.y + 4.0) as usize),
+        BLUE,
+    );
 }

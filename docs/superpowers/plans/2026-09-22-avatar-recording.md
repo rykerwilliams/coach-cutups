@@ -58,7 +58,9 @@ Each was checked in the code while writing this plan.
 - **`Reader` is `pub(crate)`** (`composite/audio.rs:253`), with `start(path, rate, channels, cancel)` at `:289` and `rest(cancel)` at `:468`. **It selects its audio stream from `decodebin3`'s collection and needs no video stream** (`:346-380`) — which is why transcription on an audio-only recording needs no new test (spec I5).
 - **`fixtures::audio_only(dir)`** already writes an audio-only file (`media/src/fixtures.rs:235`). `decode_rgb` is `:520`.
 - **`probe` answers `ProbeError::NoVideo`** for a video-less file (`media/src/probe.rs:30-31`) and **`Rotated`** for rotated video (`:32-33`) — the latter applies to sources, not to a still.
-- **The compositing spike's 2.58 ms** (`docs/superpowers/spikes/2026-09-19-compositing-throughput.md:17`) is a *resample of a 640×480 source into the inset rect*, not a near-1:1 blit. The whole vector overlay is 3.62 ms (`:39`). Don't scale 2.58 into an estimate; measure (Task 4's entry gate).
+- **The overlay route is measured and refused.** `the_avatar_blit_costs` (`media/tests/avatar.rs`, `#[ignore]`d) reads **4.20 ms at rest and 4.84 ms at full** for one inset-sized `draw_pixmap` into 1080p, against **3.2 ms** for the whole overlay. `tiny_skia` has no sprite fast path. The avatar goes on the GL inset pad (spec E); don't re-litigate it.
+- **The mixer pads are already placed per frame:** `install_geometry` reads the entry's rect out of the `Schedule` keyed on each buffer's PTS (`composite/mod.rs:411-431`), because a rect set from the pushing thread lands up to `QUEUED` frames early. That is where the pulse goes.
+- **`install_overlay_pad` sets `blend-function-src-rgb=one`** (`composite/mod.rs:273-280`) — premultiplied-over on the GPU. The inset pad needs the same, and an opaque frame blends identically under either function.
 
 **The app**
 - **`slint` is built with `default-features = false`** (`Cargo.toml:20`, features `std`, `backend-winit`, `renderer-skia-opengl`, `compat-1-18`). **No image-decoder feature**, so `slint::Image::load_from_path` has nothing to decode with. The self-view builds its images with `slint::Image::from_rgba8` (`app/src/video.rs:199-211`), and the avatar corner does the same.
@@ -186,39 +188,41 @@ Commit: `feat(app): pick one avatar image per project`.
 
 ---
 
-## Task 4: Draw the avatar, pulsing, in preview and export
+## Task 4: The avatar on the inset pad, pulsing, in preview and export
 
-**Entry gate — take this measurement before writing anything else** (spec E4):
-
-> Time `tiny_skia::PixmapMut::draw_pixmap` of an inset-sized pre-scaled pixmap (≈422×316 at 1080p) into a 1920×1080 `PixmapMut`, with bilinear filtering, at a scale of `1.0 / PULSE_GROWTH` (rest) and at `1.00` (full), over enough iterations to be stable. Write it as an `#[ignore]`d bench-shaped test in `media/tests/avatar.rs` so it can be re-run, and print both numbers.
-
-Compare against **3.2 ms**, the whole overlay's per-frame cost today. A small fraction of it: proceed, and put both numbers in the commit message. Not a small fraction: **stop, report, and the fallback is the GL PiP pad** (spec E1's right column) — do not ship the blit and hope. Ignore the old 1.5–2.6 ms estimate; it scaled a spike figure for a different operation (`spike:17`).
+**The entry gate was taken and it refused the overlay.** The measurement this task used to open with is committed as the `#[ignore]`d `the_avatar_blit_costs` (`media/tests/avatar.rs`): one `draw_pixmap` of a pre-scaled 423×317 inset into 1080p costs **4.20 ms at rest and 4.84 ms at full**, against the **3.2 ms** the whole overlay costs — more than all of it, on a preview with no margin. Spec section E was rewritten to the GL route on the strength of it; **read spec E1–E5 before building.** Do not re-take the measurement and do not re-open the choice.
 
 **Files:**
-- `crates/video-coach-media/src/{overlay.rs,composite/{avatar.rs,export.rs,preview.rs}}`
-- `crates/video-coach-media/tests/{avatar.rs,export.rs,preview.rs}`
+- `crates/video-coach-media/src/{fixtures.rs,composite/{mod.rs,avatar.rs,export.rs,preview.rs}}`
+- `crates/video-coach-media/tests/{export.rs,preview.rs}`
 - `crates/video-coach-app/src/bus/{export.rs,preview.rs}`
+- **not** `overlay.rs`: the overlay draws nothing here.
 
 **What to build:**
-1. **`composite/avatar.rs::pulse_table(recording, frames, cancel) -> Vec<f64>`:** `Reader::start(.., PULSE_RATE, 1, cancel)` + `rest`, then `core::avatar::pulse`. A file with no audio gives all zeros.
+1. **`composite/avatar.rs::pulse_table(recording, frames, cancel) -> Vec<f64>`:** `Reader::start(.., PULSE_RATE, 1, cancel)` + `rest`, then `core::avatar::pulse`. A file with no audio, or one that won't read, gives all zeros — a flat avatar at rest, never a failed run. Delete the `#[allow(dead_code)]` Task 3 left on `Avatar` and `open`.
 2. **Both jobs gain `avatar: Option<PathBuf>`**, a snapshot the bus takes from `open.folder.join(project.avatar)` — beside `scoreboard` and `highlights` (`export.rs:67-98`, `preview.rs:83-108`).
-3. **Both tails open the image once** at their own output size (1920×1080, 1280×720) and **build their pulse tables in job setup**: export beside `Mixer::new(job)` (`export.rs:275`), one table per entry whose clip `shows_avatar()`; preview once at job start. **Not beside `Pip::open`** — that is inside the frame loop (`export.rs:309`), and a whole-file audio decode there stalls the pump.
-4. **`OverlayFrame.avatar: Option<(&Pixmap, layout::Rect)>`**, filled per frame with `avatar_rect(avatar.rect, table[frame − entry.start_frame])`, or `None` for a camera clip, a clip with `show_pip` off, and any entry with no clip.
-5. **The draw step in `OverlayRenderer::draw`**, one `draw_pixmap` with a scale transform and bilinear filtering, in output space, **after `draw_highlights` and before the bar's background** (`overlay.rs:316-333`).
-6. **`Pip::open` takes `clip.shows_camera_pip()`**, checked **before** the probe (`export.rs:460`), so stderr doesn't claim a missing PiP for a file that never had one.
-7. **Preview's three sites take `shows_camera_pip()`**: `:564`, `:637`, `:894`.
+3. **Both tails open the image once** at their own output size (1920×1080, 1280×720) and **build their pulse tables in job setup**: export beside `Mixer::new(job)` (`export.rs:275`), one table per entry whose clip `shows_avatar()`, laid into one level per output frame for the run; preview once before its loop. **Not beside `Pip::open`** — that is inside the frame loop (`export.rs:309`), and a whole-file audio decode there stalls the pump.
+4. **One level per output frame on the `Schedule`**, `1.0` wherever nothing pulses, and the inset pad's probe places `avatar_rect(entry.pip, level)` instead of `entry.pip` (spec E3). `avatar_rect` is exactly `pip` at `1.0`, so **a camera export is unchanged to the integer** and nothing branches. Both tails round a rect to a pad through **one** shared helper, preview included.
+5. **Export uploads the avatar into GL memory once** (spec E2), through the hop `Filler` already takes — generalize that type to "a still RGBA image in GL memory" and let the filler be one transparent pixel of it. Each frame pushes `buffer.copy()` re-stamped: a new header over the same texture, no pixels touched. **System memory on that pad breaks `glupload` for a later entry with a real inset** (`export.rs:556-567`, reproduced).
+6. **`Pip::open` branches on `core`'s two predicates, before the probe** (`export.rs:451-475`): `shows_avatar()` → the run's texture at `pip_rect` for the image's aspect, or the filler if the image is gone; `shows_camera_pip()` → the recording; neither → the filler. A missing image says so **once for the run**, not once per entry.
+7. **Preview gets an appsrc branch for the avatar**, pushed from the pump beside the base and the overlay: `caps=RGBA,w,h ! glupload ! glcolorconvert ! mix.sink_1`, `stream-type=seekable` with the same `seek-data` callback, `wait_for_room` before the cursor's lock, EOS at the end of the schedule and `repeat-after-eos` on its pad. Its rect comes from a `BUFFER` probe keyed on PTS, never from the pushing thread.
+8. **Preview's three recording-PiP sites take `shows_camera_pip()`**: `:564`, `:637`, `:894`. An avatar recording has no video pad to link.
+9. **The inset pad blends premultiplied** — `blend-function-src-rgb=one`, in both tails, for the whole run (spec E4). An opaque camera frame blends identically either way, so there is nothing to switch at an entry join.
+10. **`fixtures::solid_png(dir, name, w, h, colour)`**, so an export test can say "this pixel is the avatar" of a one-colour image. (`still_image`'s SMPTE bars share colours with every source fixture.)
 
 **Test that must fail first:**
-- **Media, `an_avatar_clip_pulses_in_the_export`:** a one-entry avatar compilation over a `tone_video` source, with a recording that is silent for its first second and loud for its second. Read frames back with `fixtures::decode_rgb`: on a loud frame the inset's pixels reach the corners of `pip_rect`; on a silent frame they are inside a strictly smaller, concentric rect and `pip_rect`'s own corners hold the source's pixels. Frame count equals `plan.total_frames()`.
-- **Media, `an_avatar_and_a_camera_clip_export_together`:** two entries, avatar first. The asserted frame count, no stall, and the camera entry's inset present. One direction only — the reverse exercises the same pad through the same filler.
+- **Media, `an_avatar_clip_pulses_in_the_export`:** a one-entry avatar compilation whose recording is a loud tone for its first second and silent for its second. Read frames back with `fixtures::decode_rgb` and measure the circle's width across the inset's centre row: on a loud frame it is `pip_rect`'s width, on a quiet one it is that over `PULSE_GROWTH`, and it never exceeds `pip_rect`. Frame count equals `plan.total_frames()`. It fails first on the field that doesn't exist, then on a still inset.
+- **Media, `an_avatar_and_a_camera_clip_export_together`:** two entries, avatar first. The asserted frame count, no stall, and **each entry's own inset** — the caps change on the pad that used to fail an export outright. One direction only.
 - **Media, `a_missing_avatar_image_costs_the_inset_not_the_run`:** the job's `avatar` points at a path that isn't there. The export completes with the full frame count and no inset.
-- **Media, `an_avatar_clip_previews_without_stalling`:** a preview of an avatar clip produces frames and reaches its end within `STALL`. It fails first on the unrequested/unlinked PiP pad if any of the three sites is missed.
+- **Media, `an_avatar_clip_previews_without_stalling`:** a preview of an avatar clip produces frames, reaches its end within `STALL`, and shows the inset — round in its box. It fails first on the unrequested pad or the unlinked video pad if any of the three sites is missed. It then **scrubs**: one pipeline seek has to reach the avatar's appsrc too, or the graph refuses it and the preview retries it for ever.
+
+**Measure:** the export's throughput on the same fixture before and after, and the avatar export's own rate. Report all three; if the GL route blows a budget too, **stop and report** rather than inventing a third design.
 
 **Verify:** the gate. `media/tests/export.rs` runs on llvmpipe as CI does; use CLAUDE.md's `bwrap` recipe if the GPU path needs separating.
 
-**CLAUDE.md:** under "Export burns in the overlay…" — the avatar is an **overlay** element, not a mixer pad: pre-scaled, premultiplied, drawn in output space under the strokes, sized per frame by `core::avatar::avatar_rect`. Its pulse table is built in job setup from the recording's own audio, never inside the frame loop. `Clip::shows_camera_pip()` is the one reading of `show_pip × inset`, and preview has three sites to it.
+**CLAUDE.md:** under "Export burns in the overlay…" — the avatar is the **inset pad**, not an overlay element: one texture uploaded per run and re-stamped per frame, sized by `core::avatar::avatar_rect` in the pad's PTS-keyed probe, blended premultiplied. Measured: the overlay route costs more per frame than the whole overlay. Its pulse table is built in job setup from the recording's own audio, never inside the frame loop. `Clip::shows_camera_pip()` is the one reading of `show_pip × inset`, and preview has three sites to it.
 
-Commit: `feat(media): draw the avatar inset, pulsing with the commentary`.
+Commit: `feat(media): the avatar inset, pulsing with the commentary`.
 
 ---
 
@@ -257,7 +261,7 @@ Commit: `feat(app): the avatar pulses in the corner while recording`.
 2. **Backlog** what is deferred, including the spec's Deferred list (per-clip inset switching, a plate or mask, bounding the decode by pixels, animated avatars).
 3. **Check each task's CLAUDE.md addition** is there and still accurate.
 4. **`docs/hands-on-checklist.md`:** a new section, in the checklist's own voice, with the items under "The user's own steps" below.
-5. **Record Task 4's two `draw_pixmap` numbers** in the closeout commit, so the next person changing the overlay knows what the avatar costs.
+5. **Keep Task 4's `the_avatar_blit_costs`** where it is, `#[ignore]`d: it is the evidence for spec E1, and the next person tempted to draw a raster in the overlay should find it before they measure it again.
 
 Commit: `docs: close out avatar recording` (along with the review's fixes, in their own commits).
 

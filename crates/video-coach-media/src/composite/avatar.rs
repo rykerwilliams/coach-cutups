@@ -1,5 +1,12 @@
-//! The avatar image (avatar spec A3, A5): one decoder for it, and the
-//! pre-scaled, premultiplied, circular pixmap the overlay blits per frame.
+//! The avatar image (avatar spec A3, A5): one decoder for it, the pre-scaled,
+//! premultiplied, circular pixmap the mixer's inset pad carries, and the pulse
+//! that sizes that pad frame by frame.
+//!
+//! **The inset pad, not the overlay** (spec E1). One `draw_pixmap` of this
+//! pixmap into a 1080p frame was measured at 4.2–4.8 ms against the 3.2 ms the
+//! whole overlay costs — `tiny_skia` has no sprite fast path — so the scaling
+//! and the blending happen on the GPU, where every other full-frame pixel
+//! operation happens (CLAUDE.md).
 //!
 //! **One decoder.** [`decode_still`] is the whole of it — the pick validates
 //! with it, the Devices popover's thumbnail and the recording corner draw
@@ -14,6 +21,7 @@
 //! copy multiplies each of R, G and B by A.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
@@ -22,7 +30,11 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use tiny_skia::{FillRule, FilterQuality, Mask, PathBuilder, Pixmap, PixmapPaint, Transform};
+use video_coach_core::avatar::{pulse, PULSE_RATE};
 use video_coach_core::layout::{self, Rect as LayoutRect};
+
+use super::audio::Reader;
+use super::CompositeError;
 
 /// How long the still's pipeline may take before it is given up on. A still
 /// is one frame off a local file; the bound is here so a file that stalls a
@@ -140,13 +152,10 @@ fn still_from(sample: &gst::Sample) -> Result<Still, String> {
     Ok(Still { w, h, rgba })
 }
 
-/// The avatar as the overlay draws it.
-// Until the overlay's draw step lands (the render task), the tests below are
-// this type's only caller; the allow goes with that step.
-#[allow(dead_code)]
+/// The avatar as the mixer's inset pad takes it.
 pub(super) struct Avatar {
     /// Pre-scaled to the inset's size, premultiplied, and masked to the
-    /// circle inscribed in it, so the per-frame draw is a plain blit.
+    /// circle inscribed in it, so the pad has only to scale and blend it.
     pub(super) image: Pixmap,
     /// [`layout::pip_rect`] for the image's own aspect: the inset's footprint
     /// at its loudest. The aspect is not stored separately — this rect
@@ -162,7 +171,6 @@ pub(super) struct Avatar {
 /// masked to the circle inscribed in that box (spec A5), **once, here**: the
 /// mask is the same size for every frame of the run, so building it per frame
 /// would buy nothing and cost a rasterization.
-#[allow(dead_code)]
 pub(super) fn open(path: &Path, out_w: f64, out_h: f64) -> Result<Avatar, String> {
     let still = decode_still(path)?;
     let native = premultiplied(&still)?;
@@ -210,6 +218,37 @@ fn premultiplied(still: &Still) -> Result<Pixmap, String> {
         *out = [scale(px[0], a), scale(px[1], a), scale(px[2], a), a];
     }
     Ok(pixmap)
+}
+
+/// One pulse level per output frame of an entry, from `recording`'s own
+/// commentary (spec D2): how loud the coach is at each frame, smoothed, in
+/// `0..=1`.
+///
+/// **Called in job setup, never from the frame loop.** It decodes the whole
+/// file — milliseconds for a take, at about 90× realtime, but unbounded in the
+/// length of the recording — and doing that between two pushed frames would
+/// stall the pump and the encoder behind it (spec D5).
+///
+/// A recording with no audio track, one that will not read, and a cancel all
+/// give zeros: a flat avatar at rest. The sound is the inset's own, so losing
+/// it costs the motion rather than the run, exactly as a missing image costs
+/// the inset.
+pub(super) fn pulse_table(recording: &Path, frames: usize, cancel: &AtomicBool) -> Vec<f64> {
+    let read = Reader::start(recording, PULSE_RATE, 1, cancel)
+        .and_then(|reader| reader.map(|mut reader| reader.rest(cancel)).transpose());
+    let samples = match read {
+        Ok(samples) => samples.unwrap_or_default(),
+        // A cancel is the run ending, and its own `Watch` is about to see it.
+        Err(CompositeError::Cancelled) => Vec::new(),
+        Err(CompositeError::Failed(e)) => {
+            eprintln!(
+                "no avatar pulse from {}: {e}; the inset holds still",
+                recording.display()
+            );
+            Vec::new()
+        }
+    };
+    pulse(&samples, PULSE_RATE, frames)
 }
 
 /// Cuts `image` down to the circle inscribed in it — the avatar is a

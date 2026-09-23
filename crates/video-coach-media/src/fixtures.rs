@@ -266,6 +266,26 @@ pub fn still_image(dir: &Path, name: &str, w: u32, h: u32, format: StillFormat) 
     )
 }
 
+/// A `w`×`h` opaque PNG at `dir/name` in one solid `rgb`.
+///
+/// The avatar a composite test looks for in the inset. [`still_image`]'s test
+/// pattern shares its colours with every source fixture, so one flat colour is
+/// what lets an assertion say a pixel either is the avatar or isn't — and, the
+/// image being uniform, what the circle's width across a row reads is the
+/// pulse and nothing else.
+pub fn solid_png(dir: &Path, name: &str, w: u32, h: u32, rgb: u32) -> PathBuf {
+    run(
+        &format!(
+            "videotestsrc num-buffers=1 pattern=solid-color \
+               foreground-color=0x{:08x} \
+               ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1 \
+             ! videoconvert ! pngenc ! filesink name=out",
+            0xff00_0000u32 | (rgb & 0x00ff_ffff)
+        ),
+        &dir.join(name),
+    )
+}
+
 /// A `w`×`h` PNG at `dir/name`, uniformly **half-transparent white**, in
 /// straight alpha as every PNG is.
 ///

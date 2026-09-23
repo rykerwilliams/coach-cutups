@@ -98,6 +98,11 @@ impl Bus {
             commentary_volume: open.project.preferences.preview_commentary_volume,
             scoreboard: ScoreboardContext::for_project(&open.project),
             highlights: open.project.player_highlights.clone(),
+            avatar: open
+                .project
+                .avatar
+                .as_ref()
+                .map(|file| open.folder.join(file)),
         };
 
         // Whatever was on screen stops first, and takes its frame with it.
