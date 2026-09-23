@@ -1251,6 +1251,30 @@ mod tests {
         assert_eq!(renderer.fit(short, style, size, max_width).0, short);
     }
 
+    /// An entry with no caption — every whole-match entry (spec W2) — leaves
+    /// no bar at all, not an empty one: nothing is drawn over the picture.
+    #[test]
+    fn an_empty_caption_leaves_no_text_bar() {
+        let (w, h) = (640, 360);
+        let empty = render_at(&clip(Vec::new()), 0.0, "", (0, 0, w as i32, h as i32), w, h);
+        assert!(
+            empty.iter().all(|px| px[3] == 0),
+            "{} pixels drawn over a caption-less frame",
+            empty.iter().filter(|px| px[3] > 0).count()
+        );
+        // And the same frame with a caption does draw one, so the assertion
+        // above is about the caption and not about the renderer.
+        let bar = render_at(
+            &clip(Vec::new()),
+            0.0,
+            "1 / 2 | a",
+            (0, 0, w as i32, h as i32),
+            w,
+            h,
+        );
+        assert!(bar.iter().any(|px| px[3] > 0));
+    }
+
     /// The cut line is drawn on one row: the overflow never reaches the
     /// picture above the bar, which is where macOS's wrap put it.
     #[test]

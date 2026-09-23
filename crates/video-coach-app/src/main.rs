@@ -593,10 +593,11 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
                     // The clip's row is ticked only when the sheet was
                     // opened on it. The reel is never ticked by default: it
                     // renders 36 s a goal, which is a long wait nobody asked
-                    // for on an ordinary export.
+                    // for on an ordinary export. Nor is the whole match,
+                    // which is the longest render there is (spec W1).
                     ticked: match row.target {
                         ExportTarget::Clip(_) => only_clip,
-                        ExportTarget::Reel => false,
+                        ExportTarget::Reel | ExportTarget::WholeMatch => false,
                         _ => !only_clip,
                     },
                 }
@@ -1935,11 +1936,10 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         w.set_selected_clip(SharedString::new());
     }
     w.set_clip_count(project.clips.len() as i32);
-    // Exactly when the sheet would have a row (spec R1): a project of goals
-    // and no clips has its reel to export.
-    w.set_can_export(
-        !project.clips.is_empty() || project.match_events.iter().any(|m| m.kind.is_goal()),
-    );
+    // Exactly when the sheet would have a row (spec R1), asked of the sheet's
+    // own list rather than restated here: a project of goals and no clips has
+    // its reel to export, and one of footage alone has its whole match (W1).
+    w.set_can_export(!export_targets(project, None).is_empty());
     show_clips(w, project);
     let tags: Vec<TagRow> = tag_summaries(&project.clips)
         .into_iter()

@@ -9,8 +9,8 @@
 use uuid::Uuid;
 use video_coach_core::project::Project;
 use video_coach_core::scoreboard::{
-    format_clock, interpret, MatchEventKind, MatchEventRecord, MatchFormat, PeriodRole,
-    ScoreboardConfig, ScoreboardState, TeamConfig,
+    format_clock, labelled_events, MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig,
+    ScoreboardState, TeamConfig,
 };
 use video_coach_core::stroke::Rgba;
 
@@ -34,63 +34,31 @@ pub struct MatchRowText {
     pub time: String,
     /// `"1H start"`, `"Home goal"`, …
     pub label: String,
-    /// A start/stop the format has no period for, so [`interpret`] gives it no
-    /// role. Reachable with the back-anchor on, whose derived start takes a
-    /// period without taking one of the cap's places (spec S5): the record is
-    /// kept and turning the anchor off restores its role, so the row says so
-    /// rather than looking like every other one.
+    /// A start/stop the format has no period for
+    /// ([`LabelledEvent::role_less`](video_coach_core::scoreboard::LabelledEvent::role_less)).
     pub role_less: bool,
     /// A goal's span in the reel, `"−30 s / +6 s"`: its trims, or the
     /// defaults (spec R3). `None` for anything but a goal.
     pub reel_span: Option<String>,
 }
 
-/// Every tagged event in match order — the order [`interpret`] walks, so a
-/// row's role is the role the scoreboard gives it.
+/// Every tagged event in match order, as the panel lists it.
+///
+/// The labels are core's ([`labelled_events`]), so a row and a whole-match
+/// export's chapter read the same (spec W3).
 pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
-    let abs = |source_index, source_seconds| project.abs_seconds(source_index, source_seconds);
-    // Roles only exist once there is a format to interpret against.
-    let roles: Vec<(Uuid, PeriodRole)> = project.scoreboard.as_ref().map_or_else(Vec::new, |c| {
-        interpret(&project.absolute_match_events(), c)
-            .into_iter()
-            .filter_map(|e| Some((e.id?, e.role)))
-            .collect()
-    });
-
-    let mut rows: Vec<(f64, MatchRowText)> = project
-        .match_events
-        .iter()
-        .map(|m| {
-            let at = abs(m.source_index, m.source_seconds);
-            let role = roles.iter().find(|(id, _)| *id == m.id).map(|(_, r)| *r);
-            let (label, role_less) = match (m.kind, &project.scoreboard) {
-                (MatchEventKind::HomeGoal, _) => ("Home goal".to_string(), false),
-                (MatchEventKind::AwayGoal, _) => ("Away goal".to_string(), false),
-                (MatchEventKind::StartStop, None) => ("Start/stop".to_string(), false),
-                (MatchEventKind::StartStop, Some(c)) => match role {
-                    Some(PeriodRole::Start(p)) => {
-                        (format!("{} start", c.format.period_name(p)), false)
-                    }
-                    Some(PeriodRole::End(p)) => (format!("{} end", c.format.period_name(p)), false),
-                    None => ("Start/stop (no period)".to_string(), true),
-                },
-            };
-            let row = MatchRowText {
-                id: m.id,
-                kind: m.kind,
-                abs: at,
-                time: format_hms(at),
-                label,
-                role_less,
-                reel_span: m.kind.is_goal().then(|| reel_span(m)),
-            };
-            (at, row)
+    labelled_events(project)
+        .into_iter()
+        .map(|e| MatchRowText {
+            id: e.event.id,
+            kind: e.event.kind,
+            abs: e.abs_seconds,
+            time: format_hms(e.abs_seconds),
+            label: e.label,
+            role_less: e.role_less,
+            reel_span: e.event.kind.is_goal().then(|| reel_span(e.event)),
         })
-        .collect();
-    // Stable, so two events at the same instant keep their tag order, as
-    // `interpret` does.
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
-    rows.into_iter().map(|(_, row)| row).collect()
+        .collect()
 }
 
 /// `"−30 s / +6 s"`: how far the goal's reel entry runs either side of it,
@@ -110,15 +78,13 @@ fn reel_span(goal: &MatchEventRecord) -> String {
 }
 
 /// Every match event's place on the concat timeline, in match order: the
-/// chapters `[` and `]` step through, the same times as [`match_rows`]'s.
+/// chapters `[` and `]` step through, the same times as [`match_rows`]'s —
+/// the same list, so they cannot drift apart.
 pub fn match_abs(project: &Project) -> Vec<f64> {
-    let mut abs: Vec<f64> = project
-        .match_events
-        .iter()
-        .map(|m| project.abs_seconds(m.source_index, m.source_seconds))
-        .collect();
-    abs.sort_by(f64::total_cmp);
-    abs
+    labelled_events(project)
+        .into_iter()
+        .map(|e| e.abs_seconds)
+        .collect()
 }
 
 /// Where `]` goes from `abs`: the first chapter more than

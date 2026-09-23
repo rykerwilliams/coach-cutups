@@ -374,7 +374,12 @@ fn export(
     drop(encoder);
     // A skip keeps the file whole and is only reported. An I/O error may
     // leave a half-written `moov`, which is a corrupt file: it fails.
-    let chapters = chapters::splice(part, &plan.chapters())
+    let titles: Vec<(f64, &str)> = plan
+        .chapters
+        .iter()
+        .map(|(at, title)| (*at, title.as_str()))
+        .collect();
+    let chapters = chapters::splice(part, &titles)
         .map_err(|e| ExportError::Failed(format!("could not write the chapters: {e}")))?;
     Ok(ExportDone {
         path: job.path.clone(),

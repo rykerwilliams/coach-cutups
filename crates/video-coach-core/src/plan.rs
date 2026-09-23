@@ -31,6 +31,9 @@ pub enum ExportTarget {
     /// The goals reel: one entry per confirmed goal, cut from the game video
     /// around it, and no clip at all ([`crate::reel`]).
     Reel,
+    /// The whole match: every source video, in order, whole, and no clip at
+    /// all ([`crate::whole_match`]).
+    WholeMatch,
 }
 
 /// One entry's contribution to the output: a clip's, or a stretch of game
@@ -83,6 +86,17 @@ impl PlanEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompilationPlan {
     pub entries: Vec<PlanEntry>,
+    /// The file's chapters, `(start in output seconds, title)`, in order.
+    ///
+    /// One per entry, titled with the entry's text bar line, for every target
+    /// but [`ExportTarget::WholeMatch`], whose chapters are the match's own
+    /// moments ([`crate::whole_match`], spec W3). Which it is belongs here,
+    /// with the plan, rather than in the splice that writes them.
+    ///
+    /// A chapter starts at `start_frame / OUTPUT_FPS`, never at a sum of
+    /// durations: per-entry quantization would put every later chapter up to
+    /// a frame per entry early.
+    pub chapters: Vec<(f64, String)>,
 }
 
 impl CompilationPlan {
@@ -94,28 +108,18 @@ impl CompilationPlan {
     pub fn total_frames(&self) -> usize {
         self.entries.last().map_or(0, |e| e.start_frame + e.frames)
     }
+}
 
-    /// The file's chapters: one per entry, `(start in seconds, title)`, titled
-    /// with the entry's text bar line. Empty for a plan of fewer than two
-    /// entries, where a chapter would only repeat the file.
-    ///
-    /// A chapter starts at `start_frame / OUTPUT_FPS`, never at a sum of
-    /// durations: per-entry quantization would put every later chapter up to
-    /// a frame per entry early.
-    pub fn chapters(&self) -> Vec<(f64, &str)> {
-        if self.entries.len() < 2 {
-            return Vec::new();
-        }
-        self.entries
-            .iter()
-            .map(|e| {
-                (
-                    e.start_frame as f64 / f64::from(OUTPUT_FPS),
-                    e.text.as_str(),
-                )
-            })
-            .collect()
+/// One chapter per entry (spec C2), titled with its text bar line. Empty for
+/// fewer than two entries, where a chapter would only repeat the file.
+fn entry_chapters(entries: &[PlanEntry]) -> Vec<(f64, String)> {
+    if entries.len() < 2 {
+        return Vec::new();
     }
+    entries
+        .iter()
+        .map(|e| (e.start_frame as f64 / f64::from(OUTPUT_FPS), e.text.clone()))
+        .collect()
 }
 
 /// The bar's line for the `n`th of `total` clips, empty parts collapsed.
@@ -134,8 +138,9 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 /// Build a plan for `target`.
 ///
 /// [`ExportTarget::Reel`] builds its entries from the goals
-/// ([`crate::reel`]); every other target from the clips it covers, in stored
-/// order (Phase 3 spec C3). An entry names its clip by
+/// ([`crate::reel`]) and [`ExportTarget::WholeMatch`] from the source videos
+/// ([`crate::whole_match`]); every other target from the clips it covers, in
+/// stored order (Phase 3 spec C3). An entry names its clip by
 /// [`PlanEntry::clip_id`], so nothing downstream pairs entries with clips by
 /// position.
 ///
@@ -154,9 +159,18 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
     let all = project.clips.iter();
     let clips: Vec<&Clip> = match target {
         ExportTarget::Reel => {
+            let entries = crate::reel::reel_entries(project);
             return CompilationPlan {
-                entries: crate::reel::reel_entries(project),
-            }
+                chapters: entry_chapters(&entries),
+                entries,
+            };
+        }
+        ExportTarget::WholeMatch => {
+            let entries = crate::whole_match::whole_match_entries(project);
+            return CompilationPlan {
+                chapters: crate::whole_match::whole_match_chapters(project, &entries),
+                entries,
+            };
         }
         ExportTarget::AllClips => all.collect(),
         ExportTarget::Tag(tag) => all.filter(|c| c.tags.contains(tag)).collect(),
@@ -189,5 +203,8 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
         start_frame += frames;
     }
 
-    CompilationPlan { entries }
+    CompilationPlan {
+        chapters: entry_chapters(&entries),
+        entries,
+    }
 }

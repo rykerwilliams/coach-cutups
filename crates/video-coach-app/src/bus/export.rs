@@ -47,6 +47,8 @@ use super::{Bus, Event, Input, Open, UserError};
 const ALL_CLIPS_LABEL: &str = "All clips";
 /// What the goals reel is called, in the sheet and in its file name.
 const REEL_LABEL: &str = "All goals";
+/// What the whole-match export is called, in the sheet and in its file name.
+const WHOLE_MATCH_LABEL: &str = "Whole match";
 
 /// What a clip with no name of its own is called.
 const UNTITLED: &str = "Untitled";
@@ -120,18 +122,20 @@ pub struct ExportTargetRow {
     pub target: ExportTarget,
     /// What the sheet calls it, and what names its file (spec E6).
     pub label: String,
-    /// What its row counts: the clips it covers, or the reel's goals, which
-    /// are not its entries, since two goals close together share one.
+    /// What its row counts: the clips it covers, the reel's goals — which are
+    /// not its entries, since two goals close together share one — or the
+    /// whole match's source videos.
     pub count: usize,
-    /// What [`ExportTargetRow::count`] counts, singular: `"clip"` or `"goal"`.
+    /// What [`ExportTargetRow::count`] counts, singular: `"clip"`, `"goal"`
+    /// or `"video"`.
     pub unit: &'static str,
     /// How long its output runs, from its frame count
     /// (`CompilationPlan::total_frames`).
     pub seconds: f64,
 }
 
-/// The sheet's targets: All clips, one row per tag, All goals, then `selected`
-/// if a clip is (spec E8, match vision spec R1).
+/// The sheet's targets: Whole match, All clips, one row per tag, All goals,
+/// then `selected` if a clip is (spec E8, match vision specs R1 and W1).
 ///
 /// A target with no plan entry is left out, since there is nothing to export
 /// in it — which is also what keeps an empty project's sheet empty, and the
@@ -141,6 +145,10 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
         let plan = compilation_plan(project, &target);
         let (count, unit) = match target {
             ExportTarget::Reel => (reel_goals(project).len(), "goal"),
+            // One entry per source video, so the row reads "2 videos ·
+            // 54:12" — the honest warning that this is the longest render
+            // the app can be asked for (spec W4).
+            ExportTarget::WholeMatch => (plan.entries.len(), "video"),
             _ => (plan.entries.len(), "clip"),
         };
         (!plan.entries.is_empty()).then(|| ExportTargetRow {
@@ -151,8 +159,9 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
             seconds: plan.total_frames() as f64 / f64::from(OUTPUT_FPS),
         })
     };
-    let mut rows: Vec<ExportTargetRow> = row(ExportTarget::AllClips, ALL_CLIPS_LABEL.into())
+    let mut rows: Vec<ExportTargetRow> = row(ExportTarget::WholeMatch, WHOLE_MATCH_LABEL.into())
         .into_iter()
+        .chain(row(ExportTarget::AllClips, ALL_CLIPS_LABEL.into()))
         .collect();
     for tag in tag_summaries(&project.clips) {
         rows.extend(row(ExportTarget::Tag(tag.tag.clone()), tag.tag));
@@ -438,6 +447,7 @@ fn label(open: &Open, target: &ExportTarget) -> Result<String, UserError> {
             .map(|clip| clip_label(clip).to_owned())
             .ok_or_else(|| UserError::CantExport("the clip is gone".into())),
         ExportTarget::Reel => Ok(REEL_LABEL.to_owned()),
+        ExportTarget::WholeMatch => Ok(WHOLE_MATCH_LABEL.to_owned()),
     }
 }
 
@@ -493,14 +503,15 @@ fn job(
         if missing.get(entry.source_index).copied().unwrap_or(true) {
             let what = match clip {
                 Some(clip) => format!("{}'s game video", clip_label(clip)),
-                // A reel entry has no clip to name: the file names itself.
+                // A reel or whole-match entry has no clip to name: the file
+                // names itself.
                 None => {
                     let file = open
                         .project
                         .source_videos
                         .get(entry.source_index)
                         .map_or("a video", |s| s.display_name.as_str());
-                    format!("{file} (a goal's game video)")
+                    format!("{file} (the game video)")
                 }
             };
             return Err(refused(format!("{what} is missing; relink it first")));

@@ -242,19 +242,19 @@ fn chapters_start_on_each_entrys_first_frame() {
     let p = project_with(vec![a, clip("b", 1, &["shot"]), clip("c", 2, &[])]);
     let plan = compilation_plan(&p, &ExportTarget::AllClips);
     assert_eq!(plan.entries[1].start_frame, 151);
-    let chapters = plan.chapters();
+    let chapters = &plan.chapters;
     assert_eq!(chapters.len(), 3);
-    assert_eq!(chapters[0], (0.0, "1 / 3 | a"));
-    assert_eq!(chapters[1], (151.0 / 30.0, "2 / 3 | b | shot"));
+    assert_eq!(chapters[0], (0.0, "1 / 3 | a".to_string()));
+    assert_eq!(chapters[1], (151.0 / 30.0, "2 / 3 | b | shot".to_string()));
 }
 
 #[test]
 fn fewer_than_two_entries_get_no_chapters() {
     let none = compilation_plan(&project_with(vec![]), &ExportTarget::AllClips);
-    assert!(none.chapters().is_empty());
+    assert!(none.chapters.is_empty());
     let one = compilation_plan(
         &project_with(vec![clip("a", 0, &[])]),
         &ExportTarget::AllClips,
     );
-    assert!(one.chapters().is_empty());
+    assert!(one.chapters.is_empty());
 }

@@ -1348,12 +1348,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
         .iter()
         .map(|f| oracle(f.source_time, src.fps, src.frames))
         .collect();
-    let expected: Vec<(f64, String)> = compilation
-        .plan
-        .chapters()
-        .into_iter()
-        .map(|(at, title)| (at, title.to_owned()))
-        .collect();
+    let expected: Vec<(f64, String)> = compilation.plan.chapters.clone();
     assert_eq!(expected.len(), 3);
     assert_eq!(compilation.plan.entries[1].start_frame, 16);
     let path = dir.path().join("out.mp4");

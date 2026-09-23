@@ -23,4 +23,5 @@ pub mod stroke_replay;
 pub mod tag;
 pub mod timeline;
 pub mod undo;
+pub mod whole_match;
 pub mod zoom;

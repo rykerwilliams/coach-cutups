@@ -296,6 +296,70 @@ pub fn interpret(
         .collect()
 }
 
+/// One tagged event with the name the coach reads for it.
+///
+/// The Match panel's row and a whole-match export's chapter are the same
+/// label (spec W3), so the wording lives here rather than in the app.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelledEvent<'a> {
+    pub event: &'a MatchEventRecord,
+    /// Where it sits on the concat timeline, in seconds.
+    pub abs_seconds: f64,
+    /// `"1H start"`, `"Home goal"`, …
+    pub label: String,
+    /// A start/stop the format has no period for, so [`interpret`] gives it no
+    /// role. Reachable with the back-anchor on, whose derived start takes a
+    /// period without taking one of the cap's places (spec S5): the record is
+    /// kept and turning the anchor off restores its role, so the label says so
+    /// rather than looking like every other one.
+    pub role_less: bool,
+}
+
+/// Every tagged event in match order, labelled — the order [`interpret`]
+/// walks, so an event's role is the role the scoreboard gives it.
+pub fn labelled_events(project: &Project) -> Vec<LabelledEvent<'_>> {
+    // Roles only exist once there is a format to interpret against.
+    let roles: Vec<(Uuid, PeriodRole)> = project.scoreboard.as_ref().map_or_else(Vec::new, |c| {
+        interpret(&project.absolute_match_events(), c)
+            .into_iter()
+            .filter_map(|e| Some((e.id?, e.role)))
+            .collect()
+    });
+
+    let mut events: Vec<LabelledEvent> = project
+        .match_events
+        .iter()
+        .map(|event| {
+            let role = roles
+                .iter()
+                .find(|(id, _)| *id == event.id)
+                .map(|(_, r)| *r);
+            let (label, role_less) = match (event.kind, &project.scoreboard) {
+                (MatchEventKind::HomeGoal, _) => ("Home goal".to_string(), false),
+                (MatchEventKind::AwayGoal, _) => ("Away goal".to_string(), false),
+                (MatchEventKind::StartStop, None) => ("Start/stop".to_string(), false),
+                (MatchEventKind::StartStop, Some(c)) => match role {
+                    Some(PeriodRole::Start(p)) => {
+                        (format!("{} start", c.format.period_name(p)), false)
+                    }
+                    Some(PeriodRole::End(p)) => (format!("{} end", c.format.period_name(p)), false),
+                    None => ("Start/stop (no period)".to_string(), true),
+                },
+            };
+            LabelledEvent {
+                event,
+                abs_seconds: project.abs_seconds(event.source_index, event.source_seconds),
+                label,
+                role_less,
+            }
+        })
+        .collect();
+    // Stable, so two events at the same instant keep their tag order, as
+    // `interpret` does.
+    events.sort_by(|a, b| a.abs_seconds.total_cmp(&b.abs_seconds));
+    events
+}
+
 // ------------------------------------------------------------------- clock
 
 /// What the clock cell reads.

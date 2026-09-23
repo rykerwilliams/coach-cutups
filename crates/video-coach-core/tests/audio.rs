@@ -143,6 +143,7 @@ fn an_entry_without_a_clip_is_game_audio_only() {
             .collect(),
         plan: CompilationPlan {
             entries: vec![entry],
+            chapters: Vec::new(),
         },
     };
 

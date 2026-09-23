@@ -1,6 +1,7 @@
-//! Bus end to end: the goals reel and its trims (match vision spec R) — the
-//! wiring only. What the reel's plan is and which trims are allowed are
-//! core's rules and core's tests (`tests/reel.rs`, `tests/scoreboard.rs`).
+//! Bus end to end: the goals reel and its trims (match vision spec R), and
+//! the whole-match export (spec W) — the wiring only. What either plan is,
+//! and which trims are allowed, are core's rules and core's tests
+//! (`tests/reel.rs`, `tests/whole_match.rs`, `tests/scoreboard.rs`).
 //!
 //! Layout per test: `<tmp>/config` holds the state file, `<tmp>/project` the
 //! project (and, once a run starts, its `exports/`), `<tmp>/media` the
@@ -13,8 +14,9 @@ use uuid::Uuid;
 use video_coach_app::bus::{export_targets, Command, Event, TargetState, UserError};
 use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Project, Quality, Resolution};
-use video_coach_core::scoreboard::{MatchEventKind, ReelEnd};
+use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
 use video_coach_core::store::{self, EXPORTS_DIRNAME};
+use video_coach_core::stroke::Rgba;
 use video_coach_harness::{write_project, Harness};
 use video_coach_media::fixtures;
 
@@ -123,20 +125,140 @@ fn the_reel_exports_through_the_bus() {
     p.h.shutdown();
 }
 
-/// The sheet offers "All goals" once there is a goal, after the tag rows, and
-/// not before.
+/// The sheet leads with "Whole match", which any source video earns (spec
+/// W1), and offers "All goals" once there is a goal, after the tag rows.
 #[test]
-fn the_all_goals_row_follows_the_goals() {
+fn the_sheet_leads_with_the_whole_match_and_follows_the_goals() {
     let mut p = Proj::open(&[("a.webm", 3)]);
-    assert!(export_targets(&p.saved(), None).is_empty());
+    let rows = export_targets(&p.saved(), None);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].target, ExportTarget::WholeMatch);
+    assert_eq!(rows[0].label, "Whole match");
+    assert_eq!((rows[0].count, rows[0].unit), (1, "video"));
 
     let (_, project) = p.goal(0, 2.0);
     let rows = export_targets(&project, None);
-    assert_eq!(rows.len(), 1, "{rows:#?}");
-    assert_eq!(rows[0].target, ExportTarget::Reel);
-    assert_eq!(rows[0].label, "All goals");
-    assert_eq!((rows[0].count, rows[0].unit), (1, "goal"));
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    assert_eq!(rows[0].target, ExportTarget::WholeMatch);
+    assert_eq!(rows[1].target, ExportTarget::Reel);
+    assert_eq!(rows[1].label, "All goals");
+    assert_eq!((rows[1].count, rows[1].unit), (1, "goal"));
     p.h.shutdown();
+}
+
+/// The whole match renders through the same export path, named after itself,
+/// with the match's own moments as its chapters (spec W3) — read back with
+/// the only independent reader of `chpl`.
+#[test]
+fn the_whole_match_exports_with_the_matchs_own_chapters() {
+    let mut p = Proj::open(&[("a.webm", 3), ("b.webm", 3)]);
+    p.h.send(Command::SetScoreboard(ScoreboardConfig {
+        home: TeamConfig::new("Rovers", Rgba::RED, Rgba::RED),
+        away: TeamConfig::new("United", Rgba::RED, Rgba::RED),
+        format: Default::default(),
+        auto_back_anchor_p1: false,
+    }));
+    p.h.wait_changed();
+    let tags = [
+        (MatchEventKind::StartStop, 0, 0.5),
+        (MatchEventKind::HomeGoal, 0, 1.5),
+        (MatchEventKind::StartStop, 0, 2.5),
+        (MatchEventKind::StartStop, 1, 0.5),
+    ];
+    for &(kind, source_index, source_seconds) in &tags {
+        p.h.send(Command::TagMatchEvent {
+            kind,
+            source_index,
+            source_seconds,
+        });
+    }
+    let project = tags
+        .iter()
+        .map(|_| p.h.wait_changed())
+        .last()
+        .unwrap()
+        .project;
+
+    let plan = compilation_plan(&project, &ExportTarget::WholeMatch);
+    assert_eq!(plan.entries.len(), 2);
+    assert!(plan
+        .entries
+        .iter()
+        .all(|e| e.clip_id.is_none() && e.text.is_empty()));
+    let titles: Vec<&str> = plan.chapters.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(titles, ["1H start", "Home goal", "1H end", "2H start"]);
+
+    p.h.send(Command::Export {
+        targets: vec![ExportTarget::WholeMatch],
+        resolution: Resolution::R720,
+        quality: Quality::Low,
+    });
+    let done = p.h.wait_map("the run's outcome", |e| match e {
+        Event::Export(run) if !run.is_running() => Some(run.clone()),
+        _ => None,
+    });
+    let target = &done.targets[0];
+    assert_eq!(target.label, "Whole match");
+    assert_eq!(target.frames, plan.total_frames());
+    let TargetState::Done(path) = &target.state else {
+        panic!("{target:?}");
+    };
+    assert_eq!(
+        path,
+        &p.folder
+            .join(EXPORTS_DIRNAME)
+            .join("Whole match - Game.mp4")
+    );
+    assert_eq!(fixtures::decode_gray(path).len(), plan.total_frames());
+
+    let got = ffprobe_chapters(path);
+    assert_eq!(
+        got.len(),
+        plan.chapters.len(),
+        "chapters read back: {got:?}"
+    );
+    for ((at, title), (want_at, want_title)) in got.iter().zip(&plan.chapters) {
+        assert_eq!(title, want_title);
+        assert!(
+            (at - want_at).abs() < 0.001,
+            "{title:?} starts at {at}, not {want_at}"
+        );
+    }
+    p.h.shutdown();
+}
+
+/// `path`'s chapters as `ffprobe` reads them: `(start in seconds, title)`.
+///
+/// `ffprobe` is the independent reader: GStreamer's `qtdemux` doesn't read
+/// `chpl`, and no released Rust MP4 crate parses it. Without it this fails,
+/// never skips: it is a test-only build dependency (`packaging/build-deps.txt`).
+fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_chapters", "-of", "json"])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "ffprobe didn't run ({e}): install the `ffmpeg` package (packaging/build-deps.txt)"
+            )
+        });
+    assert!(
+        out.status.success(),
+        "ffprobe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["chapters"]
+        .as_array()
+        .expect("a chapters array")
+        .iter()
+        .map(|c| {
+            (
+                c["start_time"].as_str().unwrap().parse().unwrap(),
+                c["tags"]["title"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// A trim is one undo step and a saved edit; a refused one is a notice and
@@ -190,7 +312,7 @@ fn a_source_move_purges_the_trim_history() {
 }
 
 /// A reel entry has no clip to name, so the refusal names the game video's
-/// file.
+/// file — the same refusal a whole-match entry gets.
 #[test]
 fn a_missing_game_video_is_refused_naming_the_file() {
     let mut p = Proj::open_with(&[("a.webm", 2), ("b.webm", 2)], |media| {
@@ -207,7 +329,7 @@ fn a_missing_game_video_is_refused_naming_the_file() {
     });
     assert_eq!(
         p.h.wait_for_error(),
-        UserError::CantExport("b.webm (a goal's game video) is missing; relink it first".into())
+        UserError::CantExport("b.webm (the game video) is missing; relink it first".into())
     );
     p.h.shutdown();
 }
