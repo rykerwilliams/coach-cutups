@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.3.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.4.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -175,6 +175,18 @@ New in 0.3.0. Pick a picture of yourself and the app records your voice only —
 - [ ] **Take the picture away.** Delete the copy from the project folder while the app is open. **Right:** Devices says it's missing, the clip's inspector says the clip will export with no inset, and exporting still works — you just get no corner.
 - [ ] **Transcription still works** on an avatar clip (there's sound but no picture in the recording).
 - [ ] **Your call:** how much the circle grows, and how quickly it settles after a word. Both are one-line constants, so say "more", "less", "snappier" or "calmer" and I'll change them.
+
+## 13. The whole match, copied instead of re-encoded
+
+New in 0.4.0. The export sheet has a third picker, **Scoreboard**, under Resolution and Quality.
+
+- [ ] **[must work] The whole match, copied.** Leave **Scoreboard** on **Default**, tick **Whole match**, export. **Right:** it finishes in a minute or two, not an hour, and the file is about the size of your two halves put together (~2 GB, not 8). A note in the sheet says the whole match is copied and that highlights and drawings can't ride a copy.
+- [ ] **[must work] The scoreboard, in VLC.** Open the exported match in VLC. **Right:** the score and match clock appear as subtitles, updating as the match goes, and Subtitle → Sub Track can switch them off. There's a `.srt` file beside the `.mp4` — that's what VLC is reading.
+- [ ] **Tell us where you actually watch these.** Play the same file where the parents or players would: phone, TV, Google Photos, YouTube. **Right or not:** the subtitles may or may not show. Whether they do decides if this is enough or if the scoreboard needs to be inside the picture there. **This is the one answer that decides the next step.**
+- [ ] **Chapters still work** in the copied file (Playback → Chapter): "Kick-off", "<team> goal 1-0", "Half time".
+- [ ] **Burned in, on purpose.** Set **Scoreboard** to **Burned into the picture** and export the whole match again. **Right:** it re-encodes (the slow way), the board is in the picture, and there's no `.srt` beside it — the old one is cleaned up.
+- [ ] **Clips are unchanged.** Export a clip with **Separate track** chosen. **Right:** the clip still has its scoreboard burned in — a clip can't carry a subtitle track — and no `.srt` appears beside it.
+- [ ] **File sizes.** The quality levels changed: at **Medium** a match is about 2.7 GB where it used to be 10 GB, and **High** about 4.5 GB where it was 19 GB. **Right:** the picture still looks good to you, and the burned-in scoreboard text is crisp. Say if Medium looks worse than you expect.
 
 ---
 
