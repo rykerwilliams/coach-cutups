@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.2.1_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.3.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -162,6 +162,19 @@ New in 0.2.0. The first save of an older project upgrades it, so it can no longe
 - [ ] **While recording** [cam+mic]. Mid-take, pause, press **H** and ring a player. **Right:** it lands, and **Esc** leaves the tool without stopping the take.
 - [ ] **Edit and undo.** Try **Delete key here** (on and off a key frame), the row's delete, and recolouring from a pen swatch, pressing Ctrl+Z after each. **Right:** each undoes on its own. A source that a highlight uses can't be removed, and says why.
 - [ ] **Your call:** the ring's size and line thickness, whether the pill stays readable full-screen, and whether keys a second apart are close enough on a panning shot. (If they aren't, that's what the tracking phase is for.)
+
+## 12. Recording with an avatar instead of the webcam
+
+New in 0.3.0. Pick a picture of yourself and the app records your voice only — the camera is never opened — with the picture in the corner, breathing as you talk.
+
+- [ ] **Pick one.** Open **Devices** and, under **Inset**, click **Choose…**. Pick a PNG or JPEG (your gravatar is the case this was built for). **Right:** a round thumbnail appears with the file's name. The picture is copied into the project folder, so your original is untouched.
+- [ ] **[must work] Record without a camera.** Press **R**. **Right:** the take starts with no camera light and no camera permission prompt, and the corner shows your picture as a circle straight away. Talk: the circle swells on words and settles between them. It stays on screen for the whole take.
+- [ ] **In the finished video.** Preview that clip, then export it. **Right:** the same circle, in the same corner a webcam would be in, pulsing with your voice. It should look the same as what you saw while recording.
+- [ ] **Try a photo that isn't square** — a portrait phone photo. **Right:** it fills the same circle in the same place, cropped to its middle, not floating somewhere else or squashed.
+- [ ] **Both kinds in one project.** Record one clip with an avatar and, after **Remove**ing the image, one with the webcam. Export both. **Right:** each clip shows what it was recorded with.
+- [ ] **Take the picture away.** Delete the copy from the project folder while the app is open. **Right:** Devices says it's missing, the clip's inspector says the clip will export with no inset, and exporting still works — you just get no corner.
+- [ ] **Transcription still works** on an avatar clip (there's sound but no picture in the recording).
+- [ ] **Your call:** how much the circle grows, and how quickly it settles after a word. Both are one-line constants, so say "more", "less", "snappier" or "calmer" and I'll change them.
 
 ---
 
