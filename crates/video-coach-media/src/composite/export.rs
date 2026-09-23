@@ -38,6 +38,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use video_coach_core::audio::{Region, AUDIO_SAMPLE_RATE};
+use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::highlight::{highlight_shapes, PlayerHighlight};
 use video_coach_core::layout::pip_rect;
@@ -97,6 +98,11 @@ pub struct ExportJob {
     /// The output file. Written as `<path>.part` and renamed on success, so a
     /// failed export never touches a file already there.
     pub path: PathBuf,
+    /// The scoreboard as lines of text against output time, for the sidecar
+    /// beside the file (spec T1). Built by the bus from the same
+    /// `ScoreboardContext` the burned board reads; **empty means no sidecar**,
+    /// which also removes a stale one (see [`write_sidecar`]).
+    pub cues: Vec<Cue>,
     /// Which renderer writes it. [`Render::Copy`] ignores `resolution`,
     /// `quality`, `entries`, `audio`, `scoreboard`, `highlights` and `avatar`:
     /// a copy carries the sources' own packets and nothing drawn (spec N).
@@ -156,6 +162,10 @@ pub struct ExportDone {
     /// Whether the file got its chapters, one per entry, or why not. A skip
     /// never fails the export.
     pub chapters: ChapterOutcome,
+    /// The scoreboard sidecar written beside the file, or `None` — the job
+    /// carried no cues, or the write failed, which is reported and never
+    /// fatal.
+    pub sidecar: Option<PathBuf>,
     /// What was left of the `moov` reserve at EOS, in seconds of the muxer's
     /// own accounting, for the log line (spec L4, E7). The standing check that
     /// the margin is still ample on a longer match — a number in the log
@@ -336,8 +346,8 @@ fn run(
     result
 }
 
-/// The chapters, then the rename: what every renderer owes once its file is
-/// written.
+/// The chapters, the rename, then the sidecar: what every renderer owes once
+/// its file is written.
 fn finish(job: &ExportJob, part: &Path, rendered: Rendered) -> Result<ExportDone, ExportError> {
     // A skip keeps the file whole and is only reported. An I/O error may
     // leave a half-written `moov`, which is a corrupt file: it fails.
@@ -357,8 +367,49 @@ fn finish(job: &ExportJob, part: &Path, rendered: Rendered) -> Result<ExportDone
         encoder: rendered.encoder,
         diagnostics: rendered.diagnostics,
         chapters,
+        sidecar: write_sidecar(job),
         reserve_remaining: rendered.reserve_remaining,
     })
+}
+
+/// The scoreboard beside the finished file: `job.cues` as SRT at
+/// `<output>.srt`, or — with no cues — nothing at that path at all.
+///
+/// **The path is the output's own,** so the run's name cleaning and its
+/// `" (2)"` de-duplication carry, and the matching basename is what makes a
+/// player load it without being asked (spec T6).
+///
+/// **Writing and removing are one step:** the file that belongs beside this
+/// output is this string, or nothing. Otherwise a coach exports with a
+/// scoreboard, deletes it, exports again, and their player plays the old
+/// score over the new film.
+///
+/// **A failure is reported, never fatal.** A good MP4 is not thrown away
+/// because a text file could not be written. It runs only after the rename,
+/// so a cancelled or failed run neither writes nor removes anything: the last
+/// good export keeps its own sidecar.
+fn write_sidecar(job: &ExportJob) -> Option<PathBuf> {
+    let path = job.path.with_extension("srt");
+    if job.cues.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!(
+                "export: could not remove the old scoreboard {}: {e}",
+                path.display()
+            ),
+            _ => {}
+        }
+        return None;
+    }
+    match std::fs::write(&path, cues_to_srt(&job.cues)) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!(
+                "export: could not write the scoreboard {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn export(
@@ -1204,6 +1255,7 @@ mod tests {
             })],
             audio: Vec::new(),
             path: path.clone(),
+            cues: Vec::new(),
             render: Render::Encode,
             resolution: Resolution::R720,
             quality: Quality::Medium,

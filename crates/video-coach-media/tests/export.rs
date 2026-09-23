@@ -138,6 +138,7 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         })],
         audio: Vec::new(),
         path,
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -347,6 +348,7 @@ fn fiducial(kind: CounterKind) {
         sources: vec![src.path.clone()],
         entries: vec![Some(EntryMedia { recording, clip })],
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -459,6 +461,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
             })
             .collect(),
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -777,6 +780,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             entries: vec![Some(EntryMedia { recording, clip })],
             audio: Vec::new(),
             path: path.clone(),
+            cues: Vec::new(),
             render: Render::Encode,
             resolution: Resolution::R720,
             quality: Quality::Medium,
@@ -938,6 +942,7 @@ fn the_export_burns_in_the_scoreboard() {
         })],
         audio: Vec::new(),
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1052,6 +1057,7 @@ fn an_avatar_clip_pulses_in_the_export() {
         entries: vec![Some(EntryMedia { recording, clip })],
         audio: Vec::new(),
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1152,6 +1158,7 @@ fn an_avatar_and_a_camera_clip_export_together() {
             })
             .collect(),
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1217,6 +1224,7 @@ fn avatar_export(
         entries: vec![Some(EntryMedia { recording, clip })],
         audio: Vec::new(),
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1290,6 +1298,7 @@ fn sounded_job(
         sources: vec![source],
         entries: vec![Some(EntryMedia { recording, clip })],
         path,
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1487,6 +1496,7 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
         sources: vec![source],
         entries: vec![None],
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1563,7 +1573,9 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     let src = source(dir.path(), CounterKind::Vp8WebmWithAudio);
     let path = dir.path().join("out.mp4");
+    let sidecar = dir.path().join("out.srt");
     std::fs::write(&path, b"the previous export").unwrap();
+    std::fs::write(&sidecar, b"the previous scoreboard").unwrap();
     let frames = (0..60)
         .map(|n| FrameSpec {
             entry: 0,
@@ -1598,6 +1610,9 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     assert_eq!(result, Err(ExportError::Cancelled));
     assert!(!dir.path().join("out.mp4.part").exists());
     assert_eq!(std::fs::read(&path).unwrap(), b"the previous export");
+    // The sidecar is written after the rename, so a cancel neither writes one
+    // nor takes the last good export's away.
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"the previous scoreboard");
 }
 
 /// `path`'s chapters as `ffprobe` reads them: `(start in seconds, title)`.
@@ -1640,6 +1655,10 @@ fn ffprobe_chapters(path: &Path) -> Vec<(f64, String)> {
 /// The entries are 0.51 s long, so each takes 16 frames rather than 15.3:
 /// a chapter placed by summing durations would drift by most of a frame per
 /// entry, well past the millisecond this allows.
+///
+/// **It also carries no cues, and so clears the sidecar** — the case the copy
+/// tests can't reach, and the one a coach hits by switching the scoreboard
+/// picker back to burned in and exporting over the same file.
 #[test]
 fn a_compilation_gets_a_chapter_per_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -1663,6 +1682,8 @@ fn a_compilation_gets_a_chapter_per_entry() {
     assert_eq!(expected.len(), 3);
     assert_eq!(compilation.plan.entries[1].start_frame, 16);
     let path = dir.path().join("out.mp4");
+    let sidecar = dir.path().join("out.srt");
+    std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
     let done = export(ExportJob {
         // A silent track, which is still `avenc_aac`'s.
         audio: Vec::new(),
@@ -1679,6 +1700,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
         compilation,
         sources: vec![src.path.clone()],
         path: path.clone(),
+        cues: Vec::new(),
         render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
@@ -1688,6 +1710,10 @@ fn a_compilation_gets_a_chapter_per_entry() {
     })
     .unwrap();
     assert_eq!(done.chapters, ChapterOutcome::Written(3));
+    assert!(
+        !sidecar.exists(),
+        "a burned export left the old scoreboard beside it"
+    );
 
     let got = ffprobe_chapters(&path);
     assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");

@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
+use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{compilation_schedule, Compilation};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Project, Quality, Resolution, SourceRef};
@@ -66,6 +67,7 @@ fn job(m: &Match, path: PathBuf) -> ExportJob {
         sources: m.files.clone(),
         audio: Vec::new(),
         path,
+        cues: Vec::new(),
         render: Render::Copy,
         // Both unread by a copy, which carries the sources' own pixels.
         resolution: Resolution::R1080,
@@ -168,11 +170,15 @@ fn chapters(path: &Path) -> Vec<(f64, String)> {
 }
 
 /// Two sources joined: every frame of the first, then every frame of the
-/// second, in the sources' own codec, with the plan's chapters on top.
+/// second, in the sources' own codec, with the plan's chapters on top and the
+/// scoreboard in an `.srt` beside it.
 ///
 /// The chapters are what prove the `moov` was reserved: without
 /// `reserved-max-duration` the muxer writes it last, `chapters::splice` finds
 /// no room and skips, and this reads back empty.
+///
+/// The cues are written as core formats them — the score and the clock are
+/// core's, and nothing about SRT lives in media.
 #[test]
 fn a_copy_of_two_sources_is_lossless_and_chaptered() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,9 +190,25 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
         m.files.iter().map(|f| video_stream(f)).collect();
     let expected: Vec<(f64, String)> = m.compilation.plan.chapters.clone();
     assert_eq!(expected.len(), 2, "one chapter per source: {expected:?}");
+    let cues = vec![
+        Cue {
+            start: 0.0,
+            end: 1.5,
+            text: "Rovers 0 - 0 Athletic · 00:00".into(),
+        },
+        Cue {
+            start: 1.5,
+            end: 3.5,
+            text: "Rovers 1 - 0 Athletic · 00:01".into(),
+        },
+    ];
 
     let path = dir.path().join("out.mp4");
-    let done = copy(job(&m, path.clone())).unwrap();
+    let done = copy(ExportJob {
+        cues: cues.clone(),
+        ..job(&m, path.clone())
+    })
+    .unwrap();
     assert_eq!(done.encoder, "copy");
     assert_eq!(done.diagnostics, Default::default());
     assert!(
@@ -219,6 +241,13 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
         "the copy is not packet for packet"
     );
 
+    let sidecar = dir.path().join("out.srt");
+    assert_eq!(done.sidecar, Some(sidecar.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap(),
+        cues_to_srt(&cues)
+    );
+
     let got = chapters(&path);
     assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");
     for ((at, title), (want_at, want_title)) in got.iter().zip(&expected) {
@@ -228,6 +257,32 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
             "{title:?} starts at {at}, not {want_at}"
         );
     }
+}
+
+/// No cues: no sidecar, and whatever `.srt` was beside the old export is
+/// gone.
+///
+/// **This is the coach who deletes their scoreboard and exports again.**
+/// Without the removal their player auto-loads the old score over the new
+/// film, which looks like the export, not like a stale file.
+#[test]
+fn an_empty_cue_list_writes_no_sidecar_and_removes_a_stale_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match(
+        dir.path(),
+        &[("first half", 640, 360, 30), ("second half", 640, 360, 30)],
+    );
+    let path = dir.path().join("out.mp4");
+    let sidecar = dir.path().join("out.srt");
+    std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
+
+    let done = copy(job(&m, path.clone())).unwrap();
+    assert_eq!(done.sidecar, None);
+    assert!(path.exists(), "the copy wrote no file");
+    assert!(
+        !sidecar.exists(),
+        "the old scoreboard is still beside the new film"
+    );
 }
 
 /// Two sources recorded differently: refused, naming the one that differs,

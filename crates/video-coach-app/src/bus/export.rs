@@ -569,6 +569,10 @@ fn job(
             .map(|s| open.folder.join(&s.relative_path))
             .collect(),
         path: exports.join(file_name(label, &open.project.name)),
+        // The scoreboard is burned into the picture on every target today, so
+        // there is nothing to put beside the file — and an empty list is also
+        // what clears a sidecar an earlier export left there.
+        cues: Vec::new(),
         render: Render::Encode,
         resolution,
         quality,
