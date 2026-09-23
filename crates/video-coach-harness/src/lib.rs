@@ -17,7 +17,7 @@ use video_coach_app::bus::{
     Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot, StateFile,
     TranscriptionState, UserError,
 };
-use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::store;
 use video_coach_media::{fixtures, frame_times, now_ns, probe, Frame, SinkKind, TranscribeKind};
 
@@ -604,6 +604,7 @@ pub fn clip(source_index: usize) -> Clip {
         recording_filename: format!("{}.mkv", Uuid::new_v4()),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-19T00:00:00Z".into(),
         transcript: String::new(),

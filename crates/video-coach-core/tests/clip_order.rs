@@ -3,7 +3,7 @@
 
 use uuid::Uuid;
 
-use video_coach_core::project::{Clip, Project};
+use video_coach_core::project::{Clip, Inset, Project};
 use video_coach_core::undo::ClipEdit;
 
 fn clip(n: u128, source_index: usize, start: f64) -> Clip {
@@ -18,6 +18,7 @@ fn clip(n: u128, source_index: usize, start: f64) -> Clip {
         recording_filename: format!("{n}.mkv"),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: String::new(),
         transcript: String::new(),

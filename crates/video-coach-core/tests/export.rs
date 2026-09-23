@@ -12,7 +12,7 @@ use video_coach_core::export::{
     compilation_schedule, Compilation, FrameSpec, RateWindow, OUTPUT_FPS,
 };
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::zoom::Zoom;
 
 fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
@@ -27,6 +27,7 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
         recording_filename: "c.mkv".into(),
         events,
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-19T00:00:00Z".into(),
         transcript: String::new(),

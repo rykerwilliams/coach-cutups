@@ -12,7 +12,7 @@ use video_coach_core::highlight::{
     PlayerHighlight, SINGLE_KEY_SPAN,
 };
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
 
@@ -268,6 +268,7 @@ fn clip_with_events(events: Vec<CommentaryEvent>, recording_duration: f64) -> Cl
         recording_filename: "c.mkv".into(),
         events,
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-22T00:00:00Z".into(),
         transcript: String::new(),

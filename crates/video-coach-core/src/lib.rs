@@ -7,6 +7,7 @@
 //! design.
 
 pub mod audio;
+pub mod avatar;
 pub mod event;
 pub mod export;
 pub mod highlight;

@@ -9,7 +9,7 @@
 use uuid::Uuid;
 
 use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
-use video_coach_core::project::Clip;
+use video_coach_core::project::{Clip, Inset};
 use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::undo::{ClipEdit, UndoAction, UndoController, STACK_CAP};
@@ -26,6 +26,7 @@ fn clip(id: Uuid) -> Clip {
         recording_filename: format!("{id}.mkv"),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: String::new(),
         transcript: String::new(),

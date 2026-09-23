@@ -38,6 +38,23 @@ pub enum Resolution {
     R2160,
 }
 
+/// What a clip's inset holds: the webcam it was recorded with, or the
+/// project's avatar image.
+///
+/// It is a clip's own fact, recorded at capture, so a project can hold both
+/// kinds and each entry of one export renders what it was made with. Not
+/// derived from the recording's lack of a video track: a webcam take whose
+/// camera died has none either, and deriving would draw the coach's face over
+/// a take they recorded on camera — a *wrong* picture, not a missing one
+/// (spec B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Inset {
+    #[default]
+    Camera,
+    Avatar,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Quality {
@@ -148,6 +165,11 @@ pub struct Clip {
 
     pub events: Vec<CommentaryEvent>,
     pub show_pip: bool,
+    /// v10. Which inset this clip was recorded with; `show_pip` still decides
+    /// whether one is drawn at all. Read through [`Clip::shows_camera_pip`]
+    /// and [`Clip::shows_avatar`], never on its own.
+    #[serde(default)]
+    pub inset: Inset,
     pub sort_index: i64,
 
     /// RFC3339, opaque. Nothing reads it — ordering is by `sort_index` — so it
@@ -173,6 +195,21 @@ impl Clip {
             }
         }
     }
+
+    // The two halves of one decision, written together so they cannot drift:
+    // `show_pip × inset` is interpreted here and nowhere else. Each has a
+    // caller that wants it positively — the webcam PiP pad and the overlay's
+    // avatar — and they are never both true.
+
+    /// The webcam PiP pad carries this clip's recording.
+    pub fn shows_camera_pip(&self) -> bool {
+        self.show_pip && self.inset == Inset::Camera
+    }
+
+    /// The overlay draws the project's avatar for this clip.
+    pub fn shows_avatar(&self) -> bool {
+        self.show_pip && self.inset == Inset::Avatar
+    }
 }
 
 /// The project document.
@@ -192,6 +229,13 @@ pub struct Project {
     /// v9. Rings on the footage, not on a clip — see [`crate::highlight`].
     #[serde(default)]
     pub player_highlights: Vec<PlayerHighlight>,
+    /// v10. The avatar image's **file name**, relative to the project folder
+    /// — never a path. It *is* the mode: `Some` and takes record commentary
+    /// only, with that picture for the inset; `None` and they record on
+    /// camera, as they always did. There is no second flag to disagree with
+    /// it (spec B1).
+    #[serde(default)]
+    pub avatar: Option<String>,
 }
 
 impl Project {
@@ -205,6 +249,7 @@ impl Project {
             scoreboard: None,
             match_events: Vec::new(),
             player_highlights: Vec::new(),
+            avatar: None,
         }
     }
 
@@ -429,6 +474,11 @@ impl Project {
             recording_filename: format!("{}.mkv", pending.id),
             events,
             show_pip: self.preferences.pip_for_new_recordings,
+            inset: if self.avatar.is_some() {
+                Inset::Avatar
+            } else {
+                Inset::Camera
+            },
             sort_index,
             created_at,
             transcript: String::new(),

@@ -856,6 +856,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use video_coach_core::export::FrameSpec;
+    use video_coach_core::project::Inset;
     use video_coach_core::zoom::Zoom;
 
     use uuid::Uuid;
@@ -876,6 +877,7 @@ mod tests {
             recording_filename: "c.mkv".into(),
             events: Vec::new(),
             show_pip: false,
+            inset: Inset::Camera,
             sort_index: 0,
             created_at: "2026-09-19T00:00:00Z".into(),
             transcript: String::new(),

@@ -911,6 +911,7 @@ mod tests {
     use video_coach_core::event::{CommentaryEvent, EventKind};
     use video_coach_core::highlight::{highlight_shapes, HighlightKey, NormRect, PlayerHighlight};
     use video_coach_core::layout::{BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO};
+    use video_coach_core::project::Inset;
     use video_coach_core::scoreboard::{ClockDisplay, MatchFormat, TeamConfig};
     use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
     use video_coach_core::zoom::Zoom;
@@ -935,6 +936,7 @@ mod tests {
             recording_filename: "c.mkv".into(),
             events,
             show_pip: true,
+            inset: Inset::Camera,
             sort_index: 0,
             created_at: "2026-09-19T00:00:00Z".into(),
             transcript: String::new(),

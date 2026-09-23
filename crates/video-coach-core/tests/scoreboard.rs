@@ -5,7 +5,7 @@ use uuid::Uuid;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::scoreboard::{
     chapter_events, format_clock, interpret, labelled_events, scoreboard_state, AbsoluteMatchEvent,
     ClockDisplay, LabelledEvent, MatchEventKind, MatchFormat, PeriodRole, ReelEnd, ReelTrimError,
@@ -719,6 +719,7 @@ fn clip_with_events(events: Vec<CommentaryEvent>, recording_duration: f64) -> Cl
         recording_filename: "c.mkv".into(),
         events,
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-20T00:00:00Z".into(),
         transcript: String::new(),

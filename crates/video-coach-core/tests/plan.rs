@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::plan::{compilation_plan, ExportTarget, PlanEntry};
-use video_coach_core::project::{Clip, Project, SourceRef};
+use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 
 fn clip(name: &str, sort_index: i64, tags: &[&str]) -> Clip {
     Clip {
@@ -19,6 +19,7 @@ fn clip(name: &str, sort_index: i64, tags: &[&str]) -> Clip {
         recording_filename: format!("{name}.mkv"),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index,
         created_at: "2026-09-19T00:00:00Z".into(),
         transcript: String::new(),

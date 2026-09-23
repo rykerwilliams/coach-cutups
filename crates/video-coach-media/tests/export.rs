@@ -23,7 +23,9 @@ use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect, scoreboard_rects, Rect as LayoutRect};
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::project::{
+    Clip, Inset, Preferences, Project, Quality, Resolution, SourceRef,
+};
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
@@ -113,6 +115,7 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
         recording_filename: "c.mkv".into(),
         events,
         show_pip: false,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-19T00:00:00Z".into(),
         transcript: String::new(),
@@ -426,6 +429,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
             tags: vec![format!("t{i}")],
             source_index,
             show_pip,
+            inset: Inset::Camera,
             ..clip(0.0, seconds, Vec::new())
         })
         .collect();
@@ -747,6 +751,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
     };
     let clip = Clip {
         show_pip,
+        inset: Inset::Camera,
         events: vec![stroke(0.5, Rgba::RED), stroke(0.75, translucent)],
         ..clip(0.0, 0.2, Vec::new())
     };

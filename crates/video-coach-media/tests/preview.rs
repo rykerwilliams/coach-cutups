@@ -21,7 +21,7 @@ use gstreamer_video::prelude::*;
 use uuid::Uuid;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::layout::{pip_rect, BAR_HEIGHT_RATIO};
-use video_coach_core::project::Clip;
+use video_coach_core::project::{Clip, Inset};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_media::fixtures::{self, counter_video, read_counter, CounterKind, GrayFrame};
 use video_coach_media::{
@@ -64,6 +64,7 @@ fn clip(duration: f64, show_pip: bool, events: Vec<CommentaryEvent>) -> Clip {
         recording_filename: "c.webm".into(),
         events,
         show_pip,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-19T00:00:00Z".into(),
         transcript: String::new(),

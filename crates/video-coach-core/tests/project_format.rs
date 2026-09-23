@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
-use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution, SourceRef};
+use video_coach_core::project::{
+    Clip, Inset, Preferences, Project, Quality, Resolution, SourceRef,
+};
 use video_coach_core::recording::PendingClip;
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
@@ -30,6 +32,7 @@ fn sample_clip() -> Clip {
         recording_filename: "00000000-0000-0000-0000-000000000000.mkv".into(),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: "2026-09-19T12:00:00Z".into(),
         transcript: String::new(),
@@ -259,10 +262,11 @@ fn round_trips_through_the_store() {
 }
 
 /// F1. Every version this build reads, as the build that wrote it last left
-/// it: a v7 goal with no trim keys, and a v8 one with them. Neither has
-/// highlights. Every bump keeps a test like this one.
+/// it: a v7 goal with no trim keys, a v8 one with them, and a v9 file with
+/// the highlights key. None of them names an avatar or an inset. Every bump
+/// keeps a test like this one.
 #[test]
-fn v7_and_v8_files_load_under_v9() {
+fn v7_to_v9_files_load_under_v10() {
     let goal = |version: u32| {
         let mut goal = json!({
             "id": "00000000-0000-0000-0000-000000000001",
@@ -276,23 +280,38 @@ fn v7_and_v8_files_load_under_v9() {
         }
         goal
     };
-    for version in [7, 8] {
+    for version in [7, 8, 9] {
         let dir = TempDir::new().unwrap();
-        write_raw(
-            dir.path(),
-            json!({
-                "formatVersion": version,
-                "name": "x",
-                "sourceVideos": [{
-                    "relativePath": "a.mp4",
-                    "displayName": "a",
-                    "durationSeconds": 2700.0,
-                    "displayAspect": 1.5
-                }],
-                "clips": [],
-                "matchEvents": [goal(version)]
-            }),
-        );
+        let mut raw = json!({
+            "formatVersion": version,
+            "name": "x",
+            "sourceVideos": [{
+                "relativePath": "a.mp4",
+                "displayName": "a",
+                "durationSeconds": 2700.0,
+                "displayAspect": 1.5
+            }],
+            "clips": [{
+                "id": "00000000-0000-0000-0000-000000000002",
+                "name": "Transition",
+                "notes": "",
+                "tags": [],
+                "sourceIndex": 0,
+                "startSourceSeconds": 12.5,
+                "recordingDuration": 8.0,
+                "recordingFilename": "00000000-0000-0000-0000-000000000002.mkv",
+                "events": [],
+                "showPip": true,
+                "sortIndex": 0,
+                "createdAt": "2026-09-19T12:00:00Z",
+                "transcript": ""
+            }],
+            "matchEvents": [goal(version)]
+        });
+        if version >= 9 {
+            raw["playerHighlights"] = json!([]);
+        }
+        write_raw(dir.path(), raw);
         let mut p = store::read(dir.path()).expect("an older file loads");
         assert_eq!(p.format_version, version, "read keeps the version it found");
         assert_eq!(p.match_events.len(), 1);
@@ -305,8 +324,12 @@ fn v7_and_v8_files_load_under_v9() {
                 (None, None)
             }
         );
-        // v9's addition: an older file simply has none.
+        // v9's addition: a file older than it simply has none.
         assert!(p.player_highlights.is_empty());
+        // v10's: no avatar key means a camera project, and a clip with no
+        // `inset` was recorded on a camera, which is `Inset::Camera`.
+        assert_eq!(p.avatar, None);
+        assert!(p.clips.iter().all(|c| c.inset == Inset::Camera));
 
         store::write(dir.path(), &mut p).unwrap();
         assert_eq!(
@@ -315,6 +338,34 @@ fn v7_and_v8_files_load_under_v9() {
         );
         assert!(dir.path().join(format!("project.json.v{version}")).exists());
     }
+}
+
+/// v10. The mode is the picture's file name and nothing else, the inset is a
+/// clip's own fact, and both survive a write and a read at the wire spellings
+/// a v10 file is expected to hold.
+#[test]
+fn an_avatar_and_an_inset_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let mut p = sample_project();
+    p.avatar = Some("avatar.png".into());
+    p.clips[0].inset = Inset::Avatar;
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(store::read(dir.path()).unwrap(), p);
+
+    let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["formatVersion"], json!(10));
+    assert_eq!(value["avatar"], json!("avatar.png"));
+    assert_eq!(value["clips"][0]["inset"], json!("avatar"));
+
+    // And the other way round: the default is spelled out on disk too, so a
+    // v10 file has one shape.
+    let mut camera = sample_project();
+    store::write(dir.path(), &mut camera).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["avatar"], serde_json::Value::Null);
+    assert_eq!(value["clips"][0]["inset"], json!("camera"));
 }
 
 /// v8. The trims are always written, `null` for the default, so there is one
@@ -699,4 +750,49 @@ fn show_pip_comes_from_preferences() {
         !p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
             .show_pip
     );
+}
+
+/// B1: the picture *is* the mode, so a take records the inset the project was
+/// in when it was made, and a project holding both kinds renders each clip the
+/// way it was recorded.
+#[test]
+fn the_inset_of_a_new_clip_comes_from_the_projects_avatar() {
+    let mut p = Project::new("p");
+    assert_eq!(
+        p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
+            .inset,
+        Inset::Camera
+    );
+    p.avatar = Some("avatar.png".into());
+    assert_eq!(
+        p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
+            .inset,
+        Inset::Avatar
+    );
+    p.avatar = None;
+    assert_eq!(
+        p.add_recorded_clip(pending(0.0), 1.0, Vec::new(), String::new())
+            .inset,
+        Inset::Camera,
+        "removing the picture puts new takes back on the camera"
+    );
+}
+
+/// B3: the one reading of `show_pip` × `inset`, all four combinations. The
+/// two can never both be true — one inset is drawn, or none is.
+#[test]
+fn one_predicate_per_inset_and_never_both() {
+    let mut clip = sample_clip();
+    for (show_pip, inset, camera, avatar) in [
+        (true, Inset::Camera, true, false),
+        (true, Inset::Avatar, false, true),
+        (false, Inset::Camera, false, false),
+        (false, Inset::Avatar, false, false),
+    ] {
+        clip.show_pip = show_pip;
+        clip.inset = inset;
+        assert_eq!(clip.shows_camera_pip(), camera, "{show_pip} {inset:?}");
+        assert_eq!(clip.shows_avatar(), avatar, "{show_pip} {inset:?}");
+        assert!(!(clip.shows_camera_pip() && clip.shows_avatar()));
+    }
 }

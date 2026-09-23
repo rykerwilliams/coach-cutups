@@ -3,7 +3,7 @@
 
 use uuid::Uuid;
 
-use video_coach_core::project::Clip;
+use video_coach_core::project::{Clip, Inset};
 use video_coach_core::tag::{
     tag_suggestions, tag_summaries, take_suggestion, TagSummary, MAX_SUGGESTIONS,
 };
@@ -20,6 +20,7 @@ fn clip(tags: &[&str], duration: f64) -> Clip {
         recording_filename: "x.mkv".into(),
         events: Vec::new(),
         show_pip: true,
+        inset: Inset::Camera,
         sort_index: 0,
         created_at: String::new(),
         transcript: String::new(),
