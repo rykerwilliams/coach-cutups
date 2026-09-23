@@ -35,8 +35,8 @@ use video_coach_core::audio::audio_regions;
 use video_coach_core::export::{compilation_schedule, RateWindow, OUTPUT_FPS};
 use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Clip, Project, Quality, Resolution};
-use video_coach_core::reel::reel_goals;
-use video_coach_core::scoreboard::ScoreboardContext;
+use video_coach_core::reel::{reel_goals, ReelSide};
+use video_coach_core::scoreboard::{team_name, ScoreboardContext};
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
 use video_coach_media::{EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
@@ -45,7 +45,8 @@ use super::{Bus, Event, Input, Open, UserError};
 
 /// What the every-clip target is called, in the sheet and in its file name.
 const ALL_CLIPS_LABEL: &str = "All clips";
-/// What the goals reel is called, in the sheet and in its file name.
+/// What a reel of both sides' goals is called, in the sheet and in its file
+/// name. One side's is named after the team ([`reel_label`]).
 const REEL_LABEL: &str = "All goals";
 /// What the whole-match export is called, in the sheet and in its file name.
 const WHOLE_MATCH_LABEL: &str = "Whole match";
@@ -134,17 +135,18 @@ pub struct ExportTargetRow {
     pub seconds: f64,
 }
 
-/// The sheet's targets: Whole match, All clips, one row per tag, All goals,
-/// then `selected` if a clip is (spec E8, match vision specs R1 and W1).
+/// The sheet's targets: Whole match, All clips, one row per tag, the goals
+/// reels, then `selected` if a clip is (spec E8, match vision specs R1, R1b
+/// and W1).
 ///
 /// A target with no plan entry is left out, since there is nothing to export
-/// in it — which is also what keeps an empty project's sheet empty, and the
-/// reel's row away until there is a goal.
+/// in it — which is also what keeps an empty project's sheet empty, and a
+/// side's reel away until that side has scored.
 pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTargetRow> {
     let row = |target: ExportTarget, label: String| {
         let plan = compilation_plan(project, &target);
         let (count, unit) = match target {
-            ExportTarget::Reel => (reel_goals(project).len(), "goal"),
+            ExportTarget::Reel(side) => (reel_goals(project, side).len(), "goal"),
             // One entry per source video, so the row reads "2 videos ·
             // 54:12" — the honest warning that this is the longest render
             // the app can be asked for (spec W4).
@@ -166,7 +168,18 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
     for tag in tag_summaries(&project.clips) {
         rows.extend(row(ExportTarget::Tag(tag.tag.clone()), tag.tag));
     }
-    rows.extend(row(ExportTarget::Reel, REEL_LABEL.into()));
+    // A reel per side that scored, and the whole reel only when both have:
+    // with one side scoring it would be the same film twice (spec R1b).
+    let scored = |side| !reel_goals(project, side).is_empty();
+    if scored(ReelSide::Home) && scored(ReelSide::Away) {
+        rows.extend(row(
+            ExportTarget::Reel(ReelSide::All),
+            reel_label(project, ReelSide::All),
+        ));
+    }
+    for side in [ReelSide::Home, ReelSide::Away] {
+        rows.extend(row(ExportTarget::Reel(side), reel_label(project, side)));
+    }
     if let Some(clip) = selected.and_then(|id| project.clips.iter().find(|c| c.id == id)) {
         rows.extend(row(
             ExportTarget::Clip(clip.id),
@@ -174,6 +187,18 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
         ));
     }
     rows
+}
+
+/// What a reel is called, in the sheet and in its file name (spec R1b): the
+/// side's configured team name ("Rovers goals"), or "Home goals" / "Away
+/// goals" where no scoreboard is set up. Both sides' is [`REEL_LABEL`].
+fn reel_label(project: &Project, side: ReelSide) -> String {
+    let home = match side {
+        ReelSide::All => return REEL_LABEL.to_owned(),
+        ReelSide::Home => true,
+        ReelSide::Away => false,
+    };
+    format!("{} goals", team_name(project.scoreboard.as_ref(), home))
 }
 
 /// What a clip is called in a file name and in a refusal: its own name, or
@@ -446,7 +471,7 @@ fn label(open: &Open, target: &ExportTarget) -> Result<String, UserError> {
             .find(|c| c.id == *id)
             .map(|clip| clip_label(clip).to_owned())
             .ok_or_else(|| UserError::CantExport("the clip is gone".into())),
-        ExportTarget::Reel => Ok(REEL_LABEL.to_owned()),
+        ExportTarget::Reel(side) => Ok(reel_label(&open.project, *side)),
         ExportTarget::WholeMatch => Ok(WHOLE_MATCH_LABEL.to_owned()),
     }
 }

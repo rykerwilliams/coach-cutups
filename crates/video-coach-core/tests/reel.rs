@@ -4,6 +4,7 @@
 use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::{compilation_plan, CompilationPlan, ExportTarget};
 use video_coach_core::project::{Project, SourceRef};
+use video_coach_core::reel::{reel_goals, ReelSide};
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
 use video_coach_core::stroke::Rgba;
 use video_coach_core::timeline::SegmentKind;
@@ -36,8 +37,13 @@ fn with_scoreboard(mut p: Project) -> Project {
     p
 }
 
+/// The whole reel: both sides' goals.
 fn reel(p: &Project) -> CompilationPlan {
-    compilation_plan(p, &ExportTarget::Reel)
+    side(p, ReelSide::All)
+}
+
+fn side(p: &Project, side: ReelSide) -> CompilationPlan {
+    compilation_plan(p, &ExportTarget::Reel(side))
 }
 
 /// Each entry's `(source_index, start, end)`, from its one `Play` segment.
@@ -266,10 +272,79 @@ fn the_schedule_plays_each_span_at_identity_zoom() {
     let mut p = project(&[1000.0]);
     p.append_match_event(HOME, 0, 100.0);
 
-    let c = compilation_schedule(&p, &ExportTarget::Reel);
+    let c = compilation_schedule(&p, &ExportTarget::Reel(ReelSide::All));
     assert_eq!(c.frames.len(), c.plan.total_frames());
     assert_eq!(c.frames[0].source_time, 70.0);
     let last = c.frames.last().unwrap();
     assert!((last.source_time - (106.0 - 1.0 / 30.0)).abs() < 1e-9);
     assert!(c.frames.iter().all(|f| f.zoom == Zoom::IDENTITY));
+}
+
+// -------------------------------------------------------------- one side
+
+/// With one side scoring, its reel is the whole reel — the same entries and
+/// the same captions — and the other side's is empty (spec R1b).
+#[test]
+fn one_sides_reel_is_the_whole_reel_when_only_it_has_scored() {
+    let mut p = project(&[1000.0]);
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(HOME, 0, 500.0);
+
+    assert_eq!(side(&p, ReelSide::Home), reel(&p));
+    assert!(side(&p, ReelSide::Away).entries.is_empty());
+}
+
+/// A side's reel holds that side's goals, numbered within it: the other
+/// side's are not in it and do not count towards its total. The burned-in
+/// score is still the match's, so it counts every goal.
+#[test]
+fn a_sides_reel_numbers_its_own_goals() {
+    let mut p = with_scoreboard(project(&[3000.0]));
+    p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 500.0);
+    p.append_match_event(HOME, 0, 900.0);
+
+    let home = side(&p, ReelSide::Home);
+    assert_eq!(spans(&home), [(0, 70.0, 106.0), (0, 870.0, 906.0)]);
+    assert_eq!(
+        texts(&home),
+        ["1 / 2 | Rovers goal | 1-0", "2 / 2 | Rovers goal | 2-1"]
+    );
+    assert_eq!(
+        texts(&side(&p, ReelSide::Away)),
+        ["1 / 1 | United goal | 1-1"]
+    );
+}
+
+/// Only a goal in the same reel merges into its entry: with the two sides
+/// split, each keeps its own span around its own goal.
+#[test]
+fn only_a_goal_in_the_same_reel_merges() {
+    let mut p = project(&[1000.0]);
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 103.0);
+
+    assert_eq!(spans(&reel(&p)), [(0, 70.0, 109.0)]);
+    assert_eq!(spans(&side(&p, ReelSide::Home)), [(0, 70.0, 106.0)]);
+    assert_eq!(spans(&side(&p, ReelSide::Away)), [(0, 73.0, 109.0)]);
+}
+
+/// What a row counts is the reel's own goals, which a merge does not reduce.
+#[test]
+fn a_sides_goals_are_its_own() {
+    let mut p = project(&[1000.0]);
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 103.0);
+    p.append_match_event(HOME, 0, 500.0);
+
+    let count = |s| reel_goals(&p, s).len();
+    assert_eq!(
+        (
+            count(ReelSide::All),
+            count(ReelSide::Home),
+            count(ReelSide::Away)
+        ),
+        (3, 2, 1)
+    );
 }

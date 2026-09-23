@@ -7,9 +7,9 @@ use video_coach_core::export::compilation_schedule;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, SourceRef};
 use video_coach_core::scoreboard::{
-    format_clock, interpret, scoreboard_state, AbsoluteMatchEvent, ClockDisplay, MatchEventKind,
-    MatchFormat, PeriodRole, ReelEnd, ReelTrimError, ScoreboardConfig, ScoreboardContext,
-    ScoreboardState, TeamConfig,
+    chapter_events, format_clock, interpret, labelled_events, scoreboard_state, AbsoluteMatchEvent,
+    ClockDisplay, LabelledEvent, MatchEventKind, MatchFormat, PeriodRole, ReelEnd, ReelTrimError,
+    ScoreboardConfig, ScoreboardContext, ScoreboardState, TeamConfig,
 };
 use video_coach_core::stroke::Rgba;
 
@@ -793,4 +793,90 @@ fn the_score_follows_the_footage_across_a_skip() {
     assert_eq!(state_at_record_time(&ctx, &compilation, 1.0).home_score, 1);
     // Skipped back to source 41 s: the goal at 50 s has not happened yet.
     assert_eq!(state_at_record_time(&ctx, &compilation, 3.0).home_score, 0);
+}
+
+// ------------------------------------------------------- the two wordings
+
+/// The labels of `events`, in match order.
+fn labels(events: Vec<LabelledEvent<'_>>) -> Vec<String> {
+    events.into_iter().map(|e| e.label).collect()
+}
+
+/// The same events, worded twice on purpose (spec W3): the Match panel's
+/// tagging vocabulary, and the file's chapter names.
+#[test]
+fn a_chapter_names_the_moment_where_a_panel_row_names_the_tag() {
+    let mut p = project_with_sources(&[3000.0, 3000.0]);
+    p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+    p.append_match_event(MatchEventKind::AwayGoal, 0, 200.0);
+    p.append_match_event(MatchEventKind::StartStop, 0, 2800.0);
+    p.append_match_event(MatchEventKind::StartStop, 1, 100.0);
+    p.append_match_event(MatchEventKind::StartStop, 1, 2900.0);
+
+    assert_eq!(
+        labels(labelled_events(&p)),
+        [
+            "1H start",
+            "Home goal",
+            "Away goal",
+            "1H end",
+            "2H start",
+            "2H end"
+        ]
+    );
+    assert_eq!(
+        labels(chapter_events(&p)),
+        [
+            "Kick-off",
+            "H goal 1-0",
+            "A goal 1-1",
+            "Half time",
+            "Second half",
+            "Full time"
+        ]
+    );
+}
+
+/// Quarters, and a period end that is neither half time nor full time.
+#[test]
+fn a_chapter_follows_the_configured_format() {
+    let mut p = project_with_sources(&[3000.0]);
+    p.scoreboard = Some(config(periods(4, 12 * 60)));
+    for at in [10.0, 700.0, 800.0, 1500.0] {
+        p.append_match_event(MatchEventKind::StartStop, 0, at);
+    }
+
+    assert_eq!(
+        labels(chapter_events(&p)),
+        [
+            "Kick-off",
+            "First quarter ends",
+            "Second quarter",
+            "Half time"
+        ]
+    );
+}
+
+/// With no scoreboard there are no periods and no team names, so a chapter
+/// reads exactly as the panel's row does.
+#[test]
+fn a_chapter_falls_back_to_the_plain_wording_with_no_scoreboard() {
+    let mut p = project_with_sources(&[3000.0]);
+    p.scoreboard = None;
+    p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+
+    assert_eq!(labels(chapter_events(&p)), ["Start/stop", "Home goal"]);
+    assert_eq!(labels(chapter_events(&p)), labels(labelled_events(&p)));
+}
+
+/// A goal before any kick-off has no score to carry, and says so by leaving
+/// it out rather than by claiming 0-0.
+#[test]
+fn a_chapter_drops_the_score_where_the_scoreboard_has_none() {
+    let mut p = project_with_sources(&[3000.0]);
+    p.append_match_event(MatchEventKind::AwayGoal, 0, 100.0);
+
+    assert_eq!(labels(chapter_events(&p)), ["A goal"]);
 }

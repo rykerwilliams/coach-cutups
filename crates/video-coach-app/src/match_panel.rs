@@ -44,8 +44,9 @@ pub struct MatchRowText {
 
 /// Every tagged event in match order, as the panel lists it.
 ///
-/// The labels are core's ([`labelled_events`]), so a row and a whole-match
-/// export's chapter read the same (spec W3).
+/// The labels are core's ([`labelled_events`]): the tagging vocabulary, which
+/// is deliberately not how a whole-match export words the same events in its
+/// chapters (`core::scoreboard::chapter_events`, spec W3).
 pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
     labelled_events(project)
         .into_iter()

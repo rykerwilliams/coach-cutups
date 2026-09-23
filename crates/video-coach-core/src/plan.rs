@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::export::{frame_count, OUTPUT_FPS};
 use crate::project::{Clip, Project};
+use crate::reel::ReelSide;
 use crate::timeline::{playback_segments, PlaybackSegment};
 
 /// Which clips an export covers.
@@ -28,9 +29,9 @@ pub enum ExportTarget {
     /// One clip. A single-clip export is a one-entry compilation rather than a
     /// path of its own: one plan, one schedule, one progress model, one cancel.
     Clip(Uuid),
-    /// The goals reel: one entry per confirmed goal, cut from the game video
-    /// around it, and no clip at all ([`crate::reel`]).
-    Reel,
+    /// A goals reel: one entry per confirmed goal on the side it carries, cut
+    /// from the game video around it, and no clip at all ([`crate::reel`]).
+    Reel(ReelSide),
     /// The whole match: every source video, in order, whole, and no clip at
     /// all ([`crate::whole_match`]).
     WholeMatch,
@@ -158,8 +159,8 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
     let all = project.clips.iter();
     let clips: Vec<&Clip> = match target {
-        ExportTarget::Reel => {
-            let entries = crate::reel::reel_entries(project);
+        ExportTarget::Reel(side) => {
+            let entries = crate::reel::reel_entries(project, *side);
             return CompilationPlan {
                 chapters: entry_chapters(&entries),
                 entries,

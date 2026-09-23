@@ -597,7 +597,7 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
                     // which is the longest render there is (spec W1).
                     ticked: match row.target {
                         ExportTarget::Clip(_) => only_clip,
-                        ExportTarget::Reel | ExportTarget::WholeMatch => false,
+                        ExportTarget::Reel(_) | ExportTarget::WholeMatch => false,
                         _ => !only_clip,
                     },
                 }

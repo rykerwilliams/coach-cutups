@@ -116,6 +116,61 @@ impl MatchFormat {
             "BREAK"
         }
     }
+
+    /// A period's name in words: `"Second half"`, `"Third quarter"`,
+    /// `"Overtime 2"`. [`MatchFormat::period_name`]'s `"2H"` is the
+    /// scoreboard cell, which has room for two characters; this is for a
+    /// chapter read on its own, in someone else's player.
+    pub fn period_title(&self, period: u32) -> String {
+        if self.is_overtime(period) {
+            let n = period - self.regulation_periods + 1;
+            return match self.overtime_periods {
+                1 => "Overtime".to_string(),
+                _ => format!("Overtime {n}"),
+            };
+        }
+        let unit = match self.regulation_periods {
+            2 => "half",
+            4 => "quarter",
+            _ => "period",
+        };
+        match ["First", "Second", "Third", "Fourth"].get(period as usize) {
+            Some(nth) => format!("{nth} {unit}"),
+            // Five or more periods: no format the app configures has them,
+            // and a spelled-out ordinal past "fourth" is not worth a table.
+            None => format!("Period {}", period + 1),
+        }
+    }
+
+    /// What the coach calls the break after `period`: half time at the
+    /// half-way point of an even-numbered format, full time after the last
+    /// period, and the period's own end otherwise (`"First quarter ends"`).
+    fn break_title(&self, after_period: u32) -> String {
+        let last = self.total_periods().saturating_sub(1);
+        let regulation_half = self.regulation_periods.is_multiple_of(2)
+            && after_period + 1 == self.regulation_periods / 2
+            && after_period != last;
+        match (after_period == last, regulation_half) {
+            (true, _) => "Full time".to_string(),
+            (_, true) => "Half time".to_string(),
+            _ => format!("{} ends", self.period_title(after_period)),
+        }
+    }
+}
+
+/// What the coach calls one side: its configured team name, or `"Home"` /
+/// `"Away"` where no scoreboard is set up.
+///
+/// The one place that wording lives — a reel's row and file name, a goal's
+/// caption and a whole-match chapter all read it, so a team renamed in the
+/// scoreboard is renamed in all three.
+pub fn team_name(config: Option<&ScoreboardConfig>, home: bool) -> &str {
+    match config {
+        Some(c) if home => &c.home.name,
+        Some(c) => &c.away.name,
+        None if home => "Home",
+        None => "Away",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,16 +351,18 @@ pub fn interpret(
         .collect()
 }
 
-/// One tagged event with the name the coach reads for it.
+/// One tagged event with a name the coach reads for it.
 ///
-/// The Match panel's row and a whole-match export's chapter are the same
-/// label (spec W3), so the wording lives here rather than in the app.
+/// Both wordings — the Match panel's ([`labelled_events`]) and an exported
+/// file's chapters' ([`chapter_events`]) — live here rather than in the app,
+/// so neither can drift from the roles [`interpret`] gives.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelledEvent<'a> {
     pub event: &'a MatchEventRecord,
     /// Where it sits on the concat timeline, in seconds.
     pub abs_seconds: f64,
-    /// `"1H start"`, `"Home goal"`, …
+    /// `"1H start"` and `"Home goal"`, or `"Kick-off"` and
+    /// `"Rovers goal 1-0"`, depending on which of the two built it.
     pub label: String,
     /// A start/stop the format has no period for, so [`interpret`] gives it no
     /// role. Reachable with the back-anchor on, whose derived start takes a
@@ -315,9 +372,13 @@ pub struct LabelledEvent<'a> {
     pub role_less: bool,
 }
 
-/// Every tagged event in match order, labelled — the order [`interpret`]
-/// walks, so an event's role is the role the scoreboard gives it.
-pub fn labelled_events(project: &Project) -> Vec<LabelledEvent<'_>> {
+/// Every tagged event in match order, with the role [`interpret`] gave it —
+/// what both wordings are built from. `label` here means "word it", and the
+/// order is [`interpret`]'s, so an event's role is the scoreboard's.
+fn labelled_with<'a>(
+    project: &'a Project,
+    label: impl Fn(&MatchEventRecord, Option<PeriodRole>) -> (String, bool),
+) -> Vec<LabelledEvent<'a>> {
     // Roles only exist once there is a format to interpret against.
     let roles: Vec<(Uuid, PeriodRole)> = project.scoreboard.as_ref().map_or_else(Vec::new, |c| {
         interpret(&project.absolute_match_events(), c)
@@ -334,18 +395,7 @@ pub fn labelled_events(project: &Project) -> Vec<LabelledEvent<'_>> {
                 .iter()
                 .find(|(id, _)| *id == event.id)
                 .map(|(_, r)| *r);
-            let (label, role_less) = match (event.kind, &project.scoreboard) {
-                (MatchEventKind::HomeGoal, _) => ("Home goal".to_string(), false),
-                (MatchEventKind::AwayGoal, _) => ("Away goal".to_string(), false),
-                (MatchEventKind::StartStop, None) => ("Start/stop".to_string(), false),
-                (MatchEventKind::StartStop, Some(c)) => match role {
-                    Some(PeriodRole::Start(p)) => {
-                        (format!("{} start", c.format.period_name(p)), false)
-                    }
-                    Some(PeriodRole::End(p)) => (format!("{} end", c.format.period_name(p)), false),
-                    None => ("Start/stop (no period)".to_string(), true),
-                },
-            };
+            let (label, role_less) = label(event, role);
             LabelledEvent {
                 event,
                 abs_seconds: project.abs_seconds(event.source_index, event.source_seconds),
@@ -358,6 +408,62 @@ pub fn labelled_events(project: &Project) -> Vec<LabelledEvent<'_>> {
     // `interpret` does.
     events.sort_by(|a, b| a.abs_seconds.total_cmp(&b.abs_seconds));
     events
+}
+
+/// Every tagged event in match order, worded as the **Match panel** words it:
+/// `"1H start"`, `"Home goal"`.
+///
+/// This is the tagging vocabulary — short, aligned in a column, and the same
+/// words as the buttons that made the events, beside a clock and a score the
+/// coach is already reading. A file's chapters are read alone, months later,
+/// in someone else's player, so they get [`chapter_events`]' wording instead
+/// (spec W3). The two are meant to differ; changing one leaves the other
+/// alone.
+pub fn labelled_events(project: &Project) -> Vec<LabelledEvent<'_>> {
+    labelled_with(project, |event, role| {
+        match (event.kind, &project.scoreboard) {
+            (MatchEventKind::HomeGoal, _) => ("Home goal".to_string(), false),
+            (MatchEventKind::AwayGoal, _) => ("Away goal".to_string(), false),
+            (MatchEventKind::StartStop, None) => ("Start/stop".to_string(), false),
+            (MatchEventKind::StartStop, Some(c)) => match role {
+                Some(PeriodRole::Start(p)) => (format!("{} start", c.format.period_name(p)), false),
+                Some(PeriodRole::End(p)) => (format!("{} end", c.format.period_name(p)), false),
+                None => ("Start/stop (no period)".to_string(), true),
+            },
+        }
+    })
+}
+
+/// Every tagged event in match order, worded as a **film's chapters** (spec
+/// W3): `"Kick-off"`, `"Second half"`, `"Half time"`, `"Full time"`, and a
+/// goal as `"Rovers goal 1-0"` with the score after it.
+///
+/// The second wording of the same events, for the whole-match export's
+/// chapter list. Where there is no scoreboard there are no periods and no
+/// team names, so it falls back to [`labelled_events`]' plain wording, and a
+/// goal with no score behind it (none tagged by then) drops the score rather
+/// than claiming 0-0.
+pub fn chapter_events(project: &Project) -> Vec<LabelledEvent<'_>> {
+    let scoreboard = ScoreboardContext::for_project(project);
+    let config = project.scoreboard.as_ref();
+    labelled_with(project, |event, role| match (event.kind, config) {
+        (MatchEventKind::StartStop, None) => ("Start/stop".to_string(), false),
+        (MatchEventKind::StartStop, Some(c)) => match role {
+            Some(PeriodRole::Start(0)) => ("Kick-off".to_string(), false),
+            Some(PeriodRole::Start(p)) => (c.format.period_title(p), false),
+            Some(PeriodRole::End(p)) => (c.format.break_title(p), false),
+            None => ("Start/stop (no period)".to_string(), true),
+        },
+        (kind, _) => {
+            let team = team_name(config, kind == MatchEventKind::HomeGoal);
+            let score = scoreboard
+                .as_ref()
+                .and_then(|s| s.state_at(event.source_index, event.source_seconds))
+                .map(|s| format!(" {}-{}", s.home_score, s.away_score))
+                .unwrap_or_default();
+            (format!("{team} goal{score}"), false)
+        }
+    })
 }
 
 // ------------------------------------------------------------------- clock

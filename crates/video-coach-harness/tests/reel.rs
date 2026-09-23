@@ -14,6 +14,7 @@ use uuid::Uuid;
 use video_coach_app::bus::{export_targets, Command, Event, TargetState, UserError};
 use video_coach_core::plan::{compilation_plan, ExportTarget};
 use video_coach_core::project::{Project, Quality, Resolution};
+use video_coach_core::reel::ReelSide;
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
 use video_coach_core::store::{self, EXPORTS_DIRNAME};
 use video_coach_core::stroke::Rgba;
@@ -54,10 +55,20 @@ impl Proj {
         }
     }
 
-    /// Tags a goal at the caller's position and returns it with the project.
+    /// Tags a home goal at the caller's position and returns it with the
+    /// project.
     fn goal(&mut self, source_index: usize, source_seconds: f64) -> (Uuid, Project) {
+        self.goal_of(MatchEventKind::HomeGoal, source_index, source_seconds)
+    }
+
+    fn goal_of(
+        &mut self,
+        kind: MatchEventKind,
+        source_index: usize,
+        source_seconds: f64,
+    ) -> (Uuid, Project) {
         self.h.send(Command::TagMatchEvent {
-            kind: MatchEventKind::HomeGoal,
+            kind,
             source_index,
             source_seconds,
         });
@@ -99,11 +110,11 @@ fn the_reel_exports_through_the_bus() {
     p.h.wait_changed();
     p.trim(second, ReelEnd::Start, Some((0, 2.0)));
     let project = p.h.wait_changed().project;
-    let plan = compilation_plan(&project, &ExportTarget::Reel);
+    let plan = compilation_plan(&project, &ExportTarget::Reel(ReelSide::All));
     assert_eq!(plan.entries.len(), 2);
 
     p.h.send(Command::Export {
-        targets: vec![ExportTarget::Reel],
+        targets: vec![ExportTarget::Reel(ReelSide::All)],
         resolution: Resolution::R720,
         quality: Quality::Low,
     });
@@ -126,7 +137,8 @@ fn the_reel_exports_through_the_bus() {
 }
 
 /// The sheet leads with "Whole match", which any source video earns (spec
-/// W1), and offers "All goals" once there is a goal, after the tag rows.
+/// W1), and offers the scoring side's reel once there is a goal, after the
+/// tag rows. With no scoreboard set up that side is "Home".
 #[test]
 fn the_sheet_leads_with_the_whole_match_and_follows_the_goals() {
     let mut p = Proj::open(&[("a.webm", 3)]);
@@ -140,10 +152,55 @@ fn the_sheet_leads_with_the_whole_match_and_follows_the_goals() {
     let rows = export_targets(&project, None);
     assert_eq!(rows.len(), 2, "{rows:#?}");
     assert_eq!(rows[0].target, ExportTarget::WholeMatch);
-    assert_eq!(rows[1].target, ExportTarget::Reel);
-    assert_eq!(rows[1].label, "All goals");
+    assert_eq!(rows[1].target, ExportTarget::Reel(ReelSide::Home));
+    assert_eq!(rows[1].label, "Home goals");
     assert_eq!((rows[1].count, rows[1].unit), (1, "goal"));
     p.h.shutdown();
+}
+
+/// A reel row per side that has scored, named from the scoreboard, and "All
+/// goals" only once both have — with one side scoring it would be the same
+/// film twice (spec R1b).
+#[test]
+fn the_sheet_has_a_reel_row_per_side_that_scored() {
+    let mut p = Proj::open(&[("a.webm", 3)]);
+    p.h.send(Command::SetScoreboard(ScoreboardConfig {
+        home: TeamConfig::new("Rovers", Rgba::RED, Rgba::RED),
+        away: TeamConfig::new("United", Rgba::RED, Rgba::RED),
+        format: Default::default(),
+        auto_back_anchor_p1: false,
+    }));
+    p.h.wait_changed();
+
+    let (_, one_sided) = p.goal_of(MatchEventKind::AwayGoal, 0, 1.0);
+    assert_eq!(
+        reels(&one_sided),
+        [(ExportTarget::Reel(ReelSide::Away), "United goals".into())]
+    );
+
+    let (_, both) = p.goal_of(MatchEventKind::HomeGoal, 0, 2.5);
+    assert_eq!(
+        reels(&both),
+        [
+            (ExportTarget::Reel(ReelSide::All), "All goals".into()),
+            (ExportTarget::Reel(ReelSide::Home), "Rovers goals".into()),
+            (ExportTarget::Reel(ReelSide::Away), "United goals".into()),
+        ]
+    );
+    // And they are the tail of the sheet, after the whole match's row.
+    let rows = export_targets(&both, None);
+    assert_eq!(rows[0].target, ExportTarget::WholeMatch);
+    assert_eq!(rows.len(), 4, "{rows:#?}");
+    p.h.shutdown();
+}
+
+/// The sheet's reel rows, as `(target, label)`.
+fn reels(project: &Project) -> Vec<(ExportTarget, String)> {
+    export_targets(project, None)
+        .into_iter()
+        .filter(|r| matches!(r.target, ExportTarget::Reel(_)))
+        .map(|r| (r.target, r.label))
+        .collect()
 }
 
 /// The whole match renders through the same export path, named after itself,
@@ -186,7 +243,10 @@ fn the_whole_match_exports_with_the_matchs_own_chapters() {
         .iter()
         .all(|e| e.clip_id.is_none() && e.text.is_empty()));
     let titles: Vec<&str> = plan.chapters.iter().map(|(_, t)| t.as_str()).collect();
-    assert_eq!(titles, ["1H start", "Home goal", "1H end", "2H start"]);
+    assert_eq!(
+        titles,
+        ["Kick-off", "Rovers goal 1-0", "Half time", "Second half"]
+    );
 
     p.h.send(Command::Export {
         targets: vec![ExportTarget::WholeMatch],
@@ -323,7 +383,7 @@ fn a_missing_game_video_is_refused_naming_the_file() {
     p.goal(1, 1.5);
 
     p.h.send(Command::Export {
-        targets: vec![ExportTarget::Reel],
+        targets: vec![ExportTarget::Reel(ReelSide::All)],
         resolution: Resolution::R720,
         quality: Quality::Low,
     });

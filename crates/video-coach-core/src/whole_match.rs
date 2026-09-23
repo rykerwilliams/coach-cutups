@@ -12,7 +12,7 @@
 use crate::export::{frame_count, OUTPUT_FPS};
 use crate::plan::PlanEntry;
 use crate::project::Project;
-use crate::scoreboard::labelled_events;
+use crate::scoreboard::chapter_events;
 use crate::timeline::{PlaybackSegment, SegmentKind};
 
 /// One entry per source video, in order, whole.
@@ -49,8 +49,8 @@ pub(crate) fn whole_match_entries(project: &Project) -> Vec<PlanEntry> {
 }
 
 /// The match's own moments as chapters (spec W3): every period start and stop
-/// and every goal, at its **output** time, labelled as the Match panel labels
-/// it.
+/// and every goal, at its **output** time, worded as a film's chapters
+/// ([`chapter_events`]) rather than as the Match panel's rows.
 ///
 /// With nothing tagged, one chapter per source instead, named after the file —
 /// and, as for every other target, fewer than two chapters is none at all,
@@ -73,7 +73,7 @@ pub(crate) fn whole_match_chapters(project: &Project, entries: &[PlanEntry]) -> 
         Some(start_of(entry) + offset)
     };
 
-    let tagged: Vec<(f64, String)> = labelled_events(project)
+    let tagged: Vec<(f64, String)> = chapter_events(project)
         .into_iter()
         .filter_map(|e| Some((at(e.event.source_index, e.event.source_seconds)?, e.label)))
         .collect();

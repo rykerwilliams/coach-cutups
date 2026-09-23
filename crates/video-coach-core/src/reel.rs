@@ -5,11 +5,15 @@
 //! no clip behind it ([`PlanEntry::clip_id`] is `None`): no drawings, no zoom,
 //! no picture-in-picture and no commentary. What makes it a reel rather than
 //! a list of clips is the span each goal gets, which lives here.
+//!
+//! A reel carries a [`ReelSide`]: both sides' goals, or one team's (spec
+//! R1b). Only the side is filtered — the spans, the merges, the trims and the
+//! captions are the same rules, and the burned-in score is still the match's.
 
 use crate::export::frame_count;
 use crate::plan::PlanEntry;
 use crate::project::Project;
-use crate::scoreboard::{MatchEventKind, MatchEventRecord, ScoreboardContext};
+use crate::scoreboard::{team_name, MatchEventKind, MatchEventRecord, ScoreboardContext};
 use crate::timeline::{PlaybackSegment, SegmentKind};
 
 /// How long a goal's entry runs before the goal, unless its
@@ -42,6 +46,29 @@ impl MatchEventRecord {
     }
 }
 
+/// Whose goals a reel holds (spec R1b).
+///
+/// A trim belongs to the goal, not to the reel, so it holds in every reel the
+/// goal appears in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReelSide {
+    /// Both sides' goals, in match order.
+    All,
+    Home,
+    Away,
+}
+
+impl ReelSide {
+    /// Whether a goal of this kind belongs in this reel.
+    fn covers(self, kind: MatchEventKind) -> bool {
+        match self {
+            ReelSide::All => kind.is_goal(),
+            ReelSide::Home => kind == MatchEventKind::HomeGoal,
+            ReelSide::Away => kind == MatchEventKind::AwayGoal,
+        }
+    }
+}
+
 /// One entry's span of game video, before it is numbered.
 struct Span<'a> {
     /// The entry's first goal, which names it.
@@ -50,14 +77,14 @@ struct Span<'a> {
     end: f64,
 }
 
-/// Every goal the reel holds, in match order: what "goal n" and "N goals"
-/// count. Not the entries, which can be fewer, since a goal inside the
+/// Every goal `side`'s reel holds, in match order: what "goal n" and "N
+/// goals" count. Not the entries, which can be fewer, since a goal inside the
 /// previous entry makes none of its own.
-pub fn reel_goals(project: &Project) -> Vec<&MatchEventRecord> {
+pub fn reel_goals(project: &Project, side: ReelSide) -> Vec<&MatchEventRecord> {
     let mut goals: Vec<(f64, &MatchEventRecord)> = project
         .match_events
         .iter()
-        .filter(|m| m.kind.is_goal())
+        .filter(|m| side.covers(m.kind))
         .map(|m| (project.abs_seconds(m.source_index, m.source_seconds), m))
         .collect();
     // Stable, so goals tagged at the same instant keep the order they were
@@ -66,14 +93,16 @@ pub fn reel_goals(project: &Project) -> Vec<&MatchEventRecord> {
     goals.into_iter().map(|(_, goal)| goal).collect()
 }
 
-/// The reel's entries: one per goal in match order, except that a goal
-/// already inside the previous entry extends it instead (spec R2).
+/// `side`'s entries: one per goal in match order, except that a goal already
+/// inside the previous entry extends it instead (spec R2).
 ///
 /// A span is `[goal − lead-in, goal + tail]` on the goal's own source, clamped
 /// to that source and never starting before the previous entry on the same
 /// source ends, so two goals a minute apart don't replay the same footage.
-pub(crate) fn reel_entries(project: &Project) -> Vec<PlanEntry> {
-    let goals = reel_goals(project);
+/// Only a goal in the *same* reel clamps or merges: the other side's are not
+/// in it at all.
+pub(crate) fn reel_entries(project: &Project, side: ReelSide) -> Vec<PlanEntry> {
+    let goals = reel_goals(project, side);
     let mut spans: Vec<Span> = Vec::with_capacity(goals.len());
     for goal in goals {
         // `Project::remove_source` refuses a source a goal is on, so this
@@ -141,12 +170,7 @@ fn entry_text(
     total: usize,
 ) -> String {
     let home = goal.kind == MatchEventKind::HomeGoal;
-    let team = match scoreboard.map(|s| s.config()) {
-        Some(config) if home => config.home.name.as_str(),
-        Some(config) => config.away.name.as_str(),
-        None if home => "Home",
-        None => "Away",
-    };
+    let team = team_name(scoreboard.map(|s| s.config()), home);
     let mut text = format!("{n} / {total} | {team} goal");
     if let Some(state) = scoreboard.and_then(|s| s.state_at(goal.source_index, goal.source_seconds))
     {
