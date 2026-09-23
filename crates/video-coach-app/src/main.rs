@@ -33,11 +33,13 @@ use video_coach_app::highlight_view::{self, LiveHighlight as Ring};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
+use video_coach_app::self_view::self_view_rect;
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
+use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
 use video_coach_core::layout::{self, STROKE_LINE_WIDTH};
 use video_coach_core::plan::ExportTarget;
-use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
@@ -63,6 +65,18 @@ const NOTICE: Duration = Duration::from_secs(6);
 /// self-view says nothing about the recording, and a frozen one would look
 /// like the camera's picture.
 const SELF_VIEW_QUIET: Duration = Duration::from_secs(1);
+/// How far apart the recorder's `level` messages are, in seconds
+/// (`LEVEL_INTERVAL_NS`): the step the **live** pulse estimator is smoothed
+/// at (avatar spec D1). The rendered one steps at 1/30 through the same
+/// filter and the same constants.
+const LEVEL_DT: f64 = 0.1;
+/// The longest side the Devices popover's avatar thumbnail is decimated to,
+/// with room to spare for its 40 px box on a high-DPI screen.
+const THUMB_MAX: u32 = 160;
+/// And the longest side the corner's avatar is kept to. The inset is about a
+/// fifth of the picture's width, so this covers it on a large screen without
+/// uploading a phone photo whole to draw it.
+const SELF_VIEW_MAX: u32 = 512;
 /// What a drag over the picture says outside a recording, where it can only
 /// pan and at 1× visibly does nothing (`zoom_input::drawing_hint`).
 const DRAWING_HINT: &str = "Drawing works while recording — press R";
@@ -102,6 +116,17 @@ struct UiState {
     recording_t0: Option<u64>,
     /// When the self-view's latest frame arrived, during this recording.
     self_view_at: Option<Instant>,
+    /// This take's inset is the project's avatar, not a camera (avatar G2).
+    /// Taken once, at the start of the take: neither avatar command is on
+    /// the recording allow-list, so the mode cannot change under a running
+    /// one.
+    avatar_take: bool,
+    /// How loud the coach is right now, `0..=1`, the **live** estimator of
+    /// the pulse (avatar D1): stepped on each `Event::Level` through core's
+    /// own filter, and read by the placement callback. Never persisted — the
+    /// recording the render reads is (D4). 1.0 on a camera take, where
+    /// `avatar_rect` is exactly `pip_rect`.
+    self_view_level: f64,
     /// The drawings on screen, each with the `now_ns()` moment it auto-clears
     /// (Phase 6 spec D3) — the pen-up the logged rule counts from, on the
     /// same clock. Live, "now" only moves forward and a finished stroke is
@@ -194,6 +219,8 @@ impl Default for UiState {
             drag: None,
             recording_t0: None,
             self_view_at: None,
+            avatar_take: false,
+            self_view_level: 1.0,
             live_strokes: Vec::new(),
             drawing: None,
             pen: Pen::default(),
@@ -1201,7 +1228,7 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let notches: Vec<f32> = SNAP_NOTCHES.iter().map(|&n| n as f32).collect();
     window.set_zoom_notches(ModelRc::new(VecModel::from(notches)));
 
-    window.on_place_self_view(|content, cam_aspect| {
+    window.on_place_self_view(|content, cam_aspect, level| {
         let picture = layout::Rect {
             x: content.x.into(),
             y: content.y.into(),
@@ -1209,10 +1236,9 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             h: content.height.into(),
         };
         // Nothing to place on before the first layout, or with no picture.
-        if !(picture.w > 0.0 && picture.h > 0.0 && cam_aspect > 0.0) {
+        let Some(r) = self_view_rect(picture, cam_aspect.into(), level.into()) else {
             return PictureRect::default();
-        }
-        let r = layout::pip_rect_over_picture(picture, cam_aspect.into());
+        };
         PictureRect {
             x: r.x as f32,
             y: r.y as f32,
@@ -1758,6 +1784,7 @@ fn on_event(w: &AppWindow, event: Event) {
                 // `video.rs` accepts none outside a recording.
                 if status == RecordingStatus::Idle {
                     ui.self_view_at = None;
+                    ui.avatar_take = false;
                     w.set_self_view(slint::Image::default());
                 }
             });
@@ -1770,17 +1797,27 @@ fn on_event(w: &AppWindow, event: Event) {
                 w.set_level_seen(false);
                 w.set_level(0.0);
                 w.set_recording_elapsed(format_hms(0.0).into());
+                start_self_view(w);
             }
         }
         // −60…0 dBFS across the bar (R11). A meter shows peaks; the avatar's
         // own curve is `rms_db`'s, over different thresholds.
-        Event::Level { peak_db, .. } => {
+        Event::Level { peak_db, rms_db } => {
             // `max` then `min`, not `clamp`, which passes a NaN through: here
             // it reads as 0.
             #[allow(clippy::manual_clamp)]
             let fraction = ((peak_db + 60.0) / 60.0).max(0.0).min(1.0);
             w.set_level(fraction as f32);
             w.set_level_seen(true);
+            // The live estimator (avatar D1), stepped here rather than in the
+            // 30 Hz tick: the level is what moves, and it arrives at 10 Hz.
+            UI.with_borrow_mut(|ui| {
+                if ui.avatar_take {
+                    let target = avatar::level_from_db(rms_db);
+                    ui.self_view_level = avatar::smooth(ui.self_view_level, target, LEVEL_DT);
+                    w.set_self_view_level(ui.self_view_level as f32);
+                }
+            });
         }
         // The whole run travels in every event, so the sheet renders what it
         // is handed; the last one -- with nothing left running -- also
@@ -2024,7 +2061,7 @@ fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
     }
     match decode_still(&path) {
         Ok(still) => {
-            w.set_avatar_thumb(thumbnail(&still));
+            w.set_avatar_thumb(thumbnail(&still, THUMB_MAX));
             UI.with_borrow_mut(|ui| ui.avatar_shown = Some(file));
         }
         Err(e) => {
@@ -2036,17 +2073,14 @@ fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
     }
 }
 
-/// A decoded still as a Slint image, decimated to at most [`THUMB_MAX`] on a
+/// A decoded still as a Slint image, decimated to at most `longest` on a
 /// side.
 ///
-/// Nearest-neighbour, and only ever downward: this is a 40 px thumbnail, and
-/// the only thing worth avoiding is uploading a phone photo's twelve
-/// megapixels as a texture to draw it.
-fn thumbnail(still: &Still) -> slint::Image {
-    /// The longest side the thumbnail is kept to, with room to spare for the
-    /// popover's 40 px box on a high-DPI screen.
-    const THUMB_MAX: u32 = 160;
-    let step = still.w.max(still.h).div_ceil(THUMB_MAX).max(1) as usize;
+/// Nearest-neighbour, and only ever downward: nothing here is bigger than a
+/// corner inset, and the only thing worth avoiding is uploading a phone
+/// photo's twelve megapixels as a texture to draw it.
+fn thumbnail(still: &Still, longest: u32) -> slint::Image {
+    let step = still.w.max(still.h).div_ceil(longest).max(1) as usize;
     let (w, h) = (still.w as usize, still.h as usize);
     let (tw, th) = (w.div_ceil(step), h.div_ceil(step));
     let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(tw as u32, th as u32);
@@ -2110,6 +2144,7 @@ fn show_clip(w: &AppWindow) {
         w.set_clip_notes(clip.map_or("", |c| &c.notes).into());
         w.set_clip_transcript(clip.map_or("", |c| &c.transcript).into());
         w.set_clip_show_pip(clip.is_some_and(|c| c.show_pip));
+        w.set_clip_avatar(clip.is_some_and(|c| c.inset == Inset::Avatar));
     });
 }
 
@@ -2247,6 +2282,40 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
     Uuid::parse_str(&w.get_selected_clip()).ok()
 }
 
+/// The corner at the start of a take (avatar spec G2).
+///
+/// In an avatar project it is the project's image, decoded here through
+/// `media::decode_still` — the one avatar decoder, so the corner shows the
+/// pixels the export will draw, and **never `slint::Image::load_from_path`**,
+/// which has no decoder to reach for in this build (slint is built with
+/// `default-features = false`). It rests at level 0 until the first
+/// `Event::Level`.
+///
+/// A camera take sets nothing: `video.rs`'s frames fill the corner, and
+/// level 1.0 places the inset exactly where it always was.
+fn start_self_view(w: &AppWindow) {
+    let path = UI.with_borrow(|ui| {
+        let snapshot = ui.snapshot.as_ref()?;
+        Some(snapshot.folder.join(snapshot.project.avatar.as_ref()?))
+    });
+    // A take whose image has gone is still an avatar take -- the image is the
+    // mode (B1) -- and it simply has no picture to show. The popover and the
+    // inspector have already said so (A4).
+    let image = path.as_ref().and_then(|path| match decode_still(path) {
+        Ok(still) => Some(thumbnail(&still, SELF_VIEW_MAX)),
+        Err(e) => {
+            eprintln!("ui: the avatar {} won't decode: {e}", path.display());
+            None
+        }
+    });
+    w.set_self_view(image.unwrap_or_default());
+    UI.with_borrow_mut(|ui| {
+        ui.avatar_take = path.is_some();
+        ui.self_view_level = if ui.avatar_take { 0.0 } else { 1.0 };
+        w.set_self_view_level(ui.self_view_level as f32);
+    });
+}
+
 /// The self-view drew a frame (`video.rs`).
 fn self_view_arrived() {
     UI.with_borrow_mut(|ui| ui.self_view_at = Some(Instant::now()));
@@ -2277,11 +2346,16 @@ fn scan_frame_shown(stream_time: Option<f64>) {
 fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
     let content = content_size(w);
     UI.with_borrow_mut(|ui| {
+        // The quiet timer is the camera's: a frozen picture would lie about
+        // it. An avatar take has no frames at all, and a still image lies
+        // about nothing -- and is not still anyway, since its size is
+        // following the microphone (avatar G2).
         w.set_self_view_shown(
             w.get_recording()
-                && ui
-                    .self_view_at
-                    .is_some_and(|at| at.elapsed() < SELF_VIEW_QUIET),
+                && (ui.avatar_take
+                    || ui
+                        .self_view_at
+                        .is_some_and(|at| at.elapsed() < SELF_VIEW_QUIET)),
         );
         if let Some(rect) = content {
             let now_ns = now_ns();

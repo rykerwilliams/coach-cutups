@@ -398,6 +398,13 @@ component Inspector inherits Rectangle {
     in-out property <string> tags-text;
     in-out property <string> notes-text;
     in-out property <bool> show-pip;
+    /// This clip was recorded with the project's avatar rather than a camera
+    /// (avatar G3). One word of the checkbox above follows it; the property,
+    /// the command and the undo are the one `show-pip` either way.
+    in property <bool> avatar;
+    /// The project's avatar image has gone (A4), which costs an avatar clip
+    /// its inset. Said here so the coach is told before they export.
+    in property <bool> avatar-missing;
     /// The commentary as words (Phase 10 S4), editable like any other field.
     in-out property <string> transcript-text;
     /// What the bus says about this clip's transcription (S5) ...
@@ -526,10 +533,17 @@ component Inspector inherits Rectangle {
         }
 
         CheckBox {
-            text: "Show webcam in export";
+            text: root.avatar ? "Show avatar in export" : "Show webcam in export";
             enabled: root.enabled;
             checked <=> root.show-pip;
             toggled => { root.pip-toggled(self.checked); }
+        }
+
+        if root.avatar && root.avatar-missing: Text {
+            text: "The project's avatar image is missing, so this clip exports with no inset.";
+            color: #ffcc00;
+            font-size: 11px;
+            wrap: word-wrap;
         }
 
         FieldLabel { text: "Notes"; }
@@ -1722,12 +1736,18 @@ export component AppWindow inherits Window {
     in property <image> self-view;
     /// Recording (or starting) with the camera's frames arriving. Cleared by
     /// `src/main.rs` when they stop, so a self-view that failed or stalled
-    /// is hidden rather than frozen.
+    /// is hidden rather than frozen. An avatar take has no frames and stays
+    /// up for the whole of it (avatar G2).
     in property <bool> self-view-shown;
-    /// Where the webcam inset lands on the picture (`core::layout::
-    /// pip_rect_over_picture`), from the content rect and the camera's
-    /// aspect. Pure, like `place-picture`.
-    pure callback place-self-view(PictureRect, float) -> PictureRect;
+    /// How loud the coach is right now, `0..=1`, smoothed: the avatar's size
+    /// follows it (avatar G2). **1 outside an avatar take**, where it places
+    /// the camera's inset exactly as it always was.
+    in property <float> self-view-level: 1.0;
+    /// Where the inset lands on the picture (`core::layout::
+    /// pip_rect_over_picture`, sized by `core::avatar::avatar_rect`), from
+    /// the content rect, the inset's aspect and the level. Pure, like
+    /// `place-picture`.
+    pure callback place-self-view(PictureRect, float, float) -> PictureRect;
 
     // --- Zoom (spec D9; the state and the math are on the Rust side) ---
 
@@ -1829,6 +1849,9 @@ export component AppWindow inherits Window {
     in-out property <string> clip-notes;
     in-out property <string> clip-transcript;
     in-out property <bool> clip-show-pip;
+    /// The selected clip's inset is the avatar, not a camera (avatar G3):
+    /// one word of the inspector's checkbox.
+    in property <bool> clip-avatar;
     /// The selected clip's transcription and the line that describes it
     /// (Phase 10 S5). Both are written by `src/main.rs` from
     /// `Event::Transcription` -- and, unlike the fields above, they keep
@@ -2704,8 +2727,9 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // The live self-view, where the export's webcam inset
-                    // goes: over the picture, under the drawings (the
+                    // The live self-view -- the camera, or the project's
+                    // avatar breathing with the voice -- where the export's
+                    // inset goes: over the picture, under the drawings (the
                     // export's layer order), placed on the content rect so
                     // the zoom doesn't move it. Outside the content clip,
                     // since on a picture that isn't 16:9 the inset reaches
@@ -2713,7 +2737,7 @@ export component AppWindow inherits Window {
                     // input: a drag that starts on it draws, as the stroke
                     // lands over the inset in the export too.
                     if root.self-view-shown: Image {
-                        property <PictureRect> at: root.place-self-view(player.content, root.self-view.width / root.self-view.height);
+                        property <PictureRect> at: root.place-self-view(player.content, root.self-view.width / root.self-view.height, root.self-view-level);
                         x: self.at.x;
                         y: self.at.y;
                         width: self.at.width;
@@ -2979,6 +3003,8 @@ export component AppWindow inherits Window {
                                     transcript-model-enabled: root.transcript-model-enabled;
                                     transcribe-download: root.transcribe-download;
                                     show-pip <=> root.clip-show-pip;
+                                    avatar: root.clip-avatar;
+                                    avatar-missing: root.avatar-missing;
                                     begin-edit => { root.editing-clip-id = root.selected-clip; }
                                     commit(field, text) => { root.edit-clip(root.editing-clip-id, field, text); }
                                     end-edit(field, text) => {
