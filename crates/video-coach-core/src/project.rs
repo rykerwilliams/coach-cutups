@@ -11,7 +11,8 @@
 //! exactly right: `None` and empty are what an older file, written before the
 //! field existed, means (spec F2). So a field added to an existing struct is an
 //! `Option` or a `Vec` with a field-level default, and a new struct's fields
-//! get none. And only
+//! get none — or, since the reason is the rule, any type whose `Default` is
+//! what an older file means, which is why `Inset` defaults to `Camera`. And only
 //! genuinely optional keys get a default at all: defaulting `clips` would let a
 //! truncated `project.json` load as an empty project, after which the next save
 //! destroys the user's work.
