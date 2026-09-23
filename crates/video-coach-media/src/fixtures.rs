@@ -266,39 +266,27 @@ pub fn still_image(dir: &Path, name: &str, w: u32, h: u32, format: StillFormat) 
     )
 }
 
-/// A `w`×`h` opaque PNG at `dir/name` in one solid `rgb`.
+/// A `w`×`h` PNG at `dir/name` in one solid colour: `rgb` at `alpha`, in
+/// straight alpha as every PNG is.
 ///
 /// The avatar a composite test looks for in the inset. [`still_image`]'s test
 /// pattern shares its colours with every source fixture, so one flat colour is
 /// what lets an assertion say a pixel either is the avatar or isn't — and, the
 /// image being uniform, what the circle's width across a row reads is the
 /// pulse and nothing else.
-pub fn solid_png(dir: &Path, name: &str, w: u32, h: u32, rgb: u32) -> PathBuf {
+///
+/// `alpha` below 255 is the one fixture that carries transparency: it is what
+/// proves the copy into the avatar's pixmap premultiplies, since a straight
+/// copy leaves the colour channels at full strength rather than scaling them
+/// by the alpha.
+pub fn solid_png(dir: &Path, name: &str, w: u32, h: u32, rgb: u32, alpha: u8) -> PathBuf {
     run(
         &format!(
             "videotestsrc num-buffers=1 pattern=solid-color \
                foreground-color=0x{:08x} \
-               ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1 \
-             ! videoconvert ! pngenc ! filesink name=out",
-            0xff00_0000u32 | (rgb & 0x00ff_ffff)
-        ),
-        &dir.join(name),
-    )
-}
-
-/// A `w`×`h` PNG at `dir/name`, uniformly **half-transparent white**, in
-/// straight alpha as every PNG is.
-///
-/// The one fixture that carries alpha: it is what proves the copy into the
-/// avatar's pixmap premultiplies, since a straight copy leaves its colour
-/// channels at full white rather than halving them with the alpha.
-pub fn translucent_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
-    run(
-        &format!(
-            "videotestsrc num-buffers=1 pattern=white \
-               ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1 \
-               ! alpha alpha=0.5 ! videoconvert ! video/x-raw,format=RGBA \
-               ! pngenc ! filesink name=out"
+             ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1 \
+             ! videoconvert ! video/x-raw,format=RGBA ! pngenc ! filesink name=out",
+            (u32::from(alpha) << 24) | (rgb & 0x00ff_ffff)
         ),
         &dir.join(name),
     )

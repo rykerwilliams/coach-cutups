@@ -1,8 +1,8 @@
 //! The composite's layout ratios.
 
 use video_coach_core::layout::{
-    bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects, stroke_line_width, Rect,
-    BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
+    bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects, self_view_rect, stroke_line_width,
+    Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
 };
 
 fn close(a: Rect, b: Rect) -> bool {
@@ -238,4 +238,38 @@ fn stroke_line_width_scales_with_the_picture_s_height() {
         stroke_line_width(0.01, 540.0),
         stroke_line_width(0.01, 1080.0) / 2.0
     );
+}
+
+/// A 16:9 picture, offset like a letterboxed player area.
+fn player_picture() -> Rect {
+    Rect {
+        x: 12.0,
+        y: 30.0,
+        w: 1600.0,
+        h: 900.0,
+    }
+}
+
+/// The live corner's own property: a camera take's `level = 1.0` places the
+/// inset exactly where it always was, so there is one placement path and no
+/// branch (avatar spec G2). Everything else about `avatar_rect` — the rest
+/// size, monotonicity, the clamp — is pinned in `avatar.rs`'s own tests.
+#[test]
+fn a_full_level_is_exactly_where_the_camera_goes() {
+    let pip = pip_rect_over_picture(player_picture(), 16.0 / 9.0);
+    let at = self_view_rect(player_picture(), 16.0 / 9.0, 1.0).expect("a picture to place on");
+    assert!(close(at, pip));
+}
+
+#[test]
+fn nothing_to_place_on_places_nothing() {
+    let empty = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
+    assert!(self_view_rect(empty, 16.0 / 9.0, 1.0).is_none());
+    assert!(self_view_rect(player_picture(), 0.0, 1.0).is_none());
+    assert!(self_view_rect(player_picture(), f64::NAN, 1.0).is_none());
 }

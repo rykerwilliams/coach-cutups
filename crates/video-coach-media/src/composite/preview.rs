@@ -29,9 +29,10 @@
 //! every pad, so frame `n`'s overlay — and an avatar's image — goes out with
 //! frame `n` or the mixer starves. For the same reason the inset pad is
 //! requested **only** when there is something to feed it: the recording's
-//! video pad with `shows_camera_pip`, the avatar's appsrc with `shows_avatar`,
-//! and neither otherwise. An unlinked video pad `decodebin3` tolerates without
-//! stalling its branch (measured).
+//! video pad with `shows_camera_pip` **and a video track to show it**
+//! ([`camera_inset`]), the avatar's appsrc with `shows_avatar`, and neither
+//! otherwise. An unlinked video pad `decodebin3` tolerates without stalling its
+//! branch (measured).
 //!
 //! **The audio sink is the clock** (measured: `GstPulseSinkClock`), so the
 //! composite follows the commentary — the track the coach hears. The video
@@ -66,8 +67,8 @@ use video_coach_core::scoreboard::{ScoreboardConfig, ScoreboardContext, Scoreboa
 use super::decode::Decoder;
 use super::{
     avatar, display_aspect, fit_rect, frame_index, frame_time, head, install_overlay_pad,
-    install_zoom, overlay_branch, place, premultiplied_over, pulsed, rounded, stamp, stamp_buffer,
-    wait_for_room, CompositeError, Gl, PadRect, Stopper, Watch, POLL, QUEUED,
+    install_zoom, level_at, overlay_branch, place, premultiplied_over, pulsed, rounded, stamp,
+    stamp_buffer, wait_for_room, CompositeError, Gl, PadRect, Stopper, Watch, POLL, QUEUED,
 };
 use crate::mailbox::FrameMailbox;
 use crate::overlay::{OverlayFrame, OverlayRenderer};
@@ -390,9 +391,17 @@ fn run(
     let total = job.compilation.frames.len() as u64;
     // The avatar, before the pump starts (spec D5): its image decoded and
     // pre-scaled once, and one pulse level per output frame read out of the
-    // recording's own sound. A whole-file audio decode between two pushed
-    // frames would stall the pump — and here it would stall the picture.
+    // recording's own sound. An audio decode between two pushed frames would
+    // stall the pump — and here it would stall the picture.
     let avatar = AvatarInset::open(job, watch.cancel);
+    // What the inset pad will carry, decided before the graph asks for it: the
+    // avatar if this clip has one, else the recording's own video if it has
+    // some to give (see [`camera_inset`]), else no pad at all.
+    let inset = match &avatar {
+        Some(avatar) => InsetSource::Avatar(avatar),
+        None if camera_inset(job) => InsetSource::Camera,
+        None => InsetSource::Nothing,
+    };
     let mut decoder = Decoder::start(&job.source, gl, watch)?;
     let mut overlays = OverlayRenderer::new();
     let mut composite: Option<Composite> = None;
@@ -442,13 +451,7 @@ fn run(
         // memory, and with them the picture rect the overlay is drawn at.
         if composite.is_none() {
             composite = Some(Composite::start(
-                sample,
-                job,
-                avatar.as_ref(),
-                gl,
-                mailbox,
-                shared,
-                watch,
+                sample, job, inset, gl, mailbox, shared, watch,
             )?);
         }
         let composite = composite.as_ref().expect("started above");
@@ -555,8 +558,9 @@ struct AvatarInset {
     buffer: gst::Buffer,
     width: i32,
     height: i32,
-    /// `layout::pip_rect` for the image's aspect, at the preview's output
-    /// size. The pulse scales it per frame, in the pad's probe.
+    /// The square `layout::pip_rect` the avatar's circle is drawn in, at the
+    /// preview's output size. The pulse scales it per frame, in the pad's
+    /// probe.
     rect: PadRect,
     /// One pulse level per output frame of the clip, from the recording's own
     /// commentary.
@@ -569,13 +573,8 @@ impl AvatarInset {
             return None;
         }
         let path = job.avatar.as_deref()?;
-        let avatar = match avatar::open(path, f64::from(OUTPUT_WIDTH), f64::from(OUTPUT_HEIGHT)) {
-            Ok(avatar) => avatar,
-            Err(e) => {
-                eprintln!("preview: no avatar from {}: {e}", path.display());
-                return None;
-            }
-        };
+        let avatar =
+            avatar::open_reported(path, f64::from(OUTPUT_WIDTH), f64::from(OUTPUT_HEIGHT))?;
         let levels = avatar::pulse_table(&job.recording, job.compilation.frames.len(), cancel);
         Some(AvatarInset {
             width: avatar.image.width() as i32,
@@ -585,6 +584,21 @@ impl AvatarInset {
             levels: levels.into(),
         })
     }
+}
+
+/// What a preview's inset pad carries, decided before the graph is built.
+///
+/// One value rather than two flags: the three cases are exclusive, and the pad
+/// is requested, placed, fed and linked from this one answer (spec F), which is
+/// what keeps those four sites from disagreeing.
+#[derive(Clone, Copy)]
+enum InsetSource<'a> {
+    /// The recording's own video, played natively onto the pad.
+    Camera,
+    /// The project's avatar, pushed from an `appsrc` of its own.
+    Avatar(&'a AvatarInset),
+    /// Nothing: no pad is requested at all.
+    Nothing,
 }
 
 /// The composite pipeline: three mixer pads and the tail into the mailbox.
@@ -617,12 +631,17 @@ impl Composite {
     fn start(
         first: &gst::Sample,
         job: &PreviewJob,
-        avatar: Option<&AvatarInset>,
+        inset: InsetSource,
         gl: &Gl,
         mailbox: &FrameMailbox,
         shared: &Arc<Shared>,
         watch: &Watch,
     ) -> Result<Composite, CompositeError> {
+        let (camera, avatar) = match inset {
+            InsetSource::Camera => (true, None),
+            InsetSource::Avatar(avatar) => (false, Some(avatar)),
+            InsetSource::Nothing => (false, None),
+        };
         let caps = first
             .caps()
             .ok_or_else(|| CompositeError::Failed("a decoded frame has no caps".into()))?;
@@ -631,10 +650,10 @@ impl Composite {
         let picture = fit_rect(&info, OUTPUT_WIDTH, OUTPUT_HEIGHT);
 
         // The inset pad is requested only when there is something to feed it:
-        // the recording's video for a camera clip, the avatar's own appsrc for
-        // an avatar one. With neither, the pad is never asked for and the
-        // recording's video pad (if it has one) is left unlinked.
-        let pip = match (job.clip.shows_camera_pip(), avatar) {
+        // the recording's video for a camera clip that has some, the avatar's
+        // own appsrc for an avatar one. With neither, the pad is never asked
+        // for and the recording's video pad (if it has one) is left unlinked.
+        let pip = match (camera, avatar) {
             (true, _) => "queue name=pipq ! glupload ! glcolorconvert ! mix.sink_1 ".to_owned(),
             (false, Some(avatar)) => format!(
                 "appsrc name=pip format=time is-live=false block=false \
@@ -728,7 +747,7 @@ impl Composite {
         {
             pad.set_property("repeat-after-eos", true);
         }
-        if job.clip.shows_camera_pip() {
+        if camera {
             place_pip(&mix_pad("sink_1"));
         }
         // One entry, laid out once above rather than per entry, so the zoom is
@@ -746,7 +765,7 @@ impl Composite {
             move || shared.counters.sample()
         });
 
-        link_recording(&pipeline, job, &by_name)?;
+        link_recording(&pipeline, job, camera, &by_name)?;
         // The sink's QoS reports are the only place a dropped frame shows up
         // -- and it does drop, so `qos=true` on the sink is load-bearing: the
         // audio is the clock, and a late picture kept would slide further and
@@ -973,8 +992,33 @@ fn seek_to(pipeline: &gst::Pipeline, frame: u64) -> bool {
         .is_ok()
 }
 
+/// Whether the inset pad carries this clip's recording: `shows_camera_pip`
+/// **and** a video track to fill it with.
+///
+/// **The probe is not optional.** An avatar take's file has no video track
+/// (spec B4), and neither has a webcam take whose camera died or whose file was
+/// truncated; a mixer pad requested and never fed produces nothing and stalls
+/// the whole preview, with no error (measured, Phase 8). Export probes here too
+/// and falls back to its filler (`Pip::open`); preview has no pad at all
+/// instead, which is the same outcome — no inset, and a preview that plays.
+fn camera_inset(job: &PreviewJob) -> bool {
+    if !job.clip.shows_camera_pip() {
+        return false;
+    }
+    match crate::probe::probe(&job.recording) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "preview: no picture-in-picture for {}: {e}",
+                job.recording.display()
+            );
+            false
+        }
+    }
+}
+
 /// Adds `filesrc ! decodebin3` for the recording and links its streams: video
-/// to the PiP queue when there is one, audio to the volume chain.
+/// to the PiP queue when there is one (`camera`), audio to the volume chain.
 ///
 /// In Rust rather than the launch string because `decodebin3`'s pads are
 /// dynamic: parse-launch would link whichever appeared first to whichever
@@ -982,6 +1026,7 @@ fn seek_to(pipeline: &gst::Pipeline, frame: u64) -> bool {
 fn link_recording(
     pipeline: &gst::Pipeline,
     job: &PreviewJob,
+    camera: bool,
     by_name: &impl Fn(&str) -> gst::Element,
 ) -> Result<(), CompositeError> {
     let make = |factory: &str| {
@@ -1001,10 +1046,7 @@ fn link_recording(
 
     let sink_pad =
         |element: gst::Element| element.static_pad("sink").expect("a queue has a sink pad");
-    let video = job
-        .clip
-        .shows_camera_pip()
-        .then(|| sink_pad(by_name("pipq")));
+    let video = camera.then(|| sink_pad(by_name("pipq")));
     let audio = sink_pad(by_name("audioq"));
     decodebin.connect_pad_added(move |_, pad| {
         let name = pad.name();
@@ -1032,12 +1074,8 @@ fn link_recording(
 /// avatar identically at every level.
 fn place_avatar(pad: &gst::Pad, rect: PadRect, levels: Arc<[f64]>) {
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
-        if let Some(level) = info
-            .buffer()
-            .and_then(|b| b.pts())
-            .and_then(|pts| levels.get(frame_index(pts) as usize))
-        {
-            place(pad, pulsed(rect, *level), 1);
+        if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+            place(pad, pulsed(rect, level_at(&levels, pts)), 1);
         }
         gst::PadProbeReturn::Ok
     });

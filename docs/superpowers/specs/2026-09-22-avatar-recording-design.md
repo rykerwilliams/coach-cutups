@@ -1,7 +1,7 @@
 # Avatar recording: a picture that talks instead of a webcam
 
 **Date:** 2026-09-22
-**Status:** Reviewed (simplify + correctness applied). **Section E was rewritten on 2026-09-22 after its own measurement refused it** (E1): the avatar is drawn on the GL inset pad, not in the tiny-skia overlay. The user decided, 2026-09-22: one image per project; a smoothed pulse with the voice; **it pulses live in the corner while recording *and* is rendered from the recorded audio in previews and exports**; the camera is never opened in avatar mode; and the avatar rests slightly smaller than the webcam inset, reaching exactly the inset at its loudest. Open questions at the end; the plan proceeds on each one's default unless the user says otherwise.
+**Status:** Reviewed (simplify + correctness applied), and **A5, A3, D2, F and G2 amended 2026-09-23 after the review of the shipped code**: the inset's box is square and the image is cover-cropped into it (A5), one function makes the drawn pixels for the render and the UI alike (A3), the pulse's decode is bounded by the entry (D2), preview probes the recording before asking for the inset pad (F), and the corner reads the image the popover already decoded (G2). **Section E was rewritten on 2026-09-22 after its own measurement refused it** (E1): the avatar is drawn on the GL inset pad, not in the tiny-skia overlay. The user decided, 2026-09-22: one image per project; a smoothed pulse with the voice; **it pulses live in the corner while recording *and* is rendered from the recorded audio in previews and exports**; the camera is never opened in avatar mode; and the avatar rests slightly smaller than the webcam inset, reaching exactly the inset at its loudest. Open questions at the end; the plan proceeds on each one's default unless the user says otherwise.
 **Builds on:** Phase 4 (the recorder, the self-view, the recording lifecycle), Phase 7 (the composite, the overlay, the PiP pad, `layout.rs`), Phase 8 (the export graph, the audio mix), Phase 10 (the 16 kHz `Reader`), Match Vision F (the format-bump rules)
 **Evidence:**
 
@@ -71,32 +71,41 @@ Replacing the image replaces it for the whole project, including clips already r
 ```rust
 pub(super) struct Avatar {
     /// Pre-scaled to the run's largest drawn size, so the pad's per-frame
-    /// scale is never an upscale. **Premultiplied** (see below).
+    /// scale is never an upscale. Cover-cropped, circle-masked and
+    /// **premultiplied** (A5 and below).
     image: tiny_skia::Pixmap,
-    /// `layout::pip_rect(out_w, out_h, <the image's display aspect>)`: the
-    /// inset's footprint at its loudest. The aspect is not stored separately
-    /// — this rect already carries it.
+    /// `layout::pip_rect(out_w, out_h, 1.0)`: the **square** box the circle is
+    /// inscribed in, and the inset's footprint at its loudest (A5).
     rect: layout::Rect,
 }
 pub(super) fn open(path: &Path, out_w: f64, out_h: f64) -> Result<Avatar, String>;
+/// `open`, with a failure reported on stderr and `None` in its place (A4).
+/// Both tails take it, so the line is written once rather than twice.
+pub(super) fn open_reported(path: &Path, out_w: f64, out_h: f64) -> Option<Avatar>;
 ```
 
-And, because the app needs the same pixels at pick time and for the live corner (G2), one public seam on the crate:
+And two public seams on the crate — the app needs the decoder at pick time and the **drawn** pixels for the popover and the live corner (G1, G2):
 
 ```rust
 /// One still frame's straight-alpha RGBA, at its own size. The one decoder
-/// for avatar images: the pick validates with it, the corner draws with it,
-/// and `avatar::open` scales its output into the pixmap.
+/// for avatar images: the pick validates with it, and everything below scales
+/// its output.
 pub fn decode_still(path: &Path) -> Result<Still, String>;   // { w, h, rgba: Vec<u8> }
+
+/// The avatar exactly as it is drawn — cover-cropped into a square,
+/// circle-masked, premultiplied — at `size`x`size`. The one place the drawn
+/// pixels are made, so the popover's thumbnail and the corner cannot show
+/// something the export won't draw.
+pub fn drawn(path: &Path, size: u32) -> Result<Drawn, String>;  // { size, rgba }
 ```
 
 - The pipeline is `filesrc ! decodebin3 ! videoflip video-direction=auto ! videoconvert ! video/x-raw,format=RGBA,pixel-aspect-ratio=1/1 ! appsink`, with a bounded wait, **one sample pulled** and the pipeline set to NULL. `decodebin3`, never `decodebin` (CLAUDE.md).
   - **`videoflip video-direction=auto`** reads the `image-orientation` tag, which is where a phone's EXIF rotation ends up. Without it a portrait photo taken on a phone draws sideways. Note that `probe.rs` *refuses* rotated video for sources (`ProbeError::Rotated`, `crates/video-coach-media/src/probe.rs:32-33`); an avatar is a still, there is no timeline to worry about, and rotating it is right.
   - **One sample pulled** is also the rule for a multi-frame file: an animated PNG, or a file that decodes to several frames, yields its **first** frame and the pipeline stops. No animation, and no error either.
 - **The copy into the pixmap premultiplies.** tiny-skia stores premultiplied pixels; GStreamer's `RGBA` means straight alpha (`overlay.rs:26-31` says exactly this about the overlay layer). A memcpy would leave a cut-out PNG's soft edges too bright and haloed — every partly transparent pixel drawn at its full colour. The copy multiplies each of R, G and B by A/255. Nothing demultiplies on the way out either: the inset's mixer pad is told to blend premultiplied instead (E4).
-- The sample is copied into a `Pixmap` at native size, then scaled **once** into a `Pixmap` of `pip_rect(out_w, out_h, aspect)` rounded up. Everything after that reads the small one.
+- The sample is copied into a `Pixmap` at native size, then drawn **once** into a `Pixmap` of the square `pip_rect(out_w, out_h, 1.0)` rounded up, cover-cropped (A5). Everything after that reads the small one.
 - **Why not add an image crate to media:** media is the GStreamer crate and the decoders are already there. `video-coach-core` of course gets nothing: it declares no media dependency, not even an image crate (CLAUDE.md, `crates/video-coach-core/Cargo.toml:9-13`).
-- **The aspect is the image's.** `pip_rect(out_w, out_h, cam_aspect)` takes a display aspect and sizes the inset from it (`crates/video-coach-core/src/layout.rs:76-86`); an avatar hands it the image's aspect where a webcam hands it the camera's. So a tall portrait avatar gets a tall inset in the same 22%-of-width column, and `layout.rs` needs no new constant.
+- **The box is square, and the image is cropped into it** (A5). `pip_rect(out_w, out_h, 1.0)` — the same function a webcam's inset is placed by (`crates/video-coach-core/src/layout.rs:76-86`), at aspect 1, so `layout.rs` needs no new constant and the circle sits on the webcam inset's own right and bottom margins.
 
 **A4. A missing or unreadable image costs the inset, never the run.**
 
@@ -104,12 +113,14 @@ pub fn decode_still(path: &Path) -> Result<Still, String>;   // { w, h, rgba: Ve
 - **At record time:** nothing to refuse. `Project.avatar` is the mode, so "avatar mode with no image" is not a state that exists (B1). A project whose avatar *file* has gone under it still records — it is an avatar take with a missing picture, which is the export-time case above, and the Devices popover has already said so.
 - **In the UI:** the Devices popover shows the picked image, and says "avatar.png is missing" when the file has gone, so the coach finds out before a take rather than after an export.
 
-**A5. The avatar is drawn as a circle** (the user, 2026-09-22: "the image would be like my gravatar"). A square portrait is the normal case, so:
+**A5. The avatar is drawn as a circle, in a square box** (the user, 2026-09-22: "the image would be like my gravatar"). What is drawn is therefore always a circle, and where that circle sits must not depend on what was picked, so:
 
-- The image is **fitted** inside the inset keeping its own shape — a square shows whole, nothing is stretched — and then masked to a circle inscribed in that fitted box.
+- **The box is square:** `pip_rect(out_w, out_h, 1.0)`, whatever the image's own shape. A box of the image's aspect would put the circle somewhere other than where the webcam inset sits — a 3:4 portrait's would float about 240 px above the corner at 1080p, and a phone screenshot's would run off the top of the frame — because only a 1:1 image's inscribed circle fills a box of its own aspect.
+- The image is **cover-cropped** into that square: scaled until its shorter side fills the box, then centred, so the middle of the picture (where a face is) survives and nothing is stretched. It is then masked to the circle inscribed in the box.
 - The mask is built once, with the pre-scaled pixmap, not per frame: it is the same `tiny_skia::Mask` machinery the overlay already memoizes for the picture rect. The pixels the pad is handed are already round.
 - The pulse scales the circle — on the GPU, as the pad's rect (E3) — so it breathes around its own centre.
 - A transparent cut-out still works; it is simply masked too, which costs it nothing in the middle of the frame.
+- **One function makes those pixels** (`drawn`, A3), and the Devices popover's thumbnail and the live corner take it at their own size, so the coach is shown the circle the export draws rather than the raw rectangle.
 
 ### B. A project setting, a per-clip fact
 
@@ -277,7 +288,7 @@ The live one is not exact and does not need to be: it tells the coach their voic
 
 **D2. The signal for the rendered path is the recorded commentary, read once per entry.**
 
-- Media opens the entry's recording with `Reader::start(recording, PULSE_RATE, 1, cancel)` and `Reader::rest(cancel)` — the same reader transcription uses at the same rate (`crates/video-coach-media/src/composite/audio.rs:289, 468`; `crates/video-coach-media/src/transcribe.rs:629`). `PULSE_RATE = 16_000`, mono.
+- Media opens the entry's recording with `Reader::start(recording, PULSE_RATE, 1, cancel)` — the same reader transcription uses at the same rate (`crates/video-coach-media/src/composite/audio.rs:289`; `crates/video-coach-media/src/transcribe.rs:629`), `PULSE_RATE = 16_000`, mono — and reads it with `Reader::read(samples, cancel)`, which is **bounded by what the entry shows**: the entry's frames' worth of samples, zero-padded past the end of the file. An entry that shows two seconds of an hour-long take decodes two seconds, and a recording shorter than its entry goes quiet rather than short.
 - A file with no audio track comes back as `Ok(None)` and the pulse is flat.
 - **It is a second read of the file, not the export mixer's.** The mixer streams forward at 48 kHz stereo and seeks per region (`composite/audio.rs:74-92`); the pulse needs the whole thing up front, at a different rate, before the first frame is pushed. Audio decode runs about 90× realtime (Phase 8 E3), so one extra pass over a one-minute take is milliseconds.
 - **Only the commentary drives it.** The game's audio does not, so a clip where the coach says nothing over a roaring crowd shows a still avatar. That is the correct answer: the inset is the coach.
@@ -400,7 +411,7 @@ The avatar is masked to a circle (A5), so the inset's edge and every cut-out PNG
 
 `Pip::open` branches on `core`'s two predicates, **before** the probe (B3, `export.rs:451-475`):
 
-- `clip.shows_avatar()` → the run's uploaded texture at `pip_rect` for the image's aspect, or — if the image is missing or would not decode — the filler, with one line on stderr for the run rather than one per entry (A4).
+- `clip.shows_avatar()` → the run's uploaded texture at the square `pip_rect` (A5), or — if the image is missing or would not decode — the filler, with one line on stderr for the run rather than one per entry (A4).
 - `clip.shows_camera_pip()` → the recording, probed and decoded, exactly as today.
 - Neither → the 1×1 GL filler, as `show_pip: false` already does.
 
@@ -415,7 +426,7 @@ They share one composite (CLAUDE.md, `composite/`), and the avatar keeps that tr
 - **Both** build their pulse tables in job setup (D5) and index them by `frame − entry.start_frame`.
 - **Both** put the avatar on **mixer pad 1**, at `avatar_rect(pip, level)`, from one shared helper on a PTS-keyed probe (E3).
 - **Where they differ is how the pad is fed, and that is the recording's doing.** Export pumps every pad, so the avatar is one more buffer beside the recording's and the filler's — and must be GL, because that pad also carries both of those (E2). Preview plays the recording **natively** for the PiP and the commentary audio, so an avatar clip gives it no video pad to play: it gets an `appsrc` branch of its own, pushed from the same pump loop as the base and the overlay, through its own `glupload`.
-- **Preview must not request, place or link the recording's PiP branch for an avatar clip.** All three sites take `clip.shows_camera_pip()` (B3) — the launch string's branch, the pad's placement, and `decodebin3`'s pad-added link. An avatar recording has no video pad, and **an unfed mixer pad stalls everything** [measured, Phase 8 E2]; a linked pad that never produces would be the same stall from the other end.
+- **Preview must not request, place or link the recording's PiP branch unless there is a picture for it.** All three sites — the launch string's branch, the pad's placement, and `decodebin3`'s pad-added link — take one answer: `clip.shows_camera_pip()` (B3) **and the recording probing as having video**. An avatar recording has no video pad by construction (B4), and a webcam take whose camera died or whose file was truncated has none either; **an unfed mixer pad stalls everything** [measured, Phase 8 E2], and a linked pad that never produces would be the same stall from the other end. Export already probes before it opens a decoder and falls back to the filler (E5); preview has no filler, so it asks for no pad at all, which is the same outcome.
 - **The avatar's appsrc is a pumped pad like the other two**, so it takes their rules with it: `stream-type=seekable` with the same `seek-data` callback, `wait_for_room` before the cursor's lock, an EOS at the end of the schedule, and `repeat-after-eos` on its mixer pad so the held last frame still shows the inset.
 
 The consequence is the property that matters: what the coach checks in the preview is what the file gets, at a different size.
@@ -424,7 +435,7 @@ The consequence is the property that matters: what the coach checks in the previ
 
 **G1. Picking the image** lives in the Devices popover, beside the Camera and Microphone lists (`app.slint:3337-3364`), because that is already "where a take's inputs are chosen".
 
-- A third section, **Inset**, holding: the picked image as a thumbnail with its file name, a **Choose…** button that opens a file dialog (`rfd`, already a dependency), and a **Remove** button.
+- A third section, **Inset**, holding: the picked image as a thumbnail — `drawn`'s circle at `AVATAR_SIZE` (A5), decoded once per change of the file behind it and kept for the corner (G2) — with its file name, a **Choose…** button that opens a file dialog (`rfd`, already a dependency), and a **Remove** button.
 - With no image picked, the section reads "Camera — no avatar picked", and **Choose…** is the only control. There are no radio rows: the image is the mode (B1).
 - With the image file missing, the thumbnail is replaced by "avatar.png is missing".
 - **Remove** clears `Project.avatar` and deletes the project's copy (A2's Remove); the coach's original file is untouched. The section goes back to "Camera".
@@ -434,7 +445,7 @@ The consequence is the property that matters: what the coach checks in the previ
 
 The existing self-view `Image` is reused as it stands (`app.slint:1659-1667, 2643-2651`): it is already placed by `place_self_view(content, aspect)` → `layout::pip_rect_over_picture` (`main.rs:1176-1194`), already sits over the picture and under the drawings, and already takes no input. Three changes:
 
-1. **The picture.** In an avatar project the app sets `self-view` once, at the start of the take, from `media::decode_still(avatar_path)` → `slint::Image::from_rgba8`, which is the constructor the self-view frames already use (`crates/video-coach-app/src/video.rs:199-211`). **Not `slint::Image::load_from_path`:** the workspace builds slint with `default-features = false` (`Cargo.toml:20`) and no image-decoder feature, so `load_from_path` has no decoder to reach for. Going through `decode_still` is also what makes "validated at pick time" mean something — the corner and the export are then fed by the same decoder, and a file that passes the pick cannot fail in one and work in the other. Straight alpha here, premultiplied only where tiny-skia needs it (A3).
+1. **The picture.** In an avatar project the app sets `self-view` once, at the start of the take, from the image **the Devices popover already decoded** — `media::drawn(avatar_path, AVATAR_SIZE)` → `slint::Image::from_rgba8_premultiplied`, held on the UI struct beside the file identity it was decoded from (G1). **Decoded there and not here:** a decode is a GStreamer pipeline with a ten-second bound on it, and the instant the coach presses R is the one moment on the UI thread that cannot afford one. **And never `slint::Image::load_from_path`:** the workspace builds slint with `default-features = false` (`Cargo.toml:20`) and no image-decoder feature, so it has no decoder to reach for. Going through `drawn` is also what makes "validated at pick time" mean something — the corner and the export are fed by one decoder *and* one rasterizer, so the corner shows the circle the file gets. It is square, which is why the placement callback's aspect is 1.0 for an avatar take with no branch of its own.
 2. **The size follows the voice.** `place-self-view` gains a third argument, the level:
    `place-self-view(PictureRect, aspect: float, level: float) -> PictureRect`,
    and the Rust callback (`main.rs:1176-1194`) returns `avatar_rect(pip_rect_over_picture(picture, aspect), level)`.
@@ -487,8 +498,8 @@ Two fields, not three: `Preferences.avatar_for_new_recordings` is deleted (B1).
 | Crate | Contents |
 |---|---|
 | `video-coach-core` | `Inset`, `Clip::shows_camera_pip` / `shows_avatar`, `Project.avatar`, the v10 bump, the amended `project.rs` module comment. `avatar.rs`: `level_from_db`, `smooth`, `pulse` (samples in, one level per output frame out), `avatar_rect`, and the constants. **No new dependency** — the audit still lists exactly `serde`, `serde_json`, `thiserror`, `uuid`. |
-| `video-coach-media` | The camera-less recorder branch and `CaptureSources`' optional video, on both arms. `level_dbs` (peak **and** rms). `decode_still`, the one avatar decoder. `composite/avatar.rs`: the pre-scaled premultiplied `Pixmap`, and the pulse table via the existing `Reader`. The inset pad in both tails: export's upload and `Pip` branch, preview's appsrc branch, the per-frame level in `Schedule`, the pad's premultiplied blend. `Pip::open`'s predicates; preview's three PiP sites. A still-image fixture. **The overlay is untouched.** |
-| `video-coach-app` | Bus: avatar mode in `capture_sources` (both capture kinds), the camera refusal's new wording, picking, copying and removing the image, `avatar` on both jobs. UI: the Devices popover's Inset section, the pulsing corner during a take, the inspector's label. |
+| `video-coach-media` | The camera-less recorder branch and `CaptureSources`' optional video, on both arms. `level_dbs` (peak **and** rms). `decode_still`, the one avatar decoder, and `drawn`, the one rasterizer (the UI takes both). `composite/avatar.rs`: the pre-scaled, cover-cropped, circle-masked, premultiplied `Pixmap`, and the pulse table via the existing `Reader`, bounded by the entry's frames. The inset pad in both tails: export's upload and `Pip` branch, preview's appsrc branch, the per-frame level in `Schedule`, the pad's premultiplied blend. `Pip::open`'s predicates; preview's three PiP sites and its probe. A still-image fixture. **The overlay is untouched.** |
+| `video-coach-app` | Bus: avatar mode in `capture_sources` (both capture kinds), the camera refusal's new wording, picking, copying and removing the image, `avatar` on both jobs. UI: the Devices popover's Inset section (which is where the image is decoded, once per change of the file), the pulsing corner during a take, the inspector's label. |
 | `video-coach-harness` | An avatar take end to end: record with test sources, get a clip, export it. |
 
 Core touches no pixel and no file. Media hands it a slice of `f32` and a `Rect`; everything that decides the motion is tested on CI with synthetic input.
@@ -505,13 +516,14 @@ Core touches no pixel and no file. Media hands it a slice of `f32` and a `Rect`;
   - `add_recorded_clip` takes `inset` from `project.avatar.is_some()`, as it takes `show_pip` from the preference.
 - **Media** (generated fixtures only — no real camera, microphone or network, ever):
   - `fixtures::still_image(dir, w, h, format)` writes a PNG and a JPEG with `videotestsrc num-buffers=1 ! pngenc|jpegenc ! filesink`. `decode_still` reads both, keeps a non-square aspect, and errors on a non-image and on a missing file.
+  - **The drawn circle:** a square, a portrait and a landscape all open to the **same square `pip_rect`** and a square pixmap with the circle centred in it; and the crop takes the **middle** of a non-square image, which a test tells from a squash by a banded still whose middle band is a known fraction of the drawn box.
   - **Premultiplication:** a still with a half-transparent region, decoded and opened, has `pixmap` bytes whose colour channels are scaled by alpha — drawn over white it reads as the blend, not as the full colour.
   - The recorder with `CaptureSources::Test { video: None }` writes a playable Matroska with an audio track and **no** video track; `t0_ns > 0`; `StopOutcome.duration` matches the audio; `self_view_pipeline()` is `None`; `FirstBuffer` arrives.
   - `level_dbs` returns both fields, and on a loud tone `peak_db > rms_db`.
-  - Export of a one-entry avatar compilation whose commentary is loud for its first half and silent for its second: the inset spans `pip_rect` on a loud frame and a strictly smaller concentric rect on a quiet one, measured as the circle's width across the inset's centre row and read back with `fixtures::decode_rgb`. Properties, not golden images, as in Phase 9. It never exceeds `pip_rect` (I4), and the run's frame count is `plan.total_frames()`.
+  - Export of a one-entry avatar compilation whose commentary is loud for its first half and silent for its second: the inset spans `pip_rect` on a loud frame and a strictly smaller concentric rect on a quiet one, measured as the **ratio** of the circle's width across the inset's centre row at the two ends — a ratio, because chroma subsampling softens that edge by a pixel or two and divides out of one — and read back with `fixtures::decode_rgb`. Properties, not golden images, as in Phase 9. It never exceeds `pip_rect` (I4), and the run's frame count is `plan.total_frames()`.
   - **One** mixed compilation, avatar-then-camera: the asserted frame count, no stall, each entry's own inset. That is the caps change on the inset pad (I2) — the case that used to fail the export outright.
-  - An avatar clip whose image file is gone exports with no inset and no failure.
-  - Preview of an avatar clip runs, does not stall, and shows the inset — the three `show_pip` sites and the new appsrc branch in one.
+  - An avatar clip whose image file is gone exports with no inset and no failure; one whose **recording** is gone exports with the avatar held at rest on every frame, since there is no sound to pulse on.
+  - Preview of an avatar clip runs, does not stall, and shows the inset — the three `show_pip` sites and the new appsrc branch in one. And a **camera** clip whose recording has no video track previews too, which is the probe (F): without it that preview never finishes.
   - The `draw_pixmap` measurement of E1, kept as an `#[ignore]`d test rather than deleted with the design it refused.
 - **Harness:**
   - Record in an avatar project with `CaptureKind::Test`, get a clip with `inset == Avatar` and an audio-only recording, export it end to end.

@@ -268,10 +268,13 @@ silently. If you need a media type in core, you need a different design.
   **exactly the file `Project.avatar` names**, never an `avatar.*` glob over a
   folder the coach can also put files in. **Remove** deletes the project's copy
   alone — the coach's original is theirs.
-- **`media::decode_still` is the one avatar decoder.** The pick validates with
-  it, the Devices popover's thumbnail draws with it, and `composite::avatar::
-  open` scales its output, so a file that passes the pick cannot fail in an
-  export and nothing has to keep a list of extensions in step. It runs
+- **`media::decode_still` is the one avatar decoder, and `media::avatar_drawn`
+  the one rasterizer.** The pick validates with the decoder; the drawn pixels —
+  cover-cropped, circle-masked, premultiplied — are made in one place and taken
+  by the render, the Devices popover's thumbnail and the corner during a take
+  alike, so a file that passes the pick cannot fail in an export, nothing has to
+  keep a list of extensions in step, and the coach is never shown something the
+  file won't get. The decoder runs
   `decodebin3 ! videoflip video-direction=auto`, which is what keeps an
   EXIF-rotated phone photo upright (`probe` *refuses* a rotated **source**
   instead: there a timeline and a stored aspect are at stake). One sample is
@@ -279,10 +282,13 @@ silently. If you need a media type in core, you need a different design.
   dialog offers PNG and JPEG; what is accepted is what decoded.
 - **GStreamer's `RGBA` is straight alpha and tiny-skia is premultiplied**, so
   the copy into the avatar's pixmap multiplies R, G and B by A — a memcpy leaves
-  a cut-out PNG haloed. The pixmap is pre-scaled to `pip_rect` for the
-  **image's own** aspect (nothing is stretched or cropped to the inset) and
-  masked **once, at open time** to the circle inscribed in it, so the per-frame
-  draw is a plain blit.
+  a cut-out PNG haloed. The pixmap is pre-scaled to the **square**
+  `pip_rect(out_w, out_h, 1.0)` and masked **once, at open time** to the circle
+  inscribed in it, so the per-frame draw is a plain blit. **Square whatever was
+  picked, and the image cover-cropped into it** (scaled until its shorter side
+  fills the box, then centred): what is drawn is always a circle, so a box of
+  the image's own aspect would put that circle somewhere other than where the
+  webcam inset sits — a 3:4 portrait's about 240 px above the corner at 1080p.
 
 **Bus contract — caller-captured timestamps.** Any command that lands in the
 commentary event log carries its timestamp (and source-position anchor) as a
@@ -315,7 +321,7 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **An avatar project records audio only.** `Project.avatar.is_some()` is the mode, so no camera is opened, no `video_%u` pad is requested on the mux, no H.264 encoder is chosen (a machine with neither VA-API nor `x264enc` still records commentary) and there is no self-view pipeline. `CaptureSources`' video side is `Option` on **both** arms, and `capture_sources`' early return for `CaptureKind::Test` honours the mode too — a branch written only into the `Devices` arm would leave every test recording with video whatever the project said.
 - **`RecorderMessage::FirstBuffer` is the first-buffer gate** (not `FirstVideo`): a buffer reached the muxer, so there is a file worth keeping. It comes from the one pad there is — video where there is one, audio otherwise — and the start timeout says which was missing.
 - **The `level` element carries two numbers and the recorder passes both on.** The meter draws `peak_db`; the avatar pulses on `rms_db`, because speech's 10–14 dB crest factor would peg a peak-driven inset while the export barely moved.
-- **The corner during an avatar take is the project's image, pulsing.** It is decoded once at the start of the take through `media::decode_still` (never `slint::Image::load_from_path` — slint is built with no image decoder) and sized by the **live** estimator: `level`'s `rms_db` through `core::avatar::level_from_db`, smoothed at `dt = 0.1` — the message interval — by the same `core::avatar::smooth` the render uses at `1/30`. Previews and exports use the **rendered** estimator instead (RMS per output frame, read from the recording). Two estimators of one quantity, same constants, nothing persisted. `place-self-view` carries the level, and a camera take passes `1.0`, which `avatar_rect` maps to exactly `pip_rect` — one placement path. **The self-view's quiet timer is the camera's alone:** an avatar take has no frames arriving and must not be hidden by it.
+- **The corner during an avatar take is the project's image, pulsing.** It is the copy the Devices popover decoded (`media::avatar_drawn`, once per change of the file behind it — never at the start of a take, where a decode with a ten-second bound would sit on the UI thread the instant the coach presses R; and never `slint::Image::load_from_path`, since slint is built with no image decoder) and sized by the **live** estimator: `level`'s `rms_db` through `core::avatar::level_from_db`, smoothed at `dt = 0.1` — the message interval — by the same `core::avatar::smooth` the render uses at `1/30`. Previews and exports use the **rendered** estimator instead (RMS per output frame, read from the recording). Two estimators of one quantity, same constants, nothing persisted. `place-self-view` carries the level, and a camera take passes `1.0`, which `avatar_rect` maps to exactly `pip_rect` — one placement path. **The self-view's quiet timer is the camera's alone:** an avatar take has no frames arriving and must not be hidden by it.
 - **Tests:** they use injected test sources (`CaptureKind::Test`) and never the real camera or mic. See `docs/superpowers/specs/2026-09-19-linux-port-phase-4-design.md`.
 
 **Export runs one GL graph everywhere, on its own GL display.**
@@ -342,8 +348,8 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 **Export burns in the overlay and mixes the audio** (Phase 8).
 - **Layers:** the pumped source (zoom, per-entry fit rect), the webcam PiP, then one output-size overlay carrying strokes (mapped into the picture rect), the text bar's background and its glyphs. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
 - **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
-- **The avatar is that same inset pad, never the overlay.** An avatar clip's inset is the project's image: decoded and pre-scaled once, **uploaded to GL once** (the filler's own hop, for the filler's own reason) and pushed as a re-stamped header over the one texture per frame; preview, whose recording has no video pad to play, feeds the pad from an `appsrc` of its own. The pulse is the **pad's rect**, `core::avatar::avatar_rect(pip, level)`, set in the PTS-keyed probe from one level per output frame built at job setup from the recording's own audio — never in the frame loop, where a whole-file audio decode would stall the pump. `avatar_rect` is exactly `pip` at level 1.0, which is what every non-avatar frame carries, so a camera export is unchanged to the integer. Both raster pads blend `blend-function-src-rgb=one`: what they carry is a premultiplied tiny-skia pixmap. **Measured, and the reason:** drawing the inset in the overlay costs 4.2–4.8 ms a frame against the 3.2 ms the whole overlay costs — `tiny_skia` has no sprite fast path (`the_avatar_blit_costs`, `#[ignore]`d in `media/tests/avatar.rs`).
-- **`Clip::shows_camera_pip()` and `shows_avatar()` are the only readings of `show_pip × inset`.** Preview has **three** sites to the first — the launch string's branch, the pad's placement, `decodebin3`'s pad-added link — and they must agree or the mixer stalls.
+- **The avatar is that same inset pad, never the overlay.** An avatar clip's inset is the project's image: decoded and pre-scaled once, **uploaded to GL once** (the filler's own hop, for the filler's own reason) and pushed as a re-stamped header over the one texture per frame; preview, whose recording has no video pad to play, feeds the pad from an `appsrc` of its own. The pulse is the **pad's rect**, `core::avatar::avatar_rect(pip, level)`, set in the PTS-keyed probe from one level per output frame built at job setup from the recording's own audio — never in the frame loop, where an audio decode would stall the pump — and **bounded by the entry**: the reader is asked for exactly the samples the entry's frames cover, so a two-second entry of an hour-long take reads two seconds. `avatar_rect` is exactly `pip` at level 1.0, which is what every non-avatar frame carries, so a camera export is unchanged to the integer. Both raster pads blend `blend-function-src-rgb=one`: what they carry is a premultiplied tiny-skia pixmap. **Measured, and the reason:** drawing the inset in the overlay costs 4.2–4.8 ms a frame against the 3.2 ms the whole overlay costs — `tiny_skia` has no sprite fast path (`the_avatar_blit_costs`, `#[ignore]`d in `media/tests/avatar.rs`).
+- **`Clip::shows_camera_pip()` and `shows_avatar()` are the only readings of `show_pip × inset`.** Preview has **three** sites to the first — the launch string's branch, the pad's placement, `decodebin3`'s pad-added link — and they must agree or the mixer stalls. They take one answer, and it includes a **probe of the recording**: `show_pip` says the coach wants an inset, but an avatar take's file has no video track and neither has a webcam take whose camera died. Export probes before it opens a decoder and falls back to the filler; preview has no filler and asks for no pad at all.
 - **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
 - **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
 - **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. **Chapters never cost an export:** any layout problem found before the write (no room, no `moov`, a box that doesn't fit) keeps the file whole without chapters, and `bus: exported …` says why. Only an I/O error opening the file or in the positioned write itself fails it.

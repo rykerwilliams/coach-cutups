@@ -462,7 +462,7 @@ fn an_avatar_clip_previews_without_stalling() {
     // Sound alone, as an avatar take records (spec B4): no video track for a
     // PiP branch to want.
     let recording = fixtures::audio_only(dir.path());
-    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
     let clip = Clip {
         inset: Inset::Avatar,
         ..clip(1.0, true, Vec::new())
@@ -489,6 +489,38 @@ fn an_avatar_clip_previews_without_stalling() {
     picture.assert_rgb(
         "the corner of the avatar's box",
         ((pip.x + 4.0) as usize, (pip.y + 4.0) as usize),
+        BLUE,
+    );
+}
+
+/// A camera clip whose recording has no video track previews rather than
+/// stalling: there is no inset, and the clip plays out.
+///
+/// `show_pip` says the coach wants one, but a recording can have no picture to
+/// give — a webcam take whose camera died, or whose file was truncated. Export
+/// probes before it opens a decoder and falls back to its filler; preview must
+/// probe too, because it has no filler: a mixer pad requested and never fed
+/// produces no output at all, with no error, and the preview would wait for
+/// ever.
+#[test]
+fn a_camera_clip_with_no_video_in_its_recording_previews_without_stalling() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 90, BLUE, false);
+    let recording = fixtures::audio_only(dir.path());
+    let running = Running::start(source, recording, clip(1.0, true, Vec::new()), 3.0);
+    running.play_out();
+    let picture = running.settled_picture();
+    drop(running);
+
+    // The corner a webcam would have taken is the picture: no pad, no inset.
+    let pip = pip_rect(OUT_W as f64, OUT_H as f64, 16.0 / 9.0);
+    picture.assert_rgb(
+        "where the inset would be",
+        (
+            (pip.x + pip.w / 2.0) as usize,
+            (pip.y + pip.h / 2.0) as usize,
+        ),
         BLUE,
     );
 }

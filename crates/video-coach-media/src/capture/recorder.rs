@@ -26,8 +26,10 @@ use crate::mailbox::FrameMailbox;
 /// in parallel.
 const TEST_WIDTH: i32 = 320;
 const TEST_HEIGHT: i32 = 180;
-/// `level`'s posting interval: 100 ms.
-const LEVEL_INTERVAL_NS: u64 = 100_000_000;
+/// `level`'s posting interval: 100 ms. Public because it is the `dt` the live
+/// pulse estimator is smoothed at (avatar spec D1) — the app derives its step
+/// from this rather than restating the number.
+pub const LEVEL_INTERVAL_NS: u64 = 100_000_000;
 /// How much encoded audio the queue after `opusenc` holds. The mux holds audio
 /// until the first video frame arrives, and a start gives up after 5 s
 /// without one (R6). With no video pad the mux holds nothing, so the queue

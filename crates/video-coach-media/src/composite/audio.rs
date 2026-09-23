@@ -248,12 +248,16 @@ enum End {
 /// wherever the last seek put it, at the rate and channel count
 /// [`Reader::start`] was asked for.
 ///
-/// [`Reader::read`] counts its frames in [`CHANNELS`], so only the export's
-/// stereo readers may use it; [`Reader::rest`] is channel-agnostic.
+/// [`Reader::read`] counts its sample positions in this reader's own channel
+/// count, so the export's stereo mixer and the avatar's mono pulse both mean
+/// what they say; [`Reader::rest`] is channel-agnostic.
 pub(crate) struct Reader {
     pipeline: Stopper,
     appsink: gst_app::AppSink,
     path: PathBuf,
+    /// What [`Reader::start`] was asked to decode to: the stride of
+    /// [`Reader::read`]'s buffer.
+    channels: usize,
     /// This file's own errors, kept off the export's [`Watch`]: a track that
     /// stops decoding costs its sound, not the run — the same trade the
     /// picture-in-picture makes.
@@ -403,6 +407,7 @@ impl Reader {
             pipeline,
             appsink,
             path: path.to_owned(),
+            channels,
             errors,
             held: Vec::new(),
             spent: 0,
@@ -439,12 +444,17 @@ impl Reader {
         }
     }
 
-    /// The next `frames` sample positions, interleaved, **zero-padded past the
-    /// end of the file** — a recording shorter than its entry, or a source that
-    /// runs out, goes quiet rather than stopping the export.
-    fn read(&mut self, frames: usize, cancel: &AtomicBool) -> &[f32] {
+    /// The next `frames` sample positions, interleaved in this reader's own
+    /// channel count, **zero-padded past the end of the file** — a recording
+    /// shorter than its entry, or a source that runs out, goes quiet rather
+    /// than stopping the export.
+    ///
+    /// It is also the whole of the bound on the decode: nothing past `frames`
+    /// is pulled, so a caller that knows how much it will show reads that much
+    /// (the avatar's pulse table) rather than the whole file.
+    pub(crate) fn read(&mut self, frames: usize, cancel: &AtomicBool) -> &[f32] {
         self.out.clear();
-        self.out.resize(frames * CHANNELS, 0.0);
+        self.out.resize(frames * self.channels, 0.0);
         let mut filled = 0;
         while filled < self.out.len() {
             if self.spent == self.held.len() && !self.pull(cancel) {

@@ -18,10 +18,10 @@ pub mod transcribe;
 
 pub use capture::{
     list_devices, now_ns, resolve_camera, resolve_mic, Camera, CaptureSources, Devices, Mic,
-    Recorder, RecorderMessage, StopOutcome,
+    Recorder, RecorderMessage, StopOutcome, LEVEL_INTERVAL_NS,
 };
 pub use chapters::ChapterOutcome;
-pub use composite::avatar::{decode_still, Still};
+pub use composite::avatar::{decode_still, drawn as avatar_drawn, Drawn, Still};
 pub use composite::export::{
     EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
 };

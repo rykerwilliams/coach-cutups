@@ -1022,7 +1022,7 @@ fn an_avatar_clip_pulses_in_the_export() {
             window: Some((0.0, 1.0)),
         },
     );
-    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
     let clip = Clip {
         show_pip: true,
         inset: Inset::Avatar,
@@ -1062,19 +1062,17 @@ fn an_avatar_clip_pulses_in_the_export() {
     let loud = avatar_width(&out[25], &pip);
     let quiet = avatar_width(&out[59], &pip);
     let full = pip.w.round() as usize;
-    let rest = (pip.w / video_coach_core::avatar::PULSE_GROWTH).round() as usize;
-    let near = |got: usize, want: usize| got.abs_diff(want) <= 10;
+    // **The ratio, not the two widths.** Each width is a count of red pixels
+    // across a row, and the circle's edge is softened by the encoder's chroma
+    // subsampling — by a pixel or two, and by more on CI's llvmpipe than here.
+    // The ratio of the same measurement at the two ends is what the pulse
+    // actually claims, and it divides that softening out.
+    let growth = loud as f64 / quiet as f64;
     assert!(
-        near(loud, full),
-        "the avatar is {loud} px wide while the coach talks, not {full}"
-    );
-    assert!(
-        near(quiet, rest),
-        "the avatar is {quiet} px wide in the silence, not {rest}"
-    );
-    assert!(
-        loud > quiet + 15,
-        "the avatar does not pulse: {loud} px loud against {quiet} px quiet"
+        (growth - video_coach_core::avatar::PULSE_GROWTH).abs() < 0.04,
+        "the avatar grows x{growth:.3} from rest to full, not x{:.3} \
+         ({loud} px loud against {quiet} px quiet)",
+        video_coach_core::avatar::PULSE_GROWTH
     );
     // And it is centred where a webcam's inset would be, never wider.
     let centre = (
@@ -1108,7 +1106,7 @@ fn an_avatar_and_a_camera_clip_export_together() {
         },
     );
     let webcam = fixtures::solid_video(&dir.path().join("cam.webm"), 640, 360, 30, 30, GREEN, true);
-    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED);
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
     let seconds = 0.6;
     let clips: Vec<Clip> = [Inset::Avatar, Inset::Camera]
         .into_iter()
@@ -1171,50 +1169,58 @@ fn an_avatar_and_a_camera_clip_export_together() {
     );
 }
 
-/// The avatar image having gone under the project costs the inset and not the
-/// run (spec A4): the pad takes the filler, and the export produces its file.
-#[test]
-fn a_missing_avatar_image_costs_the_inset_not_the_run() {
+/// Exports 24 frames of a one-entry avatar compilation over a blue source,
+/// with `avatar` as the project's image and `recording` as the clip's
+/// commentary, and returns the frames it produced.
+fn avatar_export(
+    dir: &std::path::Path,
+    avatar: PathBuf,
+    recording: PathBuf,
+) -> Vec<fixtures::RgbFrame> {
     gst::init().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 30, BLUE, false);
+    let source = fixtures::solid_video(&dir.join("src.webm"), 640, 360, 30, 30, BLUE, false);
     let clip = Clip {
         show_pip: true,
         inset: Inset::Avatar,
-        ..clip(0.0, 0.4, Vec::new())
+        ..clip(0.0, 0.8, Vec::new())
     };
-    let frames: Vec<FrameSpec> = (0..12)
+    let frames: Vec<FrameSpec> = (0..24)
         .map(|_| FrameSpec {
             entry: 0,
             source_time: 0.5,
             zoom: Zoom::IDENTITY,
         })
         .collect();
-    let path = dir.path().join("out.mp4");
+    let path = dir.join("out.mp4");
     let compilation = one_entry(&clip, frames, "");
     let total = compilation.frames.len();
     export(ExportJob {
         compilation,
         sources: vec![source],
-        entries: vec![Some(EntryMedia {
-            recording: dir.path().join("rec.mkv"),
-            clip,
-        })],
+        entries: vec![Some(EntryMedia { recording, clip })],
         audio: Vec::new(),
         path: path.clone(),
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
         highlights: Vec::new(),
-        avatar: Some(dir.path().join("gone.png")),
+        avatar: Some(avatar),
     })
     .unwrap();
-
     let out = fixtures::decode_rgb(&path);
-    assert_eq!(
-        out.len(),
-        total,
-        "the export lost frames to a missing image"
+    assert_eq!(out.len(), total, "the export lost frames");
+    out
+}
+
+/// The avatar image having gone under the project costs the inset and not the
+/// run (spec A4): the pad takes the filler, and the export produces its file.
+#[test]
+fn a_missing_avatar_image_costs_the_inset_not_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = avatar_export(
+        dir.path(),
+        dir.path().join("gone.png"),
+        dir.path().join("rec.mkv"),
     );
     let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
     let centre = (
@@ -1227,6 +1233,27 @@ fn a_missing_avatar_image_costs_the_inset_not_the_run() {
         centre,
         BLUE,
     );
+}
+
+/// The **recording** having gone costs the pulse and not the run (spec D2):
+/// there is no sound to read, so every level is 0 and the avatar is drawn at
+/// rest, the same size on every frame.
+#[test]
+fn an_avatar_clip_whose_recording_is_gone_holds_still() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
+    let out = avatar_export(dir.path(), avatar, dir.path().join("gone.mkv"));
+
+    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    let rest = (pip.w / video_coach_core::avatar::PULSE_GROWTH).round() as usize;
+    for n in [4, 23] {
+        let width = avatar_width(&out[n], &pip);
+        assert!(
+            width.abs_diff(rest) <= 4,
+            "frame {n}: the avatar is {width} px wide, not the resting {rest}"
+        );
+    }
 }
 
 /// A one-clip export of `clip` from `source`, with its sound: the audio edit

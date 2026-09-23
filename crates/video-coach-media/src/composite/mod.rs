@@ -399,8 +399,8 @@ struct Schedule {
     ///
     /// Per **frame**, where the layouts are per entry, because that is what
     /// the pulse is. It is built in job setup from each avatar entry's own
-    /// commentary, beside the audio edit's regions: reading a whole file's
-    /// sound between two pushed frames would stall the pump (spec D5).
+    /// commentary, beside the audio edit's regions: decoding an entry's sound
+    /// between two pushed frames would stall the pump (spec D5).
     levels: Arc<[f64]>,
     /// One per plan entry, written by the pump and read on GStreamer's
     /// threads.
@@ -448,17 +448,24 @@ impl Schedule {
     /// The inset pad's rect for the frame at `pts`: its entry's inset, sized
     /// by that frame's pulse.
     fn inset(&self, pts: gst::ClockTime) -> Option<PadRect> {
-        let pip = self.layout(pts)?.pip;
-        // Past the table -- which nothing shipping reaches, since it is one
-        // level per frame of the run -- the inset stands still at full size,
-        // which is what every frame without an avatar does anyway.
-        let level = self
-            .levels
-            .get(frame_index(pts) as usize)
-            .copied()
-            .unwrap_or(1.0);
-        Some(pulsed(pip, level))
+        Some(pulsed(self.layout(pts)?.pip, level_at(&self.levels, pts)))
     }
+}
+
+/// The pulse level of the frame at `pts` in `levels`, as both tails' probes
+/// read it.
+///
+/// **Past the end of the table it is `1.0`**, which [`pulsed`] maps to the pad's
+/// rect unchanged — the same as every frame that has no avatar. Nothing
+/// shipping reaches past it (there is one level per frame of the run), and the
+/// answer to a frame that did must be a placement rather than no placement at
+/// all: a pad left where the frame before it put it is the one outcome a viewer
+/// would see.
+fn level_at(levels: &[f64], pts: gst::ClockTime) -> f64 {
+    levels
+        .get(frame_index(pts) as usize)
+        .copied()
+        .unwrap_or(1.0)
 }
 
 /// A sub-pixel layout rect as a mixer pad takes it. The pad is the one place

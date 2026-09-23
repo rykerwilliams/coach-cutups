@@ -278,12 +278,14 @@ fn export(
     // only when an entry asks for one: an avatar project exporting a
     // compilation of camera clips decodes nothing and reports nothing.
     let avatar = job
-        .entries
-        .iter()
-        .flatten()
-        .any(|media| media.clip.shows_avatar())
-        .then_some(job.avatar.as_deref())
-        .flatten()
+        .avatar
+        .as_deref()
+        .filter(|_| {
+            job.entries
+                .iter()
+                .flatten()
+                .any(|media| media.clip.shows_avatar())
+        })
         .and_then(|path| AvatarInset::open(path, &gl, &watch, (out_w, out_h)));
     let levels = match avatar {
         Some(_) => pulse_levels(job, cancel),
@@ -449,20 +451,23 @@ fn set_caps(appsrc: &gst_app::AppSrc, caps: &gst::Caps) {
 /// and the export goes on.
 struct Pip {
     source: Source,
-    /// The recording's own errors, kept off the export's [`Watch`]: a
-    /// recording that gives up costs the inset, not the run.
-    errors: Arc<Mutex<Option<String>>>,
     /// The pad's rect at full size, from the recording's **probed** display
-    /// aspect or the avatar image's — never from the pushed caps, whose 1×1
-    /// filler would make the inset square. The pulse scales it per frame, in
-    /// the pad's own probe (`Schedule::inset`).
+    /// aspect or the avatar's square box — never from the pushed caps, whose
+    /// 1×1 filler would make the inset square by accident. The pulse scales it
+    /// per frame, in the pad's own probe (`Schedule::inset`).
     rect: PadRect,
 }
 
 /// What the inset pad carries for an entry.
 enum Source {
     /// The entry's webcam recording, decoded frame by frame.
-    Camera(Decoder),
+    Camera {
+        decoder: Decoder,
+        /// The recording's own errors, kept off the export's [`Watch`]: a
+        /// recording that gives up costs the inset, not the run. Only this arm
+        /// has a file to give up.
+        errors: Arc<Mutex<Option<String>>>,
+    },
     /// The project's avatar: the one texture the run uploaded, re-stamped
     /// every frame, sized by the pulse in the pad's rect (spec E2, E3).
     Avatar(Texture),
@@ -475,7 +480,6 @@ impl Pip {
     fn filler() -> Pip {
         Pip {
             source: Source::Empty,
-            errors: Arc::default(),
             rect: FILLER_RECT,
         }
     }
@@ -504,7 +508,6 @@ impl Pip {
                 Some(avatar) => Pip {
                     // A reference to the run's one texture, not a copy of it.
                     source: Source::Avatar(avatar.texture.clone()),
-                    errors: Arc::default(),
                     rect: avatar.rect,
                 },
                 None => Pip::filler(),
@@ -533,8 +536,7 @@ impl Pip {
         };
         match Decoder::start(recording, gl, &watch) {
             Ok(decoder) => Pip {
-                source: Source::Camera(decoder),
-                errors,
+                source: Source::Camera { decoder, errors },
                 rect: rounded(pip_rect(f64::from(out_w), f64::from(out_h), aspect)),
             },
             Err(e) => refuse(e.to_string()),
@@ -576,13 +578,12 @@ impl Pip {
         record_time: f64,
         cancel: &AtomicBool,
     ) -> Option<(gst::Buffer, gst::Caps)> {
-        let errors = self.errors.clone();
-        let Source::Camera(decoder) = &mut self.source else {
+        let Source::Camera { decoder, errors } = &mut self.source else {
             return None;
         };
         let watch = Watch {
             cancel,
-            error: errors,
+            error: errors.clone(),
         };
         match decoder.frame_at(seconds_to_clock(record_time), &watch) {
             Ok(sample) => sample
@@ -700,9 +701,8 @@ impl Texture {
 /// run, and the rect it fills at its loudest.
 struct AvatarInset {
     texture: Texture,
-    /// `layout::pip_rect` for the **image's** aspect, so a tall portrait gets
-    /// a tall inset in the same column a webcam's would have (spec A3). The
-    /// pulse scales it per frame (`Schedule::inset`).
+    /// The square `layout::pip_rect` the avatar's circle is drawn in (spec
+    /// A5). The pulse scales it per frame (`Schedule::inset`).
     rect: PadRect,
 }
 
@@ -721,21 +721,17 @@ impl AvatarInset {
         watch: &Watch,
         (out_w, out_h): (i32, i32),
     ) -> Option<AvatarInset> {
-        let refuse = |why: String| {
-            eprintln!("export: no avatar from {}: {why}", path.display());
-            None
-        };
-        let avatar = match avatar::open(path, f64::from(out_w), f64::from(out_h)) {
-            Ok(avatar) => avatar,
-            Err(e) => return refuse(e),
-        };
+        let avatar = avatar::open_reported(path, f64::from(out_w), f64::from(out_h))?;
         let (w, h) = (avatar.image.width(), avatar.image.height());
         match Texture::upload(gl, watch, w, h, avatar.image.data().to_vec()) {
             Ok(texture) => Some(AvatarInset {
                 texture,
                 rect: rounded(avatar.rect),
             }),
-            Err(e) => refuse(e.to_string()),
+            Err(e) => {
+                eprintln!("export: the avatar did not upload: {e}");
+                None
+            }
         }
     }
 }

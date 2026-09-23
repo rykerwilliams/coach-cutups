@@ -1,6 +1,6 @@
 //! [`decode_still`], the one avatar decoder (avatar spec A3): the pick
-//! validates with it, the Devices popover and the recording corner draw with
-//! it, and `composite::avatar::open` scales its output into the pixmap.
+//! validates with it, and `composite::avatar`'s `drawn` and `open` scale its
+//! output into the pixmaps the UI and the inset pad take.
 //!
 //! The pixels it produces are checked where they are used, in
 //! `composite/avatar.rs`'s own tests; what is checked here is the seam the
@@ -39,7 +39,7 @@ fn decode_still_keeps_a_non_square_shape() {
 #[test]
 fn decode_still_keeps_transparency() {
     let dir = dir();
-    let path = fixtures::translucent_png(dir.path(), "half.png", 32, 32);
+    let path = fixtures::solid_png(dir.path(), "half.png", 32, 32, 0x00ff_ffff, 128);
     let still = decode_still(&path).unwrap();
     // Straight alpha, as GStreamer's RGBA is: white at half alpha is still
     // full white. Premultiplying is `avatar::open`'s job, not the decoder's.
@@ -75,22 +75,16 @@ fn decode_still_refuses_a_missing_file_with_a_message() {
     assert!(!e.is_empty(), "the refusal carries the decoder's message");
 }
 
-/// What drawing the avatar into the overlay layer would cost per frame
-/// (avatar spec E4): one `draw_pixmap` of an inset-sized, pre-scaled pixmap
-/// into a 1080p frame, at rest and at full size.
+/// What drawing the avatar into the overlay layer would cost per frame: one
+/// `draw_pixmap` of an inset-sized, pre-scaled pixmap into a 1080p frame, at
+/// rest and at full size.
 ///
-/// **This is the measurement that said no.** Taken 2026-09-22 on the
-/// reference laptop it read **4.1–4.6 ms at rest and 4.6–5.8 ms at full**,
-/// against the **3.2 ms** the whole overlay costs at 1080p — not a small
-/// fraction of the budget but more than all of it, so the avatar is not
-/// drawn here. The whole-frame clear below is the calibration: the
-/// compositing spike measured it at 0.61 ms on its machine, so a number from
-/// this one is comparable with that one.
-///
-/// The cost is the bilinear sampling under a scale, not the copy: the same
-/// blit unscaled reads ~2.0 ms and nearest-neighbour under the scale ~1.7 ms.
-/// `tiny_skia` has no sprite fast path — every `draw_pixmap` is a
-/// pattern-shaded `fill_rect`.
+/// **This is the measurement that said no** (avatar spec E1, which holds the
+/// numbers and the reading of them). It is kept because it is the evidence for
+/// a closed decision: the blit costs more than the whole overlay layer does, so
+/// the avatar rides the GL inset pad instead. The whole-frame clear below is
+/// the calibration against the compositing spike's machine, so a number from
+/// this one can be read beside that one.
 ///
 /// `#[ignore]`d because it is a measurement, not an assertion: a threshold
 /// here would fail on a loaded machine and say nothing about the design. Run
@@ -112,7 +106,9 @@ fn the_avatar_blit_costs() {
     const WARMUP: u32 = 20;
 
     let (out_w, out_h) = (1920.0, 1080.0);
-    // A 4:3 avatar: the shape a phone photo and a gravatar land nearest.
+    // A 4:3 inset: the shape this was measured at while the question was open.
+    // The square box the design settled on (spec A5) is larger still, so
+    // keeping the original geometry only understates the answer.
     let rect = pip_rect(out_w, out_h, 4.0 / 3.0);
     let mut image = Pixmap::new(rect.w.ceil() as u32, rect.h.ceil() as u32).unwrap();
     image.fill(Color::from_rgba8(200, 120, 90, 255));

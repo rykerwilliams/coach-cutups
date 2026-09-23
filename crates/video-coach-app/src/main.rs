@@ -33,11 +33,10 @@ use video_coach_app::highlight_view::{self, LiveHighlight as Ring};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
-use video_coach_app::self_view::self_view_rect;
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
-use video_coach_core::layout::{self, STROKE_LINE_WIDTH};
+use video_coach_core::layout::{self, self_view_rect, STROKE_LINE_WIDTH};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
@@ -48,8 +47,8 @@ use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{
-    decode_still, list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind, Still,
-    WhisperModel,
+    avatar_drawn, list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind,
+    WhisperModel, LEVEL_INTERVAL_NS,
 };
 
 use pickers::{Pick, Pickers};
@@ -65,18 +64,18 @@ const NOTICE: Duration = Duration::from_secs(6);
 /// self-view says nothing about the recording, and a frozen one would look
 /// like the camera's picture.
 const SELF_VIEW_QUIET: Duration = Duration::from_secs(1);
-/// How far apart the recorder's `level` messages are, in seconds
-/// (`LEVEL_INTERVAL_NS`): the step the **live** pulse estimator is smoothed
-/// at (avatar spec D1). The rendered one steps at 1/30 through the same
-/// filter and the same constants.
-const LEVEL_DT: f64 = 0.1;
-/// The longest side the Devices popover's avatar thumbnail is decimated to,
-/// with room to spare for its 40 px box on a high-DPI screen.
-const THUMB_MAX: u32 = 160;
-/// And the longest side the corner's avatar is kept to. The inset is about a
-/// fifth of the picture's width, so this covers it on a large screen without
-/// uploading a phone photo whole to draw it.
-const SELF_VIEW_MAX: u32 = 512;
+/// How far apart the recorder's `level` messages are, in seconds: the step the
+/// **live** pulse estimator is smoothed at (avatar spec D1). Derived from the
+/// recorder's own interval rather than restated, so the two cannot drift. The
+/// rendered estimator steps at 1/30 through the same filter and the same
+/// constants.
+const LEVEL_DT: f64 = LEVEL_INTERVAL_NS as f64 / 1e9;
+/// The side the project's avatar is drawn at for the UI (`media::avatar_drawn`).
+/// One size serves both places it is shown — the Devices popover's 40 px
+/// thumbnail and the corner during a take — because the corner is the larger
+/// of the two and a square this size is a megabyte: the point of the cap is
+/// only that a phone photo isn't uploaded whole to draw an inset with.
+const AVATAR_SIZE: u32 = 512;
 /// What a drag over the picture says outside a recording, where it can only
 /// pan and at 1× visibly does nothing (`zoom_input::drawing_hint`).
 const DRAWING_HINT: &str = "Drawing works while recording — press R";
@@ -168,12 +167,20 @@ struct UiState {
     scoreboard: Option<ScoreboardContext>,
     /// The transcription queue (Phase 10 S5).
     transcription: Transcription,
-    /// What the Devices popover's avatar thumbnail was decoded from: the file
-    /// name, its length and its modification time. A project change that
-    /// didn't touch the image then costs a `stat` rather than a decode on the
-    /// UI thread, and one that replaced it under the same name still costs a
-    /// decode. `None` when there is no image, or its file has gone.
+    /// What the avatar image in hand was decoded from: the file name, its
+    /// length and its modification time. A project change that didn't touch
+    /// the image then costs a `stat` rather than a decode on the UI thread,
+    /// and one that replaced it under the same name still costs a decode.
+    /// `None` when there is no image, or its file has gone.
     avatar_shown: Option<AvatarFile>,
+    /// That image, drawn as the export draws it (`media::avatar_drawn`): the
+    /// popover's thumbnail and, when a take starts, the corner.
+    ///
+    /// **Decoded once, here, at the project change** — never when the coach
+    /// presses R. A decode is a GStreamer pipeline with a ten-second bound on
+    /// it, and the start of a take is the one moment on the UI thread that
+    /// cannot afford one.
+    avatar_image: Option<slint::Image>,
 }
 
 /// Which file the avatar thumbnail stands for. Not the path: it is always
@@ -234,6 +241,7 @@ impl Default for UiState {
             scoreboard: None,
             transcription: Transcription::default(),
             avatar_shown: None,
+            avatar_image: None,
         }
     }
 }
@@ -2035,15 +2043,23 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
 /// The Devices popover's Inset section (avatar spec G1): the project's avatar
 /// image, its name, and whether its file has gone.
 ///
-/// The thumbnail comes from `media::decode_still` — the one avatar decoder,
-/// so the popover shows exactly the pixels an export will draw — but only
-/// when the file behind it has changed. This runs on the UI thread at every
-/// project change, and most of those have nothing to do with the image.
+/// **This is where the image is decoded**, once per change of the file behind
+/// it — the corner at the start of a take reads what this left in
+/// `UiState::avatar_image`. It runs on the UI thread at every project change,
+/// and most of those have nothing to do with the image, so an unchanged file
+/// costs a `stat`.
+///
+/// The pixels are `media::avatar_drawn`'s: the circle the export draws,
+/// cover-cropped and premultiplied, so the popover and the corner show what
+/// the file will get.
 fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
     let clear = |w: &AppWindow, missing| {
         w.set_avatar_missing(missing);
         w.set_avatar_thumb(slint::Image::default());
-        UI.with_borrow_mut(|ui| ui.avatar_shown = None);
+        UI.with_borrow_mut(|ui| {
+            ui.avatar_shown = None;
+            ui.avatar_image = None;
+        });
     };
     let Some(name) = snapshot.project.avatar.clone() else {
         w.set_avatar_name(SharedString::new());
@@ -2059,10 +2075,14 @@ fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
     if UI.with_borrow(|ui| ui.avatar_shown.as_ref() == Some(&file)) {
         return;
     }
-    match decode_still(&path) {
-        Ok(still) => {
-            w.set_avatar_thumb(thumbnail(&still, THUMB_MAX));
-            UI.with_borrow_mut(|ui| ui.avatar_shown = Some(file));
+    match avatar_drawn(&path, AVATAR_SIZE) {
+        Ok(drawn) => {
+            let image = drawn_image(&drawn);
+            w.set_avatar_thumb(image.clone());
+            UI.with_borrow_mut(|ui| {
+                ui.avatar_shown = Some(file);
+                ui.avatar_image = Some(image);
+            });
         }
         Err(e) => {
             // The pick decoded, so this is a file swapped under the project.
@@ -2073,26 +2093,13 @@ fn show_avatar(w: &AppWindow, snapshot: &Snapshot) {
     }
 }
 
-/// A decoded still as a Slint image, decimated to at most `longest` on a
-/// side.
-///
-/// Nearest-neighbour, and only ever downward: nothing here is bigger than a
-/// corner inset, and the only thing worth avoiding is uploading a phone
-/// photo's twelve megapixels as a texture to draw it.
-fn thumbnail(still: &Still, longest: u32) -> slint::Image {
-    let step = still.w.max(still.h).div_ceil(longest).max(1) as usize;
-    let (w, h) = (still.w as usize, still.h as usize);
-    let (tw, th) = (w.div_ceil(step), h.div_ceil(step));
-    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(tw as u32, th as u32);
-    let out = pixels.make_mut_bytes();
-    for y in 0..th {
-        for x in 0..tw {
-            let from = ((y * step) * w + x * step) * 4;
-            let to = (y * tw + x) * 4;
-            out[to..to + 4].copy_from_slice(&still.rgba[from..from + 4]);
-        }
-    }
-    slint::Image::from_rgba8(pixels)
+/// The avatar as drawn, as a Slint image. **Premultiplied**, which is what
+/// `media::avatar_drawn` hands over and what the circle's soft edge needs: read
+/// as straight alpha it would ring dark.
+fn drawn_image(drawn: &video_coach_media::Drawn) -> slint::Image {
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(drawn.size, drawn.size);
+    pixels.make_mut_bytes().copy_from_slice(&drawn.rgba);
+    slint::Image::from_rgba8_premultiplied(pixels)
 }
 
 /// The Clips list: all of `project`'s clips in stored order (C3), or those
@@ -2284,33 +2291,27 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
 
 /// The corner at the start of a take (avatar spec G2).
 ///
-/// In an avatar project it is the project's image, decoded here through
-/// `media::decode_still` — the one avatar decoder, so the corner shows the
-/// pixels the export will draw, and **never `slint::Image::load_from_path`**,
-/// which has no decoder to reach for in this build (slint is built with
-/// `default-features = false`). It rests at level 0 until the first
+/// In an avatar project it is the project's image as the export draws it —
+/// **the copy `show_avatar` already decoded**, never a decode here: the coach
+/// has just pressed R, and a decode is a GStreamer pipeline with a ten-second
+/// bound on it. (It is also never `slint::Image::load_from_path`, which has no
+/// decoder to reach for in this build: slint is built with
+/// `default-features = false`.) It rests at level 0 until the first
 /// `Event::Level`.
+///
+/// A take whose image has gone under the project is still an avatar take — the
+/// image is the mode (B1) — and simply has no picture to show; the popover and
+/// the inspector have already said so (A4).
 ///
 /// A camera take sets nothing: `video.rs`'s frames fill the corner, and
 /// level 1.0 places the inset exactly where it always was.
 fn start_self_view(w: &AppWindow) {
-    let path = UI.with_borrow(|ui| {
-        let snapshot = ui.snapshot.as_ref()?;
-        Some(snapshot.folder.join(snapshot.project.avatar.as_ref()?))
-    });
-    // A take whose image has gone is still an avatar take -- the image is the
-    // mode (B1) -- and it simply has no picture to show. The popover and the
-    // inspector have already said so (A4).
-    let image = path.as_ref().and_then(|path| match decode_still(path) {
-        Ok(still) => Some(thumbnail(&still, SELF_VIEW_MAX)),
-        Err(e) => {
-            eprintln!("ui: the avatar {} won't decode: {e}", path.display());
-            None
-        }
-    });
-    w.set_self_view(image.unwrap_or_default());
     UI.with_borrow_mut(|ui| {
-        ui.avatar_take = path.is_some();
+        ui.avatar_take = ui
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.project.avatar.is_some());
+        w.set_self_view(ui.avatar_image.clone().unwrap_or_default());
         ui.self_view_level = if ui.avatar_take { 0.0 } else { 1.0 };
         w.set_self_view_level(ui.self_view_level as f32);
     });

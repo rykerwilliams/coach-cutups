@@ -10,7 +10,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 pub use devices::{list_devices, resolve_camera, resolve_mic, Camera, Devices, Mic};
-pub use recorder::{CaptureSources, Recorder, RecorderMessage, StopOutcome};
+pub use recorder::{CaptureSources, Recorder, RecorderMessage, StopOutcome, LEVEL_INTERVAL_NS};
 
 /// Now on `GstSystemClock` (CLOCK_MONOTONIC), in nanoseconds. The only clock
 /// for an event's `host_ns` and a recording's t0 (R5): the recorder runs its
