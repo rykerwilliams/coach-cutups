@@ -302,6 +302,11 @@ pub enum CounterKind {
     /// edit list, so `qtdemux`'s segment starts after 0 and raw PTS runs
     /// ahead of stream time: the trap that makes export use stream time.
     H264Mp4BFrames,
+    /// [`CounterKind::H264Mp4BFrames`] with a **silent** AAC track sized to
+    /// the video, as the match footage a copy joins has: the shape the copy
+    /// graph's audio `concat` needs, and a separate kind rather than a flag
+    /// on the video-only one so no existing test's fixture changes shape.
+    H264AacMp4,
 }
 
 /// Bits in a counter: 2 rows of [`COUNTER_COLUMNS`] blocks, up to frame 4095.
@@ -351,8 +356,8 @@ pub fn one_clip(clip: &Clip, source_duration: f64) -> Compilation {
 ///
 /// The blocks are at least 32 px, so they survive VP8, x264, `openh264dec`,
 /// and the export graph's scaling on llvmpipe with no bad frames. Panics if
-/// `w`×`h` is too small for that, or `fps` doesn't divide 44 100 (the audio of
-/// [`CounterKind::Vp8WebmWithAudio`] is sized to the video, as in [`webm`]).
+/// `w`×`h` is too small for that, or `fps` doesn't divide 44 100 (a kind with
+/// sound sizes it to the video, as in [`webm`]).
 pub fn counter_video(
     path: &Path,
     w: u32,
@@ -424,6 +429,23 @@ pub fn counter_video_with(
             format!(
                 "appsrc name=src format=time caps={caps} \
                ! x264enc bframes=2 key-int-max={fps} ! mp4mux ! filesink name=out"
+            )
+        }
+        CounterKind::H264AacMp4 => {
+            assert!(
+                fps > 0 && AUDIO_RATE.is_multiple_of(fps),
+                "fps {fps} must divide {AUDIO_RATE} so the audio matches the video duration"
+            );
+            let samples_per_buffer = AUDIO_RATE / fps;
+            let audio_buffers = frames + gap_slots + quirks.audio_tail;
+            format!(
+                "appsrc name=src format=time caps={caps} \
+                   ! x264enc bframes=2 key-int-max={fps} ! queue ! mux. \
+                 audiotestsrc wave=silence num-buffers={audio_buffers} \
+                   samplesperbuffer={samples_per_buffer} \
+                   ! audio/x-raw,rate={AUDIO_RATE},channels=1 \
+                   ! audioconvert ! avenc_aac ! aacparse ! queue ! mux. \
+                 mp4mux name=mux ! filesink name=out"
             )
         }
     };

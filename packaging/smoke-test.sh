@@ -63,7 +63,7 @@ elements=(
     autoaudiosink alsasink
     glupload glcolorconvert gltransformation glvideomixer gldownload
     v4l2src pipewiresrc jpegdec pngdec videoflip videoconvertscale x264enc opusenc matroskamux
-    h264parse avenc_aac aacparse mp4mux
+    h264parse avenc_aac aacparse mp4mux concat
     souphttpsrc
     qtdemux matroskademux avdec_h264 avdec_h265 opusdec
 )

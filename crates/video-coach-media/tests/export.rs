@@ -37,7 +37,7 @@ use video_coach_media::fixtures::{
     read_counter, CounterKind, CounterQuirks, COUNTER_BITS,
 };
 use video_coach_media::{
-    ChapterOutcome, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
+    ChapterOutcome, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
 };
 
 /// Far beyond any export here, even on a loaded llvmpipe runner; only a hang
@@ -67,7 +67,7 @@ fn source(dir: &Path, kind: CounterKind) -> Source {
     gst::init().unwrap();
     let (name, fps) = match kind {
         CounterKind::Vp8WebmWithAudio => ("src.webm", 25),
-        CounterKind::H264Mp4BFrames => ("src.mp4", 60),
+        CounterKind::H264Mp4BFrames | CounterKind::H264AacMp4 => ("src.mp4", 60),
     };
     let frames = 5 * fps;
     let path = counter_video(&dir.join(name), 640, 360, fps, frames, kind);
@@ -138,6 +138,7 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
         })],
         audio: Vec::new(),
         path,
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -346,6 +347,7 @@ fn fiducial(kind: CounterKind) {
         sources: vec![src.path.clone()],
         entries: vec![Some(EntryMedia { recording, clip })],
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -457,6 +459,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
             })
             .collect(),
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -774,6 +777,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
             entries: vec![Some(EntryMedia { recording, clip })],
             audio: Vec::new(),
             path: path.clone(),
+            render: Render::Encode,
             resolution: Resolution::R720,
             quality: Quality::Medium,
             scoreboard: None,
@@ -934,6 +938,7 @@ fn the_export_burns_in_the_scoreboard() {
         })],
         audio: Vec::new(),
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: ScoreboardContext::for_project(&project),
@@ -1047,6 +1052,7 @@ fn an_avatar_clip_pulses_in_the_export() {
         entries: vec![Some(EntryMedia { recording, clip })],
         audio: Vec::new(),
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -1146,6 +1152,7 @@ fn an_avatar_and_a_camera_clip_export_together() {
             })
             .collect(),
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -1210,6 +1217,7 @@ fn avatar_export(
         entries: vec![Some(EntryMedia { recording, clip })],
         audio: Vec::new(),
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -1282,6 +1290,7 @@ fn sounded_job(
         sources: vec![source],
         entries: vec![Some(EntryMedia { recording, clip })],
         path,
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -1478,6 +1487,7 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
         sources: vec![source],
         entries: vec![None],
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,
@@ -1669,6 +1679,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
         compilation,
         sources: vec![src.path.clone()],
         path: path.clone(),
+        render: Render::Encode,
         resolution: Resolution::R720,
         quality: Quality::Medium,
         scoreboard: None,

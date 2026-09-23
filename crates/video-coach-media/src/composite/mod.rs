@@ -30,6 +30,7 @@
 
 pub(crate) mod audio;
 pub(crate) mod avatar;
+mod copy;
 mod decode;
 pub mod export;
 pub mod preview;

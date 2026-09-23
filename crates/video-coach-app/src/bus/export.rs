@@ -39,7 +39,9 @@ use video_coach_core::reel::{reel_goals, ReelSide};
 use video_coach_core::scoreboard::{team_name, ScoreboardContext};
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
-use video_coach_media::{EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter};
+use video_coach_media::{
+    EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
+};
 
 use super::{Bus, Event, Input, Open, UserError};
 
@@ -567,6 +569,7 @@ fn job(
             .map(|s| open.folder.join(&s.relative_path))
             .collect(),
         path: exports.join(file_name(label, &open.project.name)),
+        render: Render::Encode,
         resolution,
         quality,
         // Frozen with the project as it is now: the run's own copy of the

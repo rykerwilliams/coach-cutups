@@ -63,6 +63,18 @@ const FILLER_RECT: PadRect = (0, 0, 1, 1);
 /// which the bus and the UI have always used.
 pub type ExportError = CompositeError;
 
+/// **Which renderer writes the file, not which mode the app is in.** The bus
+/// decides from the target and the scoreboard picker (spec M3, X1); media only
+/// branches on it, once, at the top of [`run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Render {
+    /// The composite graph: every frame decoded, drawn on and encoded.
+    Encode,
+    /// The stream copy ([`copy`](super::copy)): the sources' own packets
+    /// joined, which only the whole match in track mode may ask for.
+    Copy,
+}
+
 /// What to export: one compilation, and the files its entries read.
 #[derive(Debug, Clone)]
 pub struct ExportJob {
@@ -85,6 +97,10 @@ pub struct ExportJob {
     /// The output file. Written as `<path>.part` and renamed on success, so a
     /// failed export never touches a file already there.
     pub path: PathBuf,
+    /// Which renderer writes it. [`Render::Copy`] ignores `resolution`,
+    /// `quality`, `entries`, `audio`, `scoreboard`, `highlights` and `avatar`:
+    /// a copy carries the sources' own packets and nothing drawn (spec N).
+    pub render: Render,
     pub resolution: Resolution,
     pub quality: Quality,
     /// The match clock and score to burn in, or `None` when the project has no
@@ -140,6 +156,12 @@ pub struct ExportDone {
     /// Whether the file got its chapters, one per entry, or why not. A skip
     /// never fails the export.
     pub chapters: ChapterOutcome,
+    /// What was left of the `moov` reserve at EOS, in seconds of the muxer's
+    /// own accounting, for the log line (spec L4, E7). The standing check that
+    /// the margin is still ample on a longer match — a number in the log
+    /// instead of a multi-gigabyte test. `None` from the encoded path, which
+    /// doesn't read it.
+    pub reserve_remaining: Option<f64>,
 }
 
 /// A running export. It owns its thread, and every GStreamer object it
@@ -259,6 +281,19 @@ fn quantizers(quality: Quality) -> (u32, u32) {
     }
 }
 
+/// The `moov` reserve for an output of `frames` output frames, in
+/// nanoseconds: the whole file plus a tenth plus a second.
+///
+/// **Both renderers reserve it, by this one formula.** `mp4mux` writes the
+/// `moov` first, in space reserved up front, with no temp file — `faststart`
+/// writes the whole `mdat` to `$TMPDIR`, which a crash leaks — and that layout
+/// is what [`chapters::splice`] needs. The reserve must cover the whole file,
+/// so it gets a margin.
+pub(super) fn reserved_duration(frames: usize) -> u64 {
+    let duration = frame_time(frames as u64);
+    (duration + duration / 10 + gst::ClockTime::SECOND).nseconds()
+}
+
 /// `<path>.part`: where the output is written until it is complete.
 fn part_path(path: &Path) -> PathBuf {
     let mut part = path.as_os_str().to_owned();
@@ -266,7 +301,21 @@ fn part_path(path: &Path) -> PathBuf {
     PathBuf::from(part)
 }
 
-/// Exports to the `.part` file and renames it into place, or deletes it.
+/// What only the renderer that wrote the file can say. Everything else an
+/// [`ExportDone`] carries is the same whichever one ran, and [`finish`] adds
+/// it.
+pub(super) struct Rendered {
+    pub(super) encoder: String,
+    pub(super) diagnostics: Diagnostics,
+    pub(super) reserve_remaining: Option<f64>,
+}
+
+/// Writes the `.part` file with the renderer `job` asks for, chapters it and
+/// renames it into place, or deletes it.
+///
+/// **The `.part` contract has one implementation.** The copy and the encode
+/// differ only in how the file's bytes are made; the temporary name, the
+/// chapters, the rename and the delete-on-failure are here, once (spec X1).
 fn run(
     job: &ExportJob,
     cancel: &AtomicBool,
@@ -274,17 +323,42 @@ fn run(
     on_message: &mut impl FnMut(ExportMessage),
 ) -> Result<ExportDone, ExportError> {
     let part = part_path(&job.path);
-    // The pipelines are NULL by the time `export` returns, so nothing holds
-    // the file open.
-    let result = export(job, &part, cancel, inject, on_message).and_then(|done| {
-        std::fs::rename(&part, &job.path)
-            .map(|()| done)
-            .map_err(|e| ExportError::Failed(format!("could not move the export into place: {e}")))
-    });
+    // The pipelines are NULL by the time either renderer returns, so nothing
+    // holds the file open.
+    let result = match job.render {
+        Render::Encode => export(job, &part, cancel, inject, on_message),
+        Render::Copy => super::copy::copy(job, &part, cancel, on_message),
+    }
+    .and_then(|rendered| finish(job, &part, rendered));
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
     }
     result
+}
+
+/// The chapters, then the rename: what every renderer owes once its file is
+/// written.
+fn finish(job: &ExportJob, part: &Path, rendered: Rendered) -> Result<ExportDone, ExportError> {
+    // A skip keeps the file whole and is only reported. An I/O error may
+    // leave a half-written `moov`, which is a corrupt file: it fails.
+    let titles: Vec<(f64, &str)> = job
+        .compilation
+        .plan
+        .chapters
+        .iter()
+        .map(|(at, title)| (*at, title.as_str()))
+        .collect();
+    let chapters = chapters::splice(part, &titles)
+        .map_err(|e| ExportError::Failed(format!("could not write the chapters: {e}")))?;
+    std::fs::rename(part, &job.path)
+        .map_err(|e| ExportError::Failed(format!("could not move the export into place: {e}")))?;
+    Ok(ExportDone {
+        path: job.path.clone(),
+        encoder: rendered.encoder,
+        diagnostics: rendered.diagnostics,
+        chapters,
+        reserve_remaining: rendered.reserve_remaining,
+    })
 }
 
 fn export(
@@ -293,7 +367,7 @@ fn export(
     cancel: &AtomicBool,
     inject: Option<&str>,
     on_message: &mut impl FnMut(ExportMessage),
-) -> Result<ExportDone, ExportError> {
+) -> Result<Rendered, ExportError> {
     let gl = Gl::shared()?;
     let watch = Watch {
         cancel,
@@ -425,27 +499,17 @@ fn export(
     }
     encoder.finish(&watch)?;
     let name = encoder.name();
-    // To NULL, so the muxer's file is closed before its chapters go in.
+    // To NULL, so the muxer's file is closed before `run` chapters it.
     drop(encoder);
-    // A skip keeps the file whole and is only reported. An I/O error may
-    // leave a half-written `moov`, which is a corrupt file: it fails.
-    let titles: Vec<(f64, &str)> = plan
-        .chapters
-        .iter()
-        .map(|(at, title)| (*at, title.as_str()))
-        .collect();
-    let chapters = chapters::splice(part, &titles)
-        .map_err(|e| ExportError::Failed(format!("could not write the chapters: {e}")))?;
-    Ok(ExportDone {
-        path: job.path.clone(),
+    Ok(Rendered {
         encoder: name.to_owned(),
-        chapters,
         diagnostics: plan
             .entries
             .first()
             .and_then(|e| sources.get(&e.source_index))
             .map(Decoder::diagnostics)
             .unwrap_or_default(),
+        reserve_remaining: None,
     })
 }
 
@@ -941,13 +1005,9 @@ impl Encoder {
         install_overlay_pad(&mix, out_w, out_h);
         install_zoom(&by_name("zoom"), &schedule.frames);
 
-        // `moov` goes first, in space reserved up front, with no temp file
-        // (`faststart` writes the whole `mdat` to `$TMPDIR`, which a crash
-        // leaks). The reserve must cover the whole file, so it gets a margin.
-        let duration = frame_time(job.compilation.frames.len() as u64);
         by_name("mux").set_property(
             "reserved-max-duration",
-            (duration + duration / 10 + gst::ClockTime::SECOND).nseconds(),
+            reserved_duration(job.compilation.frames.len()),
         );
         by_name("out").set_property("location", part);
 
@@ -1144,6 +1204,7 @@ mod tests {
             })],
             audio: Vec::new(),
             path: path.clone(),
+            render: Render::Encode,
             resolution: Resolution::R720,
             quality: Quality::Medium,
             scoreboard: None,
