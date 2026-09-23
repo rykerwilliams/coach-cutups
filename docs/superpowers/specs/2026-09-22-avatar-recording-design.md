@@ -104,6 +104,13 @@ pub fn decode_still(path: &Path) -> Result<Still, String>;   // { w, h, rgba: Ve
 - **At record time:** nothing to refuse. `Project.avatar` is the mode, so "avatar mode with no image" is not a state that exists (B1). A project whose avatar *file* has gone under it still records — it is an avatar take with a missing picture, which is the export-time case above, and the Devices popover has already said so.
 - **In the UI:** the Devices popover shows the picked image, and says "avatar.png is missing" when the file has gone, so the coach finds out before a take rather than after an export.
 
+**A5. The avatar is drawn as a circle** (the user, 2026-09-22: "the image would be like my gravatar"). A square portrait is the normal case, so:
+
+- The image is **fitted** inside the inset keeping its own shape — a square shows whole, nothing is stretched — and then masked to a circle inscribed in that fitted box.
+- The mask is built once, with the pre-scaled pixmap, not per frame: it is the same `tiny_skia::Mask` machinery the overlay already memoizes for the picture rect.
+- The pulse scales the circle, so it breathes around its own centre.
+- A transparent cut-out still works; it is simply masked too, which costs it nothing in the middle of the frame.
+
 ### B. A project setting, a per-clip fact
 
 **B1. The image *is* the mode. There is no separate flag.**
