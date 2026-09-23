@@ -17,8 +17,9 @@ use crate::layout::Rect;
 /// transcription uses.
 pub const PULSE_RATE: u32 = 16_000;
 
-/// The loudest inset is exactly `layout::pip_rect`; the resting one is this
-/// much smaller. 1.10 means the avatar grows 10% from rest to full.
+/// The loudest inset is exactly the rect it is given — [`avatar_box`] for an
+/// avatar, `layout::pip_rect` for a camera — and the resting one is this much
+/// smaller. 1.10 means the avatar grows 10% from rest to full.
 pub const PULSE_GROWTH: f64 = 1.10;
 
 /// Quiet enough to be at rest. Below this the avatar does not move.
@@ -101,11 +102,34 @@ pub fn pulse(samples_mono: &[f32], rate: u32, frames: usize) -> Vec<f64> {
     levels
 }
 
+/// How large the avatar's circle is against the webcam inset a camera take
+/// would fill — the user asked for smaller, 2026-09-23; it is one line to
+/// retune.
+pub const AVATAR_BOX_RATIO: f64 = 0.75;
+
+/// The box an avatar's circle is drawn in at its loudest: `pip` shrunk by
+/// [`AVATAR_BOX_RATIO`] about its **bottom-right corner**, so the circle keeps
+/// the webcam inset's own right and bottom margins and only gets smaller.
+///
+/// This is the whole of the difference between an avatar's footprint and a
+/// camera's; the pulse still grows the circle concentrically *inside* this box
+/// ([`avatar_rect`]), so nothing else moves.
+pub fn avatar_box(pip: Rect) -> Rect {
+    let (w, h) = (pip.w * AVATAR_BOX_RATIO, pip.h * AVATAR_BOX_RATIO);
+    Rect {
+        x: pip.x + pip.w - w,
+        y: pip.y + pip.h - h,
+        w,
+        h,
+    }
+}
+
 /// Where the avatar is drawn: `pip` at `level == 1.0`, and `pip` scaled about
 /// its centre by `1.0 / PULSE_GROWTH` at `level == 0.0`, lerped between.
 ///
-/// It never exceeds `pip`, so the inset's footprint is the same column a
-/// webcam's would be, and a level outside `0..=1` clamps.
+/// It never exceeds the rect it is given — [`avatar_box`] on the avatar paths,
+/// the webcam inset itself on the camera's — so the footprint is that rect's,
+/// and a level outside `0..=1` clamps.
 pub fn avatar_rect(pip: Rect, level: f64) -> Rect {
     let level = clamp01(level);
     // The lerp is written so the endpoints are exact: at `level == 1.0` the

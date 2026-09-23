@@ -31,7 +31,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use tiny_skia::{FillRule, FilterQuality, Mask, PathBuilder, Pixmap, PixmapPaint, Transform};
-use video_coach_core::avatar::{pulse, PULSE_RATE};
+use video_coach_core::avatar::{avatar_box, pulse, PULSE_RATE};
 use video_coach_core::export::OUTPUT_FPS;
 use video_coach_core::layout::{self, Rect as LayoutRect};
 
@@ -181,8 +181,8 @@ pub(super) struct Avatar {
     /// Cover-cropped into the square inset, premultiplied, and masked to the
     /// circle inscribed in it, so the pad has only to scale and blend it.
     pub(super) image: Pixmap,
-    /// [`layout::pip_rect`] for a **square** inset: the avatar's footprint at
-    /// its loudest.
+    /// [`avatar_box`] of [`layout::pip_rect`] for a **square** inset: the
+    /// avatar's footprint at its loudest.
     pub(super) rect: LayoutRect,
 }
 
@@ -197,12 +197,17 @@ pub(super) struct Avatar {
 /// shorter side covers the box, then centred, so the middle of the picture —
 /// where a face is — is what survives.
 ///
+/// **And the box is [`avatar_box`] of that rect, not the rect**: a photograph
+/// at the webcam's full size reads as too big (the coach's, on seeing it), so
+/// the box is shrunk about its bottom-right corner — keeping the inset's own
+/// right and bottom margins — and only then does the pulse breathe inside it.
+///
 /// The circle is masked in **once, here**: the mask is the same size for every
 /// frame of the run, so building it per frame would buy nothing and cost a
 /// rasterization.
 pub(super) fn open(path: &Path, out_w: f64, out_h: f64) -> Result<Avatar, String> {
     let still = decode_still(path)?;
-    let rect = layout::pip_rect(out_w, out_h, 1.0);
+    let rect = avatar_box(layout::pip_rect(out_w, out_h, 1.0));
     // Rounded **up**, so the drawn box is never short of the rect it stands
     // for; everything after this reads the small pixmap.
     let image = circular(&still, rect.w.ceil() as u32)?;
@@ -396,8 +401,8 @@ mod tests {
         assert_eq!(alpha(w / 8, h / 8), 0, "outside the circle");
     }
 
-    /// Whatever shape is picked, the inset is the **square** `pip_rect` and
-    /// the pixmap is square with it (spec A5).
+    /// Whatever shape is picked, the inset is the **square** `pip_rect` cut
+    /// down by `avatar_box`, and the pixmap is square with it (spec A5).
     ///
     /// A box of the image's own aspect would put the circle — which is what is
     /// actually drawn — somewhere other than where the webcam inset sits: a 3:4
@@ -406,7 +411,7 @@ mod tests {
     #[test]
     fn an_avatar_is_drawn_in_a_square_inset_whatever_its_shape() {
         let dir = dir();
-        let square = layout::pip_rect(1920.0, 1080.0, 1.0);
+        let square = avatar_box(layout::pip_rect(1920.0, 1080.0, 1.0));
         for (name, w, h) in [
             ("square.png", 96, 96),
             ("tall.png", 60, 80),

@@ -2,8 +2,8 @@
 //! per-frame table the render reads, and where the picture lands.
 
 use video_coach_core::avatar::{
-    avatar_rect, level_from_db, pulse, smooth, PULSE_ATTACK, PULSE_CEILING_DB, PULSE_FLOOR_DB,
-    PULSE_GROWTH, PULSE_RATE, PULSE_RELEASE,
+    avatar_box, avatar_rect, level_from_db, pulse, smooth, AVATAR_BOX_RATIO, PULSE_ATTACK,
+    PULSE_CEILING_DB, PULSE_FLOOR_DB, PULSE_GROWTH, PULSE_RATE, PULSE_RELEASE,
 };
 use video_coach_core::layout::Rect;
 
@@ -163,6 +163,38 @@ fn every_level_is_in_range_whatever_the_audio() {
     for (n, v) in pulse(&samples, PULSE_RATE, 60).into_iter().enumerate() {
         assert!((0.0..=1.0).contains(&v), "frame {n}: {v}");
     }
+}
+
+// --------------------------------------------------------------- avatar_box
+
+/// The avatar's box is the webcam inset's corner, smaller: it keeps the
+/// inset's own **right and bottom** edges — its margins from the frame — and
+/// gives up `AVATAR_BOX_RATIO` of the width and height at the other two.
+#[test]
+fn the_avatar_box_keeps_the_insets_corner_and_only_shrinks() {
+    let pip = pip();
+    let r = avatar_box(pip);
+    assert!(
+        (r.x + r.w - (pip.x + pip.w)).abs() < 1e-12,
+        "the right edge is the inset's: {r:?}"
+    );
+    assert!(
+        (r.y + r.h - (pip.y + pip.h)).abs() < 1e-12,
+        "the bottom edge is the inset's: {r:?}"
+    );
+    assert!((r.w - pip.w * AVATAR_BOX_RATIO).abs() < 1e-12, "{r:?}");
+    assert!((r.h - pip.h * AVATAR_BOX_RATIO).abs() < 1e-12, "{r:?}");
+    assert!(r.x > pip.x && r.y > pip.y, "smaller, not moved: {r:?}");
+}
+
+/// And the pulse still breathes inside that box: the two compose, so the
+/// avatar at its loudest is the box and never the inset.
+#[test]
+fn the_avatar_never_reaches_past_its_box() {
+    let (pip, r) = (pip(), avatar_box(pip()));
+    assert_eq!(avatar_rect(r, 1.0), r);
+    assert!(avatar_rect(r, 1.0).w < pip.w, "smaller than a camera's");
+    assert!(avatar_rect(r, 0.0).w < r.w, "and at rest, smaller still");
 }
 
 // -------------------------------------------------------------- avatar_rect

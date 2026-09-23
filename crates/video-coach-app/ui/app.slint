@@ -1743,11 +1743,15 @@ export component AppWindow inherits Window {
     /// follows it (avatar G2). **1 outside an avatar take**, where it places
     /// the camera's inset exactly as it always was.
     in property <float> self-view-level: 1.0;
+    /// This take's inset is the project's avatar, not the camera (avatar G2).
+    /// It picks the placement rule: an avatar is drawn in its own, smaller
+    /// box (`core::layout::avatar_self_view_rect`).
+    in property <bool> self-view-avatar;
     /// Where the inset lands on the picture (`core::layout::
     /// pip_rect_over_picture`, sized by `core::avatar::avatar_rect`), from
-    /// the content rect, the inset's aspect and the level. Pure, like
-    /// `place-picture`.
-    pure callback place-self-view(PictureRect, float, float) -> PictureRect;
+    /// the content rect, the inset's aspect, the level and which kind of take
+    /// it is. Pure, like `place-picture`.
+    pure callback place-self-view(PictureRect, float, float, bool) -> PictureRect;
 
     // --- Zoom (spec D9; the state and the math are on the Rust side) ---
 
@@ -2737,7 +2741,7 @@ export component AppWindow inherits Window {
                     // input: a drag that starts on it draws, as the stroke
                     // lands over the inset in the export too.
                     if root.self-view-shown: Image {
-                        property <PictureRect> at: root.place-self-view(player.content, root.self-view.width / root.self-view.height, root.self-view-level);
+                        property <PictureRect> at: root.place-self-view(player.content, root.self-view.width / root.self-view.height, root.self-view-level, root.self-view-avatar);
                         x: self.at.x;
                         y: self.at.y;
                         width: self.at.width;

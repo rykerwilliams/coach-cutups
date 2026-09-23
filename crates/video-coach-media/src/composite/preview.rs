@@ -558,9 +558,9 @@ struct AvatarInset {
     buffer: gst::Buffer,
     width: i32,
     height: i32,
-    /// The square `layout::pip_rect` the avatar's circle is drawn in, at the
-    /// preview's output size. The pulse scales it per frame, in the pad's
-    /// probe.
+    /// The avatar's box — `avatar_box` of the square `layout::pip_rect` —
+    /// which its circle is drawn in, at the preview's output size. The pulse
+    /// scales it per frame, in the pad's probe.
     rect: PadRect,
     /// One pulse level per output frame of the clip, from the recording's own
     /// commentary.

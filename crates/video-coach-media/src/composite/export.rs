@@ -701,8 +701,9 @@ impl Texture {
 /// run, and the rect it fills at its loudest.
 struct AvatarInset {
     texture: Texture,
-    /// The square `layout::pip_rect` the avatar's circle is drawn in (spec
-    /// A5). The pulse scales it per frame (`Schedule::inset`).
+    /// The avatar's box — `avatar_box` of the square `layout::pip_rect` —
+    /// which its circle is drawn in (spec A5). The pulse scales it per frame
+    /// (`Schedule::inset`).
     rect: PadRect,
 }
 

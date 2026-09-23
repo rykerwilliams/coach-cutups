@@ -1,8 +1,10 @@
 //! The composite's layout ratios.
 
+use video_coach_core::avatar::avatar_box;
 use video_coach_core::layout::{
-    bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects, self_view_rect, stroke_line_width,
-    Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO, SCOREBOARD_FONT_RATIO,
+    avatar_self_view_rect, bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects,
+    self_view_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
+    SCOREBOARD_FONT_RATIO,
 };
 
 fn close(a: Rect, b: Rect) -> bool {
@@ -251,14 +253,41 @@ fn player_picture() -> Rect {
 }
 
 /// The live corner's own property: a camera take's `level = 1.0` places the
-/// inset exactly where it always was, so there is one placement path and no
-/// branch (avatar spec G2). Everything else about `avatar_rect` — the rest
-/// size, monotonicity, the clamp — is pinned in `avatar.rs`'s own tests.
+/// inset exactly where it always was — the avatar's smaller box is the avatar
+/// path's alone (avatar spec G2). Everything else about `avatar_rect` — the
+/// rest size, monotonicity, the clamp — is pinned in `avatar.rs`'s own tests.
 #[test]
 fn a_full_level_is_exactly_where_the_camera_goes() {
     let pip = pip_rect_over_picture(player_picture(), 16.0 / 9.0);
     let at = self_view_rect(player_picture(), 16.0 / 9.0, 1.0).expect("a picture to place on");
     assert!(close(at, pip));
+}
+
+/// And an avatar take's corner is that same inset, square and cut down to the
+/// avatar's box — the render's rule, over the picture (avatar spec G2).
+#[test]
+fn an_avatar_take_is_placed_in_the_smaller_box() {
+    let picture = player_picture();
+    let square = pip_rect_over_picture(picture, 1.0);
+    let at = avatar_self_view_rect(picture, 1.0).expect("a picture to place on");
+    assert!(close(at, avatar_box(square)));
+    // Which is the webcam inset's own right and bottom margins, kept.
+    assert!((at.x + at.w - (square.x + square.w)).abs() < 1e-9, "{at:?}");
+    assert!((at.y + at.h - (square.y + square.h)).abs() < 1e-9, "{at:?}");
+    // The pulse still shrinks it from there, and never grows it past the box.
+    let rest = avatar_self_view_rect(picture, 0.0).expect("a picture to place on");
+    assert!(rest.w < at.w, "{rest:?} against {at:?}");
+}
+
+#[test]
+fn an_avatar_take_with_nothing_to_place_on_places_nothing() {
+    let empty = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
+    assert!(avatar_self_view_rect(empty, 1.0).is_none());
 }
 
 #[test]

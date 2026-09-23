@@ -36,7 +36,7 @@ use video_coach_app::match_panel::{
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
-use video_coach_core::layout::{self, self_view_rect, STROKE_LINE_WIDTH};
+use video_coach_core::layout::{self, avatar_self_view_rect, self_view_rect, STROKE_LINE_WIDTH};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
@@ -1236,15 +1236,22 @@ fn wire_zoom(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     let notches: Vec<f32> = SNAP_NOTCHES.iter().map(|&n| n as f32).collect();
     window.set_zoom_notches(ModelRc::new(VecModel::from(notches)));
 
-    window.on_place_self_view(|content, cam_aspect, level| {
+    window.on_place_self_view(|content, cam_aspect, level, avatar| {
         let picture = layout::Rect {
             x: content.x.into(),
             y: content.y.into(),
             w: content.width.into(),
             h: content.height.into(),
         };
+        // One placement rule per kind of take (avatar G2): the avatar has a
+        // box of its own, smaller than the inset a camera fills, and the
+        // camera's lands on `pip_rect_over_picture` as it always has.
+        let placed = match avatar {
+            true => avatar_self_view_rect(picture, level.into()),
+            false => self_view_rect(picture, cam_aspect.into(), level.into()),
+        };
         // Nothing to place on before the first layout, or with no picture.
-        let Some(r) = self_view_rect(picture, cam_aspect.into(), level.into()) else {
+        let Some(r) = placed else {
             return PictureRect::default();
         };
         PictureRect {
@@ -1793,6 +1800,7 @@ fn on_event(w: &AppWindow, event: Event) {
                 if status == RecordingStatus::Idle {
                     ui.self_view_at = None;
                     ui.avatar_take = false;
+                    w.set_self_view_avatar(false);
                     w.set_self_view(slint::Image::default());
                 }
             });
@@ -2303,14 +2311,16 @@ fn selected_id(w: &AppWindow) -> Option<Uuid> {
 /// image is the mode (B1) — and simply has no picture to show; the popover and
 /// the inspector have already said so (A4).
 ///
-/// A camera take sets nothing: `video.rs`'s frames fill the corner, and
-/// level 1.0 places the inset exactly where it always was.
+/// A camera take clears the flag and gets no picture here: `video.rs`'s
+/// frames fill the corner, and `self_view_rect` at level 1.0 places the inset
+/// exactly where it always was.
 fn start_self_view(w: &AppWindow) {
     UI.with_borrow_mut(|ui| {
         ui.avatar_take = ui
             .snapshot
             .as_ref()
             .is_some_and(|s| s.project.avatar.is_some());
+        w.set_self_view_avatar(ui.avatar_take);
         w.set_self_view(ui.avatar_image.clone().unwrap_or_default());
         ui.self_view_level = if ui.avatar_take { 0.0 } else { 1.0 };
         w.set_self_view_level(ui.self_view_level as f32);

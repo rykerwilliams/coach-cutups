@@ -19,6 +19,7 @@ use gstreamer as gst;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use uuid::Uuid;
+use video_coach_core::avatar::avatar_box;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::layout::{pip_rect, BAR_HEIGHT_RATIO};
 use video_coach_core::project::{Clip, Inset};
@@ -479,8 +480,9 @@ fn an_avatar_clip_previews_without_stalling() {
     running.poll_frame("the schedule a second time", |n| n >= FPS - 1.0);
     drop(running);
 
-    // A square image, so the inset is the square `pip_rect`.
-    let pip = pip_rect(OUT_W as f64, OUT_H as f64, 1.0);
+    // A square image, so the inset is the square `pip_rect`, cut down to the
+    // avatar's own box.
+    let pip = avatar_box(pip_rect(OUT_W as f64, OUT_H as f64, 1.0));
     let centre = (
         (pip.x + pip.w / 2.0) as usize,
         (pip.y + pip.h / 2.0) as usize,

@@ -19,6 +19,7 @@ use gstreamer_app as gst_app;
 use gstreamer_pbutils as pbutils;
 use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
+use video_coach_core::avatar::avatar_box;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect, scoreboard_rects, Rect as LayoutRect};
@@ -997,12 +998,14 @@ fn avatar_width(frame: &fixtures::RgbFrame, pip: &LayoutRect) -> usize {
 }
 
 /// The avatar rides the inset pad and **the commentary sizes it**: the image
-/// spans `pip_rect` while the coach is talking and settles to
-/// `1 / PULSE_GROWTH` of it when they stop (spec E1, E3).
+/// spans its box — `avatar_box` of the square `pip_rect` — while the coach is
+/// talking and settles to `1 / PULSE_GROWTH` of it when they stop (spec E1,
+/// E3).
 ///
 /// The recording is loud for its first second and silent for its second, so
 /// one export carries both ends of the pulse and the same frames prove it
-/// never exceeds the rect a webcam would have had (spec I4).
+/// never exceeds that box, which is itself inside the rect a webcam would have
+/// had (spec I4, A5).
 #[test]
 fn an_avatar_clip_pulses_in_the_export() {
     gst::init().unwrap();
@@ -1054,9 +1057,10 @@ fn an_avatar_clip_pulses_in_the_export() {
 
     let out = fixtures::decode_rgb(&path);
     assert_eq!(out.len(), total, "one output frame per schedule frame");
-    // A square image, so the inset is the square `pip_rect` and the circle
-    // inscribed in it spans the whole of it at full size.
-    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    // A square image, so the inset is the square `pip_rect` cut down to the
+    // avatar's box, and the circle inscribed in that spans the whole of it at
+    // full size.
+    let pip = avatar_box(pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0));
     // Frame 25 is 0.83 s in, well inside the tone; frame 59 is 0.97 s after
     // it stopped, which is four release constants.
     let loud = avatar_width(&out[25], &pip);
@@ -1081,7 +1085,13 @@ fn an_avatar_clip_pulses_in_the_export() {
     );
     assert_rgb(&out[25], "the avatar", centre, RED);
     assert_rgb(&out[59], "the resting avatar", centre, RED);
-    assert!(loud <= full + 2, "the avatar is wider than the inset rect");
+    assert!(loud <= full + 2, "the avatar is wider than its box");
+    // And that box is the smaller one the coach asked for, not the webcam's.
+    let webcam = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0).w.round() as usize;
+    assert!(
+        loud < webcam - 2,
+        "the avatar is {loud} px across, no smaller than the {webcam} px inset          a camera take would fill"
+    );
 }
 
 /// One compilation, an avatar entry and then a camera one: the inset pad
@@ -1222,7 +1232,7 @@ fn a_missing_avatar_image_costs_the_inset_not_the_run() {
         dir.path().join("gone.png"),
         dir.path().join("rec.mkv"),
     );
-    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    let pip = avatar_box(pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0));
     let centre = (
         (pip.x + pip.w / 2.0) as usize,
         (pip.y + pip.h / 2.0) as usize,
@@ -1245,7 +1255,7 @@ fn an_avatar_clip_whose_recording_is_gone_holds_still() {
     let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
     let out = avatar_export(dir.path(), avatar, dir.path().join("gone.mkv"));
 
-    let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0);
+    let pip = avatar_box(pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0));
     let rest = (pip.w / video_coach_core::avatar::PULSE_GROWTH).round() as usize;
     for n in [4, 23] {
         let width = avatar_width(&out[n], &pip);

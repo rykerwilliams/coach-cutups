@@ -113,22 +113,40 @@ pub fn pip_rect_over_picture(picture: Rect, cam_aspect: f64) -> Rect {
     }
 }
 
-/// The live self-view's rect over `picture`, for an inset of display aspect
-/// `cam_aspect` at `level` (avatar spec G2).
+/// The live self-view's rect over `picture`, for a **camera** take whose
+/// inset has display aspect `cam_aspect` (avatar spec G2).
 ///
 /// The corner over the player is where the export puts the inset, so it is
-/// [`pip_rect_over_picture`] sized by [`avatar_rect`](crate::avatar::avatar_rect)
-/// — the same two functions the render uses. **A camera take passes
-/// `level = 1.0`**, which `avatar_rect` maps to exactly `pip_rect_over_picture`:
-/// one placement path, no branch, and the camera's inset lands where it has
-/// always landed. An avatar take passes the smoothed live level and the picture
-/// breathes around that same centre; its image is square (avatar spec A5), so
-/// `cam_aspect` is 1.0 and the box is the square one the render uses.
+/// [`pip_rect_over_picture`] and nothing else: the camera's inset lands where
+/// it has always landed, at exactly the rect the render gives it.
+/// `level` is the inset's size on the pulse's `0..=1` scale; a camera take
+/// passes `1.0`, which [`avatar_rect`](crate::avatar::avatar_rect) maps to
+/// `pip_rect_over_picture` itself. An avatar take has its own rule —
+/// [`avatar_self_view_rect`] — because its box is smaller.
 ///
 /// `None` before the first layout, or with no picture to place on.
 pub fn self_view_rect(picture: Rect, cam_aspect: f64, level: f64) -> Option<Rect> {
     (picture.w > 0.0 && picture.h > 0.0 && cam_aspect > 0.0)
         .then(|| crate::avatar::avatar_rect(pip_rect_over_picture(picture, cam_aspect), level))
+}
+
+/// The live self-view's rect over `picture` for an **avatar** take at `level`
+/// (avatar spec G2): where the render draws the avatar, over the player.
+///
+/// One placement rule per kind of take. The avatar's image is square (avatar
+/// spec A5), so the inset it is placed in is the square `pip_rect`, shrunk to
+/// the avatar's own box ([`avatar_box`](crate::avatar::avatar_box)) and then
+/// breathed by the live level ([`avatar_rect`](crate::avatar::avatar_rect)) —
+/// the same two functions, in the same order, as the render.
+///
+/// `None` before the first layout, or with no picture to place on.
+pub fn avatar_self_view_rect(picture: Rect, level: f64) -> Option<Rect> {
+    (picture.w > 0.0 && picture.h > 0.0).then(|| {
+        crate::avatar::avatar_rect(
+            crate::avatar::avatar_box(pip_rect_over_picture(picture, 1.0)),
+            level,
+        )
+    })
 }
 
 // --------------------------------------------------------------- scoreboard
