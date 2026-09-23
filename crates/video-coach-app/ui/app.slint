@@ -1324,6 +1324,9 @@ component ExportSheet inherits Rectangle {
     /// 720p or 1080p, and Low / Medium / High: the pickers' indices.
     in-out property <int> resolution;
     in-out property <int> quality;
+    /// How the scoreboard is carried: 0 Default (the target's own), 1 burned
+    /// into the picture, 2 a separate track (spec M1).
+    in-out property <int> scoreboard;
     callback tick(int, bool);
     callback start();
     callback cancel();
@@ -1382,6 +1385,26 @@ component ExportSheet inherits Rectangle {
                     enabled: !root.exporting;
                     current-index <=> root.quality;
                 }
+            }
+        }
+
+        // Its own row rather than a third column: "Burned into the picture"
+        // doesn't fit a third of this sheet.
+        VerticalLayout {
+            spacing: 4px;
+            FieldLabel { text: "Scoreboard"; }
+            ComboBox {
+                model: ["Default", "Burned into the picture", "Separate track"];
+                enabled: !root.exporting;
+                current-index <=> root.scoreboard;
+            }
+            // The only place the trade is spelled out, and only where it is
+            // being made (spec M1, N).
+            if root.scoreboard == 2: Text {
+                text: "Copied, not re-encoded; highlights and drawings can't ride a copy.";
+                color: Palette.alternate-foreground;
+                font-size: 11px;
+                wrap: word-wrap;
             }
         }
 
@@ -1962,6 +1985,7 @@ export component AppWindow inherits Window {
     /// and persisted by the bus when a run starts (spec E4).
     in-out property <int> export-resolution;
     in-out property <int> export-quality;
+    in-out property <int> export-scoreboard;
     /// The run in progress, and when it finishes; both from the bus's events,
     /// so a closed sheet reopens on the run it left.
     in property <[RunRow]> export-run;
@@ -3490,6 +3514,7 @@ export component AppWindow inherits Window {
                 exporting: root.exporting;
                 resolution <=> root.export-resolution;
                 quality <=> root.export-quality;
+                scoreboard <=> root.export-scoreboard;
                 tick(index, ticked) => { root.tick-target(index, ticked); }
                 start => { root.start-export(); }
                 cancel => { root.cancel-export(); }

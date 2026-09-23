@@ -312,6 +312,7 @@ fn a_highlight_reaches_an_export() {
         targets: vec![ExportTarget::Clip(clip)],
         resolution: Resolution::R720,
         quality: Quality::Low,
+        scoreboard: None,
     });
     let done = h.wait_map("the run's outcome", |e| match e {
         Event::Export(run) if !run.is_running() => Some(run.clone()),

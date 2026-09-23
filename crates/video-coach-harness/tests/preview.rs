@@ -110,6 +110,7 @@ impl Rig {
             targets: vec![ExportTarget::Clip(self.clip)],
             resolution: Resolution::R720,
             quality: Quality::Low,
+            scoreboard: None,
         });
     }
 }

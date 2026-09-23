@@ -37,7 +37,7 @@ use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
 use video_coach_core::layout::{self, avatar_self_view_rect, self_view_rect, STROKE_LINE_WIDTH};
-use video_coach_core::plan::ExportTarget;
+use video_coach_core::plan::{ExportTarget, ScoreboardMode};
 use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
     MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
@@ -624,6 +624,12 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
                     2 => Quality::High,
                     _ => Quality::Medium,
                 },
+                // 0 is "Default", which is the target's own (spec M1).
+                scoreboard: match w.get_export_scoreboard() {
+                    1 => Some(ScoreboardMode::Burned),
+                    2 => Some(ScoreboardMode::Track),
+                    _ => None,
+                },
             });
         }
     });
@@ -637,7 +643,7 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
 /// row ticked or everything but it (spec E8), and the pickers at the
 /// project's last choice (spec E4).
 fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
-    let Some((resolution, quality, rows)) = UI.with_borrow_mut(|ui| {
+    let Some((resolution, quality, scoreboard, rows)) = UI.with_borrow_mut(|ui| {
         let project = &ui.snapshot.as_ref()?.project;
         let targets = export_targets(project, clip);
         let rows: Vec<TargetRow> = targets
@@ -670,6 +676,7 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         let picked = (
             prefs.last_export_resolution,
             prefs.last_export_quality,
+            prefs.last_export_scoreboard,
             rows,
         );
         // The rows the sheet shows and the targets a tick means, in the same
@@ -689,6 +696,11 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
         Quality::Low => 0,
         Quality::Medium => 1,
         Quality::High => 2,
+    });
+    w.set_export_scoreboard(match scoreboard {
+        None => 0,
+        Some(ScoreboardMode::Burned) => 1,
+        Some(ScoreboardMode::Track) => 2,
     });
     w.set_export_any_ticked(rows.iter().any(|row| row.ticked));
     w.set_export_targets(ModelRc::new(VecModel::from(rows)));

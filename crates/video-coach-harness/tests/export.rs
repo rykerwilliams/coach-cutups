@@ -95,6 +95,7 @@ impl Rig {
             targets,
             resolution: Resolution::R720,
             quality: Quality::Low,
+            scoreboard: None,
         });
     }
 

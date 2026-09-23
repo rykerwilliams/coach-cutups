@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{export_targets, Command, Event, TargetState, UserError};
-use video_coach_core::plan::{compilation_plan, ExportTarget};
+use video_coach_core::plan::{compilation_plan, ExportTarget, ScoreboardMode};
 use video_coach_core::project::{Project, Quality, Resolution};
 use video_coach_core::reel::ReelSide;
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig, TeamConfig};
@@ -117,6 +117,7 @@ fn the_reel_exports_through_the_bus() {
         targets: vec![ExportTarget::Reel(ReelSide::All)],
         resolution: Resolution::R720,
         quality: Quality::Low,
+        scoreboard: None,
     });
     let done = p.h.wait_map("the run's outcome", |e| match e {
         Event::Export(run) if !run.is_running() => Some(run.clone()),
@@ -252,6 +253,10 @@ fn the_whole_match_exports_with_the_matchs_own_chapters() {
         targets: vec![ExportTarget::WholeMatch],
         resolution: Resolution::R720,
         quality: Quality::Low,
+        // Burned in, which is the encoded path: these fixtures are WebM, and
+        // the copy Default would pick joins H.264 in MP4 alone (spec E2).
+        // The copy's own chapters are `media/tests/copy.rs`.
+        scoreboard: Some(ScoreboardMode::Burned),
     });
     let done = p.h.wait_map("the run's outcome", |e| match e {
         Event::Export(run) if !run.is_running() => Some(run.clone()),
@@ -386,6 +391,7 @@ fn a_missing_game_video_is_refused_naming_the_file() {
         targets: vec![ExportTarget::Reel(ReelSide::All)],
         resolution: Resolution::R720,
         quality: Quality::Low,
+        scoreboard: None,
     });
     assert_eq!(
         p.h.wait_for_error(),

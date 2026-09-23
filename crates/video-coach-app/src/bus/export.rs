@@ -32,9 +32,12 @@ use std::time::Instant;
 
 use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
-use video_coach_core::export::{compilation_schedule, RateWindow, OUTPUT_FPS};
-use video_coach_core::plan::{compilation_plan, ExportTarget};
-use video_coach_core::project::{Clip, Project, Quality, Resolution};
+use video_coach_core::cues::{scoreboard_cues, Cue};
+use video_coach_core::export::{compilation_schedule, Compilation, RateWindow, OUTPUT_FPS};
+use video_coach_core::plan::{
+    compilation_plan, default_scoreboard_mode, ExportTarget, ScoreboardMode,
+};
+use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution};
 use video_coach_core::reel::{reel_goals, ReelSide};
 use video_coach_core::scoreboard::{team_name, ScoreboardContext};
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
@@ -259,14 +262,17 @@ impl Active {
                 let seconds = self.target_started.elapsed().as_secs_f64();
                 eprintln!(
                     "bus: exported {}: {} frames in {seconds:.1} s ({:.1} fps), \
-                     decoder {:?}, glupload caps {:?}, encoder {}, chapters {:?}",
+                     decoder {:?}, glupload caps {:?}, encoder {}, chapters {:?}, \
+                     sidecar {:?}, moov reserve left {:?}",
                     done.path.display(),
                     target.frames,
                     target.frames as f64 / seconds,
                     d.decoder,
                     d.glupload_caps,
                     done.encoder,
-                    done.chapters
+                    done.chapters,
+                    done.sidecar,
+                    done.reserve_remaining
                 );
                 TargetState::Done(done.path)
             }
@@ -280,6 +286,15 @@ impl Active {
             TargetState::Done(_) => target.frames,
             _ => rendered,
         };
+        // The next target starts its own measurement (spec X3): a copy runs
+        // at thousands of output frames a wall second against an encode's
+        // tens, and the targets queued behind it must not inherit that rate
+        // and be promised they finish at once. The window needs a span before
+        // it answers again, so the gap is silent rather than wrong — and the
+        // event this finish emits must be silent too, or the sheet keeps the
+        // copy's rate until the next target's first progress lands.
+        self.rate = RateWindow::default();
+        self.run.rate = None;
     }
 
     /// The next target's job, or `None` once the run is over.
@@ -310,18 +325,19 @@ impl Bus {
         targets: Vec<ExportTarget>,
         resolution: Resolution,
         quality: Quality,
+        scoreboard: Option<ScoreboardMode>,
     ) {
-        if let Err(e) = self.start_run(targets, resolution, quality) {
+        let pickers = Pickers {
+            resolution,
+            quality,
+            scoreboard,
+        };
+        if let Err(e) = self.start_run(targets, pickers) {
             self.emit(Event::Error(e));
         }
     }
 
-    fn start_run(
-        &mut self,
-        targets: Vec<ExportTarget>,
-        resolution: Resolution,
-        quality: Quality,
-    ) -> Result<(), UserError> {
+    fn start_run(&mut self, targets: Vec<ExportTarget>, pickers: Pickers) -> Result<(), UserError> {
         let refused = |why: &str| UserError::CantExport(why.into());
         if self.export.is_some() {
             return Err(refused("an export is running"));
@@ -349,15 +365,7 @@ impl Bus {
         let mut jobs = VecDeque::with_capacity(targets.len());
         let mut rows = Vec::with_capacity(targets.len());
         for (target, label) in targets.iter().zip(labels) {
-            let job = job(
-                open,
-                &self.missing,
-                &exports,
-                target,
-                &label,
-                resolution,
-                quality,
-            )?;
+            let job = job(open, &self.missing, &exports, target, &label, pickers)?;
             rows.push(ExportTargetRun {
                 label,
                 frames: job.compilation.frames.len(),
@@ -375,9 +383,10 @@ impl Bus {
         // The sheet's pickers are the project's from here on (spec E4).
         if let Some(open) = &mut self.open {
             let prefs = &mut open.project.preferences;
-            if (prefs.last_export_resolution, prefs.last_export_quality) != (resolution, quality) {
-                prefs.last_export_resolution = resolution;
-                prefs.last_export_quality = quality;
+            if Pickers::of(prefs) != pickers {
+                prefs.last_export_resolution = pickers.resolution;
+                prefs.last_export_quality = pickers.quality;
+                prefs.last_export_scoreboard = pickers.scoreboard;
                 self.project_changed();
             }
         }
@@ -497,6 +506,82 @@ fn de_duplicate(labels: &mut [String]) {
     }
 }
 
+/// The export sheet's three pickers, which travel together: through the run
+/// into every job, and into the project's `Preferences` when it starts (spec
+/// E4, M2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pickers {
+    resolution: Resolution,
+    quality: Quality,
+    /// `None` is the sheet's "Default": the target's own mode.
+    scoreboard: Option<ScoreboardMode>,
+}
+
+impl Pickers {
+    /// What `prefs` last remembered, for the "only when it changed" write-back
+    /// that keeps opening the sheet from dirtying the project.
+    fn of(prefs: &Preferences) -> Self {
+        Pickers {
+            resolution: prefs.last_export_resolution,
+            quality: prefs.last_export_quality,
+            scoreboard: prefs.last_export_scoreboard,
+        }
+    }
+}
+
+/// What the sheet's Scoreboard picker means for one target (spec M3).
+struct Carry {
+    /// Which renderer writes the file.
+    render: Render,
+    /// The scoreboard beside the file, or empty — which also clears a sidecar
+    /// an earlier export left there.
+    cues: Vec<Cue>,
+    /// The board to burn into the picture, or `None`. Media reads this in one
+    /// place, the per-frame overlay state, so `None` **is** "don't draw it" —
+    /// there is no mode flag to carry into media at all.
+    scoreboard: Option<ScoreboardContext>,
+}
+
+/// The whole of the mapping: the picker (or, for "Default", the target's own
+/// mode) into the two job fields that carry the board, and the renderer.
+///
+/// `context` is the run's frozen [`ScoreboardContext`], `None` for a project
+/// with no scoreboard set up — which means no cues either, since there is
+/// nothing to derive them from (spec E5).
+fn carry_scoreboard(
+    target: &ExportTarget,
+    picked: Option<ScoreboardMode>,
+    compilation: &Compilation,
+    context: Option<ScoreboardContext>,
+) -> Carry {
+    match picked.unwrap_or_else(|| default_scoreboard_mode(target)) {
+        ScoreboardMode::Burned => Carry {
+            render: Render::Encode,
+            cues: Vec::new(),
+            scoreboard: context,
+        },
+        // Only the whole match is copied, and only the whole match carries a
+        // cue list: a clip or a reel is drawn on, zoomed and captioned, so it
+        // re-encodes either way, and it already says what it is in its own
+        // text bar (spec T1, X1). The board simply isn't in it.
+        ScoreboardMode::Track => match target {
+            ExportTarget::WholeMatch => Carry {
+                render: Render::Copy,
+                cues: match &context {
+                    Some(context) => scoreboard_cues(compilation, context),
+                    None => Vec::new(),
+                },
+                scoreboard: None,
+            },
+            _ => Carry {
+                render: Render::Encode,
+                cues: Vec::new(),
+                scoreboard: None,
+            },
+        },
+    }
+}
+
 /// The job that renders `target` as `label`, or why it can't run.
 ///
 /// A snapshot: later edits to the project don't reach a running export. The
@@ -508,8 +593,7 @@ fn job(
     exports: &Path,
     target: &ExportTarget,
     label: &str,
-    resolution: Resolution,
-    quality: Quality,
+    pickers: Pickers,
 ) -> Result<ExportJob, UserError> {
     let refused = |why: String| UserError::CantExport(why);
     let compilation = compilation_schedule(&open.project, target);
@@ -558,6 +642,14 @@ fn job(
         }));
     }
 
+    let carry = carry_scoreboard(
+        target,
+        pickers.scoreboard,
+        &compilation,
+        // Frozen with the project as it is now: the run's own copy of the
+        // events on the concat timeline (spec S2).
+        ScoreboardContext::for_project(&open.project),
+    );
     let job = ExportJob {
         audio: audio_regions(&compilation, &open.project.preferences),
         compilation,
@@ -569,16 +661,11 @@ fn job(
             .map(|s| open.folder.join(&s.relative_path))
             .collect(),
         path: exports.join(file_name(label, &open.project.name)),
-        // The scoreboard is burned into the picture on every target today, so
-        // there is nothing to put beside the file — and an empty list is also
-        // what clears a sidecar an earlier export left there.
-        cues: Vec::new(),
-        render: Render::Encode,
-        resolution,
-        quality,
-        // Frozen with the project as it is now: the run's own copy of the
-        // events on the concat timeline (spec S2).
-        scoreboard: ScoreboardContext::for_project(&open.project),
+        cues: carry.cues,
+        render: carry.render,
+        resolution: pickers.resolution,
+        quality: pickers.quality,
+        scoreboard: carry.scoreboard,
         highlights: open.project.player_highlights.clone(),
         // The project's one image, snapshotted like everything else here: a
         // pick or a removal while this run is going does not reach it (I6).

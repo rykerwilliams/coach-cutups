@@ -31,7 +31,7 @@ use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use uuid::Uuid;
 use video_coach_core::highlight::{HighlightEdit, NormRect};
-use video_coach_core::plan::ExportTarget;
+use video_coach_core::plan::{ExportTarget, ScoreboardMode};
 use video_coach_core::project::{AspectMismatch, Project, Quality, Resolution, SourceReferenced};
 use video_coach_core::scoreboard::{MatchEventKind, ReelEnd, ScoreboardConfig};
 use video_coach_core::skip::SkipCoordinator;
@@ -245,13 +245,17 @@ pub enum Command {
 
     // Export (Phase 5 spec X4, Phase 8 spec E1).
     /// Render each target into `<project>/exports/`, one after another, in
-    /// the background. `resolution` and `quality` are the sheet's pickers,
-    /// and become the project's (spec E4). Refused while another run is
-    /// going; dropped while recording.
+    /// the background. `resolution`, `quality` and `scoreboard` are the
+    /// sheet's pickers, and become the project's (spec E4). Refused while
+    /// another run is going; dropped while recording.
     Export {
         targets: Vec<ExportTarget>,
         resolution: Resolution,
         quality: Quality,
+        /// How every ticked target carries the scoreboard, or `None` for the
+        /// sheet's "Default" — which is per target
+        /// (`video_coach_core::plan::default_scoreboard_mode`).
+        scoreboard: Option<ScoreboardMode>,
     },
     /// Stop the running export, if any. Its outcome still arrives as the
     /// run's own: a cancel too late to stop a target reports it done.
@@ -847,7 +851,8 @@ impl Bus {
                 targets,
                 resolution,
                 quality,
-            } => self.export(targets, resolution, quality),
+                scoreboard,
+            } => self.export(targets, resolution, quality, scoreboard),
             Command::CancelExport => self.cancel_export(),
             Command::Transcribe { clip_id } => self.transcribe(clip_id),
             Command::CancelTranscription => self.cancel_transcription(),
