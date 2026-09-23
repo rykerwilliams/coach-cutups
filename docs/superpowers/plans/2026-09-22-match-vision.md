@@ -459,6 +459,33 @@ Commit: `docs: close out P1 of match vision` (along with the review's fixes, in 
 
 ---
 
+## P1b: the whole-match export (spec W)
+
+Asked for by the user while tagging the first match: the film itself, with the clock and score burned in and no commentary. It is P1's machinery pointed at whole sources, so it needs no new format.
+
+### Task 1b.1: Export the whole match, with the match's own chapters
+
+**Files:**
+- `crates/video-coach-core/src/{plan.rs,reel.rs (or a new whole_match.rs)}`
+- `crates/video-coach-app/src/{bus/export.rs,main.rs}`
+- `crates/video-coach-core/tests/plan.rs`, `crates/video-coach-harness/tests/reel.rs` (or its own test file)
+
+**What to build:**
+1. **`ExportTarget::WholeMatch`.** `compilation_plan` gives one entry per source video, in order, each `[0, duration]`, `clip_id: None` and an empty `text`. Everything else follows from P1: game sound, no PiP, the scoreboard and highlights per displayed frame.
+2. **Chapters from the match's own events** for this target only: every period start and stop and every goal, at its absolute time, labelled as `match_rows` labels them. A match with no events falls back to one chapter per source. The reel and clip exports keep `chapters()`'s one-per-entry rule (C2). Put the choice where `chapters()` lives, not in the media splice.
+3. **The row:** label "Whole match", detail the running time, present whenever the project has a source, **never ticked by default** (like the reel). It goes first in the sheet.
+4. **The empty caption** must leave no text bar (the overlay already skips an empty one — confirm with a test rather than trusting it).
+
+**Test that must fail first:** a core test that `WholeMatch` plans one whole entry per source with no clip, and that its chapters are the match's events, not its entries. Then a harness test that the export runs end to end on a two-source project with a goal, writing `Whole match - <project>.mp4` whose frame count equals the plan's, and whose chapters read back through `ffprobe` as the goal and the periods.
+
+**Verify:** the gate.
+
+**Hands-on:** export a real match; the clock and score are right throughout, there is no commentary and no inset, and VLC lists the goals as chapters.
+
+Commit: `feat(export): the whole match, with the clock and the score burned in`.
+
+---
+
 ## P2: hand-placed highlights (format v9)
 
 Order: 2.1, 2.2, 2.3, 2.4, 2.5, then 2.6 closes the phase and releases. 2.3 needs 2.2 for its export test, and 2.5 needs 2.3 and 2.4.

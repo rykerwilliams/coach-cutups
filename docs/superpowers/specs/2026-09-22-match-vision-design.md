@@ -192,6 +192,15 @@ A plan with fewer than two entries gets no chapters.
   - **`OverlayFrame.clip` becomes `Option<&Clip>`,** and `None` draws no strokes. That is the smaller reshape: `stroke_replay::visible_strokes` keeps its `&Clip` argument and its call sites.
   - The pump, the mixer geometry, the audio pipeline, the `.part` rename and the progress model are unchanged.
 
+### W. The whole-match export (the user, 2026-09-22; Q6 (a) answered yes)
+
+The coach wants the match itself, end to end, with the clock and score burned in and **no commentary** — the film a parent or a player watches, not a cutdown.
+
+- **W1. `ExportTarget::WholeMatch`,** one row, "Whole match", present whenever the project has a source video. Like the reel it is **not ticked by default**: it is the longest render the app can be asked for.
+- **W2. One entry per source video, in order, whole.** `clip_id: None`, so there is game sound, no commentary, no webcam inset, and the scoreboard and any highlights are drawn from each displayed frame, exactly as the reel does. The entries carry no caption: the scoreboard already names the period and the clock, and a text bar across the whole match would be noise.
+- **W3. Chapters are the match's own moments,** not one per entry: every period start and stop and every goal, labelled as the Match panel labels them ("Second half", "Home goal 1-0"). The reel and clip exports keep a chapter per entry (C2). A match with no events still gets one chapter per half.
+- **W4. It is long, and the coach is told.** The row's detail is the running time ("2 videos · 54:12"), which is the honest warning.
+
 ### H. Player highlights
 
 **H1. A highlight belongs to the footage, not to a clip.** It is stored on the project, positioned by `source_index` and source seconds, like a match event. Because of that it shows wherever that footage is on screen: scanning, recording, the preview, every clip export that crosses it, and the reel. **Highlights may be placed outside a recording** (the user's decision, 2026-09-22), while pen drawings stay recording-only: a highlight that follows a player only works when placed on the footage before recording, the reel can only show highlights that belong to the footage, and the recording-only rule protects the commentary's meaning, which a label on the footage doesn't touch.
@@ -653,7 +662,6 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 ## Deferred
 
 - **Goals inside a clip export as chapters** (C2). A goal chapter would split its clip's chapter. Q6 asks.
-- **A whole-match export with chapters at goals and periods** (Q6).
 - **Previewing a reel entry in the app.** "Reel starts here" is set from the scan picture, which is the footage itself.
 - **A reel of one team's goals.** The user asked for every goal in one video. Revisit on request; it is `Reel` gaining a filter.
 - **An automatic guess at the move's start** (the last stoppage, or a change of possession) **and assist labels ("assist #7").** The 30 s default and the coach's trims already meet the build-up requirement, and a guess that can come out *shorter* is the one way to cut an assist out silently. Stoppage times are also not stored (D6), so a guess needs either a stored signal list or a re-analysis. Change of possession and assists need ball tracking, which the ball's few pixels in the wide framing make doubtful, and jersey numbers. **Revisit** only with an asymmetric bar: the guess starts at or before the coach's own trimmed start on ≥ 95% of goals, measured against trims collected on tagged matches. Otherwise it may only ever lengthen the default.
@@ -695,4 +703,5 @@ The questions keep their numbers, so earlier references stay valid. Each open on
 - **Q7. The reel holds confirmed goals only,** and its export row says "N suggested goals not confirmed" while goal suggestions are pending (R2).
 - **Q8. Highlights may be placed outside a recording,** while scanning, and are saved with the footage. Pen drawings stay recording-only (Scope, H1, H3).
 - **Fast scanning (S), 2026-09-22:** scanning only, never while recording; `L` faster and `J` slower, forward only, sound muted above 1×; a speed button too.
+- **Q6 (a). Yes to a whole-match export** with chapters at goals and periods (W), asked for while tagging the first match. (b), goal chapters inside a clip's export, stays deferred.
 - **Q9. No scoring-side detection from the kicking kit.** P5 is a formation check that only drops false kick-offs, is built only if P3 shows the precision bars need it, and stores nothing (D5). The side is in Deferred.
