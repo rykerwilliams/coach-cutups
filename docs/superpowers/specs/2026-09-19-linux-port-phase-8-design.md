@@ -17,7 +17,7 @@ Export **compilations**: all clips, one tag's clips, or a single clip, each as o
 1. **Targets.** An export sheet lists **All clips**, one row per tag, and the selected clip; all are ticked by default except the single clip. Each ticked target produces one MP4.
 2. **The picture.** Each frame carries the game video with zoom, the webcam PiP (when the clip's `show_pip` is on), the drawings, and the text bar `"<n> / <total> | <name> | tag1, tag2"`, where `<total>` is that target's clip count.
 3. **The audio.** Game audio during play segments only, commentary throughout, 5 ms fades at every region edge, and **no systematic offset** between picture and sound.
-4. **Quality.** Resolution (720p / **1080p**) and quality (Low / **Medium** / High) are chosen in the sheet and persist. Quality is a quantizer.
+4. **Quality.** Resolution (720p / **1080p**) and quality (Low / **Medium** / High) are chosen in the sheet and persist. Quality is a quantizer — the hardware encoder has no other mode — so the file size follows the footage, and Medium lands a busy 1080p match at 6–8 Mbit/s.
 5. **Progress.** Per-target progress in exact frames, a rate, time left and a finish time, and **Cancel works**.
 6. **Files.** `<project>/exports/<label> - <project>.mp4`, written as `.part` and renamed.
 
@@ -83,7 +83,8 @@ Export **compilations**: all clips, one tag's clips, or a single clip, each as o
 ### E4. Quality and resolution
 
 - **Resolution: 720p or 1080p (default).** **2160p is dropped:** it runs at 0.56× realtime and only upscales the user's 1440p footage. `Resolution::R2160` stays in the format for later.
-- **Quality is a quantizer:** Low/Medium/High → QP 28/24/20, for both `vah264lpenc` and `x264enc pass=qual`. The macOS bitrate table is not ported.
+- **Quality is a quantizer:** Low/Medium/High → VA QP **30/26/22**, and `x264enc pass=qual` four steps lower (26/22/18), which matches the VA encoder's SSIM within 0.001. The macOS bitrate table is not ported, because it cannot be honoured: `vah264lpenc`'s `rate-control` enum offers only `cqp`.
+  - **Remeasured after shipping.** The first ladder was 28/24/20, and QP 20 put a 56-minute match at 19 Mbit/s against its own ~5 Mbit/s source — for +0.004 SSIM over QP 22. The table of bitrates and SSIMs per level, on real 1080p30 Trace footage, lives on `quantizers` in `composite/export.rs`.
 - Both persist in the existing `Preferences` fields.
 
 ### E5. Progress, ETA and running

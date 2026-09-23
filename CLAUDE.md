@@ -328,7 +328,19 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The graph:** decode (`decodebin3` → the player's `gl_bin` → pull `appsink`) → a Rust pump → `appsrc` → `gltransformation` (zoom) → `glvideomixer` (letterbox, pinned to 1920×1080@30) → NV12 `gldownload` → encoder → `mp4mux`.
 - **The GL display:** process-wide and surfaceless (`GLDisplayEGL::new_surfaceless()`), never the UI's. CI has no GPU, so Mesa's llvmpipe runs the same graph; there is no software variant.
 - **Picking source frames:** use **stream time** (`segment.to_stream_time`), not raw PTS: MP4 edit lists offset raw PTS. Round seconds to ns (`seconds_to_clock`). Seek `KEY_UNIT|SNAP_BEFORE`, then pull forward: ACCURATE seeks drop frames in VFR or gapped files.
-- **Quality is a constant QP:** `vah264lpenc` is CQP-only.
+- **Quality is a constant quantizer, because nothing else is on offer.**
+  `vah264lpenc`'s `rate-control` enum has exactly one member on the reference
+  driver (`gst-inspect-1.0 vah264lpenc`); `rate-control=cbr` and `=vbr` fail to
+  parse. `bitrate`, `target-usage` and `b-frames` exist as properties and are
+  measurable no-ops, and `trellis=true` **doubles** the file. So there is no
+  bitrate target and no size ceiling — a busy passage costs what it costs.
+  Low/Medium/High are **VA QP 30/26/22**, and `x264enc` gets **QP − 4**
+  (26/22/18), which matches the VA encoder's SSIM within 0.001. `x264enc` also
+  needs **`vbv-buf-capacity=0`**: it hands `bitrate`'s 2048 kbit/s default to
+  libx264 as a VBV maximum even in constant-quality mode, which silently capped
+  every software export at ~1.7 Mbit/s. The ladder and its bitrates are
+  tabulated on `quantizers` in `composite/export.rs`; `the_quality_ladder_reaches_both_encoders`
+  pins it.
 - **Never block a push or pull without a bound.** A blocking `appsrc` push hangs forever after a downstream error.
 - **To test CI's path locally,** hide the GPU with `GST_REGISTRY=<scratch>/reg.bin bwrap --dev-bind / / --tmpfs /dev/dri cargo test …`. See `docs/superpowers/specs/2026-09-19-linux-port-phase-5-design.md`.
 

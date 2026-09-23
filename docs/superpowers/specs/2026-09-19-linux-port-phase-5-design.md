@@ -128,9 +128,9 @@ encode:  appsrc (the decode caps rewritten to framerate=30/1, format=time)
   - `vah264enc` and `nvh264enc` aren't present on any machine here, so their settings would be untested. They are added when someone can run them.
 - **Quality is a quantizer.** This phase uses one fixed setting, **QP 24**:
   - VA: `rate-control=cqp qpi=24 qpp=24 key-int-max=60`;
-  - x264: `pass=qual quantizer=24 speed-preset=veryfast key-int-max=60`. That is constant quality, which is smaller than constant QP at the same quality.
-- **Phase 8** adds the quality and resolution picker (QP 28/24/20).
-- **The parent spec's bitrate ladder is superseded:** the CQP-only encoder can't reach a bitrate target.
+  - x264: `pass=qual quantizer=24 speed-preset=veryfast key-int-max=60 vbv-buf-capacity=0`. That is constant quality, which is smaller than constant QP at the same quality. **The zeroed VBV capacity is required:** `x264enc` passes `bitrate` (default 2048 kbit/s) to libx264 as a VBV maximum in this mode too, which capped the software encoder at ~1.7 Mbit/s whatever quantizer it was given.
+- **Phase 8** adds the quality and resolution picker. Its ladder was later remeasured on real match footage: VA QP 30/26/22, x264 QP − 4 — see `quantizers` in `composite/export.rs`.
+- **The parent spec's bitrate ladder is superseded:** the CQP-only encoder can't reach a bitrate target. Confirmed on the reference driver: `vah264lpenc`'s `rate-control` enum has `cqp` and nothing else, and `bitrate`, `target-usage` and `b-frames` are all no-ops.
 
 ### X4. Control: an `Exporter` that owns its thread
 

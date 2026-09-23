@@ -219,13 +219,43 @@ fn output_size(resolution: Resolution) -> (i32, i32) {
     }
 }
 
-/// The quantizer for `quality` (spec E4). Quality **is** a quantizer: the
-/// hardware encoder is CQP-only, and macOS's bitrate table was a no-op.
-fn quantizer(quality: Quality) -> u32 {
+/// The constant quantizer each encoder gets for `quality` (spec E4): the VA
+/// encoder's `qpi`/`qpp`, and `x264enc`'s constant-quality level.
+///
+/// **Quality is a quantizer, because nothing else is on offer.** On the
+/// reference driver `vah264lpenc`'s `rate-control` enum has exactly one
+/// member, `cqp` — `rate-control=cbr` and `=vbr` fail to even parse — so there
+/// is no bitrate to target and no VBV to cap the peaks. `bitrate`,
+/// `target-usage` and `b-frames` are all present as properties and all
+/// measurably no-ops (`b-frames=2` and `target-usage=1` reproduce the CQP
+/// stream byte for byte); `trellis=true` makes the file **twice** as big.
+///
+/// **The ladder is measured on real match footage** — 1080p30 Trace video of a
+/// whole pitch, a quiet 20 s and a busy 24 s of the same half, both through
+/// this graph, with SSIM against a near-lossless encode of the same composited
+/// frames. Per level, quiet passage → busy passage:
+///
+/// | level  | VA QP | Mbit/s      | SSIM   | 56-min match |
+/// |--------|-------|-------------|--------|--------------|
+/// | Low    | 30    | 3.3 – 5.0   | 0.965  | ~1.8 GB      |
+/// | Medium | 26    | 5.5 – 7.7   | 0.982  | ~2.7 GB      |
+/// | High   | 22    | 9.0 – 12.6  | 0.990  | ~4.5 GB      |
+///
+/// The old ladder was 28/24/20, and QP 20 put a 56-minute match at 19 Mbit/s —
+/// nearly 4× its own ~5 Mbit/s source — for +0.004 SSIM over QP 22. Every
+/// level moved two steps up; the file a coach shares halved and nothing on the
+/// scoreboard or the ball is softer to look at.
+///
+/// **`x264enc` is four steps lower for the same picture.** Constant quality on
+/// `veryfast` matches the VA encoder's SSIM within 0.001 at QP − 4 (0.9898 vs
+/// 0.9897, 0.9825 vs 0.9815, 0.9686 vs 0.9647) — the low-power VA path just
+/// spends more bits for it. One number for both would make the software
+/// fallback quietly worse than the hardware it stands in for.
+fn quantizers(quality: Quality) -> (u32, u32) {
     match quality {
-        Quality::Low => 28,
-        Quality::Medium => 24,
-        Quality::High => 20,
+        Quality::Low => (30, 26),
+        Quality::Medium => (26, 22),
+        Quality::High => (22, 18),
     }
 }
 
@@ -759,8 +789,10 @@ fn pulse_levels(job: &ExportJob, cancel: &AtomicBool) -> Vec<f64> {
 }
 
 /// The H.264 encoders export can use, in preference order, with their
-/// launch-string settings. Only encoders someone has run are listed (spec X3).
-fn encoders(qp: u32) -> [(&'static str, String); 2] {
+/// launch-string settings for `quality` ([`quantizers`]). Only encoders
+/// someone has run are listed (spec X3).
+fn encoders(quality: Quality) -> [(&'static str, String); 2] {
+    let (qp, crf) = quantizers(quality);
     [
         (
             "vah264lpenc",
@@ -768,9 +800,19 @@ fn encoders(qp: u32) -> [(&'static str, String); 2] {
         ),
         // Constant quality: smaller than constant QP at the same quality.
         // `medium` runs at 0.39x realtime; `veryfast` keeps up.
+        //
+        // **`vbv-buf-capacity=0` is not a detail.** `x264enc` feeds `bitrate`
+        // (default 2048 kbit/s) to libx264 as a VBV *maximum* in this mode
+        // too, so the quality level was capped at about 1.7 Mbit/s whatever it
+        // was set to: constant quality 24, 26 and 28 all came out within 5% of
+        // each other and of one another's SSIM (0.890). Zeroing the capacity
+        // turns the VBV off, which is what constant quality means.
         (
             "x264enc",
-            format!("pass=qual quantizer={qp} speed-preset=veryfast key-int-max=60"),
+            format!(
+                "pass=qual quantizer={crf} speed-preset=veryfast key-int-max=60 \
+                 vbv-buf-capacity=0"
+            ),
         ),
     ]
 }
@@ -824,7 +866,7 @@ impl Encoder {
         watch: &Watch,
     ) -> Result<Encoder, ExportError> {
         let (out_w, out_h) = output_size(job.resolution);
-        let (name, settings) = encoders(quantizer(job.quality))
+        let (name, settings) = encoders(job.quality)
             .into_iter()
             .find(|(name, _)| gst::ElementFactory::find(name).is_some())
             .ok_or_else(|| {
@@ -1034,13 +1076,40 @@ mod tests {
     }
 
     #[test]
-    fn the_output_size_and_the_quantizer_follow_the_pickers() {
+    fn the_output_size_follows_the_picker() {
         assert_eq!(output_size(Resolution::R720), (1280, 720));
         assert_eq!(output_size(Resolution::R1080), (1920, 1080));
+    }
+
+    /// The measured ladder, and that both encoders are actually told it: the
+    /// numbers in [`quantizers`] are a table of bitrates and SSIMs on real
+    /// footage, and a typo here is a silent 2× in what a coach downloads.
+    #[test]
+    fn the_quality_ladder_reaches_both_encoders() {
         assert_eq!(
-            [Quality::Low, Quality::Medium, Quality::High].map(quantizer),
-            [28, 24, 20]
+            [Quality::Low, Quality::Medium, Quality::High].map(quantizers),
+            [(30, 26), (26, 22), (22, 18)]
         );
+        for quality in [Quality::Low, Quality::Medium, Quality::High] {
+            let (qp, crf) = quantizers(quality);
+            let [(va, va_settings), (x264, x264_settings)] = encoders(quality);
+            assert_eq!(va, "vah264lpenc");
+            assert_eq!(
+                va_settings,
+                format!("rate-control=cqp qpi={qp} qpp={qp} key-int-max=60")
+            );
+            assert_eq!(x264, "x264enc");
+            assert!(
+                x264_settings.contains(&format!("quantizer={crf} ")),
+                "{quality:?}: {x264_settings}"
+            );
+            // Without this the level is capped at `bitrate`'s 2048 kbit/s
+            // default, whatever quantizer it was given.
+            assert!(
+                x264_settings.contains("vbv-buf-capacity=0"),
+                "{quality:?}: {x264_settings}"
+            );
+        }
     }
 
     /// An element erroring mid-stream, downstream of `appsrc`, ends the
