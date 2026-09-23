@@ -486,6 +486,23 @@ Commit: `feat(export): the whole match, with the clock and the score burned in`.
 
 ---
 
+### Task 1b.2: A reel per team (spec R1b)
+
+Asked for right after the whole-match export. It follows Task 1b.1, which touches the same files.
+
+**What to build:**
+1. **`ExportTarget::Reel(ReelSide)`** with `ReelSide::{All, Home, Away}`. `reel_goals` takes the side; `reel_entries` filters by it, and everything downstream (spans, merges, captions, trims) is unchanged. A trim belongs to the goal, so it holds in every reel the goal appears in.
+2. **The rows:** one per side that has goals, labelled from the scoreboard's team names ("<team> goals"), or "Home goals" / "Away goals" without one; plus "All goals" only when both sides have scored. None ticked by default. The reel rows stay after the tag rows.
+3. **The captions** number within the chosen side's reel.
+
+**Test that must fail first:** a core test that a one-sided project plans the same entries for `All` and for that side, and that `Home` and `Away` split a two-sided project; then an app test that the sheet shows two rows for a one-sided project (that side plus no "All"), and three when both have scored.
+
+**Verify:** the gate.
+
+Commit: `feat(export): a goals reel per team`.
+
+---
+
 ## P2: hand-placed highlights (format v9)
 
 Order: 2.1, 2.2, 2.3, 2.4, 2.5, then 2.6 closes the phase and releases. 2.3 needs 2.2 for its export test, and 2.5 needs 2.3 and 2.4.

@@ -154,6 +154,13 @@ A plan with fewer than two entries gets no chapters.
 - **The row is not ticked by default** (the user, 2026-09-22): the reel renders about 36 s a goal, which an ordinary export should not pay for unasked. The coach ticks it.
 - **The Export… button is enabled whenever the sheet would have a row** (`export_targets` is not empty), not on "the project has clips". A project with goals and no clips, which every ground-truth project is, can export its reel.
 
+**R1b. A reel can hold one team's goals** (the user, 2026-09-22). `Reel` carries a side: all goals, the home team's, or the away team's.
+
+- The sheet shows a row per side that has goals, named from the scoreboard ("Rovers goals"), falling back to "Home goals" / "Away goals" with no scoreboard set up.
+- "All goals" appears only when both sides have scored; with one side scoring it would be the same film twice.
+- The caption's `n / total` counts within the reel that was picked, and the file name follows E6 as usual ("Rovers goals - <project>.mp4").
+- No row is ticked by default (R1).
+
 **R2. Each goal is one plan entry, with one `Play` segment.** The segment spans `[goal − lead_in, goal + tail]` on the goal's own source.
 
 - **Defaults:** `REEL_LEAD_IN = 30 s` and `REEL_TAIL = 6 s`, overridden per goal, each side independently (R3).
@@ -663,7 +670,6 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 - **Goals inside a clip export as chapters** (C2). A goal chapter would split its clip's chapter. Q6 asks.
 - **Previewing a reel entry in the app.** "Reel starts here" is set from the scan picture, which is the footage itself.
-- **A reel of one team's goals.** The user asked for every goal in one video. Revisit on request; it is `Reel` gaining a filter.
 - **An automatic guess at the move's start** (the last stoppage, or a change of possession) **and assist labels ("assist #7").** The 30 s default and the coach's trims already meet the build-up requirement, and a guess that can come out *shorter* is the one way to cut an assist out silently. Stoppage times are also not stored (D6), so a guess needs either a stored signal list or a re-analysis. Change of possession and assists need ball tracking, which the ball's few pixels in the wide framing make doubtful, and jersey numbers. **Revisit** only with an asymmetric bar: the guess starts at or before the coach's own trimmed start on ≥ 95% of goals, measured against trims collected on tagged matches. Otherwise it may only ever lengthen the default.
 - **Which side scored, from the kit that kicks off** (D5). The team that kicks off conceded, so the formation check could label a goal row "Home goal?". Dropped by the user (Q9): the coach confirms with Z or X while watching the goal, so the label saves no keystroke, and it would cost a stored kit colour, a format bump, a kit-to-side mapping, a scoring row and a bar. Revisit if a confirm path appears that doesn't involve watching the goal.
 - **Detecting the painted halfway line** (D5). Revisit if the kits' separation proves ambiguous.
