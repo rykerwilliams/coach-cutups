@@ -245,13 +245,19 @@ silently. If you need a media type in core, you need a different design.
   new struct's fields get no default: a missing one is a malformed file. Never a
   field-level default on an `f64` or a `bool` (`project.rs`'s header).
 - **Every bump comes with a test that every readable version still loads**
-  (`project_format.rs::v7_to_v9_files_load_under_v10`).
+  (`project_format.rs::v7_to_v9_files_load_under_the_current_version`, and one
+  per bump beside it).
 - **v10 adds `Project.avatar` and `Clip.inset`.** `avatar` is the image's file
   name in the project folder and *is* avatar mode — `Some` means takes record
   commentary only, `None` means they record on camera, and there is no second
   flag to disagree with it. `inset` is what a clip was recorded with, defaulting
   to `Camera`, which is what every v7–v9 clip was. Both are additive, so the
   readable floor stays 7.
+- **v11 adds `Preferences::last_export_scoreboard`** (the export sheet's
+  Scoreboard picker, `None` = Default). A field added to `Preferences` takes
+  **no** attribute: that container carries `#[serde(default)]` and fills from
+  its hand-written `Default` impl, so a field-level one would be a second copy
+  of the default.
 - **The first save after an upgrade keeps `project.json.v<old>`**, once, never
   overwritten, so the older build can still be gone back to. It is copied to a
   temporary name and renamed, like `project.json` itself, so a failed copy

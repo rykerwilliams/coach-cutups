@@ -18,7 +18,7 @@ use crate::project::Project;
 /// key at all and so decodes as 1 — indistinguishable from a current file,
 /// and the guard would then need to sniff field shapes. One comparison cannot
 /// have holes.
-pub const CURRENT_FORMAT_VERSION: u32 = 10;
+pub const CURRENT_FORMAT_VERSION: u32 = 11;
 
 /// The oldest format version this build reads: the first the Linux port wrote.
 /// Everything below it is a macOS-era file. Every change since v7 is additive

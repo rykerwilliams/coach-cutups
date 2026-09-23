@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::event::CommentaryEvent;
 use crate::highlight::PlayerHighlight;
+use crate::plan::ScoreboardMode;
 use crate::recording::PendingClip;
 use crate::scoreboard::{MatchEventRecord, ScoreboardConfig};
 use crate::undo::ClipEdit;
@@ -78,6 +79,9 @@ pub struct Preferences {
     pub preview_commentary_volume: f64,
     pub last_export_resolution: Resolution,
     pub last_export_quality: Quality,
+    /// Which way the export sheet last carried the scoreboard, or `None` for
+    /// its per-target default ([`crate::plan::default_scoreboard_mode`]). v11.
+    pub last_export_scoreboard: Option<ScoreboardMode>,
     /// Stable identifier for the preferred camera: its PipeWire `node.name`.
     /// A hint: if the device is absent at launch the app falls back to the
     /// default **without clearing this**, so the preference is restored if the
@@ -96,6 +100,7 @@ impl Default for Preferences {
             preview_commentary_volume: 1.0,
             last_export_resolution: Resolution::R1080,
             last_export_quality: Quality::Medium,
+            last_export_scoreboard: None,
             preferred_camera_id: None,
             preferred_mic_id: None,
             pip_for_new_recordings: true,

@@ -3,6 +3,7 @@
 //! Pure data: no media dependency. The export layer consumes this to drive its
 //! frame pump.
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::export::{frame_count, OUTPUT_FPS};
@@ -35,6 +36,34 @@ pub enum ExportTarget {
     /// The whole match: every source video, in order, whole, and no clip at
     /// all ([`crate::whole_match`]).
     WholeMatch,
+}
+
+/// How an export carries the scoreboard.
+///
+/// `Burned` paints it into the picture, as every export did before; `Track`
+/// leaves the picture alone and carries the same score and clock beside the
+/// file as cues ([`crate::cues`]). It is an export choice, not a project one:
+/// the preview always draws the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScoreboardMode {
+    Burned,
+    Track,
+}
+
+/// What the sheet's "Default" means for `target`: a whole match is copied with
+/// its scoreboard beside it, everything else is re-encoded with it burned in.
+///
+/// Here rather than in the app so the exhaustive match sits beside the enum it
+/// matches, and so the sheet and the job builder read one rule.
+pub fn default_scoreboard_mode(target: &ExportTarget) -> ScoreboardMode {
+    match target {
+        ExportTarget::WholeMatch => ScoreboardMode::Track,
+        ExportTarget::AllClips
+        | ExportTarget::Tag(_)
+        | ExportTarget::Clip(_)
+        | ExportTarget::Reel(_) => ScoreboardMode::Burned,
+    }
 }
 
 /// One entry's contribution to the output: a clip's, or a stretch of game

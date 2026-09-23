@@ -8,6 +8,7 @@
 
 pub mod audio;
 pub mod avatar;
+pub mod cues;
 pub mod event;
 pub mod export;
 pub mod highlight;

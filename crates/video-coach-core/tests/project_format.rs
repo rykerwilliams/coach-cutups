@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::highlight::{HighlightKey, NormRect, PlayerHighlight};
+use video_coach_core::plan::ScoreboardMode;
 use video_coach_core::project::{
     Clip, Inset, Preferences, Project, Quality, Resolution, SourceRef,
 };
@@ -266,7 +267,7 @@ fn round_trips_through_the_store() {
 /// the highlights key. None of them names an avatar or an inset. Every bump
 /// keeps a test like this one.
 #[test]
-fn v7_to_v9_files_load_under_v10() {
+fn v7_to_v9_files_load_under_the_current_version() {
     let goal = |version: u32| {
         let mut goal = json!({
             "id": "00000000-0000-0000-0000-000000000001",
@@ -340,6 +341,37 @@ fn v7_to_v9_files_load_under_v10() {
     }
 }
 
+/// F1, for v11. A v10 file has no `lastExportScoreboard` key: it loads, the
+/// preference reads `None`, and the next save stamps the current version and
+/// keeps the v10 file beside it. Every bump owes this test.
+#[test]
+fn a_v10_file_loads_under_the_current_version() {
+    let dir = TempDir::new().unwrap();
+    let mut raw = serde_json::to_value(sample_project()).unwrap();
+    raw["formatVersion"] = json!(10);
+    raw["preferences"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lastExportScoreboard")
+        .expect("v11 writes the key this test removes");
+    write_raw(dir.path(), raw);
+
+    let mut p = store::read(dir.path()).expect("a v10 file loads");
+    assert_eq!(p.preferences.last_export_scoreboard, None);
+
+    // The picker's choice belongs to the match, so it is written with it.
+    p.preferences.last_export_scoreboard = Some(ScoreboardMode::Track);
+    store::write(dir.path(), &mut p).unwrap();
+    assert_eq!(p.format_version, 11);
+    assert_eq!(store::read(dir.path()).unwrap(), p);
+    assert!(dir.path().join("project.json.v10").exists());
+
+    let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["formatVersion"], json!(11));
+    assert_eq!(value["preferences"]["lastExportScoreboard"], json!("track"));
+}
+
 /// v10. The mode is the picture's file name and nothing else, the inset is a
 /// clip's own fact, and both survive a write and a read at the wire spellings
 /// a v10 file is expected to hold.
@@ -354,7 +386,7 @@ fn an_avatar_and_an_inset_round_trip() {
 
     let text = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(value["formatVersion"], json!(10));
+    assert_eq!(value["formatVersion"], json!(CURRENT_FORMAT_VERSION));
     assert_eq!(value["avatar"], json!("avatar.png"));
     assert_eq!(value["clips"][0]["inset"], json!("avatar"));
 
