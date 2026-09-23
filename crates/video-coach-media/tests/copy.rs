@@ -16,7 +16,9 @@ use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{compilation_schedule, Compilation};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Project, Quality, Resolution, SourceRef};
-use video_coach_media::fixtures::{counter_video, decode_counters, CounterKind};
+use video_coach_media::fixtures::{
+    counter_video_with, decode_counters, CounterKind, CounterQuirks,
+};
 use video_coach_media::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render};
 
 /// Far beyond any copy here; only a hang reaches it.
@@ -37,6 +39,11 @@ struct Match {
 /// `sources` as `(name, width, height, frames)`, written as H.264 + AAC in
 /// MP4 — the shape a copy can join — and planned as one whole match.
 fn whole_match(dir: &Path, sources: &[(&str, u32, u32, u32)]) -> Match {
+    whole_match_with(dir, sources, CounterQuirks::default())
+}
+
+/// [`whole_match`] with `quirks` on every source.
+fn whole_match_with(dir: &Path, sources: &[(&str, u32, u32, u32)], quirks: CounterQuirks) -> Match {
     gst::init().unwrap();
     let mut project = Project::new("Match");
     let files = sources
@@ -49,7 +56,15 @@ fn whole_match(dir: &Path, sources: &[(&str, u32, u32, u32)]) -> Match {
                 duration_seconds: f64::from(frames) / f64::from(FPS),
                 display_aspect: f64::from(w) / f64::from(h),
             });
-            counter_video(&dir.join(file), w, h, FPS, frames, CounterKind::H264AacMp4)
+            counter_video_with(
+                &dir.join(file),
+                w,
+                h,
+                FPS,
+                frames,
+                CounterKind::H264AacMp4,
+                quirks,
+            )
         })
         .collect();
     Match {
@@ -152,6 +167,15 @@ fn video_stream(path: &Path) -> (String, String, i64, i64, i64) {
         number("height"),
         number("nb_read_packets"),
     )
+}
+
+/// How long `path`'s `stream` (`v:0`, `a:0`) runs, in seconds.
+fn stream_seconds(path: &Path, stream: &str) -> f64 {
+    ffprobe(path, &["-select_streams", stream, "-show_streams"])["streams"][0]["duration"]
+        .as_str()
+        .expect("a stream duration")
+        .parse()
+        .expect("a stream duration in seconds")
 }
 
 /// `path`'s chapters as `(start in seconds, title)`.
@@ -257,6 +281,58 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
             "{title:?} starts at {at}, not {want_at}"
         );
     }
+}
+
+/// Sources whose sound stops three seconds short of their picture: the
+/// muxer needs sound the first file has run out of, and only the *next*
+/// file's demuxer can give it.
+///
+/// **This is the deadlock, with the race taken out.** The two-`concat` graph
+/// hung on it every time, and on ordinary footage — where the two tracks end
+/// a few milliseconds apart — roughly one run in three, or four in eight
+/// under load: the muxer waited on a stream whose demuxer was blocked
+/// pushing the *other* one, and how far apart the two `concat`s switched was
+/// the machine's business. Nothing here is the machine's business any more:
+/// one file is copied at a time, and a push never waits unless every muxer
+/// pad already has something to write.
+#[test]
+fn a_source_whose_sound_stops_early_is_copied() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match_with(
+        dir.path(),
+        &[
+            ("first half", 640, 360, 120),
+            ("second half", 640, 360, 120),
+        ],
+        CounterQuirks {
+            // Four seconds of picture, one of sound: three times the second
+            // a `queue` holds, so no queue size could have hidden this.
+            audio_tail: -90,
+            ..CounterQuirks::default()
+        },
+    );
+    let path = dir.path().join("out.mp4");
+
+    copy(job(&m, path.clone())).unwrap();
+
+    let counters = decode_counters(&path);
+    let want: Vec<u32> = m.frames.iter().flat_map(|&frames| 0..frames).collect();
+    assert_eq!(
+        counters, want,
+        "the join lost, repeated or reordered frames"
+    );
+
+    // **And the second half's sound starts where its picture does.** One base
+    // per source advances both tracks together (spec L7): eight seconds of
+    // picture, and sound that runs out a second into each half — five in all.
+    // A base per track, which `concat` had, would start the second half's
+    // sound where the first half's ran out, three seconds early, and every
+    // further source would add its own.
+    let (video, audio) = (stream_seconds(&path, "v:0"), stream_seconds(&path, "a:0"));
+    assert!(
+        (video - 8.0).abs() < 0.05 && (audio - 5.0).abs() < 0.1,
+        "the join moved a track: {video} s of picture against {audio} s of sound"
+    );
 }
 
 /// No cues: no sidecar, and whatever `.srt` was beside the old export is

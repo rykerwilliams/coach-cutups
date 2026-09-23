@@ -376,9 +376,10 @@ pub struct CounterQuirks {
     /// intervals late, so frame `after`'s duration doesn't reach the next
     /// frame's PTS.
     pub gap: Option<(u32, u32)>,
-    /// Frame intervals of audio past the video's end
-    /// ([`CounterKind::Vp8WebmWithAudio`] only).
-    pub audio_tail: u32,
+    /// Frame intervals of sound past the video's end, or **negative** for a
+    /// track that stops that far short of the picture (the kinds that have
+    /// sound at all).
+    pub audio_tail: i32,
 }
 
 /// [`counter_video`] with `quirks`. Frame `i` still shows `i`.
@@ -402,6 +403,9 @@ pub fn counter_video_with(
     );
     let caps = format!("video/x-raw,format=I420,width={w},height={h},framerate={fps}/1");
     let gap_slots = quirks.gap.map_or(0, |(_, slots)| slots);
+    // Buffers of sound for `frames` frames of picture: one each, plus the
+    // quirk's tail, which may take some away.
+    let audio_buffers = ((frames + gap_slots) as i32 + quirks.audio_tail).max(0);
     // The frame interval frame `i` is pushed at.
     let slot = move |i: u32| match quirks.gap {
         Some((after, slots)) if i > after => i + slots,
@@ -414,7 +418,6 @@ pub fn counter_video_with(
                 "fps {fps} must divide {AUDIO_RATE} so the audio matches the video duration"
             );
             let samples_per_buffer = AUDIO_RATE / fps;
-            let audio_buffers = frames + gap_slots + quirks.audio_tail;
             format!(
                 "appsrc name=src format=time caps={caps} \
                    ! vp8enc deadline=1 keyframe-max-dist={fps} ! queue ! mux. \
@@ -437,7 +440,6 @@ pub fn counter_video_with(
                 "fps {fps} must divide {AUDIO_RATE} so the audio matches the video duration"
             );
             let samples_per_buffer = AUDIO_RATE / fps;
-            let audio_buffers = frames + gap_slots + quirks.audio_tail;
             format!(
                 "appsrc name=src format=time caps={caps} \
                    ! x264enc bframes=2 key-int-max={fps} ! queue ! mux. \
