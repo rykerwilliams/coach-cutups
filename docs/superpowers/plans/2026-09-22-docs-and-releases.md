@@ -146,7 +146,8 @@ The plan was written against `origin/main` = `1213305`, when the workspace said 
   - `deploy` doesn't wait on `check`.
 - **Job `build`:**
   - checkout;
-  - the pinned mdbook;
+  - **mdbook pinned to `0.5.4`**, the version Task 4 built with;
+  - **a guard on the `book.toml` hazard, measured in Task 4:** given an unknown key, mdBook 0.5.4 logs `ERROR Failed to deserialize output.html`, **discards the whole `[output.html]` table and still exits 0** — so a typo would ship a site with no `site-url` and no edit links, green. Assert the output instead of trusting the exit status: `grep -q 'href="/coach-cutups/' docs/book/book/404.html`.
   - `sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev`;
   - `dtolnay/rust-toolchain@1.92` and `Swatinem/rust-cache@v2`;
   - `mdbook build docs/book`;

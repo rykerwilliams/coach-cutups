@@ -26,6 +26,9 @@ apple/App/Info.plist
 # Rust build artifacts
 target/
 
+# mdBook output (docs/book/src is the source; the site is built by CI)
+docs/book/book/
+
 # Local test fixtures (large video files; not tracked)
 fixtures/
 

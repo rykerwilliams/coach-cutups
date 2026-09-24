@@ -1,0 +1,12 @@
+[book]
+title = "Coach Cuts"
+src = "src"
+language = "en"
+
+[build]
+create-missing = false
+
+[output.html]
+site-url = "/coach-cutups/"
+git-repository-url = "https://github.com/rykerwilliams/coach-cutups"
+edit-url-template = "https://github.com/rykerwilliams/coach-cutups/edit/main/docs/book/{path}"
