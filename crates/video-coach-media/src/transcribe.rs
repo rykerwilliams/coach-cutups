@@ -25,6 +25,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::composite::audio::Reader;
 use crate::composite::CompositeError;
 use crate::download::{download, Fetch};
+use crate::job::{self, JobMessage};
 
 /// `WHISPER_SAMPLE_RATE`: the only rate whisper.cpp takes — `whisper_full`
 /// has no rate argument and does not resample, so the pipeline does.
@@ -509,6 +510,18 @@ pub enum TranscribeMessage {
     Finished(Result<String, TranscribeError>),
 }
 
+impl JobMessage for TranscribeMessage {
+    /// A job thread that unwound still has to finish, and the coach still has
+    /// to be told something they can act on — a bare `index out of bounds` is
+    /// not it. The panic's own words follow the sentence, for the developer
+    /// reading the same line.
+    fn panicked(message: String) -> TranscribeMessage {
+        TranscribeMessage::Finished(Err(TranscribeError::Failed(format!(
+            "the transcription stopped unexpectedly: {message}"
+        ))))
+    }
+}
+
 /// A running transcription: the sound of one recording read, then recognised.
 /// Dropping it cancels the run — and, unlike [`Exporter`](crate::Exporter),
 /// **does not wait for it**.
@@ -547,22 +560,16 @@ impl Transcriber {
     pub fn start(
         recording: PathBuf,
         kind: TranscribeKind,
-        mut on_message: impl FnMut(TranscribeMessage) + Send + 'static,
+        on_message: impl FnMut(TranscribeMessage) + Send + 'static,
     ) -> Transcriber {
         let cancel = Arc::new(AtomicBool::new(false));
-        // The handle is dropped on purpose: nothing here ever joins (see the
-        // type's own docs), and the last `Finished` is what says the job is
-        // over, on every path including a cancelled one.
-        std::thread::Builder::new()
-            .name("transcribe".into())
-            .spawn({
-                let cancel = cancel.clone();
-                move || {
-                    let result = transcribe(&recording, &kind, &cancel, &mut on_message);
-                    on_message(TranscribeMessage::Finished(result));
-                }
-            })
-            .expect("spawn the transcription thread");
+        // [`job::spawn`] is what makes the last `Finished` unconditional — on
+        // a cancelled path, a failed one and a panicked one alike. Nothing
+        // joins the thread it starts; see the type's own docs.
+        job::spawn("transcribe", on_message, {
+            let cancel = cancel.clone();
+            move |send| TranscribeMessage::Finished(transcribe(&recording, &kind, &cancel, send))
+        });
         Transcriber { cancel }
     }
 
@@ -594,7 +601,7 @@ fn transcribe(
     recording: &Path,
     kind: &TranscribeKind,
     cancel: &Arc<AtomicBool>,
-    on_message: &mut impl FnMut(TranscribeMessage),
+    on_message: &mut dyn FnMut(TranscribeMessage),
 ) -> Result<String, TranscribeError> {
     if let (TranscribeKind::Whisper { model, .. }, Some(fetch)) = (kind, kind.will_download()) {
         download(

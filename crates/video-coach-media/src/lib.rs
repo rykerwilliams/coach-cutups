@@ -10,6 +10,7 @@ pub mod composite;
 mod download;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod job;
 pub mod mailbox;
 mod overlay;
 pub mod player;
