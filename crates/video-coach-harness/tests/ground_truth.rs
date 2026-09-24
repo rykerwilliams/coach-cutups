@@ -31,17 +31,19 @@
 //! `--test-threads=1` because the analysis decodes whole halves, and two at
 //! once would fight over the decoder and ruin every timing line.
 
+use std::fmt;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use video_coach_core::signals::{
-    cheer_excess, cheers_from, whistles, Whistle, CHEER_MIN_SECONDS, CHEER_SNR_DB, MEDIAN_SECONDS,
-    SIGNAL_SAMPLE_RATE, WHISTLE_LONG_SECONDS, WHISTLE_MIN_SECONDS, WHISTLE_PITCH_HZ,
-    WHISTLE_SNR_DB, WHISTLE_TONALITY_DB,
+    cheer_excess, cheers_from, clap_texture_at, claps_from, whistles, ClapTexture, Whistle,
+    CHEER_MIN_SECONDS, CHEER_SNR_DB, CLAP_MIN_SECONDS, CLAP_RATE_SNR_DB, CLAP_TEXTURE_SECONDS,
+    MEDIAN_SECONDS, ONSET_RISE_DB, SIGNAL_SAMPLE_RATE, WHISTLE_LONG_SECONDS, WHISTLE_MIN_SECONDS,
+    WHISTLE_PITCH_HZ, WHISTLE_SNR_DB, WHISTLE_TONALITY_DB,
 };
 use video_coach_harness::score::{
-    cheer_coverage, print_audio_diagnostics, score, show_rate, Detection, ScoreReport, Tally,
+    onset_coverage, print_audio_diagnostics, score, show_rate, Detection, ScoreReport, Tally,
     CHEER_TOLERANCE, PERIOD_TOLERANCE, SEEK_LEAD, SEEK_WINDOW,
 };
 use video_coach_harness::truth::{folders, Truth};
@@ -56,6 +58,24 @@ const CHEER_MIN_SWEEP: [f64; 3] = [
     CHEER_MIN_SECONDS,
     CHEER_MIN_SECONDS + 0.5,
 ];
+
+/// The onset rises the texture pass is run at. This is the one clap threshold
+/// that changes the series rather than reading it, so each value costs its own
+/// pass over the samples; three is what a half's seconds will pay for.
+const CLAP_RISE_SWEEP: [f32; 3] = [4.0, ONSET_RISE_DB, 9.0];
+
+/// How far a texture must stand over its own rolling median. Wider than the
+/// cheer's ±1 dB because nothing has ever measured this cue: 2 dB is "a quarter
+/// more transients than usual" and 6 dB is "four times as many".
+const CLAP_SNR_SWEEP: [f32; 4] = [2.0, CLAP_RATE_SNR_DB, 4.0, 6.0];
+
+/// How long a texture must hold.
+const CLAP_MIN_SWEEP: [f64; 3] = [0.5, CLAP_MIN_SECONDS, 2.0];
+
+/// The sets every sweep is totalled over. The split is G2's: constants are
+/// chosen on the tuning match and read off the held-out ones, and `all` exists
+/// only so a number can be compared with the one Task 3.3 printed.
+const SETS: [&str; 3] = ["tuning", "held_out", "all"];
 
 #[test]
 #[ignore = "needs the coach's tagged matches: see this file's module docs"]
@@ -86,7 +106,10 @@ fn ground_truth() {
          whistle_snr={WHISTLE_SNR_DB:.1}dB whistle_tonality={WHISTLE_TONALITY_DB:.1}dB \
          whistle_pitch={WHISTLE_PITCH_HZ:.0}Hz whistle_min={WHISTLE_MIN_SECONDS:.2}s \
          whistle_long={WHISTLE_LONG_SECONDS:.1}s cheer_snr={CHEER_SNR_DB:.1}dB \
-         cheer_min={CHEER_MIN_SECONDS:.1}s detector=none",
+         cheer_min={CHEER_MIN_SECONDS:.1}s onset_rise={ONSET_RISE_DB:.1}dB \
+         clap_block={CLAP_TEXTURE_SECONDS:.1}s clap_rate_snr={CLAP_RATE_SNR_DB:.1}dB \
+         clap_min={CLAP_MIN_SECONDS:.1}s \
+         detector=none",
         tuning.name,
         held_out
             .iter()
@@ -95,11 +118,12 @@ fn ground_truth() {
             .join(","),
     );
 
-    // The sweep's totals, indexed as CHEER_SNR_SWEEP × CHEER_MIN_SWEEP: how
-    // many cheers the whole set produced, how many of the sixteen truth goals
-    // one covered, and the worst single half — a rule that averages well and
-    // fires forty times in one half is not a rule the coach would keep.
-    let mut sweep = [[Sweep::default(); CHEER_MIN_SWEEP.len()]; CHEER_SNR_SWEEP.len()];
+    // Two cues on the same tags, at the same tolerance, over the same halves:
+    // the level rule Task 3.3 measured, and the texture — how many sharp
+    // transients a second the 2 kHz-up band holds. The question is whether the
+    // texture finds goals the level cue cannot hear.
+    let mut grids = [Grid::level("cheer"), Grid::texture("clap_rate")];
+    let mut union = [Sweep::default(); SETS.len()];
 
     // No detector exists yet (Tasks 3.4–3.5 build it), so every match is
     // scored against an empty detection set: precision undefined, recall 0.
@@ -108,23 +132,54 @@ fn ground_truth() {
     let detected: Vec<Detection> = Vec::new();
     let mut aggregate = Tally::default();
     for (i, truth) in truths.iter().enumerate() {
+        // G2's split, and the only place it is decided: the first folder named
+        // is the tuning match and nothing else is.
+        let sets: &[usize] = if i == 0 { &[0, 2] } else { &[1, 2] };
         for (src, path) in truth.sources.iter().enumerate() {
             let analysis = analyse(path);
             analysis.print(&truth.name, src);
+
             let cheers = cheers_from(&analysis.excess, CHEER_SNR_DB, CHEER_MIN_SECONDS);
-            print_audio_diagnostics(&truth.name, src, &truth.events, &analysis.whistles, &cheers);
-            for (s, &snr) in CHEER_SNR_SWEEP.iter().enumerate() {
-                for (m, &min) in CHEER_MIN_SWEEP.iter().enumerate() {
-                    let cheers = cheers_from(&analysis.excess, snr, min);
-                    let (covered, goals) = cheer_coverage(&truth.events, src, &cheers);
+            let claps = claps_from(
+                &analysis.texture(ONSET_RISE_DB).rate_excess,
+                &analysis.texture(ONSET_RISE_DB).rate,
+                CLAP_RATE_SNR_DB,
+                CLAP_MIN_SECONDS,
+            );
+            print_audio_diagnostics(
+                &truth.name,
+                src,
+                &truth.events,
+                &analysis.whistles,
+                &cheers,
+                &claps,
+            );
+
+            for grid in &mut grids {
+                for (index, point) in grid.points.clone().iter().enumerate() {
+                    let onsets = analysis.onsets(grid.feature, *point);
+                    let (covered, goals) = onset_coverage(&truth.events, src, &onsets);
                     println!(
-                        "SWEEP  match={} src={src} cheer_snr={snr:.1} cheer_min={min:.1} \
-                         cheers={} goals_covered={covered}/{goals}",
+                        "SWEEP  match={} src={src} feature={} {point} bursts={} \
+                         goals_covered={covered}/{goals}",
                         truth.name,
-                        cheers.len(),
+                        grid.feature,
+                        onsets.len(),
                     );
-                    sweep[s][m].add(cheers.len(), covered, goals);
+                    for &set in sets {
+                        grid.cells[index][set].add(onsets.len(), covered, goals, analysis.seconds);
+                    }
                 }
+            }
+
+            // The one number that says whether the texture cue is worth having
+            // even if it loses on its own: how much of the match the two cues
+            // cover between them at their initial constants.
+            let mut both: Vec<f64> = cheers.iter().map(|c| c.onset).collect();
+            both.extend(claps.iter().map(|c| c.onset));
+            let (covered, goals) = onset_coverage(&truth.events, src, &both);
+            for &set in sets {
+                union[set].add(both.len(), covered, goals, analysis.seconds);
             }
         }
 
@@ -138,9 +193,97 @@ fn ground_truth() {
         }
     }
     aggregate.print("held_out", None);
-    for (s, &snr) in CHEER_SNR_SWEEP.iter().enumerate() {
-        for (m, &min) in CHEER_MIN_SWEEP.iter().enumerate() {
-            sweep[s][m].print(snr, min);
+    for grid in &grids {
+        grid.print();
+    }
+    for (set, totals) in union.iter().enumerate() {
+        totals.print(
+            SETS[set],
+            "cheer_or_clap",
+            Point {
+                rise: None,
+                snr: f32::NAN,
+                min: f64::NAN,
+            },
+        );
+    }
+}
+
+/// One point of a feature's threshold grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Point {
+    /// The onset rise the texture pass ran at — `None` for a feature the rise
+    /// does not reach.
+    rise: Option<f32>,
+    snr: f32,
+    min: f64,
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rise {
+            Some(rise) => write!(f, "rise={rise:.1} ")?,
+            None => write!(f, "rise=n/a ")?,
+        }
+        write!(f, "snr={:.1} min={:.1}", self.snr, self.min)
+    }
+}
+
+/// One feature's totals over its grid, for each of [`SETS`].
+struct Grid {
+    feature: &'static str,
+    points: Vec<Point>,
+    cells: Vec<[Sweep; SETS.len()]>,
+}
+
+impl Grid {
+    fn new(feature: &'static str, points: Vec<Point>) -> Grid {
+        let cells = vec![[Sweep::default(); SETS.len()]; points.len()];
+        Grid {
+            feature,
+            points,
+            cells,
+        }
+    }
+
+    /// The level cue's grid, exactly as Task 3.3 swept it.
+    fn level(feature: &'static str) -> Grid {
+        let mut points = Vec::new();
+        for &snr in &CHEER_SNR_SWEEP {
+            for &min in &CHEER_MIN_SWEEP {
+                points.push(Point {
+                    rise: None,
+                    snr,
+                    min,
+                });
+            }
+        }
+        Grid::new(feature, points)
+    }
+
+    /// The onset-rate grid: the rise as well, because it is what the series is
+    /// made of.
+    fn texture(feature: &'static str) -> Grid {
+        let mut points = Vec::new();
+        for &rise in &CLAP_RISE_SWEEP {
+            for &snr in &CLAP_SNR_SWEEP {
+                for &min in &CLAP_MIN_SWEEP {
+                    points.push(Point {
+                        rise: Some(rise),
+                        snr,
+                        min,
+                    });
+                }
+            }
+        }
+        Grid::new(feature, points)
+    }
+
+    fn print(&self) {
+        for (point, cells) in self.points.iter().zip(&self.cells) {
+            for (set, totals) in cells.iter().enumerate() {
+                totals.print(SETS[set], self.feature, *point);
+            }
         }
     }
 }
@@ -151,29 +294,74 @@ struct Analysis {
     /// The cheer band over its rolling median, kept rather than the cheers so
     /// the sweep costs nothing.
     excess: Vec<f32>,
+    /// One texture per [`CLAP_RISE_SWEEP`] value, in that order.
+    textures: Vec<ClapTexture>,
     /// How much sound there was, which is what the timing lines are per.
     seconds: f64,
     decode: Duration,
     signals: Duration,
+    texture: Duration,
 }
 
 impl Analysis {
+    /// The texture measured at `rise`.
+    fn texture(&self, rise: f32) -> &ClapTexture {
+        let at = CLAP_RISE_SWEEP
+            .iter()
+            .position(|r| *r == rise)
+            .expect("the rise is one this run measured");
+        &self.textures[at]
+    }
+
+    /// Where one feature says a burst began, at one grid point — the one shape
+    /// every cue is graded in, so the comparison between them is like for like.
+    fn onsets(&self, feature: &str, point: Point) -> Vec<f64> {
+        match feature {
+            "cheer" => cheers_from(&self.excess, point.snr, point.min)
+                .iter()
+                .map(|c| c.onset)
+                .collect(),
+            "clap_rate" => {
+                let texture = self.texture(point.rise.expect("the rate grid carries a rise"));
+                claps_from(&texture.rate_excess, &texture.rate, point.snr, point.min)
+                    .iter()
+                    .map(|c| c.onset)
+                    .collect()
+            }
+            other => panic!("no feature called {other}"),
+        }
+    }
+
     /// One `SIGNAL` line: what the pass found and what it cost (V-6's audio
     /// half; the motion pass is Task 3.4's).
     fn print(&self, match_name: &str, source_index: usize) {
+        let texture = self.texture(ONSET_RISE_DB);
+        let median = |values: &[f32]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f32::total_cmp);
+            sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
+        };
         println!(
             "SIGNAL match={match_name} src={source_index} dur={:.0} decode_s={:.1} \
-             signals_s={:.1} realtime={:.0}x whistles={} long={} longest={:.2}",
+             signals_s={:.1} texture_s={:.1} realtime={:.0}x whistles={} long={} longest={:.2} \
+             onset_rate_median={:.1} onset_rate_max={:.1}",
             self.seconds,
             self.decode.as_secs_f64(),
             self.signals.as_secs_f64(),
-            self.seconds / (self.decode + self.signals).as_secs_f64(),
+            self.texture.as_secs_f64(),
+            self.seconds / (self.decode + self.signals + self.texture).as_secs_f64(),
             self.whistles.len(),
             self.whistles.iter().filter(|w| w.is_long()).count(),
             // What the long floor would have to come down to to find any:
             // `long=0` on its own says nothing about whether the floor is
             // wrong or the whistles are absent.
             self.whistles.iter().map(|w| w.duration).fold(0.0, f64::max),
+            // The baseline the texture's dB are over. A half whose background
+            // already holds thirty transients a second has no headroom for
+            // applause to stand out in, and that is a fact about the venue
+            // rather than about the threshold.
+            median(&texture.rate),
+            texture.rate.iter().copied().fold(0.0, f32::max),
         );
     }
 }
@@ -188,43 +376,75 @@ fn analyse(path: &Path) -> Analysis {
     let started = Instant::now();
     let whistles = whistles(&samples);
     let excess = cheer_excess(&samples);
+    let signals = started.elapsed();
+    let started = Instant::now();
+    let textures = CLAP_RISE_SWEEP
+        .iter()
+        .map(|&rise| clap_texture_at(&samples, rise))
+        .collect();
     Analysis {
         whistles,
         excess,
+        textures,
         seconds: samples.len() as f64 / f64::from(SIGNAL_SAMPLE_RATE),
         decode,
-        signals: started.elapsed(),
+        signals,
+        texture: started.elapsed(),
     }
 }
 
-/// One grid point's totals over every half in the run.
+/// One grid point's totals over every half in one set.
 #[derive(Debug, Clone, Copy, Default)]
 struct Sweep {
-    cheers: usize,
+    bursts: usize,
+    halves: usize,
     /// The most any single half produced.
     worst_half: usize,
     covered: usize,
     goals: usize,
+    /// How many goals this many bursts would have covered if they had fallen
+    /// at random — see [`Sweep::print`].
+    chance: f64,
 }
 
 impl Sweep {
-    fn add(&mut self, cheers: usize, covered: usize, goals: usize) {
-        self.cheers += cheers;
-        self.worst_half = self.worst_half.max(cheers);
+    fn add(&mut self, bursts: usize, covered: usize, goals: usize, seconds: f64) {
+        self.bursts += bursts;
+        self.halves += 1;
+        self.worst_half = self.worst_half.max(bursts);
         self.covered += covered;
         self.goals += goals;
+        // A goal is "covered" when some burst's onset lands within
+        // CHEER_TOLERANCE of it, so `bursts` onsets scattered at random over a
+        // half of `seconds` cover it with probability
+        // `1 − (1 − 2·tolerance/seconds)^bursts`. This is not a nicety: a grid
+        // point that fires every fourteen seconds covers seven goals in ten
+        // *knowing nothing*, and without this column that reads as a detector.
+        let reach = (2.0 * CHEER_TOLERANCE / seconds).min(1.0);
+        self.chance += goals as f64 * (1.0 - (1.0 - reach).powi(bursts as i32));
     }
 
-    fn print(&self, snr: f32, min: f64) {
+    fn print(&self, set: &str, feature: &str, point: Point) {
         let recall = (self.goals != 0).then(|| self.covered as f64 / self.goals as f64);
+        // Firings a half, not firings: the sets hold different numbers of
+        // halves, and a rule is kept or dropped on what one half of it looks
+        // like to the coach.
+        let per_half = (self.halves != 0).then(|| self.bursts as f64 / self.halves as f64);
+        // `lift` is the only column that compares two cues fairly: recall
+        // alone rewards a rule for firing more often, and these rules can be
+        // made to fire as often as you like.
+        let chance = (self.goals != 0).then(|| self.chance / self.goals as f64);
         println!(
-            "SWEEP  set=all cheer_snr={snr:.1} cheer_min={min:.1} cheers={} \
-             worst_half={} goals_covered={}/{} r={}",
-            self.cheers,
+            "SWEEP  set={set} feature={feature} {point} bursts={} per_half={} \
+             worst_half={} goals_covered={}/{} r={} chance={} lift={}",
+            self.bursts,
+            per_half.map_or("n/a".to_string(), |r| format!("{r:.1}")),
             self.worst_half,
             self.covered,
             self.goals,
             show_rate(recall),
+            show_rate(chance),
+            show_rate(recall.zip(chance).map(|(r, c)| r - c)),
         );
     }
 }

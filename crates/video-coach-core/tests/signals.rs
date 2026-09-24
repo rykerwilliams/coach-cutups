@@ -7,7 +7,7 @@
 //! term that separates a whistle from a shout.
 
 use video_coach_core::signals::{
-    cheers, whistles, Cheer, Whistle, CHEER_MIN_SECONDS, HOP_SAMPLES, HOP_SECONDS,
+    cheers, claps, whistles, Cheer, Clap, Whistle, CHEER_MIN_SECONDS, HOP_SAMPLES, HOP_SECONDS,
     SIGNAL_SAMPLE_RATE, WHISTLE_BIN_HZ, WHISTLE_LONG_SECONDS, WHISTLE_MIN_SECONDS,
 };
 
@@ -230,6 +230,95 @@ fn a_rise_that_does_not_hold_is_not_a_cheer() {
     let mut sound = crowd(60.0, 0.01, |_| 1.0);
     louder(&mut sound, 30.0, 0.6, 10.0);
     assert_eq!(cheers(&sound), Vec::new());
+}
+
+// ----------------------------------------------------------------- claps
+//
+// The cue these pin is the one the level cue cannot reach: applause is quiet
+// and textured, so every fixture here is built so that the *level* rule and the
+// *texture* rule disagree about it.
+
+/// Adds a train of `per_second` hand claps over `[start, start + duration)`.
+///
+/// Each clap is a burst of white noise with a 2 ms decay and no sustain, which
+/// is what one looks like on a 2 ms envelope: the attack lands inside one block
+/// and the tail is gone three blocks later. The gaps are jittered by ±20 %,
+/// because a crowd clapping in lockstep is a fixture artefact and a periodic
+/// train is the one thing a rate counter could get right by accident.
+fn clapping(samples: &mut [f32], start: f64, duration: f64, per_second: f64, amplitude: f32) {
+    let mut noise = Noise::new();
+    let gap = RATE / per_second;
+    let tail = at(0.010);
+    let end = at(start + duration).min(samples.len());
+    let mut n = at(start);
+    while n < end {
+        for k in 0..tail.min(end - n) {
+            let decay = (-(k as f32) / (RATE as f32 * 0.002)).exp();
+            samples[n + k] += amplitude * decay * noise.next();
+        }
+        n += (gap * (1.0 + 0.2 * f64::from(noise.next()))) as usize;
+    }
+}
+
+#[test]
+fn a_train_of_transients_is_one_clap() {
+    let mut sound = crowd(90.0, 0.01, |_| 1.0);
+    clapping(&mut sound, 45.0, 3.0, 20.0, 0.06);
+    let found: Vec<Clap> = claps(&sound);
+    let clap = only(&found, "clap");
+    assert!(
+        (clap.onset - 45.0).abs() <= 1.0,
+        "{clap:?} does not start at 45 s"
+    );
+    assert!(
+        clap.duration >= 2.0,
+        "{clap:?} covers less than the 3 s train"
+    );
+    assert!(
+        clap.rate >= 10.0,
+        "{clap:?} counts under half of a 20 a second train"
+    );
+}
+
+#[test]
+fn a_shout_the_level_rule_fires_on_is_not_a_clap() {
+    // The same background, raised 10 dB for three seconds: one sustained
+    // broadband sound, which is what a shout is. It is **louder** than the clap
+    // train above and the level rule takes it — so this is the fixture that
+    // says the texture rule is not the level rule wearing a different name.
+    let mut sound = crowd(90.0, 0.01, |_| 1.0);
+    louder(&mut sound, 45.0, 3.0, 10.0);
+    assert_eq!(cheers(&sound).len(), 1, "the level rule should fire on it");
+    assert_eq!(claps(&sound), Vec::new());
+}
+
+#[test]
+fn a_whistle_is_not_a_clap() {
+    let mut sound = crowd(90.0, 0.01, |_| 1.0);
+    tone(&mut sound, 45.0, 3.0, 3_200.0, 3_200.0, 0.1);
+    assert_eq!(claps(&sound), Vec::new());
+}
+
+#[test]
+fn clapping_rides_a_venue_that_is_getting_louder() {
+    // The same 20 dB ramp the cheer rule is pinned against. Nothing absolute
+    // survives it, and the texture's rolling median is what makes a quiet
+    // venue's applause and a loud one's comparable.
+    let mut sound = crowd(180.0, 0.01, |t| {
+        10.0f32.powf((t as f32 / 180.0) * 20.0 / 20.0)
+    });
+    clapping(
+        &mut sound,
+        150.0,
+        3.0,
+        20.0,
+        0.06 * 10.0f32.powf(20.0 / 20.0),
+    );
+    let clap = only(&claps(&sound), "clap");
+    assert!(
+        (clap.onset - 150.0).abs() <= 1.0,
+        "{clap:?} does not start at 150 s"
+    );
 }
 
 #[test]

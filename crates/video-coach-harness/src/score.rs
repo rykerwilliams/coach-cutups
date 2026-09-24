@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use video_coach_core::signals::{Cheer, Whistle};
+use video_coach_core::signals::{Cheer, Clap, Whistle};
 
 use crate::truth::{TruthEvent, TruthKind};
 
@@ -332,6 +332,7 @@ pub fn print_audio_diagnostics(
     truth: &[TruthEvent],
     whistles: &[Whistle],
     cheers: &[Cheer],
+    claps: &[Clap],
 ) {
     let long: Vec<&Whistle> = whistles.iter().filter(|w| w.is_long()).collect();
     for tag in truth
@@ -344,13 +345,26 @@ pub fn print_audio_diagnostics(
             tag.seconds,
         );
         match tag.kind {
-            TruthKind::Goal => match nearest(cheers, tag.seconds, |c| c.onset) {
-                Some((cheer, offset)) => println!(
-                    "{head} cheer={offset:+.1} dur={:.1} peak={:+.1}",
-                    cheer.duration, cheer.peak_db
-                ),
-                None => println!("{head} cheer=none"),
-            },
+            // Both cues on one line, so a goal the level cue missed and the
+            // texture cue found — the whole question this pass exists to
+            // answer — is one line to read rather than two to join up.
+            TruthKind::Goal => {
+                let cheer = match nearest(cheers, tag.seconds, |c| c.onset) {
+                    Some((cheer, offset)) => format!(
+                        "cheer={offset:+.1} cheer_dur={:.1} cheer_peak={:+.1}",
+                        cheer.duration, cheer.peak_db
+                    ),
+                    None => "cheer=none".to_string(),
+                };
+                let clap = match nearest(claps, tag.seconds, |c| c.onset) {
+                    Some((clap, offset)) => format!(
+                        "clap={offset:+.1} clap_dur={:.1} clap_peak={:+.1} clap_rate={:.1}",
+                        clap.duration, clap.peak_db, clap.rate
+                    ),
+                    None => "clap=none".to_string(),
+                };
+                println!("{head} {cheer} {clap}");
+            }
             // The long whistle is what D4 says a period ends on, so it is
             // reported first; when the half has none — and measured, no half
             // in the design footage has one at the initial constants — the
@@ -380,6 +394,17 @@ pub fn cheer_coverage(
     source_index: usize,
     cheers: &[Cheer],
 ) -> (usize, usize) {
+    let onsets: Vec<f64> = cheers.iter().map(|c| c.onset).collect();
+    onset_coverage(truth, source_index, &onsets)
+}
+
+/// How many goals on one source have **any** of `onsets` within
+/// [`CHEER_TOLERANCE`], out of how many there are.
+///
+/// Onsets rather than a burst type, so that one cue, another cue and the union
+/// of the two are all graded by the same function at the same tolerance — which
+/// is the only way the comparison between them means anything.
+pub fn onset_coverage(truth: &[TruthEvent], source_index: usize, onsets: &[f64]) -> (usize, usize) {
     let goals = truth
         .iter()
         .filter(|t| t.source_index == source_index && t.kind == TruthKind::Goal);
@@ -387,7 +412,7 @@ pub fn cheer_coverage(
     let mut total = 0;
     for goal in goals {
         total += 1;
-        if nearest(cheers, goal.seconds, |c| c.onset)
+        if nearest(onsets, goal.seconds, |o| *o)
             .is_some_and(|(_, offset)| offset.abs() <= CHEER_TOLERANCE)
         {
             covered += 1;
