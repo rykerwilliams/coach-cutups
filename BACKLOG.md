@@ -807,3 +807,15 @@ Each entry: what, why deferred, when to revisit.
   than a logic error. It is not BACKLOG #70 (that is the whisper teardown).
 - **When to revisit:** if it recurs, or if a coach reports a take whose replay
   drifts from where they paused. Start by printing the margin on failure.
+
+76. **`a_cancelled_copy_leaves_nothing`'s fixtures sit on the 30 s EOS bound.**
+  That test generates two 1280×720 × 900-frame H.264 sources, and
+  `fixtures.rs`'s pipeline bound is 30 s; unloaded the suite takes ~29 s, so on
+  any busy machine (CI included) the test fails in fixture generation with
+  "fixture pipeline did not reach EOS within 30 s" — nothing to do with the
+  copy it tests. Verified pre-existing on unmodified HEAD under load, 3 of 3.
+- **Why deferred:** it fails loudly in the fixture, not silently in the code,
+  and the copy path itself is proven by the deterministic deadlock test.
+- **When to revisit:** the first time CI fails on it, or with the next test
+  touching that file — a smaller fixture (fewer frames, or 640×360) is the fix,
+  not a wider bound.

@@ -81,7 +81,8 @@ fn whole_match_with(
     }
 }
 
-/// A copy of `m` to `path`, with no scoreboard beside it.
+/// A copy of `m` to `path`, with no scoreboard at all: no sidecar written and
+/// no track requested.
 fn job(m: &Match, path: PathBuf) -> ExportJob {
     ExportJob {
         compilation: m.compilation.clone(),
@@ -169,6 +170,69 @@ fn stream_seconds(path: &Path, stream: &str) -> f64 {
         .expect("a stream duration in seconds")
 }
 
+/// `path`'s subtitle track as `(start, end, text)`, read out of the samples
+/// themselves (spec T1).
+///
+/// **`mp4mux` writes an empty sample between cues** — measured, and expected:
+/// 3,400 cues come back as 6,799 samples, and here two come back as three.
+/// They are the muxer's own "nothing is on screen now", two bytes of zero
+/// length and no text, and they are dropped here, so what is left is the cue
+/// list that was written.
+fn subtitle_cues(path: &Path) -> Vec<(f64, f64, String)> {
+    ffprobe(
+        path,
+        &["-select_streams", "s:0", "-show_packets", "-show_data"],
+    )["packets"]
+        .as_array()
+        .expect("a packets array")
+        .iter()
+        .filter_map(|p| {
+            let seconds = |key: &str| {
+                p[key]
+                    .as_str()
+                    .expect("a packet time")
+                    .parse::<f64>()
+                    .expect("a packet time in seconds")
+            };
+            let text = tx3g_text(p["data"].as_str().unwrap_or_default());
+            let start = seconds("pts_time");
+            (!text.is_empty()).then(|| (start, start + seconds("duration_time"), text))
+        })
+        .collect()
+}
+
+/// The text of one `tx3g` sample, out of `ffprobe -show_data`'s hex dump.
+///
+/// A sample is a two-byte big-endian length and then the UTF-8 itself. The
+/// dump's own ASCII column is not read instead: it replaces every byte past
+/// 0x7f with a dot, and the scoreboard's separator is a `·`. The hex runs in
+/// fixed columns — eight bytes of offset, `": "`, then 39 columns — so taking
+/// those and keeping the hex digits cannot stray into the ASCII.
+fn tx3g_text(dump: &str) -> String {
+    let hex: String = dump
+        .lines()
+        .flat_map(|line| line.chars().skip(10).take(39))
+        .filter(char::is_ascii_hexdigit)
+        .collect();
+    let bytes: Vec<u8> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).expect("hex is ASCII"), 16)
+                .expect("a hex byte")
+        })
+        .collect();
+    String::from_utf8(bytes.get(2..).unwrap_or_default().to_vec()).expect("a tx3g sample is UTF-8")
+}
+
+/// How many streams `path` has.
+fn streams(path: &Path) -> usize {
+    ffprobe(path, &["-show_streams"])["streams"]
+        .as_array()
+        .expect("a streams array")
+        .len()
+}
+
 /// `path`'s chapters as `(start in seconds, title)`.
 fn chapters(path: &Path) -> Vec<(f64, String)> {
     ffprobe(path, &["-show_chapters"])["chapters"]
@@ -191,14 +255,17 @@ fn want(m: &Match) -> Vec<u32> {
 
 /// Two sources joined: every frame of the first, then every frame of the
 /// second, in the sources' own codec, with the plan's chapters on top and the
-/// scoreboard in an `.srt` beside it.
+/// scoreboard both in an `.srt` beside it and on a `tx3g` track inside it.
 ///
 /// The chapters are what prove the `moov` was reserved: without
 /// `reserved-max-duration` the muxer writes it last, `chapters::splice` finds
 /// no room and skips, and this reads back empty.
 ///
 /// The cues are written as core formats them — the score and the clock are
-/// core's, and nothing about SRT lives in media.
+/// core's, and nothing about SRT lives in media — and the same lines go on the
+/// embedded track, which is what survives the file being copied somewhere a
+/// sidecar isn't (spec T1). A cue whose separator is a `·` is deliberate: the
+/// track carries UTF-8, not ASCII.
 #[test]
 fn a_copy_of_two_sources_is_lossless_and_chaptered() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,6 +334,28 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
         cues_to_srt(&cues)
     );
 
+    // And the same cues inside the file. The times are exact to the
+    // millisecond because the track's timescale is pinned to 1000 (spec T1):
+    // left automatic, a cue boundary rounds to whatever `mp4mux` chose.
+    let embedded = subtitle_cues(&path);
+    assert_eq!(
+        embedded.len(),
+        cues.len(),
+        "the text track reads: {embedded:?}"
+    );
+    for ((start, end, text), cue) in embedded.iter().zip(&cues) {
+        assert_eq!(text, &cue.text);
+        assert!(
+            (start - cue.start).abs() < 0.001 && (end - cue.end).abs() < 0.001,
+            "the cue {text:?} runs {start}..{end}, not {}..{}",
+            cue.start,
+            cue.end
+        );
+    }
+    let text = &ffprobe(&path, &["-select_streams", "s:0", "-show_streams"])["streams"][0];
+    assert_eq!(text["codec_tag_string"].as_str(), Some("tx3g"));
+    assert_eq!(text["time_base"].as_str(), Some("1/1000"));
+
     let got = chapters(&path);
     assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");
     for ((at, title), (want_at, want_title)) in got.iter().zip(&expected) {
@@ -309,15 +398,22 @@ fn a_single_source_is_copied_with_no_chapters() {
     assert_eq!(video_stream(&path).4, video_stream(&m.files[0]).4);
     assert_eq!(done.sidecar, Some(dir.path().join("out.srt")));
     assert!(chapters(&path).is_empty(), "a lone source got a chapter");
+    // Picture, sound and the scoreboard: a lone source is carried on the same
+    // three tracks a joined one is.
+    assert_eq!(streams(&path), 3, "a track went missing");
+    assert_eq!(
+        subtitle_cues(&path),
+        vec![(cues[0].start, cues[0].end, cues[0].text.clone())]
+    );
 }
 
-/// Sources with no sound at all: no audio pad is requested and the output has
-/// none (spec E4).
+/// Sources with no sound at all, and no scoreboard to carry: neither pad is
+/// requested and the output has picture and nothing else (spec E4, T1).
 ///
 /// The muxer takes its pads once and for all before the first packet, so
-/// "there is no audio track" is a decision the gate makes and nothing after it
-/// can revisit — which is why it has a test of its own rather than riding on
-/// the sounded ones.
+/// "there is no audio track" and "there is no subtitle track" are decisions
+/// made before `PLAYING` that nothing after can revisit — which is why they
+/// have a test of their own rather than riding on the sounded ones.
 #[test]
 fn sources_with_no_sound_are_copied_without_an_audio_track() {
     let dir = tempfile::tempdir().unwrap();
@@ -336,11 +432,11 @@ fn sources_with_no_sound_are_copied_without_an_audio_track() {
         want(&m),
         "the join lost, repeated or reordered frames"
     );
-    let streams = ffprobe(&path, &["-show_streams"])["streams"]
-        .as_array()
-        .expect("a streams array")
-        .len();
-    assert_eq!(streams, 1, "the copy invented a track");
+    assert_eq!(
+        streams(&path),
+        1,
+        "the copy invented a track nothing was asked to be put on"
+    );
 }
 
 /// Sources whose sound stops three seconds short of their picture: the

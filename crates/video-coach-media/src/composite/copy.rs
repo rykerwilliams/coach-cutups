@@ -7,6 +7,7 @@
 //!                                                 ! aacparse  ! appsink
 //! into, for the whole output:   appsrc ! mp4mux ! filesink <path>.part
 //!                               appsrc ! that same mp4mux
+//!                               appsrc (the cues) ! that same mp4mux
 //! ```
 //!
 //! **Rust owns the ordering, as the encoded export's pump does, and that is
@@ -56,6 +57,16 @@
 //! chapters and the cues are placed at, which is the only way those three can
 //! agree by construction.
 //!
+//! **The scoreboard rides inside the file as well as beside it** (spec T1).
+//! When the run has cues, a third pad carries them as a `tx3g` text track —
+//! the same lines the `.srt` gets — so the board survives the file being
+//! copied to a phone or sent on, where a sidecar does not. It is the one pad
+//! here that is not fed from a demuxer: [`Output::start`] pushes the whole
+//! list, which is a couple of hundred kilobytes on a full match, and ends that
+//! stream at once. **A requested pad that runs dry stalls the muxer**, so the
+//! cues are never trickled: the track is complete before the first packet of
+//! picture arrives, and from there it can only be drained.
+//!
 //! **Nothing downstream refuses a mismatch for us.** Concatenating a 320×240
 //! and a 640×480 H.264 file through this graph produced no error and no
 //! warning (measured): one file, one `stsd`, describing most of its samples
@@ -71,13 +82,14 @@ use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use video_coach_core::cues::Cue;
 use video_coach_core::export::OUTPUT_FPS;
 
 use super::export::{
     reserve_remaining, reserved_duration, ExportError, ExportJob, ExportMessage, Render, Rendered,
 };
 use super::{frame_time, watch_bus, Stopper, Watch, POLL};
-use crate::player::{seconds, Diagnostics};
+use crate::player::{seconds, seconds_to_clock, Diagnostics};
 
 /// How long a file has to declare its streams before the copy gives up.
 ///
@@ -101,6 +113,12 @@ const STALL: Duration = Duration::from_secs(60);
 /// exactly. Left automatic, `mp4mux` picks a timescale that need not divide
 /// the source's, and then every sample duration rounds.
 const VIDEO_TIMESCALE: u32 = 90_000;
+
+/// The scoreboard track's timescale (spec T1): the conventional text clock,
+/// and the one at which every millisecond the `.srt` beside the file can
+/// express lands on a tick exactly. Left automatic, `mp4mux` picks its own and
+/// a cue boundary rounds to it.
+const TEXT_TIMESCALE: u32 = 1_000;
 
 /// How far ahead of the muxer a track may run before a push waits, in bytes
 /// of queued packets — about six seconds of the design footage.
@@ -176,7 +194,10 @@ pub(super) fn copy(
     // and with it the `.part` — is built only once they can all be joined.
     let audio_rate = declare(&files, &watch)?;
 
-    let out = Output::start(part, total, audio_rate, &watch)?;
+    // `None` is "leave the scoreboard beside this output alone" (spec T1); it
+    // is no more a track here than it is a sidecar.
+    let cues = job.cues.as_deref().unwrap_or_default();
+    let out = Output::start(part, total, audio_rate, cues, &watch)?;
     let mut percent = 0;
     for (entry, file) in job.compilation.plan.entries.iter().zip(&files) {
         // **The plan says where this source starts**, and so do the chapters
@@ -571,12 +592,19 @@ struct Output {
 }
 
 impl Output {
-    /// Builds and starts the muxing pipeline. `audio_rate` is the sample rate
-    /// of the sources' sound, or `None` when they have none (spec E4).
+    /// Builds and starts the muxing pipeline, and writes `cues` to the
+    /// scoreboard track. `audio_rate` is the sample rate of the sources'
+    /// sound, or `None` when they have none (spec E4).
+    ///
+    /// **Every pad this run will have is requested here**, before `PLAYING`:
+    /// `mp4mux` takes its pads once and for all, so whether there is a
+    /// scoreboard track is settled by `cues` being empty or not and nothing
+    /// after this can revisit it.
     fn start(
         part: &Path,
         total: usize,
         audio_rate: Option<u32>,
+        cues: &[Cue],
         watch: &Watch,
     ) -> Result<Output, ExportError> {
         let pipeline = gst::Pipeline::new();
@@ -601,6 +629,12 @@ impl Output {
             total,
             error: watch.error.clone(),
         });
+        // Requested only when there is something to put on it (spec T1): an
+        // empty cue list leaves the output with no subtitle track at all,
+        // rather than an empty one for a player to offer.
+        let text = (!cues.is_empty())
+            .then(|| text_track(&pipeline, &mux))
+            .transpose()?;
         let eos = watch_bus(&pipeline, watch, |_| {});
         let out = Output {
             pipeline: Stopper(pipeline),
@@ -610,6 +644,9 @@ impl Output {
         };
         if out.pipeline.set_state(gst::State::Playing).is_err() {
             return Err(watch.failure("could not start the copy"));
+        }
+        if let Some(text) = &text {
+            write_cues(text, cues);
         }
         Ok(out)
     }
@@ -706,19 +743,94 @@ fn feed(
     // Each source arrives with its own segment, re-based onto the output's
     // timeline; without this `appsrc` would keep the first one and warn.
     src.set_property("handle-segment-change", true);
+    attach(pipeline, mux, &src, template, timescale)?;
+    Ok(src)
+}
+
+/// The scoreboard's own track (spec T1): an `appsrc` of
+/// `text/x-raw, format=utf8` into a `subtitle_%u` pad, which `mp4mux` writes
+/// as `tx3g`.
+///
+/// **Unbounded, because the whole list goes in at once.** A match is a few
+/// thousand cues and a couple of hundred kilobytes — nothing against the
+/// gigabytes of picture beside it — and holding it all is what makes this pad
+/// incapable of running dry while the copy is still going.
+fn text_track(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+) -> Result<gst_app::AppSrc, ExportError> {
+    let src = gst_app::AppSrc::builder()
+        .format(gst::Format::Time)
+        .is_live(false)
+        .block(false)
+        // 0 is `appsrc`'s "no limit": see this function's doc.
+        .max_bytes(0)
+        .caps(
+            &gst::Caps::builder("text/x-raw")
+                .field("format", "utf8")
+                .build(),
+        )
+        .build();
+    attach(pipeline, mux, &src, "subtitle_%u", TEXT_TIMESCALE)?;
+    Ok(src)
+}
+
+/// Writes every cue to the scoreboard track and ends it.
+///
+/// **The whole track, before a packet of picture is copied.** The cues are
+/// output times already (spec U2), so they ride `appsrc`'s own segment
+/// untouched — nothing here is re-based the way a source's packets are. Ending
+/// the stream immediately is what keeps a third pad from being a third way to
+/// stall: `appsrc` sends the EOS after the muxer has taken the last cue, so
+/// the pad has something to write until it has written everything, and is then
+/// out of the muxer's accounting altogether.
+///
+/// **`mp4mux` writes an empty sample between cues** (measured: 3,400 cues come
+/// back as 6,799 samples). That is the muxer's own way of saying "nothing is on
+/// screen now", not a cue this pushed, and it is why a sample count read off
+/// the finished file is about twice the number of lines written here.
+fn write_cues(src: &gst_app::AppSrc, cues: &[Cue]) {
+    for cue in cues {
+        let start = seconds_to_clock(cue.start);
+        let mut buffer = gst::Buffer::from_slice(cue.text.clone().into_bytes());
+        {
+            let buffer = buffer.get_mut().expect("a fresh buffer is writable");
+            buffer.set_pts(start);
+            // A cue ends where the next begins, and `end` is never before
+            // `start`; `saturating_sub` says so rather than trusting it.
+            buffer.set_duration(seconds_to_clock(cue.end).saturating_sub(start));
+        }
+        if src.push_buffer(buffer).is_err() {
+            break;
+        }
+    }
+    let _ = src.end_of_stream();
+}
+
+/// Adds `src` to the pipeline and links it to a freshly requested `template`
+/// pad of `mux`, with that track's timescale pinned (spec L3, T1).
+fn attach(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+    src: &gst_app::AppSrc,
+    template: &str,
+    timescale: u32,
+) -> Result<(), ExportError> {
     add_many(pipeline, &[src.upcast_ref()])?;
     let pad = mux.request_pad_simple(template).ok_or_else(|| {
         ExportError::Failed(format!("the muxer gave no {template} pad for the copy"))
     })?;
     pad.set_property("trak-timescale", timescale);
-    link_pads(src.upcast_ref(), &pad)?;
-    Ok(src)
+    link_pads(src.upcast_ref(), &pad)
 }
 
-/// The muxer's tracks, and where on the output's timeline the copy has
-/// reached. Every source's packets pass through here, one source at a time.
+/// The muxer's **copied** tracks, and where on the output's timeline the copy
+/// has reached. Every source's packets pass through here, one source at a
+/// time.
 ///
-/// There is no third track: the scoreboard is a sidecar file (spec T1).
+/// The scoreboard's track is not one of these: it is written whole before any
+/// source is opened and never touched again (see [`write_cues`]), so it is
+/// nothing a demuxer thread has to know about.
 struct Copying {
     video: gst_app::AppSrc,
     /// `None` when no source has sound (spec E4).
