@@ -5,13 +5,12 @@
 //! in core because only the ground-truth test calls it — nothing the app ships
 //! scores anything.
 //!
-//! The detection types mirror the spec's `SuggestionKind` but are **owned
-//! here**, so P3 measures without a project-format change. P4 adds the stored
-//! shape.
+//! A [`Detection`] is one of core's suggestions positioned on a source. The
+//! kinds and tiers are core's own (`core::kickoff`), which is also the shape
+//! P4 stores in `project.json`; what lives here is only the grading.
 
-use std::fmt;
-
-use video_coach_core::signals::{Cheer, Clap, Whistle};
+pub use video_coach_core::kickoff::{GoalTier, SuggestionKind};
+use video_coach_core::signals::{Cheer, Whistle};
 
 use crate::truth::{TruthEvent, TruthKind};
 
@@ -35,37 +34,9 @@ pub const SEEK_WINDOW: f64 = 20.0;
 
 // ------------------------------------------------------------- detections
 
-/// How much evidence a goal detection has (D4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoalTier {
-    /// A cheer in `[window start, K − 15 s]`.
-    High,
-    /// A kick-off with no cheer behind it.
-    Quiet,
-}
-
-impl fmt::Display for GoalTier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            GoalTier::High => "high",
-            GoalTier::Quiet => "quiet",
-        })
-    }
-}
-
-/// What a detection claims to have found.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DetectionKind {
-    Goal {
-        tier: GoalTier,
-        /// `[start, end]` in source seconds: where the goal must be (D4).
-        window: (f64, f64),
-        /// The estimated instant, high tier only.
-        at: Option<f64>,
-    },
-    PeriodStart,
-    PeriodEnd,
-}
+// `GoalTier` and `SuggestionKind` are **core's** (`core::kickoff`): the rule
+// that produces them lives there, and P4 stores that same shape in
+// `project.json`. The harness only positions one on a source and grades it.
 
 /// One suggestion, positioned on one source.
 ///
@@ -75,7 +46,7 @@ pub enum DetectionKind {
 pub struct Detection {
     pub source_index: usize,
     pub seconds: f64,
-    pub kind: DetectionKind,
+    pub kind: SuggestionKind,
 }
 
 impl Detection {
@@ -83,15 +54,15 @@ impl Detection {
     /// goal, the window start for a quiet one, and 10 s early for a period.
     pub fn seek(&self) -> f64 {
         match self.kind {
-            DetectionKind::Goal {
+            SuggestionKind::Goal {
                 window,
                 at: Some(at),
                 ..
             } => (at - SEEK_LEAD).max(window.0),
-            DetectionKind::Goal {
+            SuggestionKind::Goal {
                 window, at: None, ..
             } => window.0,
-            DetectionKind::PeriodStart | DetectionKind::PeriodEnd => self.seconds - SEEK_LEAD,
+            SuggestionKind::PeriodStart | SuggestionKind::PeriodEnd => self.seconds - SEEK_LEAD,
         }
     }
 }
@@ -317,8 +288,13 @@ pub fn nearest<'a, T: 'a>(
         .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
 }
 
-/// The `DIAG` lines (Task 3.3): for every tag on one source, the signal that
-/// should have found it and how far away it sat.
+/// The `DIAG` lines: for every tag on one source, the signal that should have
+/// found it and how far away it sat.
+///
+/// The applause texture had a column here while it was being measured, and no
+/// longer does: it lost to the level cue at every matched firing rate on the
+/// held-out matches, so the run no longer pays a pass over the samples for it.
+/// `core::signals::clap_texture` keeps the cue and that measurement.
 ///
 /// **No detection is involved.** These say whether the cue exists in the
 /// sound at all, which is a different question from whether the rules built on
@@ -332,7 +308,6 @@ pub fn print_audio_diagnostics(
     truth: &[TruthEvent],
     whistles: &[Whistle],
     cheers: &[Cheer],
-    claps: &[Clap],
 ) {
     let long: Vec<&Whistle> = whistles.iter().filter(|w| w.is_long()).collect();
     for tag in truth
@@ -356,14 +331,7 @@ pub fn print_audio_diagnostics(
                     ),
                     None => "cheer=none".to_string(),
                 };
-                let clap = match nearest(claps, tag.seconds, |c| c.onset) {
-                    Some((clap, offset)) => format!(
-                        "clap={offset:+.1} clap_dur={:.1} clap_peak={:+.1} clap_rate={:.1}",
-                        clap.duration, clap.peak_db, clap.rate
-                    ),
-                    None => "clap=none".to_string(),
-                };
-                println!("{head} {cheer} {clap}");
+                println!("{head} {cheer}");
             }
             // The long whistle is what D4 says a period ends on, so it is
             // reported first; when the half has none — and measured, no half
@@ -448,8 +416,8 @@ pub fn score(truth: &[TruthEvent], found: &[Detection]) -> ScoreReport {
 
     score_goals(truth, found, &mut report);
     for (kind, detected) in [
-        (TruthKind::PeriodStart, DetectionKind::PeriodStart),
-        (TruthKind::PeriodEnd, DetectionKind::PeriodEnd),
+        (TruthKind::PeriodStart, SuggestionKind::PeriodStart),
+        (TruthKind::PeriodEnd, SuggestionKind::PeriodEnd),
     ] {
         let counts = score_periods(truth, found, kind, detected, &mut report);
         match kind {
@@ -481,13 +449,13 @@ fn score_goals(truth: &[TruthEvent], found: &[Detection], report: &mut ScoreRepo
     // — the pairing is deterministic.
     let mut detections: Vec<&Detection> = found
         .iter()
-        .filter(|d| matches!(d.kind, DetectionKind::Goal { .. }))
+        .filter(|d| matches!(d.kind, SuggestionKind::Goal { .. }))
         .collect();
     detections.sort_by(|a, b| window_of(a).0.total_cmp(&window_of(b).0));
 
     for d in detections {
         let (start, end) = window_of(d);
-        let DetectionKind::Goal { tier, at, .. } = d.kind else {
+        let SuggestionKind::Goal { tier, at, .. } = d.kind else {
             unreachable!("filtered to goals above")
         };
         let hit = goals.iter().enumerate().find(|(i, t)| {
@@ -538,7 +506,7 @@ fn counts_for(tally: &mut Tally, tier: GoalTier) -> &mut Counts {
 
 fn window_of(d: &Detection) -> (f64, f64) {
     match d.kind {
-        DetectionKind::Goal { window, .. } => window,
+        SuggestionKind::Goal { window, .. } => window,
         _ => (d.seconds, d.seconds),
     }
 }
@@ -547,7 +515,7 @@ fn score_periods(
     truth: &[TruthEvent],
     found: &[Detection],
     kind: TruthKind,
-    detected: DetectionKind,
+    detected: SuggestionKind,
     report: &mut ScoreReport,
 ) -> Counts {
     let tags: Vec<&TruthEvent> = truth.iter().filter(|t| t.kind == kind).collect();

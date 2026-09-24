@@ -496,13 +496,26 @@ measurement phase: it stores nothing, suggests nothing and adds no command).
   burst's loudest bin hops. Tonality is what rejects sound that is broadband
   *and* steady (a horn, a buzzer), and the horn fixture in
   `core/tests/signals.rs` is the test that fails without it.
-- **Measured on the three tagged matches** (2026-09-24, release): **25–30 s per
-  half, ~65x realtime**, so G4's 5-minute bar is not in danger from the sound.
-  Two results are the phase's own stop-early triggers: **cheer recall at the
-  sixteen truth goals is 7/16** at the initial constants (one venue covers
-  almost none of its goals), and **no half holds a whistle longer than 0.78 s**,
-  so D4's "a period ends on the last long whistle" has no signal at the 0.8 s
-  floor. Read `WHISTLE_LONG_SECONDS` as unset rather than tuned.
+- **The picture is `core::motion` and `core::kickoff`**, read off the same
+  decode: five frames a second of mean absolute luma difference, and one 32x18
+  thumbnail a second. **Stillness is a quantile of the half's own motion**
+  (`still_theta`), never a level — the median motion of a half runs 16–19 in two
+  of the three venues and 4–8 in the third. On this footage the threshold has to
+  land near the **median** (the camera's motion is bimodal), and the spec's
+  "then motion above θ for 3 s" has to be read as the *median* of those 3 s: the
+  literal reading found **0 candidates in 6 halves**.
+- **P3's verdict is `docs/superpowers/spikes/2026-09-24-match-vision-measurements.md`,
+  and it is negative. Read it before touching any of this.** Held out, the whole
+  rule finds **7 goals of 9 with 29 false ones**, whose windows cover **57% of
+  the match** — against a chance recall of 0.63, so the lift is **+0.15**.
+  Periods are worse (start 0.50/0.50, end 0.00): the period whistles are audible
+  and detected, but nothing tells them from the 41–85 other whistles in a half,
+  not duration and not loudness. The cheer is the one real cue (8 of 9 held-out
+  goals at 24 firings a half). **P4 is not justified and is not started**;
+  nothing here is wired to the bus, the format or the UI.
+- **Measured on the three tagged matches** (2026-09-24, release): the whole
+  `Analyzer` is **67–84 s per file, ~24x realtime**, well inside G4's 5-minute
+  bar.
 - **The measurement run is `#[ignore]`d and needs `--release`** — an
   unoptimised Goertzel bank is about forty times slower:
   ```bash
@@ -510,7 +523,9 @@ measurement phase: it stores nothing, suggests nothing and adds no command).
     cargo test --release -p video-coach-harness --test ground_truth -- \
       --ignored --nocapture --test-threads=1
   ```
-  The coach's folders are **the only copy of the footage and are read-only**:
+  **One run, not two** — sound and picture are scored together, off one
+  `Analyzer` pass per source. The coach's folders are **the only copy of the
+  footage and are read-only**:
   `store::read` plus a `kickoffs.txt` read, never a `Bus`, never a write. CI
   never sees them; every unit test is synthetic. **Nothing identifying goes in
   the repo or a pasted report** — no club, opponent, player, file or folder

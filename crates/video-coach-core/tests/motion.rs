@@ -9,9 +9,23 @@
 //! run in the harness.
 
 use video_coach_core::motion::{
-    peaks, still_intervals, still_intervals_at, Template, Thumbnail, MOTION_HZ, STILL_MIN_SECONDS,
-    STILL_THETA, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH,
+    at_quantile, peaks, still_intervals, still_intervals_at, still_theta, Template, Thumbnail,
+    MOTION_HZ, STILL_MIN_SECONDS, STILL_QUANTILE, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH,
 };
+
+/// A stand-in for the absolute threshold the spec started with. It is a test
+/// fixture and no longer a constant of the module: measured over six halves,
+/// no absolute level ports between venues, so the shipped rule reads
+/// [`STILL_QUANTILE`] off each half's own distribution.
+const THETA: f32 = 3.0;
+
+/// [`still_intervals`] with a threshold spelled out, which is what these pin:
+/// the shipped entry point reads its threshold off the series, so a fixture
+/// built out of two levels would be measuring the quantile rather than the
+/// run-finding.
+fn intervals(motion: &[f32]) -> Vec<std::ops::Range<f64>> {
+    still_intervals_at(motion, MOTION_HZ, THETA, STILL_MIN_SECONDS)
+}
 
 /// A motion series at [`MOTION_HZ`] from `(seconds, value)` stretches.
 fn series(stretches: &[(f64, f32)]) -> Vec<f32> {
@@ -53,25 +67,28 @@ fn halfway(shift: f64) -> Thumbnail {
 #[test]
 fn a_long_still_stretch_is_an_interval_and_a_short_one_is_not() {
     let motion = series(&[
-        (12.0, STILL_THETA - 1.0),
-        (3.0, STILL_THETA + 10.0),
-        (6.0, STILL_THETA - 1.0),
+        (STILL_MIN_SECONDS + 2.0, THETA - 1.0),
+        (3.0, THETA + 10.0),
+        (STILL_MIN_SECONDS - 4.0, THETA - 1.0),
     ]);
-    let still = still_intervals(&motion, MOTION_HZ);
+    let still = intervals(&motion);
     assert_eq!(still.len(), 1, "{still:?}");
     assert!((still[0].start - 0.0).abs() < 1e-9, "{still:?}");
-    assert!((still[0].end - 12.0).abs() < 1e-9, "{still:?}");
+    assert!(
+        (still[0].end - (STILL_MIN_SECONDS + 2.0)).abs() < 1e-9,
+        "{still:?}"
+    );
 }
 
 #[test]
 fn the_floor_is_inclusive() {
-    let exactly = series(&[(STILL_MIN_SECONDS, 0.0), (5.0, STILL_THETA + 1.0)]);
-    assert_eq!(still_intervals(&exactly, MOTION_HZ).len(), 1);
+    let exactly = series(&[(STILL_MIN_SECONDS, 0.0), (5.0, THETA + 1.0)]);
+    assert_eq!(intervals(&exactly).len(), 1);
     let one_frame_short = series(&[
         (STILL_MIN_SECONDS - 1.0 / MOTION_HZ, 0.0),
-        (5.0, STILL_THETA + 1.0),
+        (5.0, THETA + 1.0),
     ]);
-    assert!(still_intervals(&one_frame_short, MOTION_HZ).is_empty());
+    assert!(intervals(&one_frame_short).is_empty());
 }
 
 #[test]
@@ -79,22 +96,59 @@ fn one_moving_frame_splits_a_still_stretch() {
     // The rule has no tolerance, and this is where that is decided: a single
     // frame over the threshold ends the interval. A hold broken by one
     // flicker is two holds.
-    let mut motion = series(&[(30.0, 0.0)]);
-    motion[(15.0 * MOTION_HZ) as usize] = STILL_THETA + 5.0;
-    let still = still_intervals(&motion, MOTION_HZ);
+    let split = STILL_MIN_SECONDS + 5.0;
+    let mut motion = series(&[(2.0 * split, 0.0)]);
+    motion[(split * MOTION_HZ) as usize] = THETA + 5.0;
+    let still = intervals(&motion);
     assert_eq!(still.len(), 2, "{still:?}");
-    assert!((still[0].end - 15.0).abs() < 1e-9, "{still:?}");
-    assert!((still[1].start - 15.2).abs() < 1e-9, "{still:?}");
+    assert!((still[0].end - split).abs() < 1e-9, "{still:?}");
+    assert!(
+        (still[1].start - (split + 1.0 / MOTION_HZ)).abs() < 1e-9,
+        "{still:?}"
+    );
 }
 
 #[test]
 fn a_higher_threshold_keeps_a_noisier_hold() {
-    let motion = series(&[(12.0, 3.5), (5.0, 20.0)]);
+    let motion = series(&[(STILL_MIN_SECONDS + 2.0, 3.5), (5.0, 20.0)]);
     assert!(still_intervals_at(&motion, MOTION_HZ, 3.0, STILL_MIN_SECONDS).is_empty());
     assert_eq!(
         still_intervals_at(&motion, MOTION_HZ, 4.0, STILL_MIN_SECONDS).len(),
         1
     );
+}
+
+#[test]
+fn the_threshold_is_read_off_the_halfs_own_motion() {
+    // Two halves of the same shape, one filmed in a venue whose pan is twenty
+    // times busier. Measured over six halves, that is the real spread — median
+    // motion 4–8 on one match against 16–19 on two others — and it is why no
+    // absolute θ can ship.
+    let quiet = series(&[(60.0, 1.0), (20.0, 0.2), (60.0, 1.0)]);
+    // A hold of 20 s and a quantile that lands between the two levels.
+    let busy: Vec<f32> = quiet.iter().map(|m| m * 20.0).collect();
+    assert_eq!(
+        still_intervals(&quiet, MOTION_HZ),
+        still_intervals(&busy, MOTION_HZ),
+        "the same half at two gains is the same hold"
+    );
+    // And the absolute rule the quantile replaced calls one of them still from
+    // end to end.
+    assert_eq!(intervals(&quiet).len(), 1);
+    assert!(intervals(&busy).is_empty());
+}
+
+#[test]
+fn the_quantile_is_nearest_rank_and_survives_an_empty_series() {
+    let values: Vec<f32> = (0..=100).map(|i| i as f32).collect();
+    assert_eq!(at_quantile(&values, 0.0), 0.0);
+    assert_eq!(at_quantile(&values, 0.2), 20.0);
+    assert_eq!(at_quantile(&values, 1.0), 100.0);
+    assert_eq!(at_quantile(&[], STILL_QUANTILE), 0.0);
+    // Still is at or below the threshold, so exactly the quantile's own share
+    // of a half is still — which is what makes the firing rate portable.
+    let theta = still_theta(&values, 0.2);
+    assert_eq!(values.iter().filter(|&&v| v <= theta).count(), 21);
 }
 
 #[test]

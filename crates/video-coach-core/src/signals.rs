@@ -126,7 +126,15 @@ pub const WHISTLE_PITCH_HZ: f32 = 150.0;
 pub const WHISTLE_MIN_SECONDS: f64 = 0.15;
 
 /// What [`Whistle::is_long`] means: the half-ending blast, not a play-on peep.
-/// **Initial value** (spec D2).
+///
+/// **The spec's value, kept because nothing measured supports another.** No
+/// whistle in six halves ran longer than 0.78 s, so at this floor a period has
+/// none to end on; and bringing the floor down to 0.35 s — 4–5 long whistles a
+/// half — finds only **half** the period tags at ±10 s and gets half of those
+/// wrong. Duration does not mark the kick-off and final whistles: at the twelve
+/// tags they run 0.16–0.69 s, which is every other whistle's range as well.
+/// Loudness does not either (the loudest whistle in a file's first or last five
+/// minutes is the tagged one **once** in twelve).
 pub const WHISTLE_LONG_SECONDS: f64 = 0.8;
 
 /// The cheer band's lower edge.
@@ -209,9 +217,18 @@ pub struct Whistle {
 }
 
 impl Whistle {
-    /// Long enough to be a period's end rather than a stoppage (spec D4).
+    /// Long enough to be a period's end rather than a stoppage (spec D4), at
+    /// [`WHISTLE_LONG_SECONDS`].
     pub fn is_long(&self) -> bool {
-        self.duration >= WHISTLE_LONG_SECONDS
+        self.is_longer_than(WHISTLE_LONG_SECONDS)
+    }
+
+    /// [`Whistle::is_long`] at a floor the caller picks, so the one constant
+    /// the footage flatly refuted can be swept (spec G2): measured over six
+    /// halves, **no whistle anywhere ran longer than 0.78 s**, so at the 0.8 s
+    /// floor a period has no long whistle to end on.
+    pub fn is_longer_than(&self, seconds: f64) -> bool {
+        self.duration >= seconds
     }
 }
 

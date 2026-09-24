@@ -52,13 +52,29 @@ pub const THUMBNAIL_WIDTH: usize = 32;
 /// The thumbnail grid's height, at 16:9.
 pub const THUMBNAIL_HEIGHT: usize = 18;
 
-/// Below this the picture counts as still. **Initial value** (spec D2), in
-/// the units of the mean absolute luma difference media computes: 0–255 per
-/// pixel.
-pub const STILL_THETA: f32 = 3.0;
+/// How much of a half's own motion counts as still: the quantile of its
+/// distribution that [`still_theta`] reads the threshold off.
+///
+/// **A quantile and not a level, because a level does not port** [measured,
+/// six halves]: the mean absolute luma difference has no absolute meaning
+/// across venues, and its median ran 16–19 on two of the three tagged matches
+/// against 4–8 on the third. At the spec's absolute θ = 3 the rule finds one
+/// tagged kick-off in six.
+///
+/// **Half, not a fifth, and that is a fact about the footage.** The virtual
+/// camera is a slow pan on a fixed tripod, so a half's motion is two clusters —
+/// play in the high teens and twenties, everything else near zero — and the
+/// threshold has to land between them. On this footage that is the median: at a
+/// fifth no run of frames is continuously under it and the cue fires **0.3
+/// times a half**, at half it fires 21–24. The chosen value is the tuning
+/// match's (spec G2), and the rule it feeds still failed its bars — see
+/// `docs/superpowers/spikes/2026-09-24-match-vision-measurements.md`.
+pub const STILL_QUANTILE: f64 = 0.50;
 
-/// The shortest hold that counts as a walk-back. **Initial value** (spec D3).
-pub const STILL_MIN_SECONDS: f64 = 10.0;
+/// The shortest hold that counts as a walk-back. Chosen on the tuning match:
+/// the spec's initial 10 s and this differ by a third of the candidates and
+/// nothing in what they find.
+pub const STILL_MIN_SECONDS: f64 = 15.0;
 
 /// How alike a frame and a known kick-off must be to be one. **Initial
 /// value**, and the one P3's sweep has the least prior information about: a
@@ -76,13 +92,48 @@ pub const KICKOFF_MIN_GAP_SECONDS: f64 = 30.0;
 ///
 /// `hz` is the series' sample rate ([`MOTION_HZ`] for media's pass).
 pub fn still_intervals(motion: &[f32], hz: f64) -> Vec<Range<f64>> {
-    still_intervals_at(motion, hz, STILL_THETA, STILL_MIN_SECONDS)
+    still_intervals_at(
+        motion,
+        hz,
+        still_theta(motion, STILL_QUANTILE),
+        STILL_MIN_SECONDS,
+    )
+}
+
+/// The stillness threshold for one half: the `quantile`th of its own motion.
+///
+/// This is the whole of what makes the picture rules portable — see
+/// [`STILL_QUANTILE`]. A frozen half reads 0 and is then one hold from end to
+/// end, which never resumes and so is never a kick-off
+/// ([`kickoff`](crate::kickoff)); an empty series reads 0 and has no frames to
+/// hold anything.
+pub fn still_theta(motion: &[f32], quantile: f64) -> f32 {
+    at_quantile(motion, quantile)
+}
+
+/// The `q`th quantile of `values` by nearest rank, or 0 for an empty series.
+///
+/// Sorts a copy: a half is 8,500 numbers and the run reads a handful of
+/// quantiles off it, so nothing here is worth a selection algorithm.
+pub fn at_quantile(values: &[f32], q: f64) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let at = (q.clamp(0.0, 1.0) * (sorted.len() - 1) as f64).round() as usize;
+    sorted[at.min(sorted.len() - 1)]
 }
 
 /// The still intervals of `motion` at the given threshold and floor.
 ///
 /// Split out from [`still_intervals`] so a whole sweep of θ costs one decode
 /// (spec G2).
+///
+/// Still is **at or below** `theta` and moving is over it, so a threshold read
+/// off the series' own [`at_quantile`] leaves exactly that share of the half
+/// still — which is what lets [`STILL_QUANTILE`] mean "this much of this half"
+/// rather than "this much of it unless that much of it is the same number".
 ///
 /// **A single frame over θ ends an interval.** There is no tolerance, and it
 /// is a choice rather than an oversight: at 5 fps one frame is 200 ms, and on
@@ -99,12 +150,12 @@ pub fn still_intervals_at(
     let mut out = Vec::new();
     let mut i = 0;
     while i < motion.len() {
-        if motion[i] >= theta {
+        if motion[i] > theta {
             i += 1;
             continue;
         }
         let mut end = i + 1;
-        while end < motion.len() && motion[end] < theta {
+        while end < motion.len() && motion[end] <= theta {
             end += 1;
         }
         // Frame `i` covers `[i/hz, (i+1)/hz)`, so a run of `n` frames is

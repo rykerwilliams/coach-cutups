@@ -877,3 +877,54 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** with the next README pass, or the first time anyone asks
   again. The docs session on `claude/docs` owns the README and is the natural
   place for the wording once the behaviour is known.
+
+## P3 deferrals (spec `docs/superpowers/specs/2026-09-22-match-vision-design.md`, verdict `docs/superpowers/spikes/2026-09-24-match-vision-measurements.md`)
+
+80. **The sixteen restarts have never been written down, and V-3 depends on
+  them.** `kickoffs.txt` is the blank template in all three tagged folders, so
+  D4's `W` is still the spec's guess of 150 s. Measured, `W` is the single most
+  influential number in the goal rule: it sets how much of the match the
+  suggestions claim, and at the chosen constants that is **57% of a held-out
+  match**, which is most of the gap between the rule and chance.
+- **What to do:** the coach writes the restart of each of the sixteen goals into
+  `kickoffs.txt` (`<1-based source> <mm:ss>`, the moment the ball is played from
+  the centre spot). The ground-truth run reads it already and scores V-3 without
+  another line of code.
+- **Why deferred:** it is the user's own step and nothing in the repo can do it.
+- **When to revisit:** before any further work on suggested goals. Nothing else
+  in P3's follow-ups is worth doing first.
+
+81. **Task 3.6 — the detector runtime and formation-feasibility spike (L3, V-2,
+  V-7) — is deferred with P5 rather than run.** Its entry condition is met (the
+  goal precision bars failed), but it measures `rten` against `ort` for a
+  detector nothing has decided to build, and V-2 — does the virtual camera frame
+  both halves of the pitch at a kick-off? — only matters once P5 is wanted.
+- **Why deferred:** the verdict says the formation check is the **only** cue
+  left with a chance of clearing the bars, and whether to build it is the user's
+  call, not a measurement's. Running the runtime benchmark first would pin a
+  dependency choice to a phase that may never start.
+- **When to revisit:** when the user asks for P5, or for P6 (click-to-track),
+  which needs the same runtime and the same V-7 latency figure.
+
+82. **P4 (showing suggestions) is not justified and is not started.** No
+  `MatchSuggestion` in the project format, no `Analyze` command, no Match-panel
+  row, no scrubber mark. Held out, the rule finds 7 goals of 9 with 29 false
+  ones, and the periods are worse.
+- **What would change it:** #80's restarts, a learned audio tagger in place of
+  the level cue (the spec defers YAMNet), or P5's formation check. Not another
+  threshold sweep: 540 points were tried and the best of them is worth +0.15
+  over chance on footage it had not seen.
+- **Why deferred:** the analysis backend is built, measured and shelved exactly
+  as P3 said it would be if the numbers came out this way.
+- **When to revisit:** when one of the three inputs above lands.
+
+83. **`a_pause_while_a_flushing_seek_recovers_playing_sticks` flaked once under
+  the full workspace run.** `video-coach-media`'s lib tests, 2026-09-24: one
+  failure inside a `cargo test --workspace` (every other suite green), and the
+  same suite reran 122/122 green on its own a minute later. The test races a
+  pause against a flushing seek's recovery, so a loaded machine — the workspace
+  run has several GStreamer suites alive at once — is the obvious suspect.
+- **Why deferred:** one occurrence, green on rerun, and the assertion is about
+  a state the app reaches constantly and no user has ever seen wrong.
+- **When to revisit:** if it fails twice, or once on CI. Then print the states
+  the recovery went through rather than only the final one.

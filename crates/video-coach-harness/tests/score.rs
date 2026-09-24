@@ -4,10 +4,10 @@
 //! measurement tooling CI can run, and it is what pins the pairing rules the
 //! `#[ignore]`d `ground_truth` test reports through.
 
+use video_coach_core::kickoff::{GoalTier, SuggestionKind};
 use video_coach_core::signals::Cheer;
 use video_coach_harness::score::{
-    cheer_coverage, nearest, score, show_rate, Detection, DetectionKind, GoalTier, CHEER_TOLERANCE,
-    PERIOD_TOLERANCE,
+    cheer_coverage, nearest, score, show_rate, Detection, CHEER_TOLERANCE, PERIOD_TOLERANCE,
 };
 use video_coach_harness::truth::{folders, parse_kickoffs, TruthError, TruthEvent, TruthKind};
 
@@ -33,7 +33,7 @@ fn found_goal(k: f64, width: f64, tier: GoalTier) -> Detection {
     Detection {
         source_index: 0,
         seconds: k,
-        kind: DetectionKind::Goal {
+        kind: SuggestionKind::Goal {
             tier,
             window: (k - width, k),
             at: (tier == GoalTier::High).then_some(k - 5.0),
@@ -41,7 +41,7 @@ fn found_goal(k: f64, width: f64, tier: GoalTier) -> Detection {
     }
 }
 
-fn found_period(seconds: f64, kind: DetectionKind) -> Detection {
+fn found_period(seconds: f64, kind: SuggestionKind) -> Detection {
     Detection {
         source_index: 0,
         seconds,
@@ -138,7 +138,7 @@ fn the_period_tolerance_is_inclusive() {
     let at = |error: f64| {
         score(
             &[tag(100.0, TruthKind::PeriodStart)],
-            &[found_period(100.0 + error, DetectionKind::PeriodStart)],
+            &[found_period(100.0 + error, SuggestionKind::PeriodStart)],
         )
         .tally
         .period_start
@@ -153,7 +153,7 @@ fn the_period_tolerance_is_inclusive() {
 fn a_period_start_never_matches_a_period_end() {
     let r = score(
         &[tag(100.0, TruthKind::PeriodEnd)],
-        &[found_period(100.0, DetectionKind::PeriodStart)],
+        &[found_period(100.0, SuggestionKind::PeriodStart)],
     );
     assert_eq!(r.tally.period_end.misses, 1);
     assert_eq!(r.tally.period_start.fp, 1);
@@ -164,8 +164,8 @@ fn period_pairing_takes_the_nearer_detection() {
     let r = score(
         &[tag(100.0, TruthKind::PeriodStart)],
         &[
-            found_period(96.0, DetectionKind::PeriodStart),
-            found_period(102.0, DetectionKind::PeriodStart),
+            found_period(96.0, SuggestionKind::PeriodStart),
+            found_period(102.0, SuggestionKind::PeriodStart),
         ],
     );
     assert_eq!((r.tally.period_start.tp, r.tally.period_start.fp), (1, 1));
@@ -183,8 +183,8 @@ fn period_pairing_uses_each_side_once() {
             tag(106.0, TruthKind::PeriodStart),
         ],
         &[
-            found_period(101.0, DetectionKind::PeriodStart),
-            found_period(105.0, DetectionKind::PeriodStart),
+            found_period(101.0, SuggestionKind::PeriodStart),
+            found_period(105.0, SuggestionKind::PeriodStart),
         ],
     );
     assert_eq!(

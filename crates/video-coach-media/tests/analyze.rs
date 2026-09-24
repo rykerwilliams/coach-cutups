@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use video_coach_core::motion::{still_intervals, MOTION_HZ, THUMBNAIL_HZ};
+use video_coach_core::motion::{still_intervals_at, MOTION_HZ, STILL_MIN_SECONDS, THUMBNAIL_HZ};
 use video_coach_media::fixtures::{counter_video, solid_video, CounterKind};
 use video_coach_media::{analyze, AnalyzeError, AnalyzeMessage, Analyzer};
 
@@ -25,8 +25,9 @@ const SECONDS: u32 = 6;
 
 /// A hold longer than [`STILL_MIN_SECONDS`](video_coach_core::motion::STILL_MIN_SECONDS),
 /// so the stillness rule has something to find at its own constant rather
-/// than at one invented for a test.
-const STILL_SECONDS: u32 = 12;
+/// than at one invented for a test. Derived from that constant, because it is
+/// measured and has moved once already.
+const STILL_SECONDS: u32 = STILL_MIN_SECONDS as u32 + 2;
 
 /// Far beyond any pass here; only a hang reaches it.
 const LIMIT: Duration = Duration::from_secs(120);
@@ -60,7 +61,14 @@ fn a_still_picture_barely_moves_and_is_one_long_still_interval() {
     );
     let loudest = series.motion.iter().copied().fold(0.0, f32::max);
     assert!(loudest < 1.0, "a flat colour moved by {loudest}");
-    let still = still_intervals(&series.motion, MOTION_HZ);
+    // At a threshold spelled out, not at the shipped
+    // [`STILL_QUANTILE`](video_coach_core::motion::STILL_QUANTILE): that one is
+    // a quantile of the series' own distribution, so on a fixture that holds
+    // still from end to end it marks half the frames as moving by
+    // construction. Which threshold ports is core's question and the
+    // ground-truth run's; what this pins is that the decode hands core a
+    // series its rules can read.
+    let still = still_intervals_at(&series.motion, MOTION_HZ, 1.0, STILL_MIN_SECONDS);
     assert_eq!(still.len(), 1, "{still:?}");
 }
 
@@ -83,7 +91,7 @@ fn a_changing_picture_moves_and_holds_still_nowhere() {
     let series = analyze::motion::series(&path, &AtomicBool::new(false)).expect("the pass runs");
     let quietest = series.motion.iter().copied().fold(f32::MAX, f32::min);
     assert!(quietest > 5.0, "a counter's quietest step was {quietest}");
-    assert!(still_intervals(&series.motion, MOTION_HZ).is_empty());
+    assert!(still_intervals_at(&series.motion, MOTION_HZ, 1.0, STILL_MIN_SECONDS).is_empty());
 }
 
 #[test]
