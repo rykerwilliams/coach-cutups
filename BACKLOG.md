@@ -1001,3 +1001,32 @@ Each entry: what, why deferred, when to revisit.
   the projects this would switch between — build them in that order.
 - **When to revisit:** with the New match… flow, or the first time the coach
   says the picker is slowing them down again.
+
+86. **A cut that spans matches — the same thing across several projects.** The
+  coach (2026-09-24), on the back of #85: *"especially good to get clips of the
+  'same thing' across different game projects?"* — every corner of the season,
+  one player's goals across three matches, every time a press worked. Today a
+  clip belongs to a project and an export is built from one project's plan, so
+  the answer is export three reels and join them elsewhere.
+- **What already fits.** Tags are the existing "same thing" (`Clip.tags`, the
+  per-tag export rows), and `ExportJob` is already a self-contained value —
+  entries carrying their own source paths, recordings, cues and scoreboard. So
+  an export whose entries come from several projects is not a new renderer; it
+  is a new way to *build* the entry list. This is the same realisation as the
+  export queue (#77), one step further: the queue runs several jobs, this builds
+  one job from several projects.
+- **What doesn't.** The match clock and the scoreboard are per project, so an
+  entry from another match must carry its own — the plan currently derives them
+  once per job. The text bar's numbering ("2 / 5") means nothing across matches.
+  Clip ids are unique per project, not globally. And nothing in the app can
+  currently *see* another project's clips, which is the real work: a library
+  view over a set of project folders, which is #85's drawer grown a level.
+- **The decisions before any code:** what the set of projects is (a folder the
+  coach nominates, the recents list, something explicit like a "season"); whether
+  the result is an export or a saved compilation that can be re-exported; and
+  whether the scoreboard is drawn per entry from its own match or dropped.
+- **Why deferred:** it needs #85's library view to exist first, and it wants the
+  music (#84) and the queue (#77) to have settled, since all three are about
+  work that outlives one open project.
+- **When to revisit:** after the New match… flow and the recents drawer, or when
+  the coach first asks for "every corner this season" out loud.
