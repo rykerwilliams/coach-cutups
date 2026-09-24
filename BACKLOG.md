@@ -819,3 +819,21 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** the first time CI fails on it, or with the next test
   touching that file — a smaller fixture (fewer frames, or 640×360) is the fix,
   not a wider bound.
+
+77. **An export queue across projects.** The coach (2026-09-24): "i open project
+  1, do stuff, enqueue. then project 2, do stuff, enqueue, then start the queue
+  and walk away for a bit. other apps have this sort of thing, like mkvtoolnix's
+  muxer." Today an export run belongs to the open project and starts at once
+  (`bus/export.rs`'s `Active`/`ExportRun`), so exporting three matches means
+  sitting through three of them.
+- **Why deferred:** it is a real feature, not a fix. The queue outlives the open
+  project, so a queued job has to carry its own snapshot — the plan, the
+  sources' paths, the scoreboard, the cues and the tags — rather than reading a
+  project that may since have changed or closed; it needs somewhere to live
+  across a restart, a way to show progress for a project that isn't open, and a
+  rule for what a queued job does when its footage moves. That is a spec, not a
+  patch.
+- **When to revisit:** once the coach has more than two matches in flight, or
+  the first time they ask again. Start from the fact that `ExportJob` is already
+  a self-contained value: the queue is a list of them plus a folder to write to,
+  and the hard part is building one without the project open.
