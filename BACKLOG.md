@@ -928,3 +928,32 @@ Each entry: what, why deferred, when to revisit.
   a state the app reaches constantly and no user has ever seen wrong.
 - **When to revisit:** if it fails twice, or once on CI. Then print the states
   the recovery went through rather than only the final one.
+
+84. **Music under a goals reel.** The coach (2026-09-24): "pull in soundtrack
+  files that are licensed for use, e.g. rock, edm, etc. for the goals clips." A
+  reel is the one export with no commentary — it is game sound alone — and a
+  highlights reel is the one thing people expect music under.
+- **The mixing is the easy half.** `core::audio` already builds the regions and
+  the envelope the export mixes in Rust, and the reel's entries are the same
+  plan every other target uses: a track becomes one more region under the whole
+  compilation, ducked or replacing the game sound. `avenc_aac` already encodes
+  the result.
+- **The licence is the hard half, and it is the reason this is not a weekend.**
+  The app is AGPL and runs on the coach's machine; the *output* is a video they
+  may upload. Bundling audio means shipping files whose licence permits
+  redistribution AND synchronisation AND the coach's own upload, and YouTube's
+  Content ID will flag plenty of "royalty-free" music regardless of what its
+  licence says. The workable shapes, roughly in order of how little they promise
+  on someone else's behalf: (a) the coach points at their own files, and the app
+  only mixes; (b) a curated list of links the coach downloads themselves; (c)
+  the `.deb` ships tracks, which means clearing each one and carrying the
+  licences in `packaging/copyright`.
+- **The decisions before any code:** which of those three; whether the music
+  ducks under the game sound or replaces it; whether a track is per-project or
+  per-export; and what happens when a reel is longer than the track (loop, fade,
+  or refuse).
+- **Why deferred:** it is a licensing question with a small piece of code
+  attached, not the other way round.
+- **When to revisit:** when the coach says which of the three shapes they want.
+  (a) is buildable immediately and is the one that promises nothing on anyone
+  else's behalf.
