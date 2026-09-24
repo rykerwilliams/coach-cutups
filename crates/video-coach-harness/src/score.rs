@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use video_coach_core::signals::{Cheer, Whistle};
+
 use crate::truth::{TruthEvent, TruthKind};
 
 /// How far a period detection may sit from its tag and still match (G3).
@@ -284,6 +286,114 @@ impl ScoreReport {
             );
         }
     }
+}
+
+// ------------------------------------------------------- audio diagnostics
+
+/// How near a truth goal a cheer's onset must be for the cheer to have covered
+/// it.
+///
+/// Generous on purpose. Measured on one whole half, a goal's cheer starts
+/// **0.4–1.4 s after** the frame the coach tags, so five seconds either side
+/// is far wider than the signal needs; anything outside it is the detector
+/// missing the goal, not the coach tagging it late. The number that decides
+/// whether the cheer cue is viable at all is a recall, and a recall read off a
+/// tolerance that is argued about is worth nothing.
+pub const CHEER_TOLERANCE: f64 = 5.0;
+
+/// The item whose time is nearest `at`, with the signed offset to it —
+/// positive when the signal is **later** than the tag.
+pub fn nearest<'a, T: 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+    at: f64,
+    time: impl Fn(&T) -> f64,
+) -> Option<(&'a T, f64)> {
+    items
+        .into_iter()
+        .map(|item| {
+            let offset = time(item) - at;
+            (item, offset)
+        })
+        .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+}
+
+/// The `DIAG` lines (Task 3.3): for every tag on one source, the signal that
+/// should have found it and how far away it sat.
+///
+/// **No detection is involved.** These say whether the cue exists in the
+/// sound at all, which is a different question from whether the rules built on
+/// it fire — and it is the one that decides whether there is any point in
+/// building the rules. A period tag's offset is also the only honest way to
+/// read [`PERIOD_TOLERANCE`]: if the twelve tags sit tens of seconds from
+/// their nearest long whistle, that ±10 s is measuring the coach's reaction.
+pub fn print_audio_diagnostics(
+    match_name: &str,
+    source_index: usize,
+    truth: &[TruthEvent],
+    whistles: &[Whistle],
+    cheers: &[Cheer],
+) {
+    let long: Vec<&Whistle> = whistles.iter().filter(|w| w.is_long()).collect();
+    for tag in truth
+        .iter()
+        .filter(|t| t.source_index == source_index && t.kind != TruthKind::Restart)
+    {
+        let head = format!(
+            "DIAG   match={match_name} src={source_index} kind={} tag={:.1}",
+            kind_key(tag.kind),
+            tag.seconds,
+        );
+        match tag.kind {
+            TruthKind::Goal => match nearest(cheers, tag.seconds, |c| c.onset) {
+                Some((cheer, offset)) => println!(
+                    "{head} cheer={offset:+.1} dur={:.1} peak={:+.1}",
+                    cheer.duration, cheer.peak_db
+                ),
+                None => println!("{head} cheer=none"),
+            },
+            // The long whistle is what D4 says a period ends on, so it is
+            // reported first; when the half has none — and measured, no half
+            // in the design footage has one at the initial constants — the
+            // nearest whistle of **any** length is reported instead, marked
+            // `long=false`. "None at all" and "none long enough" are different
+            // failures, and only one of them is a threshold.
+            _ => match nearest(long.iter().copied(), tag.seconds, |w| w.start)
+                .or_else(|| nearest(whistles, tag.seconds, |w| w.start))
+            {
+                Some((whistle, offset)) => println!(
+                    "{head} whistle={offset:+.1} long={} dur={:.2} snr={:.1} tonality={:.1}",
+                    whistle.is_long(),
+                    whistle.duration,
+                    whistle.snr_db,
+                    whistle.tonality_db
+                ),
+                None => println!("{head} whistle=none"),
+            },
+        }
+    }
+}
+
+/// How many goals on one source have a cheer within [`CHEER_TOLERANCE`], out
+/// of how many there are.
+pub fn cheer_coverage(
+    truth: &[TruthEvent],
+    source_index: usize,
+    cheers: &[Cheer],
+) -> (usize, usize) {
+    let goals = truth
+        .iter()
+        .filter(|t| t.source_index == source_index && t.kind == TruthKind::Goal);
+    let mut covered = 0;
+    let mut total = 0;
+    for goal in goals {
+        total += 1;
+        if nearest(cheers, goal.seconds, |c| c.onset)
+            .is_some_and(|(_, offset)| offset.abs() <= CHEER_TOLERANCE)
+        {
+            covered += 1;
+        }
+    }
+    (covered, total)
 }
 
 fn kind_key(kind: TruthKind) -> &'static str {

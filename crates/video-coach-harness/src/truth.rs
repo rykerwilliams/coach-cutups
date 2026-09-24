@@ -267,8 +267,11 @@ fn periods(project: &Project, out: &mut Vec<TruthEvent>) {
 /// Parse `kickoffs.txt`: one restart per line, `<1-based source> <mm:ss>`.
 ///
 /// `#` starts a comment, so G1's `# missing` line — a goal whose restart is not
-/// in the file — needs no special case. Blank lines are ignored. Anything else
-/// is an error naming its line, never a silent skip.
+/// in the file — needs no special case. Blank lines are ignored, and so is a
+/// line that names a source with no time after it: that is the template's own
+/// half-filled shape, a restart not written down yet. Anything else is an
+/// error naming its line, never a silent skip, because a *mistyped* restart
+/// would quietly distort V-3.
 pub fn parse_kickoffs(text: &str) -> Result<Vec<Restart>, TruthError> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -281,9 +284,9 @@ pub fn parse_kickoffs(text: &str) -> Result<Vec<Restart>, TruthError> {
             line,
             why: why.to_string(),
         };
-        let mut fields = body.split_whitespace();
-        let (Some(index), Some(time), None) = (fields.next(), fields.next(), fields.next()) else {
-            return Err(bad("expected `<1-based source index> <mm:ss>`"));
+        let fields: Vec<&str> = body.split_whitespace().collect();
+        let [index, rest @ ..] = fields.as_slice() else {
+            unreachable!("a non-empty body has at least one field");
         };
         let index: usize = index
             .parse()
@@ -291,6 +294,17 @@ pub fn parse_kickoffs(text: &str) -> Result<Vec<Restart>, TruthError> {
         let source_index = index
             .checked_sub(1)
             .ok_or_else(|| bad("the source index is 1-based, so 0 is not one"))?;
+        let time = match rest {
+            // The template the coach fills in writes each goal's video number
+            // and leaves the time blank underneath it. A line still waiting
+            // for its time is a restart not written yet, not a mistyped one:
+            // the file is half filled in while the coach works through a
+            // match, and refusing it would stop the whole measurement run over
+            // a goal nobody has got to.
+            [] => continue,
+            [time] => time,
+            _ => return Err(bad("expected `<1-based source index> <mm:ss>`")),
+        };
         out.push(Restart {
             source_index,
             seconds: mm_ss(time).ok_or_else(|| bad("the time is not `mm:ss`"))?,

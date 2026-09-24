@@ -6,7 +6,8 @@
 //!         ! audioconvert ! audioresample ! appsink F32LE/16k/1ch
 //! ```
 //!
-//! That is the export's own [`Reader`], asked for different caps. The reuse is
+//! That is the export's own [`Reader`](crate::composite::audio::Reader), asked
+//! for different caps, through the shared `read_all`. The reuse is
 //! what makes a recording with no audio track *fail* rather than hang:
 //! `decodebin3` never posts `no-more-pads` here, so the missing track is
 //! recognised from its stream collection and nowhere else.
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::composite::audio::Reader;
+use crate::composite::audio;
 use crate::composite::CompositeError;
 use crate::download::{download, Fetch};
 use crate::job::{self, JobMessage};
@@ -625,26 +626,11 @@ fn transcribe(
 
 /// All of `path`'s sound as 16 kHz mono samples in [-1, 1].
 ///
-/// **On a worker thread, never the bus:** a minute of commentary decodes in
-/// about a second, and the event loop has frames to deliver.
-///
-/// A file with no audio track and a file that cannot be read are two different
-/// errors, and both are errors: export folds them into silence and runs on,
-/// but an empty transcript is how a clip says it has never been transcribed
-/// (spec S4), so a swallowed failure here would be invisible.
+/// A missing audio track is an error here and silence in the export, and the
+/// difference matters: an empty transcript is how a clip says it has never
+/// been transcribed (spec S4), so a swallowed failure would be invisible.
 fn read_all(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>, CompositeError> {
-    match Reader::start(path, TRANSCRIBE_SAMPLE_RATE, TRANSCRIBE_CHANNELS, cancel) {
-        Ok(Some(mut reader)) => reader.rest(cancel),
-        Ok(None) => Err(CompositeError::Failed(format!(
-            "{} has no sound to transcribe",
-            path.display()
-        ))),
-        Err(CompositeError::Failed(e)) => Err(CompositeError::Failed(format!(
-            "could not read the sound of {}: {e}",
-            path.display()
-        ))),
-        Err(cancelled) => Err(cancelled),
-    }
+    audio::read_all(path, TRANSCRIBE_SAMPLE_RATE, TRANSCRIBE_CHANNELS, cancel)
 }
 
 #[cfg(test)]
@@ -737,9 +723,10 @@ mod tests {
         // Cancelled after the pipeline is up, so the cancel lands where the
         // samples are read rather than where the file is opened.
         let cancel = AtomicBool::new(false);
-        let mut reader = Reader::start(&path, TRANSCRIBE_SAMPLE_RATE, TRANSCRIBE_CHANNELS, &cancel)
-            .expect("the recording opens")
-            .expect("the recording has sound");
+        let mut reader =
+            audio::Reader::start(&path, TRANSCRIBE_SAMPLE_RATE, TRANSCRIBE_CHANNELS, &cancel)
+                .expect("the recording opens")
+                .expect("the recording has sound");
         cancel.store(true, Ordering::SeqCst);
         assert_eq!(reader.rest(&cancel), Err(CompositeError::Cancelled));
 

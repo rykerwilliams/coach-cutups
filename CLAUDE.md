@@ -477,6 +477,45 @@ field and in its paste box alike, both read by `core::match_entry`
 - **A highlight may be placed outside a recording**, while pen drawings stay
   recording-only: a highlight describes the footage, a drawing the commentary.
 
+**Match analysis is dB over a rolling median, never a level** (P3 — the
+measurement phase: it stores nothing, suggests nothing and adds no command).
+- **Core owns the maths, media owns the decode.** `core::signals` is
+  `whistles` / `cheers` / `cheer_excess`, pure functions over a slice of
+  16 kHz mono samples on 32 ms windows at a 16 ms hop.
+  `media::analyze::audio::samples` is the **third caller of the export's own
+  `Reader`** (`composite::audio::read_all`, which transcription now shares) and
+  adds no decode path. A whole half is 27 MB of `f32`, which is what lets every
+  rule stay a pure function of a slice.
+- **Nothing absolute can work.** Venue gain differs by ~27 dB between the three
+  tagged matches, so every threshold is dB over a **60 s rolling median of the
+  signal's own band**, computed from a half-dB histogram — sorting each span
+  over a hundred thousand windows costs minutes.
+- **A whistle needs three terms**: level over that median, a ±150 Hz pitch
+  hold, and **tonality**, the peak bin over the median of the other bins in the
+  same window. Most broadband sound fails the pitch hold on its own — a noise
+  burst's loudest bin hops. Tonality is what rejects sound that is broadband
+  *and* steady (a horn, a buzzer), and the horn fixture in
+  `core/tests/signals.rs` is the test that fails without it.
+- **Measured on the three tagged matches** (2026-09-24, release): **25–30 s per
+  half, ~65x realtime**, so G4's 5-minute bar is not in danger from the sound.
+  Two results are the phase's own stop-early triggers: **cheer recall at the
+  sixteen truth goals is 7/16** at the initial constants (one venue covers
+  almost none of its goals), and **no half holds a whistle longer than 0.78 s**,
+  so D4's "a period ends on the last long whistle" has no signal at the 0.8 s
+  floor. Read `WHISTLE_LONG_SECONDS` as unset rather than tuned.
+- **The measurement run is `#[ignore]`d and needs `--release`** — an
+  unoptimised Goertzel bank is about forty times slower:
+  ```bash
+  COACH_GROUND_TRUTH=B=<folder>:A=<folder>:C=<folder> \
+    cargo test --release -p video-coach-harness --test ground_truth -- \
+      --ignored --nocapture --test-threads=1
+  ```
+  The coach's folders are **the only copy of the footage and are read-only**:
+  `store::read` plus a `kickoffs.txt` read, never a `Bus`, never a write. CI
+  never sees them; every unit test is synthetic. **Nothing identifying goes in
+  the repo or a pasted report** — no club, opponent, player, file or folder
+  name. The matches are A, B and C.
+
 ### Reference implementation (`apple/`, not maintained)
 
 The macOS app is kept as the reference for behavior and invariants. It is **not

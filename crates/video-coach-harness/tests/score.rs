@@ -4,8 +4,10 @@
 //! measurement tooling CI can run, and it is what pins the pairing rules the
 //! `#[ignore]`d `ground_truth` test reports through.
 
+use video_coach_core::signals::Cheer;
 use video_coach_harness::score::{
-    score, show_rate, Detection, DetectionKind, GoalTier, PERIOD_TOLERANCE,
+    cheer_coverage, nearest, score, show_rate, Detection, DetectionKind, GoalTier, CHEER_TOLERANCE,
+    PERIOD_TOLERANCE,
 };
 use video_coach_harness::truth::{folders, parse_kickoffs, TruthError, TruthEvent, TruthKind};
 
@@ -228,6 +230,32 @@ fn a_restart_is_a_diagnostic_and_is_not_scored() {
     assert_eq!(r.missed_goals, vec![goal(400.0)]);
 }
 
+// -------------------------------------------------------- audio coverage
+
+fn cheer(onset: f64) -> Cheer {
+    Cheer {
+        onset,
+        duration: 1.2,
+        peak_db: 30.0,
+    }
+}
+
+#[test]
+fn a_cheer_covers_a_goal_up_to_the_tolerance_and_no_further() {
+    // The offset is signed the way the report reads it: positive means the
+    // cheer came **after** the tag, which is what a goal's cheer does. A sign
+    // flipped here would move every DIAG line and the headline recall with it.
+    let (_, offset) = nearest(&[cheer(101.0)], 100.0, |c| c.onset).expect("a cheer");
+    assert_eq!(offset, 1.0);
+
+    let goals = [goal(100.0), goal(500.0)];
+    let inside = cheer(100.0 + CHEER_TOLERANCE);
+    let outside = cheer(500.0 + CHEER_TOLERANCE + 0.1);
+    assert_eq!(cheer_coverage(&goals, 0, &[inside, outside]), (1, 2));
+    // A goal on another source is not this source's to cover.
+    assert_eq!(cheer_coverage(&goals, 1, &[inside, outside]), (0, 0));
+}
+
 // ------------------------------------------------------------ kickoffs.txt
 
 #[test]
@@ -250,9 +278,18 @@ fn kickoffs_parses_comments_blanks_and_a_missing_line() {
 }
 
 #[test]
+fn a_line_waiting_for_its_time_is_not_a_restart_and_not_an_error() {
+    // The template hands the coach a video number under each goal and a blank
+    // where the time goes. A half-filled file is the normal state of one while
+    // a match is being worked through, and it must not stop the run.
+    let restarts = parse_kickoffs("1 07:13\n2\n2  \n").expect("a half-filled notes file");
+    assert_eq!(restarts.len(), 1);
+    assert_eq!(restarts[0].seconds, 433.0);
+}
+
+#[test]
 fn a_malformed_kickoffs_line_names_its_line() {
     for (text, line) in [
-        ("1 07:13\n1\n", 2),
         ("1 07:13\n2 7m13\n", 2),
         ("1 07:13\n\n\n0 07:13\n", 4),
         ("x 07:13\n", 1),

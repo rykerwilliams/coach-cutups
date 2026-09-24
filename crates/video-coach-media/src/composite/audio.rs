@@ -532,6 +532,37 @@ impl Reader {
     }
 }
 
+/// All of `path`'s sound at `rate` and `channels`, in one pass and with no
+/// seeking.
+///
+/// **On a worker thread, never the bus:** a minute of sound decodes in about
+/// a second, and the event loop has frames to deliver.
+///
+/// A file with no audio track and a file that cannot be read are two different
+/// errors, and both are errors: the export folds them into silence and runs
+/// on, but a caller that asked for a whole file has no use for part of one.
+/// [`Reader::rest`] is what makes a cancel an error here rather than a short
+/// buffer, which a caller cannot tell from a whole file.
+pub(crate) fn read_all(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<f32>, CompositeError> {
+    match Reader::start(path, rate, channels, cancel) {
+        Ok(Some(mut reader)) => reader.rest(cancel),
+        Ok(None) => Err(CompositeError::Failed(format!(
+            "{} has no sound",
+            path.display()
+        ))),
+        Err(CompositeError::Failed(e)) => Err(CompositeError::Failed(format!(
+            "could not read the sound of {}: {e}",
+            path.display()
+        ))),
+        Err(cancelled) => Err(cancelled),
+    }
+}
+
 /// Records `pipeline`'s first `ERROR` and its stream collection, and drops
 /// every message: nothing here needs a GL context, and nothing polls the bus.
 fn install(

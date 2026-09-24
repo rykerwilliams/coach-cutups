@@ -4,6 +4,7 @@
 //! Every entry point here assumes `gstreamer::init()` has already run.
 //! See `docs/superpowers/specs/2026-09-19-linux-port-design.md`.
 
+pub mod analyze;
 pub mod capture;
 pub mod chapters;
 pub mod composite;
@@ -17,6 +18,7 @@ pub mod player;
 pub mod probe;
 pub mod transcribe;
 
+pub use analyze::AnalyzeError;
 pub use capture::{
     list_devices, now_ns, resolve_camera, resolve_mic, Camera, CaptureSources, Devices, Mic,
     Recorder, RecorderMessage, StopOutcome, LEVEL_INTERVAL_NS,

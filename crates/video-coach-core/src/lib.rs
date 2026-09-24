@@ -21,6 +21,7 @@ pub mod project;
 pub mod recording;
 pub mod reel;
 pub mod scoreboard;
+pub mod signals;
 pub mod skip;
 pub mod store;
 pub mod stroke;
