@@ -112,6 +112,24 @@ export struct PasteEcho {
     button: string,
 }
 
+/// One ready-made colour in the setup sheet's picker
+/// (`src/color_picker.rs`'s `KIT_COLORS`).
+export struct KitColor {
+    /// The swatch's tooltip: "Royal blue", "Claret", ….
+    name: string,
+    /// `#rrggbb`, written into the field as it stands.
+    hex: string,
+}
+
+/// A colour as the picker's strip and area hold it: `hue` in degrees
+/// (0..360), `sat` and `val` in 0..1. Every conversion to and from it is
+/// Rust's (`src/color_picker.rs`) -- see [`ColorPicker`].
+export struct Hsv {
+    hue: float,
+    sat: float,
+    val: float,
+}
+
 /// A goal row's reel buttons (spec R3): set one end of the goal's span at the
 /// scan position, or put it back to the default.
 export enum ReelTrim {
@@ -1543,10 +1561,14 @@ component SetupField inherits VerticalLayout {
     in property <string> label;
     in property <string> placeholder;
     in property <bool> ok: true;
-    /// A colour field shows what its text parses to, beside the caption.
+    /// A colour field shows what its text parses to, beside the caption, and
+    /// the swatch is the way in to the picker.
     in property <bool> has-swatch;
     in property <color> swatch;
     in-out property <string> text;
+    /// The swatch was clicked: open the picker over this field. Where it
+    /// hangs is the sheet's business -- it knows which field this is.
+    callback pick();
 
     spacing: 2px;
 
@@ -1566,12 +1588,20 @@ component SetupField inherits VerticalLayout {
         if root.has-swatch: VerticalLayout {
             alignment: center;
             Rectangle {
-                width: 12px;
-                height: 12px;
-                border-radius: 2px;
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
                 border-width: 1px;
-                border-color: Palette.border;
+                // Lit on hover: without it the swatch reads as the preview it
+                // used to be, and the picker behind it is never found.
+                border-color: touch.has-hover ? Palette.foreground : Palette.border;
                 background: root.swatch;
+
+                touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.pick(); }
+                }
+                Tooltip { text: @markdown("Pick a colour"); }
             }
         }
     }
@@ -1581,12 +1611,178 @@ component SetupField inherits VerticalLayout {
     }
 }
 
+/// The colour picker the setup sheet's swatches open: a row of ready-made kit
+/// colours for the coach who doesn't know the club's hex codes, then a hue
+/// strip and a saturation/brightness area for anything else. **The hex box is
+/// not in here** -- it is the field's own, still in the sheet above, so there
+/// is only ever one place an exact code is typed.
+///
+/// **No colour maths here.** Every colour it draws and every colour it
+/// reports goes through `src/color_picker.rs` (`hex-of-hsv`) and
+/// `match_panel::parse_hex` (`hex-color`): what the project stores is the hex
+/// string, so the picker has to land on exactly those bytes. Slint's own
+/// `Colors.hsv` would be a second rounding, and then the swatch, the field
+/// and the scoreboard could disagree in the last bit.
+component ColorPicker inherits Rectangle {
+    in property <[KitColor]> kit-colors;
+    /// Where the picker is standing. The hue is held by the sheet rather than
+    /// read back out of the hex: grey has none (see `sync-from-text`).
+    in property <float> hue;
+    in property <float> sat;
+    in property <float> val;
+    pure callback hex-color(string) -> color;
+    pure callback hex-of-hsv(float, float, float) -> string;
+    /// A ready-made colour, taken as it stands.
+    callback pick(string);
+    /// A point in the area or on the strip, as hue / saturation / brightness.
+    callback take(float, float, float);
+
+    property <length> swatch-size: 20px;
+    /// The strip and the area are as wide as the row of kit colours, so the
+    /// three controls line up without a number written twice.
+    property <length> span: root.kit-colors.length * (root.swatch-size + 2px) - 2px;
+
+    width: body.preferred-width;
+    height: body.preferred-height;
+    background: Palette.background;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Palette.border;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000099;
+
+    // Swallows whatever misses a control, so the backdrop behind can't close
+    // the popup from under the pointer.
+    TouchArea { }
+
+    body := VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 2px;
+            for kit in root.kit-colors: Rectangle {
+                width: root.swatch-size;
+                height: root.swatch-size;
+                border-radius: 3px;
+                // The pen swatches' dark rim, so white and gold hold against
+                // the popup behind them.
+                border-width: 1px;
+                border-color: #00000066;
+                background: root.hex-color(kit.hex);
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.pick(kit.hex); }
+                }
+                Tooltip { text: @markdown("\{kit.name}"); }
+            }
+        }
+
+        // Saturation across, brightness down, over the strip's hue: the two
+        // gradients are the standard pair, white washing out to the right and
+        // black coming up from the bottom.
+        Rectangle {
+            width: root.span;
+            height: 110px;
+            border-radius: 3px;
+            background: root.hex-color(root.hex-of-hsv(root.hue, 1, 1));
+
+            Rectangle {
+                border-radius: 3px;
+                background: @linear-gradient(90deg, #ffffff 0%, #ffffff00 100%);
+            }
+            Rectangle {
+                border-radius: 3px;
+                background: @linear-gradient(180deg, #00000000 0%, #000000 100%);
+            }
+            Rectangle {
+                x: root.sat * parent.width - self.width / 2;
+                y: (1 - root.val) * parent.height - self.height / 2;
+                width: 12px;
+                height: 12px;
+                border-radius: self.width / 2;
+                border-width: 2px;
+                border-color: #ffffff;
+
+                // A dark rim inside the white one, so the marker is visible
+                // over the white corner as well as the black one.
+                Rectangle {
+                    border-radius: self.width / 2;
+                    border-width: 1px;
+                    border-color: #00000099;
+                }
+            }
+            area := TouchArea {
+                mouse-cursor: crosshair;
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down
+                        && event.button == PointerEventButton.left) {
+                        root.take-area();
+                    }
+                }
+                // Only while a button is down; `pressed` is the primary one.
+                // The pointer is grabbed on press, so this keeps arriving off
+                // the rectangle -- `take-area` clamps to its edge.
+                moved => { if (self.pressed) { root.take-area(); } }
+            }
+        }
+
+        Rectangle {
+            width: root.span;
+            height: 14px;
+            border-radius: 3px;
+            background: @linear-gradient(90deg,
+                #ff0000 0%, #ffff00 16.7%, #00ff00 33.3%, #00ffff 50%,
+                #0000ff 66.7%, #ff00ff 83.3%, #ff0000 100%);
+
+            Rectangle {
+                x: root.hue / 360 * parent.width - self.width / 2;
+                y: -3px;
+                width: 8px;
+                height: parent.height + 6px;
+                border-radius: 4px;
+                border-width: 2px;
+                border-color: #ffffff;
+            }
+            strip := TouchArea {
+                mouse-cursor: pointer;
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down
+                        && event.button == PointerEventButton.left) {
+                        root.take-hue();
+                    }
+                }
+                moved => { if (self.pressed) { root.take-hue(); } }
+            }
+        }
+    }
+
+    /// The pointer in the area, as a colour. Clamped, because Slint grabs the
+    /// pointer on press: a drag that leaves the rectangle should pin to its
+    /// edge rather than run off the end of the scale.
+    function take-area() {
+        root.take(root.hue,
+            Math.min(1, Math.max(0, area.mouse-x / area.width)),
+            Math.min(1, Math.max(0, 1 - area.mouse-y / area.height)));
+    }
+
+    /// The pointer on the strip, as a hue. Saturation and brightness stay put
+    /// -- the strip only turns the colour round.
+    function take-hue() {
+        root.take(Math.min(360, Math.max(0, strip.mouse-x / strip.width * 360)),
+            root.sat, root.val);
+    }
+}
+
 /// The match setup sheet (Phase 9 S4): both teams with their three colours,
 /// the match format, and the back-anchor -- "my video starts after kick-off".
 ///
-/// Colours are **hex fields**: Slint 1.18 has no colour picker, and the Mac's
-/// inspector cell was effectively a field too. Nothing here is an undo step:
-/// the sheet has Cancel, and the history is the coach's tagging (spec S5).
+/// Each colour is a hex field **and** a swatch that opens [`ColorPicker`]:
+/// the exact code for the coach who has it, a kit colour or a drag for
+/// everyone else. The field is what the two agree on, so picking writes the
+/// hex and typing a hex moves the picker. Nothing here is an undo step: the
+/// sheet has Cancel, and the history is the coach's tagging (spec S5).
 component MatchSetupSheet inherits Rectangle {
     in-out property <string> home-name;
     in-out property <string> home-primary;
@@ -1601,9 +1797,22 @@ component MatchSetupSheet inherits Rectangle {
     in-out property <string> overtime-periods;
     in-out property <string> overtime-minutes;
     in-out property <bool> back-anchor;
+    /// The picker's ready-made colours (`src/color_picker.rs`).
+    in property <[KitColor]> kit-colors;
+    /// Which colour field the picker is open over -- -1 for closed, else the
+    /// order the columns read: home primary, accent, text, then away's.
+    ///
+    /// **The window owns it**, so its Esc can close the popup before it
+    /// closes the sheet, and so `close-match-setup` can't leave a stale one
+    /// showing the next time the sheet opens.
+    in-out property <int> picker-field;
     /// The window's validators. They take the text so the bindings below
     /// re-evaluate on every keystroke.
     pure callback hex-color(string) -> color;
+    /// The picker's two conversions, both Rust's (`src/color_picker.rs`):
+    /// there is one hex-to-colour path in this app and this is it.
+    pure callback hsv-of-hex(string) -> Hsv;
+    pure callback hex-of-hsv(float, float, float) -> string;
     pure callback valid-name(string) -> bool;
     pure callback valid-hex(string) -> bool;
     /// One per numeric field: each knows its own range, which lives in
@@ -1635,6 +1844,74 @@ component MatchSetupSheet inherits Rectangle {
     property <string> orphaned:
         root.over-cap(root.regulation-periods, root.overtime-periods, root.back-anchor);
 
+    // --- The picker's state ---------------------------------------------
+    //
+    // Slint has no dynamic alias, so the open field is dispatched by hand,
+    // once each way: a binding out and a function in.
+
+    property <string> picker-text:
+        root.picker-field == 0 ? root.home-primary
+        : root.picker-field == 1 ? root.home-secondary
+        : root.picker-field == 2 ? root.home-font
+        : root.picker-field == 3 ? root.away-primary
+        : root.picker-field == 4 ? root.away-secondary
+        : root.away-font;
+
+    function write(hex: string) {
+        if (root.picker-field == 0) { root.home-primary = hex; }
+        else if (root.picker-field == 1) { root.home-secondary = hex; }
+        else if (root.picker-field == 2) { root.home-font = hex; }
+        else if (root.picker-field == 3) { root.away-primary = hex; }
+        else if (root.picker-field == 4) { root.away-secondary = hex; }
+        else if (root.picker-field == 5) { root.away-font = hex; }
+    }
+
+    /// Where the picker is standing. Held here rather than read straight off
+    /// the field, because the hex cannot say everything: grey has no hue and
+    /// black has neither hue nor saturation, so a drag into the white corner
+    /// would swing the strip to red and the next drag would come back a
+    /// different colour.
+    property <float> picker-hue;
+    property <float> picker-sat;
+    property <float> picker-val;
+    property <Hsv> text-hsv: root.hsv-of-hex(root.picker-text);
+
+    /// Pulls the picker onto the field's text. Typing a hex moves it; so
+    /// does a kit colour, which is written as text like any other. What the
+    /// picker itself just wrote is left alone -- the second test -- so a drag
+    /// doesn't fight the hex it produced a moment ago, and opening the popup
+    /// on a colour and touching nothing rewrites nothing.
+    function sync-from-text() {
+        if (root.picker-field >= 0 && root.valid-hex(root.picker-text)
+            && root.hex-of-hsv(root.picker-hue, root.picker-sat, root.picker-val)
+                != root.picker-text) {
+            root.picker-sat = root.text-hsv.sat;
+            root.picker-val = root.text-hsv.val;
+            if (root.text-hsv.sat > 0 && root.text-hsv.val > 0) {
+                root.picker-hue = root.text-hsv.hue;
+            }
+        }
+    }
+    changed picker-text => { root.sync-from-text(); }
+    changed picker-field => { root.sync-from-text(); }
+
+    /// Where the popup hangs: under the clicked field, left-aligned with it.
+    /// Bindings off the fields' own ids rather than coordinates handed up
+    /// from a click, so the anchor follows the layout -- and so opening the
+    /// picker by setting `picker-field` alone lands where a click would.
+    /// The two columns hold the same three fields in the same order, so the
+    /// row decides the y and only the column decides the x.
+    property <length> anchor-x:
+        (root.picker-field < 3 ? home-primary.absolute-position.x
+            : away-primary.absolute-position.x) - root.absolute-position.x;
+    property <length> anchor-y:
+        (root.picker-field == 0 || root.picker-field == 3
+            ? home-primary.absolute-position.y + home-primary.height
+        : root.picker-field == 1 || root.picker-field == 4
+            ? home-accent.absolute-position.y + home-accent.height
+        : home-text.absolute-position.y + home-text.height)
+        - root.absolute-position.y + 4px;
+
     width: 520px;
     height: sheet.preferred-height;
     background: Palette.background;
@@ -1665,29 +1942,32 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-name(root.home-name);
                     text <=> root.home-name;
                 }
-                SetupField {
+                home-primary := SetupField {
                     label: "Primary";
                     has-swatch: true;
                     swatch: root.hex-color(root.home-primary);
                     ok: root.valid-hex(root.home-primary);
                     placeholder: "#rrggbb";
                     text <=> root.home-primary;
+                    pick => { root.picker-field = 0; }
                 }
-                SetupField {
+                home-accent := SetupField {
                     label: "Accent";
                     has-swatch: true;
                     swatch: root.hex-color(root.home-secondary);
                     ok: root.valid-hex(root.home-secondary);
                     placeholder: "#rrggbb";
                     text <=> root.home-secondary;
+                    pick => { root.picker-field = 1; }
                 }
-                SetupField {
+                home-text := SetupField {
                     label: "Text";
                     has-swatch: true;
                     swatch: root.hex-color(root.home-font);
                     ok: root.valid-hex(root.home-font);
                     placeholder: "#rrggbb";
                     text <=> root.home-font;
+                    pick => { root.picker-field = 2; }
                 }
             }
             VerticalLayout {
@@ -1699,29 +1979,32 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-name(root.away-name);
                     text <=> root.away-name;
                 }
-                SetupField {
+                away-primary := SetupField {
                     label: "Primary";
                     has-swatch: true;
                     swatch: root.hex-color(root.away-primary);
                     ok: root.valid-hex(root.away-primary);
                     placeholder: "#rrggbb";
                     text <=> root.away-primary;
+                    pick => { root.picker-field = 3; }
                 }
-                SetupField {
+                away-accent := SetupField {
                     label: "Accent";
                     has-swatch: true;
                     swatch: root.hex-color(root.away-secondary);
                     ok: root.valid-hex(root.away-secondary);
                     placeholder: "#rrggbb";
                     text <=> root.away-secondary;
+                    pick => { root.picker-field = 4; }
                 }
-                SetupField {
+                away-text := SetupField {
                     label: "Text";
                     has-swatch: true;
                     swatch: root.hex-color(root.away-font);
                     ok: root.valid-hex(root.away-font);
                     placeholder: "#rrggbb";
                     text <=> root.away-font;
+                    pick => { root.picker-field = 5; }
                 }
             }
         }
@@ -1788,6 +2071,40 @@ component MatchSetupSheet inherits Rectangle {
                 primary: true;
                 enabled: root.can-save;
                 clicked => { root.save(); }
+            }
+        }
+    }
+
+    // The picker, over the sheet rather than over the window: a scrim of its
+    // own would be a modal on top of a modal, and the coach would have two
+    // Escs to get back to the game. The sheet itself is the backdrop -- a
+    // click anywhere else closes the popup and nothing behind it moves --
+    // which also makes a second click on the same swatch a toggle.
+    if root.picker-field >= 0: Rectangle {
+        TouchArea {
+            clicked => { root.picker-field = -1; }
+        }
+
+        ColorPicker {
+            // Kept inside the sheet at both ends: the away column's swatches
+            // are near the right edge, and the Text row's popup would
+            // otherwise hang off the bottom.
+            x: Math.min(Math.max(8px, root.anchor-x), root.width - 8px - self.width);
+            y: Math.min(Math.max(8px, root.anchor-y), root.height - 8px - self.height);
+            kit-colors: root.kit-colors;
+            hue: root.picker-hue;
+            sat: root.picker-sat;
+            val: root.picker-val;
+            hex-color(text) => { return root.hex-color(text); }
+            hex-of-hsv(hue, sat, val) => { return root.hex-of-hsv(hue, sat, val); }
+            // Both land in the field, which is what the sheet saves: there is
+            // no colour held anywhere the hex box can't see.
+            pick(hex) => { root.write(hex); }
+            take(hue, sat, val) => {
+                root.picker-hue = hue;
+                root.picker-sat = sat;
+                root.picker-val = val;
+                root.write(root.hex-of-hsv(hue, sat, val));
             }
         }
     }
@@ -2411,6 +2728,13 @@ export component AppWindow inherits Window {
     /// The setup sheet is up. UI state: the panel's button opens it, its own
     /// buttons and Esc close it.
     in-out property <bool> match-sheet-open;
+    /// Which of the setup sheet's six colour fields the picker is open over,
+    /// -1 for none. Up here rather than inside the sheet so Esc closes the
+    /// popup before the sheet (`handle-key`), and so a sheet that closes with
+    /// the popup up doesn't reopen with it still showing.
+    in-out property <int> match-picker-field: -1;
+    /// The picker's ready-made kit colours, from `src/color_picker.rs`.
+    in property <[KitColor]> kit-colors;
     /// Its fields, seeded from the project when it opens and read back on
     /// Save (`src/main.rs`). Two-way bound down to the fields, since a
     /// `text:` or `checked:` binding breaks once the user edits it.
@@ -2556,6 +2880,11 @@ export component AppWindow inherits Window {
     pure callback hex-color(string) -> color;
     pure callback valid-name(string) -> bool;
     pure callback valid-hex(string) -> bool;
+    /// The picker's two conversions, both `src/color_picker.rs`'s: the hex
+    /// string is what the project stores, so there is one path to a colour in
+    /// this app and these go through it.
+    pure callback hsv-of-hex(string) -> Hsv;
+    pure callback hex-of-hsv(float, float, float) -> string;
     pure callback valid-periods(string) -> bool;
     pure callback valid-overtime-periods(string) -> bool;
     pure callback valid-minutes(string) -> bool;
@@ -2627,8 +2956,11 @@ export component AppWindow inherits Window {
     }
 
     /// Closes the setup sheet, however it was closed, and puts focus back on
-    /// the window so the shortcuts work again.
+    /// the window so the shortcuts work again. The colour picker goes with
+    /// it: the sheet that held it is about to be destroyed, and reopening on
+    /// a popup over last time's field would be a surprise.
     function close-match-setup() {
+        root.match-picker-field = -1;
         root.match-sheet-open = false;
         keys.focus();
     }
@@ -2682,9 +3014,17 @@ export component AppWindow inherits Window {
         // Esc closes it, and everything else goes to whatever in it has
         // focus. Ahead of the Esc cascade and the tag keys, so neither fires
         // behind it.
+        //
+        // An open colour picker takes the first Esc: it is the innermost
+        // thing on screen, and a coach who opened it to look at the kit
+        // colours should not lose the whole setup to one key.
         if (root.match-sheet-open) {
             if (pressed && event.text == Key.Escape) {
-                root.close-match-setup();
+                if (root.match-picker-field >= 0) {
+                    root.match-picker-field = -1;
+                } else {
+                    root.close-match-setup();
+                }
                 return accept;
             }
             return reject;
@@ -4004,7 +4344,11 @@ export component AppWindow inherits Window {
                 overtime-periods <=> root.match-overtime-periods;
                 overtime-minutes <=> root.match-overtime-minutes;
                 back-anchor <=> root.match-back-anchor;
+                kit-colors: root.kit-colors;
+                picker-field <=> root.match-picker-field;
                 hex-color(text) => { return root.hex-color(text); }
+                hsv-of-hex(text) => { return root.hsv-of-hex(text); }
+                hex-of-hsv(hue, sat, val) => { return root.hex-of-hsv(hue, sat, val); }
                 valid-name(text) => { return root.valid-name(text); }
                 valid-hex(text) => { return root.valid-hex(text); }
                 valid-periods(text) => { return root.valid-periods(text); }

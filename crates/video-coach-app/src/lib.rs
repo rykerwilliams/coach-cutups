@@ -5,6 +5,7 @@
 //! `docs/superpowers/specs/2026-09-19-linux-port-phase-2-design.md`.
 
 pub mod bus;
+pub mod color_picker;
 pub mod drawing;
 pub mod format;
 pub mod highlight_view;

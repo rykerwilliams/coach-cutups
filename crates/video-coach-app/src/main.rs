@@ -27,6 +27,7 @@ use video_coach_app::bus::{
     Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile,
     TargetState, TranscriptionState, WindowSize,
 };
+use video_coach_app::color_picker;
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
 use video_coach_app::format::{finish_at, format_hms, format_hms_tenths, sentence};
 use video_coach_app::highlight_view::{self, LiveHighlight as Ring};
@@ -875,6 +876,34 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     // no name.
     window.on_valid_name(|text| !text.trim().is_empty());
     window.on_valid_hex(|text| parse_hex(&text).is_some());
+    // The colour picker: its row of ready-made colours, and the two
+    // conversions it is drawn and read with. Both are `color_picker`'s, so
+    // the picker lands on exactly the bytes the field stores and the
+    // scoreboard draws — see that module's header.
+    window.set_kit_colors(ModelRc::new(VecModel::from(
+        color_picker::KIT_COLORS
+            .iter()
+            .map(|kit| KitColor {
+                name: kit.name.into(),
+                hex: kit.hex.into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    window.on_hsv_of_hex(|text| {
+        // Half-typed text has no position; the sheet gates on `valid-hex`
+        // before it moves the picker, so this is never what it stands on.
+        let hsv = color_picker::hsv_of_hex(&text).unwrap_or(color_picker::Hsv {
+            hue: 0.0,
+            sat: 0.0,
+            val: 0.0,
+        });
+        Hsv {
+            hue: hsv.hue,
+            sat: hsv.sat,
+            val: hsv.val,
+        }
+    });
+    window.on_hex_of_hsv(|hue, sat, val| color_picker::hex_of_hsv(hue, sat, val).into());
     // One validator per field, sharing its range with the parse that builds
     // the config, so a field can't read good and then fail to save.
     window.on_valid_periods(|text| parse_periods(&text).is_some());
