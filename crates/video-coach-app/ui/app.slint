@@ -2652,6 +2652,16 @@ export component AppWindow inherits Window {
     /// scanning as well as while recording.
     in property <[LiveHighlight]> live-highlights;
 
+    /// The scoreboard over the scan picture (spec S3), already rasterized by
+    /// `media`'s overlay — the same code the export burns in — so there is no
+    /// second drawing of the board to keep honest. It is drawn at the content
+    /// rect's top-left corner, where the export puts it, at the logical size
+    /// below: the image is in device pixels, so it stays crisp on a scaled
+    /// display. An empty image, and a zero width, draw nothing.
+    in property <image> scoreboard;
+    in property <length> scoreboard-width;
+    in property <length> scoreboard-height;
+
     // --- The H tool and the Highlights panel (spec H3) ---
 
     /// The tool is on. UI state: `H` toggles it and Esc leaves it.
@@ -2838,6 +2848,9 @@ export component AppWindow inherits Window {
     callback step-scan-speed(ScanStep);
     callback scrub-move(float);
     callback scrub-release(float);
+    /// A wheel over the scrubber: the scroll's deltas and whether Shift was
+    /// held. It skips rather than seeking — see `wheel.rs`.
+    callback scrub-scroll(length, length, bool);
     /// R, Record or Stop: the bus starts a recording when idle, else stops
     /// (or aborts) it.
     callback toggle-recording();
@@ -3665,6 +3678,22 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // The scoreboard the export burns in, shown while scanning
+                    // (spec S3). Over the drawings and the rings, which is the
+                    // export's layer order, and placed on the content rect
+                    // rather than the picture, so the zoom doesn't move it —
+                    // in the export it is chrome on the output frame. Hidden
+                    // while previewing, where the clip's own texture already
+                    // carries its board.
+                    if root.scoreboard-width > 0 && !root.previewing: Image {
+                        x: player.content.x;
+                        y: player.content.y;
+                        width: root.scoreboard-width;
+                        height: root.scoreboard-height;
+                        source: root.scoreboard;
+                        image-fit: fill;
+                    }
+
                     zoom-area := TouchArea {
                         // Only over a picture: the empty-state cards cover it
                         // otherwise. Off while previewing, which is at
@@ -4015,6 +4044,11 @@ export component AppWindow inherits Window {
                     scrubber := Scrubber {
                         // Something to play, and not recording.
                         enabled: root.can-play && !root.recording;
+                        // The wheel sends a skip, which the bus allows while
+                        // recording, so it outlives the drag's gate. Gated
+                        // like the frame step otherwise: something to play,
+                        // and the game video in front, not a preview.
+                        wheel-enabled: root.can-play && !root.previewing;
                         maximum: max(root.total-seconds, 0.001);
                         // The concat timeline's: a preview's scale is its
                         // clip's, where they would mean nothing.
@@ -4022,6 +4056,7 @@ export component AppWindow inherits Window {
                         value <=> root.position-seconds;
                         moved(value) => { root.scrub-move(value); }
                         released(value) => { root.scrub-release(value); }
+                        scrolled(dx, dy, shift) => { root.scrub-scroll(dx, dy, shift); }
                     }
 
                     HorizontalLayout {

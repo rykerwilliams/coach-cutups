@@ -20,6 +20,10 @@ export struct Mark {
 
 export component Scrubber {
     in property <bool> enabled;
+    /// The wheel over the track moves the playhead. Gated on its own, not on
+    /// `enabled`: a wheel sends a **skip**, which the bus allows mid-take,
+    /// while a scrub is refused there (see `wheel.rs`).
+    in property <bool> wheel-enabled;
     in property <float> maximum;
     /// Drawn on the track, under the thumb and the pointer: a click on a
     /// mark scrubs there like anywhere else.
@@ -32,6 +36,9 @@ export component Scrubber {
     /// Where a scrub ended: a pointer-up, or a cancelled drag, which lands
     /// where it had got to. Not when disabled mid-drag: see below.
     callback released(float);
+    /// A wheel over the track: the raw scroll deltas and whether Shift was
+    /// held. Rust adds them up into whole notches and skips by them.
+    callback scrolled(/* dx */ length, /* dy */ length, /* shift */ bool);
 
     min-height: slider.min-height;
     horizontal-stretch: 1;
@@ -80,6 +87,22 @@ export component Scrubber {
         minimum: 0;
         maximum: root.maximum;
         value: root.value;
+    }
+
+    // The wheel, behind the pointer area below: that one has no
+    // `scroll-event`, so wheels fall through to this one, while presses stop
+    // there whenever it is enabled. Declared here so a wheel still works
+    // while a recording has disabled the scrub.
+    TouchArea {
+        enabled: root.wheel-enabled;
+        scroll-event(event) => {
+            // Never mid-drag: the pointer is already saying where to go.
+            if (root.scrubbing) {
+                return reject;
+            }
+            root.scrolled(event.delta-x, event.delta-y, event.modifiers.shift);
+            return accept;
+        }
     }
 
     // Above the slider and the marks, so it takes every pointer event.

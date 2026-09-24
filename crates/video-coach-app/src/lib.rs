@@ -10,4 +10,5 @@ pub mod drawing;
 pub mod format;
 pub mod highlight_view;
 pub mod match_panel;
+pub mod wheel;
 pub mod zoom_input;

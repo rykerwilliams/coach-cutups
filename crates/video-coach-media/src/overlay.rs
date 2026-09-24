@@ -748,6 +748,78 @@ impl OverlayRenderer {
     }
 }
 
+// ------------------------------------------------ the scan view's scoreboard
+
+/// The scoreboard on its own, as an image for the app to draw over the **scan**
+/// picture: premultiplied RGBA, tightly packed, `width` × `height`.
+///
+/// Premultiplied because the pixmap is (see this module's header); Slint takes
+/// it as it is through `Image::from_rgba8_premultiplied`.
+pub struct ScoreboardImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Draws [`ScoreboardImage`]s — the **same** board the composite burns in, by
+/// the same code, so the coach scans against the picture they will export.
+///
+/// One per window: it holds the fonts and the remembered name fits, and the
+/// app draws a new board only when the clock ticks or the score changes.
+pub struct ScoreboardRenderer(OverlayRenderer);
+
+impl ScoreboardRenderer {
+    pub fn new() -> ScoreboardRenderer {
+        ScoreboardRenderer(OverlayRenderer::new())
+    }
+
+    /// The board as it would be burned into an `out_w`×`out_h` frame, cropped
+    /// to the top-left corner it occupies: the bar, its inset from the two
+    /// edges, and room for the stoppage tail, which hangs past the clock cell.
+    ///
+    /// The tail's room is kept whether or not the clock is in stoppage, so the
+    /// image is one size for a given frame and entering stoppage doesn't move
+    /// the board. Everything outside the crop is clipped by the pixmap, which
+    /// is why the cells' own geometry is untouched — they are still placed in
+    /// `out_w`×`out_h` space, exactly as the export places them.
+    ///
+    /// `None` for a frame too small to hold a pixel of board.
+    pub fn render(
+        &mut self,
+        config: &ScoreboardConfig,
+        state: ScoreboardState,
+        out_w: f64,
+        out_h: f64,
+    ) -> Option<ScoreboardImage> {
+        let rects = scoreboard_rects(out_w, out_h);
+        let (width, height) = (
+            (rects.tail.x + rects.tail.w).ceil(),
+            (rects.bar.y + rects.bar.h).ceil(),
+        );
+        if !(width >= 1.0 && height >= 1.0) {
+            return None;
+        }
+        let (width, height) = (width as u32, height as u32);
+        // Zeroed is transparent, and premultiplied transparent at that, so
+        // nothing has to clear it the way `draw` clears a recycled buffer.
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let mut pixmap = PixmapMut::from_bytes(&mut pixels, width, height)?;
+        self.0
+            .draw_scoreboard(&mut pixmap, config, state, out_w, out_h);
+        Some(ScoreboardImage {
+            width,
+            height,
+            pixels,
+        })
+    }
+}
+
+impl Default for ScoreboardRenderer {
+    fn default() -> ScoreboardRenderer {
+        ScoreboardRenderer::new()
+    }
+}
+
 /// How wide a shaped [`Buffer`]'s widest row is.
 fn line_width(buffer: &Buffer) -> f32 {
     buffer
@@ -1820,6 +1892,39 @@ mod tests {
         assert_eq!(at(&px, OUT_W, r.home.x as u32 + 4, y), [0, 0, 255, 255]);
         // And it is still there past the board's right edge.
         assert_eq!(at(&px, OUT_W, 900, y), [255, 51, 51, 255]);
+    }
+
+    /// The scan view's board is the burned-in board, byte for byte, over the
+    /// corner it crops to — which is the whole point of rasterizing it here
+    /// instead of drawing it a second time in Slint. In stoppage, so the tail
+    /// outside the bar is covered too.
+    #[test]
+    fn the_scan_boards_pixels_are_the_burned_in_boards() {
+        let config = scoreboard_config();
+        let state = state(ClockDisplay::Stoppage {
+            base: 2700.0,
+            plus: 90.0,
+        });
+        let burned = render_scoreboard(&config, state);
+        let scan = ScoreboardRenderer::new()
+            .render(&config, state, f64::from(OUT_W), f64::from(OUT_H))
+            .expect("a board on an export-sized frame");
+
+        // Wide enough for the tail, which hangs outside the bar.
+        let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+        assert!(f64::from(scan.width) >= r.tail.x + r.tail.w);
+        assert!(f64::from(scan.height) >= r.bar.y + r.bar.h);
+
+        let cropped = scan.pixels.as_chunks::<4>().0;
+        for y in 0..scan.height {
+            for x in 0..scan.width {
+                assert_eq!(
+                    cropped[(y * scan.width + x) as usize],
+                    at(&burned, OUT_W, x, y),
+                    "at {x},{y}"
+                );
+            }
+        }
     }
 
     /// A frame with no scoreboard leaves the board's rects alone: the two

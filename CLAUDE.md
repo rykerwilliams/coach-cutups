@@ -412,6 +412,16 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
   `draw_label` centres and does not clip, so an unfitted label spills out of
   both ends of its cell. The columns are sized so nothing realistic shrinks;
   fitting is what makes a spill impossible rather than unlikely.
+- **The scan view shows the same board, from the same rasterizer.** Not a
+  second drawing of it in Slint: `media::ScoreboardRenderer` renders the
+  board's own corner of the frame and the window draws that image over the
+  content rect (`show_board` in `main.rs`). It is a viewing aid — nothing is
+  exported or stored — and the tick rasterizes only when the key
+  `(config, state, device pixels)` changes, so a board costs **~0.3 ms at
+  720p, about once a second**, not once a frame. It follows the displayed
+  frame's source time as the highlight rings do, is dropped while `scrubbing`
+  and restored on release, and is kept through a fast scan, where the shown
+  frame's own time is as honest at 32× as at 1×.
 
 **Match events are tagged at the playhead or typed, in one grammar.** `z` /
 `x` / `v` tag where the game video is; the editor sheet ("Edit events…" in the

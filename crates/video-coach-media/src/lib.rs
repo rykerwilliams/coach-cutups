@@ -33,6 +33,7 @@ pub use composite::preview::{Preview, PreviewJob, PreviewMessage, PreviewPositio
 pub use composite::{frame_times, Gl};
 pub use download::{download, Fetch};
 pub use mailbox::{Frame, FrameMailbox};
+pub use overlay::{ScoreboardImage, ScoreboardRenderer};
 pub use player::{
     keep_pulsesink_out, Diagnostics, Origin, PlayerEvent, PositionHandle, SinkKind, SourcePlayer,
 };

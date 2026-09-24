@@ -34,6 +34,7 @@ use video_coach_app::highlight_view::{self, LiveHighlight as Ring};
 use video_coach_app::match_panel::{
     self, parse_hex, parse_minutes, parse_overtime_periods, parse_periods,
 };
+use video_coach_app::wheel::Wheel;
 use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
@@ -42,15 +43,16 @@ use video_coach_core::match_entry::{self, PendingMatchEvent};
 use video_coach_core::plan::{ExportTarget, ScoreboardMode};
 use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
-    MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
+    MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, ScoreboardState,
+    TeamConfig,
 };
 use video_coach_core::stroke::{Rgba, Stroke};
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
 use video_coach_core::undo::ClipEdit;
 use video_coach_core::zoom::{Zoom, SNAP_NOTCHES};
 use video_coach_media::{
-    avatar_drawn, list_devices, now_ns, Devices, PositionHandle, PreviewPosition, SinkKind,
-    WhisperModel, LEVEL_INTERVAL_NS,
+    avatar_drawn, list_devices, now_ns, Devices, PositionHandle, PreviewPosition,
+    ScoreboardRenderer, SinkKind, WhisperModel, LEVEL_INTERVAL_NS,
 };
 
 use pickers::{Pick, Pickers};
@@ -167,6 +169,18 @@ struct UiState {
     /// Rebuilt on every project change and **never carried across one**: a
     /// source add, move, remove or relink moves the offsets it froze.
     scoreboard: Option<ScoreboardContext>,
+    /// Draws the scoreboard the scan picture carries (spec S3) — **media's
+    /// own rasterizer**, so the board on screen is the board the export burns
+    /// in, pixel for pixel. Built on first use: a project with no scoreboard
+    /// never pays for its fonts.
+    board_renderer: Option<ScoreboardRenderer>,
+    /// What the board on screen stands for: the teams, what it reads, and the
+    /// device pixels it was drawn for. The tick rasterizes only when this
+    /// changes — which is when the clock ticks (once a second), the score
+    /// changes or the window is resized, not every frame.
+    board_key: Option<BoardKey>,
+    /// The wheel over the scrubber, part-way to its next notch.
+    wheel: Wheel,
     /// The transcription queue (Phase 10 S5).
     transcription: Transcription,
     /// What the avatar image in hand was decoded from: the file name, its
@@ -189,6 +203,11 @@ struct UiState {
 /// the open project's folder, and the folder changing brings a project
 /// change with it.
 type AvatarFile = (String, u64, Option<SystemTime>);
+
+/// What the scan picture's scoreboard is drawn from: the teams, what the board
+/// reads at the displayed frame, and the frame it is laid out on in **device**
+/// pixels. Equal keys draw the same board, so the tick can skip the raster.
+type BoardKey = (ScoreboardConfig, ScoreboardState, u32, u32);
 
 /// A drag in the H tool, from its press (spec H3).
 struct HighlightDrag {
@@ -241,6 +260,9 @@ impl Default for UiState {
             preview_duration: None,
             export_targets: Vec::new(),
             scoreboard: None,
+            board_renderer: None,
+            board_key: None,
+            wheel: Wheel::default(),
             transcription: Transcription::default(),
             avatar_shown: None,
             avatar_image: None,
@@ -472,6 +494,23 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
     window.on_scrub_move(cmd(bus, |abs| Command::ScrubMove { abs }));
     window.on_scrub_release(cmd(bus, |abs| Command::ScrubRelease { abs }));
+    // A wheel over the scrubber skips, by whole notches, through the same
+    // coordinator a held arrow key drives (`wheel.rs`). The moment is
+    // captured here, at the input event, as the bus contract requires.
+    window.on_scrub_scroll({
+        let send = send(bus);
+        move |dx, dy, shift| {
+            let (Some(dx), Some(dy)) = (finite(dx), finite(dy)) else {
+                return;
+            };
+            if let Some(delta) = UI.with_borrow_mut(|ui| ui.wheel.scrolled(dx, dy, shift)) {
+                send(Command::Skip {
+                    delta,
+                    host_ns: now_ns(),
+                });
+            }
+        }
+    });
     window.on_volume_changed(cmd(bus, |value| Command::SetVolume {
         value,
         commit: false,
@@ -1985,6 +2024,43 @@ fn slint_highlight(ring: &Ring) -> LiveHighlight {
     }
 }
 
+/// Draws the scan picture's scoreboard for `key` and hands it to the window,
+/// or clears it for `None`. The one writer of the three properties, so the
+/// image and the size it is drawn at can never disagree.
+///
+/// The board is rasterized in **device** pixels (`key`'s size already is) and
+/// drawn at the logical size they came from, so it stays crisp on a scaled
+/// display rather than being a logical-size image stretched over it.
+fn show_board(w: &AppWindow, ui: &mut UiState, key: Option<BoardKey>) {
+    let drawn = key.as_ref().and_then(|(config, state, out_w, out_h)| {
+        ui.board_renderer
+            .get_or_insert_with(ScoreboardRenderer::new)
+            .render(config, *state, f64::from(*out_w), f64::from(*out_h))
+    });
+    // Slint's scale factor is positive; a stray zero would divide the size
+    // below to infinity, so it falls back to drawing the raster one to one.
+    let scale = match f64::from(w.window().scale_factor()) {
+        scale if scale > 0.0 => scale,
+        _ => 1.0,
+    };
+    let (width, height) = drawn.as_ref().map_or((0.0, 0.0), |image| {
+        (
+            f64::from(image.width) / scale,
+            f64::from(image.height) / scale,
+        )
+    });
+    w.set_scoreboard(drawn.map_or_else(slint::Image::default, |image| {
+        slint::Image::from_rgba8_premultiplied(slint::SharedPixelBuffer::clone_from_slice(
+            &image.pixels,
+            image.width,
+            image.height,
+        ))
+    }));
+    w.set_scoreboard_width(width as f32);
+    w.set_scoreboard_height(height as f32);
+    ui.board_key = key;
+}
+
 /// The one place the pen changes, in the window and for the next stroke.
 fn set_pen(w: &AppWindow, pen: Pen) {
     UI.with_borrow_mut(|ui| ui.pen = pen);
@@ -2753,6 +2829,36 @@ fn tick(w: &AppWindow, position: &PositionHandle, preview: &PreviewPosition) {
                 rings.iter().map(slint_highlight).collect::<Vec<_>>(),
             )));
             ui.highlight_rings = rings;
+        }
+        // The scoreboard over the scan picture (spec S3) — a viewing aid, and
+        // nothing else: it changes no export and is stored nowhere. It is
+        // rasterized by `media`'s own overlay code, so the board the coach
+        // scans against is the board the export burns in, and it follows **the
+        // displayed frame's** source time exactly as the rings above do.
+        //
+        // **Dropped while scrubbing**, restored on release: a drag is a burst
+        // of flushing seeks, and the board is the one thing on screen that
+        // would be redrawn by each of them. A fast scan (J/L) keeps it — the
+        // shown frame's own time is as honest at 32× as at 1×, and the clock
+        // simply ticks faster.
+        let board = match (shown, content, &ui.scoreboard) {
+            (Some((source_index, secs)), Some((cw, ch)), Some(scoreboard))
+                if !w.get_scrubbing() =>
+            {
+                let scale = f64::from(w.window().scale_factor());
+                scoreboard.state_at(source_index, secs).map(|state| {
+                    (
+                        scoreboard.config().clone(),
+                        state,
+                        (cw * scale).round() as u32,
+                        (ch * scale).round() as u32,
+                    )
+                })
+            }
+            _ => None,
+        };
+        if ui.board_key != board {
+            show_board(w, ui, board);
         }
         // Whether "Delete key here" has a key to remove (spec H3): the
         // selected highlight's, on the frame on screen — the same number a
