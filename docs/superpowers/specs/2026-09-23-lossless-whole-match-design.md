@@ -168,7 +168,9 @@ Rovers 1 - 0 Athletic · 14:05
 | TV — USB stick or DLNA | Often ignored |
 | YouTube | **This is the file you upload as captions** |
 
-The honest summary for the user: **on a computer it just works; on a phone or a TV it is a coin toss.** The burned option is there for the audience that can't — and the user's own report (**the hands-on step**) decides whether the embedded track is ever worth building.
+The honest summary for the user: **on a computer it just works; on a phone or a TV it is a coin toss.** The burned option is there for the audience that can't.
+
+**The coach's verdict, 2026-09-24 [measured, in the wild]:** they uploaded a copied whole match to YouTube and **attached the `.srt` as a subtitle track there — "it works as expected"**. That is the route that matters for this audience: the upload carries the scoreboard without re-encoding a frame, and the viewer switches it on with YouTube's own captions button. It also settles the question the embedded `tx3g` track was built against — the track rides along for a file that travels on its own, and the sidecar is what a share platform ingests.
 
 ### U. Where the cue text comes from
 
