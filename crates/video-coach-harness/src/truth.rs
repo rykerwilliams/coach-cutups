@@ -55,6 +55,21 @@ pub struct Truth {
     pub events: Vec<TruthEvent>,
 }
 
+/// One goal and the restart that followed it (V-3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WalkBack {
+    pub source_index: usize,
+    pub goal: f64,
+    pub restart: f64,
+}
+
+impl WalkBack {
+    /// How long the children took to walk back and restart.
+    pub fn seconds(&self) -> f64 {
+        self.restart - self.goal
+    }
+}
+
 /// One parsed `kickoffs.txt` line.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Restart {
@@ -130,6 +145,53 @@ impl Truth {
                 .collect(),
             events,
         })
+    }
+
+    /// V-3: every goal that has a restart written down, paired with it.
+    ///
+    /// The walk-back is the gap between the two, and it is the only thing that
+    /// sets `W`: a goal's window reaches back from the restart, so a window
+    /// shorter than the longest walk-back cannot hold its goal and one longer
+    /// claims match the rule knows nothing about.
+    ///
+    /// A goal takes the first restart between it and the **next goal**. Both
+    /// bounds earn their place: a goal the half ended on has no restart at all,
+    /// and without the upper one it would take the *following* goal's and
+    /// report a walk-back of several minutes — which is precisely the number
+    /// `W` is set from, so a silent mis-pairing here would be worse than no
+    /// measurement.
+    pub fn walk_backs(&self) -> Vec<WalkBack> {
+        let mut out = Vec::new();
+        for source_index in 0..self.durations.len() {
+            let restarts: Vec<f64> = self
+                .on(source_index, TruthKind::Restart)
+                .map(|e| e.seconds)
+                .collect();
+            let goals: Vec<f64> = self
+                .on(source_index, TruthKind::Goal)
+                .map(|e| e.seconds)
+                .collect();
+            for (i, &goal) in goals.iter().enumerate() {
+                let next_goal = goals.get(i + 1).copied().unwrap_or(f64::INFINITY);
+                if let Some(&restart) = restarts.iter().find(|&&r| r >= goal && r < next_goal) {
+                    out.push(WalkBack {
+                        source_index,
+                        goal,
+                        restart,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// How many goals this match has, restart or no restart — the denominator
+    /// [`walk_backs`](Self::walk_backs) is read against.
+    pub fn goal_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| e.kind == TruthKind::Goal)
+            .count()
     }
 
     /// Every event of one kind on one source, in time order.

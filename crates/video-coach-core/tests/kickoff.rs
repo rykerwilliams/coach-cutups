@@ -88,16 +88,25 @@ fn goals(found: &[Suggestion]) -> Vec<&Suggestion> {
 
 #[test]
 fn a_cheer_then_a_kick_off_is_a_high_tier_goal() {
-    let found = suggest(&[kick(100.0), kick(600.0)], &[cheer(520.0)], &[], ungated());
+    // The cheer stands a measured walk-back before the restart: V-3 timed
+    // nine of them at 20.5-46.4 s, so 30 s is the middle of what the footage
+    // does rather than a number that fits the window.
+    let cheer_at = 600.0 - 30.0;
+    let found = suggest(
+        &[kick(100.0), kick(600.0)],
+        &[cheer(cheer_at)],
+        &[],
+        ungated(),
+    );
     let goals = goals(&found);
     assert_eq!(goals.len(), 1, "{found:?}");
     let SuggestionKind::Goal { tier, window, at } = goals[0].kind else {
         unreachable!("filtered to goals")
     };
     assert_eq!(tier, GoalTier::High);
-    assert_eq!(at, Some(520.0 - AT_LEAD_SECONDS));
+    assert_eq!(at, Some(cheer_at - AT_LEAD_SECONDS));
     assert!(
-        window.0 <= 520.0 && 520.0 <= window.1,
+        window.0 <= cheer_at && cheer_at <= window.1,
         "the window {window:?} holds the cheer it was made from"
     );
 }
@@ -184,19 +193,23 @@ fn the_first_kick_off_is_a_period_start_and_not_a_goal() {
 
 #[test]
 fn a_window_clamps_to_the_previous_kick_off() {
-    // The measured case: 65 s from a period start to the first goal, which is
-    // shorter than W, so the clamp is what stops the window running back
-    // through the kick-off that started play.
+    // At the spec's guessed W = 150 the measured 65 s from a period start to
+    // the first goal was clipped every time. At the **measured** W = 60 it no
+    // longer is -- a goal has to fall inside a minute of the kick-off for the
+    // clamp to reach at all -- so the clamp is now belt-and-braces rather than
+    // load-bearing, and this pins it on a pair that still reaches it.
+    let start = 52.0;
+    let restart = start + GOAL_WINDOW_SECONDS - 20.0;
     let found = suggest(
-        &[kick(52.0), kick(52.0 + 65.0 + 30.0)],
-        &[cheer(100.0)],
+        &[kick(start), kick(restart)],
+        &[cheer(start + 5.0)],
         &[],
         ungated(),
     );
     let SuggestionKind::Goal { window, .. } = goals(&found)[0].kind else {
         unreachable!("filtered to goals")
     };
-    assert_eq!(window.0, 52.0, "clamped to K_prev, not to K − W");
+    assert_eq!(window.0, start, "clamped to K_prev, not to K − W");
 }
 
 #[test]
@@ -227,15 +240,17 @@ fn one_runs_goal_windows_are_disjoint() {
 
 #[test]
 fn a_gated_kick_off_does_not_clamp_the_window_after_it() {
-    // The silent restart at 300 is dropped, so the goal at 400 keeps its full
-    // W rather than paying twice for the gate.
+    // The silent restart at 370 is dropped, so the goal at 400 keeps its full
+    // W rather than paying twice for the gate. The three are inside one W of
+    // each other on purpose: at the measured 60 s that is what it takes for a
+    // dropped candidate to be able to clamp the next one at all.
     let rule = Rule {
         cheer_gates: true,
         ..Rule::default()
     };
     let found = suggest(
-        &[kick(100.0), kick(300.0), kick(400.0)],
-        &[cheer(320.0)],
+        &[kick(100.0), kick(370.0), kick(400.0)],
+        &[cheer(360.0)],
         &[],
         rule,
     );

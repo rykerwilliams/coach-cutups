@@ -26,25 +26,34 @@
 //! tagged matches (2026-09-24, six halves, sixteen goals):
 //!
 //! - the cheer covers **7 of 16** goals at its initial constants and never more
-//!   than 11 anywhere in a sweep, and only then at fifty firings a half;
+//!   than 12 anywhere in a sweep, and only then at eighty firings a half;
 //! - stillness at an absolute θ finds **1 of 6** tagged kick-offs, and the
 //!   quantile threshold this module now reads
 //!   ([`STILL_QUANTILE`](crate::motion::STILL_QUANTILE)) is what makes the cue
 //!   mean the same thing in two venues 27 dB and a camera apart;
-//! - **no post-goal restart has ever been timed** — `kickoffs.txt` is a blank
-//!   template in all three folders — so [`GOAL_WINDOW_SECONDS`] rests on the
-//!   spec's estimate and V-3 is unmeasured.
+//! - **nine post-goal restarts have now been timed** (V-3), and they run
+//!   20.5–46.4 s after the goal, not the 30–90 s the spec guessed — so
+//!   [`GOAL_WINDOW_SECONDS`] is 60 s and not 150.
 //!
-//! **The whole rule was then swept over 540 combinations and chosen on the
-//! tuning match**: a stillness quantile of 0.50, a hold of 15 s, a cheer 10 dB
-//! over its median for 0.5 s, `W = 150 s`, the gate on. The picture half of
-//! that point is [`motion`](crate::motion)'s constants; the sound half is
-//! **not** — [`signals`](crate::signals)' own were chosen by the cue's own
+//! **The whole rule was then swept over 180 combinations and chosen on the
+//! tuning match**: a stillness quantile of 0.50, a hold of 10 s, a cheer 10 dB
+//! over its median for 0.5 s, the gate on. `W` is **not** in that grid — it is
+//! measured, and a grid free to widen the window always holds a point that
+//! claims half the match and reads the coverage back as recall. The picture
+//! half of the point is [`motion`](crate::motion)'s constants; the sound half
+//! is **not** — [`signals`](crate::signals)' own were chosen by the cue's own
 //! measurement, and the two differ. On the held-out matches that point scores
-//! **7 goals of 9 with 29 false ones**, against a chance recall of 0.63,
-//! because its windows cover 57% of the match. A rule worth 0.15 over
-//! highlighting half the game at random is not a rule to show a coach, and
-//! **nothing here is wired to the UI.**
+//! **7 goals of 9 with 30 false ones**, against a chance recall of 0.30,
+//! because its windows cover 29% of the match. **Lift +0.48**, up from +0.15
+//! at the guessed `W`: the rule knows something, and it is still a row the
+//! coach would dismiss four times in five, so **nothing here is wired to the
+//! UI.**
+//!
+//! **What the restarts showed is where the fault is.** Given the nine timed
+//! restarts instead of the picture's guesses, the sound confirms **9 of 9**
+//! goals — every goal's cheer stands inside `[K − W, K − 15 s]` of its real
+//! restart. The confirmation rule is right; what fails is [`kickoffs`], which
+//! offers about 21 candidate restarts a half where a half holds three.
 //!
 //! The verdict those numbers add up to is
 //! `docs/superpowers/spikes/2026-09-24-match-vision-measurements.md`, and it is
@@ -57,10 +66,19 @@ use crate::signals::{Cheer, Whistle};
 
 /// How far back a goal's window reaches from `K` — D4's `W`.
 ///
-/// **Unmeasured.** V-3 sets it from the walk-back durations in `kickoffs.txt`,
-/// and no restart has been written down yet, so this is still the spec's
-/// estimate of "30–90 s of walking back, generously".
-pub const GOAL_WINDOW_SECONDS: f64 = 150.0;
+/// **Measured (V-3, 2026-09-24).** Nine post-goal restarts were timed by hand
+/// across two matches, one on a 7-a-side pitch and one on a 9-a-side one, so
+/// the spread is how long children take to walk back rather than a venue
+/// quirk: the gaps run **20.5 s to 46.4 s**, mean 29.7 s. `W` is the longest
+/// of those rounded up to the next quarter-minute — every observed walk-back
+/// plus up to 15 s of margin — and **not** a value tuned against the matches
+/// the rule is read off, because the restarts exist only for the held-out two
+/// and tuning on them would be the leak the split exists to prevent.
+///
+/// The spec's estimate was 150 s, three times the longest walk-back ever
+/// observed, and that is most of why a suggestion used to claim over half the
+/// match.
+pub const GOAL_WINDOW_SECONDS: f64 = 60.0;
 
 /// How long the picture must move again for a hold to have ended in a restart
 /// rather than in a camera twitch (D3).
@@ -80,6 +98,12 @@ pub const WHISTLE_AFTER_SECONDS: f64 = 2.0;
 /// Measured on one traced goal, the restart drew its own cheer of +44 dB for
 /// 2.6 s about a minute after the goal — so this clamp is what stops a rule
 /// reading the applause for the kick-off as evidence of the kick-off.
+///
+/// **It has less room than it looks.** V-3's nine timed restarts run 20.5 s to
+/// 46.4 s after their goal, so on the shortest walk-back the goal's own cheer
+/// stands **5.5 s** the right side of this clamp. A clamp of 20 s would have
+/// thrown two of the nine goals' cheers away, which is why it stays at 15
+/// rather than being widened to keep more restart applause out.
 pub const CHEER_CLAMP_SECONDS: f64 = 15.0;
 
 /// How far before its cheer's onset a high-tier goal's estimated instant sits
@@ -96,11 +120,17 @@ pub const DEDUP_SECONDS: f64 = 10.0;
 /// and not by argument.
 ///
 /// It is `true`, **measured**. At the chosen constants, turning it off on the
-/// tuning match adds 18 quiet-tier rows carrying 2 goals — a precision of
-/// **0.11** against the 40% bar — and takes the share of the match the
-/// suggestions cover from 50% to **80%**, which is most of a half of football
-/// highlighted as "a goal may be in here". A tier the coach would dismiss every
-/// row of costs more than it finds, so it never reaches P4.
+/// tuning match adds 38 quiet-tier rows carrying 3 goals — a precision of
+/// **0.08** against the 40% bar — and takes the share of the match the
+/// suggestions cover from **31% to 75%**. It buys the last three goals at the
+/// price of highlighting three quarters of the football, which is what chance
+/// would score anyway: lift goes *down*, 0.26 to 0.25. A tier the coach would
+/// dismiss every row of costs more than it finds, so it never reaches P4.
+///
+/// **The restarts left it unchanged.** Scored against the nine timed restarts,
+/// gating on and gating off give the identical 9 of 9: every real restart in
+/// the set had a cheer behind it, so the gate has never yet thrown a goal
+/// away.
 pub const CHEER_GATES_CANDIDATES: bool = true;
 
 /// What anchored a kick-off's time.

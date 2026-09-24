@@ -9,7 +9,9 @@ use video_coach_core::signals::Cheer;
 use video_coach_harness::score::{
     cheer_coverage, nearest, score, show_rate, Detection, CHEER_TOLERANCE, PERIOD_TOLERANCE,
 };
-use video_coach_harness::truth::{folders, parse_kickoffs, TruthError, TruthEvent, TruthKind};
+use video_coach_harness::truth::{
+    folders, parse_kickoffs, Truth, TruthError, TruthEvent, TruthKind,
+};
 
 fn goal(seconds: f64) -> TruthEvent {
     TruthEvent {
@@ -347,4 +349,39 @@ fn a_restart_may_carry_the_tenth_the_readout_showed() {
     for bad in ["1 11:57.50", "1 11:5.5", "1 11:60.5"] {
         assert!(parse_kickoffs(bad).is_err(), "{bad} should be refused");
     }
+}
+
+/// V-3's pairing: a goal takes the restart between it and the next goal, and
+/// nothing else. The gap it yields is what sets `W`, so a mis-pairing would not
+/// be a wrong diagnostic but a wrong constant.
+#[test]
+fn a_goal_takes_the_restart_before_the_next_goal_and_no_other() {
+    let truth = Truth {
+        name: "A".into(),
+        sources: vec!["/one".into(), "/two".into()],
+        durations: vec![1600.0, 1600.0],
+        events: vec![
+            // Two goals, the first with a restart, the second ending the half.
+            goal(100.0),
+            tag(126.0, TruthKind::Restart),
+            goal(1500.0),
+            // A different source, so nothing crosses between them.
+            TruthEvent {
+                source_index: 1,
+                seconds: 200.0,
+                kind: TruthKind::Goal,
+            },
+            TruthEvent {
+                source_index: 1,
+                seconds: 240.0,
+                kind: TruthKind::Restart,
+            },
+        ],
+    };
+    let walks = truth.walk_backs();
+    assert_eq!(walks.len(), 2, "{walks:?}");
+    assert_eq!(walks[0].seconds(), 26.0);
+    assert_eq!(walks[1].source_index, 1);
+    assert_eq!(walks[1].seconds(), 40.0);
+    assert_eq!(truth.goal_count(), 3);
 }

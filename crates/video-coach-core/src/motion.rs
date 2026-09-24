@@ -71,10 +71,14 @@ pub const THUMBNAIL_HEIGHT: usize = 18;
 /// `docs/superpowers/spikes/2026-09-24-match-vision-measurements.md`.
 pub const STILL_QUANTILE: f64 = 0.50;
 
-/// The shortest hold that counts as a walk-back. Chosen on the tuning match:
-/// the spec's initial 10 s and this differ by a third of the candidates and
-/// nothing in what they find.
-pub const STILL_MIN_SECONDS: f64 = 15.0;
+/// The shortest hold that counts as a walk-back. Chosen on the tuning match.
+///
+/// It was 15 s while `W` was the spec's guessed 150 s, and 10 s once V-3
+/// measured `W` at 60: a hold is only evidence of a restart if a goal's window
+/// can still reach the goal from it, and the shorter floor keeps the holds that
+/// a minute-wide window can use. Measured, the two differ by about a third of
+/// the candidates a half.
+pub const STILL_MIN_SECONDS: f64 = 10.0;
 
 /// How alike a frame and a known kick-off must be to be one. **Initial
 /// value**, and the one P3's sweep has the least prior information about: a

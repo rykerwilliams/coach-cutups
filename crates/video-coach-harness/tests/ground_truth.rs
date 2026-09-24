@@ -40,6 +40,7 @@
 //! | Prefix | The question |
 //! |---|---|
 //! | `TAGS`, `GAPS` | what the coach's tags alone say, with no detector |
+//! | `RGAP`, `RSTAT` | V-3: how long a walk-back takes, and so what `W` is |
 //! | `SIGNAL`, `MDIST` | what one analysis found and what it cost (V-6, V-8) |
 //! | `DIAG` | per tag, the nearest signal that should have found it |
 //! | `SWEEP` | the cheer cue's coverage against a chance baseline |
@@ -47,6 +48,8 @@
 //! | `WHIST`, `WSWEEP`, `PSEL` | periods from whistles alone: the long floor swept, and the loudest-whistle rule |
 //! | `PICTURE`, `PSWEEP`, `PORT` | the kick-off picture, against templates held out by match |
 //! | `RGRID`, `CHOSE` | the whole rule, swept on the tuning match and chosen there |
+//! | `WCURVE` | the `W` trade, for the record — the headline is V-3's `W`, not this curve's best |
+//! | `OGOAL`, `ORACLE`, `ONEAR` | the confirmation rule with the restarts **known** |
 //! | `SCORE`, `CHANCE`, `SEEK` | the chosen rule on the held-out matches, against chance |
 //! | `HIT`, `MISS`, `NEAR` | every goal it found, missed, and every cheer it threw away |
 //!
@@ -59,7 +62,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use video_coach_core::kickoff::{
-    kickoffs, near_misses, suggest, KickOff, Rule, SuggestionKind, CHEER_CLAMP_SECONDS,
+    kickoffs, near_misses, suggest, Anchor, KickOff, Rule, SuggestionKind, CHEER_CLAMP_SECONDS,
     GOAL_WINDOW_SECONDS, RESUME_SECONDS,
 };
 use video_coach_core::motion::{
@@ -76,7 +79,7 @@ use video_coach_harness::score::{
     onset_coverage, print_audio_diagnostics, score, show_rate, Detection, ScoreReport, Tally,
     CHEER_TOLERANCE, PERIOD_TOLERANCE, SEEK_LEAD, SEEK_WINDOW,
 };
-use video_coach_harness::truth::{folders, Truth, TruthEvent, TruthKind};
+use video_coach_harness::truth::{folders, Truth, TruthEvent, TruthKind, WalkBack};
 use video_coach_media::analyze::{AnalyzeMessage, Analyzer, Signals};
 
 /// The cheer thresholds the cue is reported at: the initial value and one step
@@ -95,17 +98,23 @@ const QUANTILE_SWEEP: [f64; 5] = [0.05, 0.20, 0.30, 0.40, 0.50];
 
 /// The stillness floors. A shorter floor finds a kick-off whose walk-back was
 /// brief and costs candidates everywhere else, which is the whole trade.
-const STILL_MIN_SWEEP: [f64; 3] = [6.0, 10.0, STILL_MIN_SECONDS];
+const STILL_MIN_SWEEP: [f64; 3] = [6.0, STILL_MIN_SECONDS, 15.0];
 
 /// How long a whistle must hold to end a period. **The one constant the
 /// footage flatly refuted**: no half holds one longer than 0.78 s, so the
 /// spec's 0.8 s finds none at all. The sweep runs down to a peep.
 const LONG_WHISTLE_SWEEP: [f64; 5] = [WHISTLE_MIN_SECONDS, 0.25, 0.35, 0.50, WHISTLE_LONG_SECONDS];
 
-/// D4's `W`, swept. **Unmeasured from the footage**: V-3 sets it from the
-/// walk-back durations in `kickoffs.txt`, and no restart has been written down
-/// yet.
-const WINDOW_SWEEP: [f64; 3] = [90.0, GOAL_WINDOW_SECONDS, 240.0];
+/// D4's `W`, swept — **for the record, not to choose from.**
+///
+/// `W` is now measured (V-3): [`GOAL_WINDOW_SECONDS`] is the longest timed
+/// walk-back rounded up, and the run asserts it covers every one of them. This
+/// curve exists because a single number hides the trade — a wider `W` buys
+/// recall with share of the match — and because the restarts were written down
+/// only for the **held-out** matches, so picking `W` off this curve's held-out
+/// column would be a leak. The headline number is at
+/// [`GOAL_WINDOW_SECONDS`] and nowhere else.
+const WINDOW_CURVE: [f64; 5] = [30.0, 45.0, GOAL_WINDOW_SECONDS, 90.0, 150.0];
 
 /// The similarity thresholds for the picture cue. Nothing external has ever
 /// measured it, so the sweep is wide: 0.5 is "vaguely the same scene" and 0.9
@@ -152,6 +161,7 @@ fn ground_truth() {
         check(truth);
         truth.print_census();
     }
+    restarts(&truths);
 
     let tuning = truths.first().expect("at least one match").name.clone();
     println!(
@@ -193,6 +203,84 @@ fn ground_truth() {
     periods_from_whistles(&truths, &halves);
     picture(&halves);
     rule(&truths, &halves);
+}
+
+// ------------------------------------------------------ V-3, the walk-backs
+
+/// **V-3: how long the children take to walk back**, per match and pooled —
+/// the measurement the whole goal rule rests on and the one nothing had ever
+/// taken.
+///
+/// A goal's window reaches `W` back from the restart, so the longest walk-back
+/// is the shortest `W` that can hold every goal, and every second past it is
+/// match claimed for nothing. The line this prints is the one that decides
+/// whether [`GOAL_WINDOW_SECONDS`] is a measurement or a guess.
+fn restarts(truths: &[Truth]) {
+    let mut pooled: Vec<f64> = Vec::new();
+    for truth in truths {
+        let walks = truth.walk_backs();
+        let gaps: Vec<f64> = walks.iter().map(WalkBack::seconds).collect();
+        for w in &walks {
+            println!(
+                "RGAP   match={} src={} goal={:.1} restart={:.1} gap={:.1}",
+                truth.name,
+                w.source_index,
+                w.goal,
+                w.restart,
+                w.seconds(),
+            );
+        }
+        println!(
+            "RSTAT  match={} goals={} timed={} {}",
+            truth.name,
+            truth.goal_count(),
+            gaps.len(),
+            spread(&gaps),
+        );
+        pooled.extend(gaps);
+    }
+    println!(
+        "RSTAT  set=pooled matches={} timed={} {}",
+        truths.iter().filter(|t| !t.walk_backs().is_empty()).count(),
+        pooled.len(),
+        spread(&pooled),
+    );
+
+    // What the spread implies for `W`, and for the one other constant a
+    // walk-back bounds: a goal's own cheer has to stand the far side of
+    // `CHEER_CLAMP_SECONDS`, so the **shortest** walk-back is what says
+    // whether the clamp is safe.
+    let longest = pooled.iter().copied().fold(f64::MIN, f64::max);
+    let shortest = pooled.iter().copied().fold(f64::MAX, f64::min);
+    let covered = pooled.iter().filter(|&&g| g <= GOAL_WINDOW_SECONDS).count();
+    println!(
+        "RSTAT  implies W={GOAL_WINDOW_SECONDS:.0}s covers={covered}/{} margin={:.1}s \
+         clamp={CHEER_CLAMP_SECONDS:.0}s clamp_margin={:.1}s",
+        pooled.len(),
+        GOAL_WINDOW_SECONDS - longest,
+        shortest - CHEER_CLAMP_SECONDS,
+    );
+    assert!(
+        covered == pooled.len(),
+        "W={GOAL_WINDOW_SECONDS} does not reach back past a {longest:.1}s walk-back: \
+         the headline W must cover every timed restart, not be tuned to a score"
+    );
+}
+
+/// The five numbers a spread is worth printing as.
+fn spread(values: &[f64]) -> String {
+    if values.is_empty() {
+        return "min=n/a max=n/a mean=n/a median=n/a".to_string();
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    format!(
+        "min={:.1} max={:.1} mean={mean:.1} median={:.1}",
+        sorted[0],
+        sorted[sorted.len() - 1],
+        at_quantile(&sorted.iter().map(|&v| v as f32).collect::<Vec<f32>>(), 0.5,),
+    )
 }
 
 // --------------------------------------------------------------- one half
@@ -306,6 +394,34 @@ impl Half {
             min_seconds,
             &self.signals.whistles,
         )
+    }
+
+    /// The kick-offs as the **coach** wrote them down: the period start and
+    /// every timed restart, with no detector involved.
+    ///
+    /// Feeding these to [`suggest`] is the confirmation rule with the picture's
+    /// half of the job done perfectly, so what is left to be wrong is the
+    /// sound — which is the only way to tell a rule that is wrong from a
+    /// detector that is.
+    fn tagged_kickoffs(&self) -> Vec<KickOff> {
+        let mut tags = self.kickoff_tags.clone();
+        tags.sort_by(f64::total_cmp);
+        tags.into_iter()
+            .map(|seconds| KickOff {
+                seconds,
+                still: seconds..seconds,
+                anchor: Anchor::StillEnd,
+            })
+            .collect()
+    }
+
+    /// How many restarts this half has written down. Zero means it cannot be
+    /// scored against them at all, which is the tuning match's situation.
+    fn restart_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| e.kind == TruthKind::Restart)
+            .count()
     }
 
     fn long_whistles(&self, seconds: f64) -> Vec<&Whistle> {
@@ -742,24 +858,28 @@ impl Point {
 }
 
 /// Every combination the tuning match chooses from.
-fn grid(long_whistle: f64) -> Vec<Point> {
+///
+/// **`W` is not in it.** It used to be, and it was the most influential number
+/// in the rule: a grid free to widen the window always holds a point that
+/// claims half the match and calls the recall a detector. V-3 measured it
+/// instead, so the grid now chooses the other constants *at* the window the
+/// footage says a walk-back needs.
+fn grid(long_whistle: f64, window: f64) -> Vec<Point> {
     let mut out = Vec::new();
     for quantile in QUANTILE_SWEEP {
         for still_min in STILL_MIN_SWEEP {
             for cheer_snr in CHEER_SNR_SWEEP {
                 for cheer_min in CHEER_MIN_SWEEP {
-                    for window in WINDOW_SWEEP {
-                        for gate in [true, false] {
-                            out.push(Point {
-                                quantile,
-                                still_min,
-                                cheer_snr,
-                                cheer_min,
-                                window,
-                                gate,
-                                long_whistle,
-                            });
-                        }
+                    for gate in [true, false] {
+                        out.push(Point {
+                            quantile,
+                            still_min,
+                            cheer_snr,
+                            cheer_min,
+                            window,
+                            gate,
+                            long_whistle,
+                        });
                     }
                 }
             }
@@ -790,7 +910,7 @@ fn rule(truths: &[Truth], halves: &[Half]) {
     // bars, and sweeping them together would let a period win pay for a goal
     // loss.
     let long_whistle = choose_long_whistle(truths, halves);
-    let points = grid(long_whistle);
+    let points = grid(long_whistle, GOAL_WINDOW_SECONDS);
 
     let tuning = truths.first().expect("at least one match");
     let mut best: Option<(Point, f64, usize)> = None;
@@ -841,7 +961,10 @@ fn rule(truths: &[Truth], halves: &[Half]) {
         }
     }
     let (chosen, ..) = best.expect("the grid is not empty");
-    println!("CHOSE  set=tuning {chosen}");
+    println!("CHOSE  set=tuning {chosen} w_from=restarts_v3");
+
+    window_curve(truths, halves, chosen);
+    oracle(truths, halves, chosen);
 
     // Held out, once, at the chosen point — and never touched again (G2).
     let mut held_out = Tally::default();
@@ -877,6 +1000,189 @@ fn rule(truths: &[Truth], halves: &[Half]) {
     }
     held_out.print("held_out", None);
     chance.print("held_out");
+}
+
+/// One point's totals over one set of matches, and what the same windows would
+/// have scored knowing nothing.
+fn measure(truths: &[Truth], halves: &[Half], point: Point, tuning: bool) -> (Tally, Chance) {
+    let mut tally = Tally::default();
+    let mut chance = Chance::default();
+    for truth in truths {
+        let mine: Vec<&Half> = halves
+            .iter()
+            .filter(|h| h.match_name == truth.name)
+            .collect();
+        if mine.first().is_none_or(|h| h.tuning != tuning) {
+            continue;
+        }
+        tally.add(&grade(truth, halves, point).tally);
+        for half in &mine {
+            chance.add(&detections(half, point), half);
+        }
+    }
+    (tally, chance)
+}
+
+/// **The `W` curve**: the whole trade a single window number hides.
+///
+/// Every other constant is the one the tuning match chose; only the window
+/// moves. The held-out column is printed for the record and **not** chosen
+/// from: the restarts that set `W` were written down for the held-out matches
+/// only, so tuning `W` against their score would be reading the answer off the
+/// paper it is meant to be marked against. The headline is
+/// [`GOAL_WINDOW_SECONDS`], which the [`restarts`] assertion pins to the
+/// longest walk-back ever timed.
+fn window_curve(truths: &[Truth], halves: &[Half], chosen: Point) {
+    for window in WINDOW_CURVE {
+        let point = Point { window, ..chosen };
+        for tuning in [true, false] {
+            let (tally, chance) = measure(truths, halves, point, tuning);
+            let lift = tally
+                .goals
+                .recall()
+                .zip(chance.recall())
+                .map(|(r, c)| r - c);
+            println!(
+                "WCURVE set={} W={window:.0} tp={} fp={} fn={} p={} r={} share={:.2} \
+                 chance={} lift={}{}",
+                if tuning { "tuning" } else { "held_out" },
+                tally.goals.tp,
+                tally.goals.fp,
+                tally.goals.misses,
+                show_rate(tally.goals.precision()),
+                show_rate(tally.goals.recall()),
+                chance.share(),
+                show_rate(chance.recall()),
+                show_rate(lift),
+                if window == GOAL_WINDOW_SECONDS {
+                    " headline=true"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+}
+
+/// **The confirmation rule with the restarts known** — the measurement that was
+/// impossible until the coach timed them.
+///
+/// Every candidate is a restart that really happened, so the picture cannot be
+/// wrong and the only question left is D4's own: **does a cheer stand in
+/// `[K − W, K − 15 s]` of a real restart, and only of a real restart?** Gated,
+/// that is the rule's ceiling; ungated it is a check that `W` reaches back past
+/// every walk-back. The matches with no restarts written down are skipped and
+/// the line says how many were scored, because a zero there is a blank file and
+/// not a failure.
+fn oracle(truths: &[Truth], halves: &[Half], chosen: Point) {
+    let at = |name: &str, src: usize| -> Option<&Half> {
+        halves
+            .iter()
+            .find(|h| h.match_name == name && h.source_index == src)
+    };
+
+    // Per goal: the pair the design is made of, and whether it holds.
+    for truth in truths {
+        for w in truth.walk_backs() {
+            let Some(half) = at(&truth.name, w.source_index) else {
+                continue;
+            };
+            let cheers = half.cheers(chosen.cheer_snr, chosen.cheer_min);
+            let onsets: Vec<f64> = cheers.iter().map(|c| c.onset).collect();
+            let qualifies = onsets
+                .iter()
+                .any(|&o| o >= w.restart - chosen.window && o <= w.restart - CHEER_CLAMP_SECONDS);
+            println!(
+                "OGOAL  match={} src={} goal={:.1} restart={:.1} gap={:.1} cheer={} \
+                 qualifies={qualifies}",
+                truth.name,
+                w.source_index,
+                w.goal,
+                w.restart,
+                w.seconds(),
+                onsets
+                    .iter()
+                    .map(|&o| o - w.goal)
+                    .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+                    .map_or("none".to_string(), |d| format!("{d:+.1}")),
+            );
+        }
+    }
+
+    for gate in [true, false] {
+        let rule = Rule {
+            cheer_gates: gate,
+            ..chosen.rule()
+        };
+        let mut tally = Tally::default();
+        let mut chance = Chance::default();
+        let mut scored = 0;
+        for truth in truths {
+            let mine: Vec<&Half> = halves
+                .iter()
+                .filter(|h| h.match_name == truth.name && h.restart_count() > 0)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            scored += 1;
+            let per_half = |half: &Half| -> Vec<Detection> {
+                suggest(
+                    &half.tagged_kickoffs(),
+                    &half.cheers(chosen.cheer_snr, chosen.cheer_min),
+                    &half.signals.whistles,
+                    rule,
+                )
+                .into_iter()
+                .map(|s| Detection {
+                    source_index: half.source_index,
+                    seconds: s.seconds,
+                    kind: s.kind,
+                })
+                .collect()
+            };
+            let found: Vec<Detection> = mine.iter().flat_map(|h| per_half(h)).collect();
+            tally.add(&score(&truth.events, &found).tally);
+            for half in &mine {
+                chance.add(&per_half(half), half);
+            }
+            if gate {
+                // The near misses the design means: a cheer with no restart
+                // behind it, judged against restarts that really happened
+                // rather than against a stillness rule's guesses.
+                for half in &mine {
+                    let cheers = half.cheers(chosen.cheer_snr, chosen.cheer_min);
+                    let near = near_misses(&half.tagged_kickoffs(), &cheers, rule).len();
+                    println!(
+                        "ONEAR  {} cheers={} explained={} near_misses={near}",
+                        half.id(),
+                        cheers.len(),
+                        cheers.len() - near,
+                    );
+                }
+            }
+        }
+        let lift = tally
+            .goals
+            .recall()
+            .zip(chance.recall())
+            .map(|(r, c)| r - c);
+        println!(
+            "ORACLE set=restarts_known gate={gate} matches={scored} W={:.0} tp={} fp={} fn={} \
+             p={} r={} high_tp={} quiet_tp={} share={:.2} chance={} lift={}",
+            chosen.window,
+            tally.goals.tp,
+            tally.goals.fp,
+            tally.goals.misses,
+            show_rate(tally.goals.precision()),
+            show_rate(tally.goals.recall()),
+            tally.goals_high.tp,
+            tally.goals_quiet.tp,
+            chance.share(),
+            show_rate(chance.recall()),
+            show_rate(lift),
+        );
+    }
 }
 
 /// The whistle floor the period rule runs at: the one that finds the most
