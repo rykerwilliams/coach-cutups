@@ -630,23 +630,15 @@ Each entry: what, why deferred, when to revisit.
   short read as `Finish::Failed("the recording is incomplete")`, which reuses
   the slot Phase 10 already has.
 
-64. **A panic inside a transcription job would wedge the queue for the
-  session.** `Transcriber::start`'s thread calls `on_message(Finished(..))`
-  after `transcribe` returns, so a panic on the way there sends no `Finished`
-  at all — and `whisper_run`'s scoped `run.join().expect(…)` re-panics rather
-  than returning an `Err`. `Bus::transcribing` then stays `Some` forever,
-  `run_next_if_idle` returns at its first line, and every later clip sits in
-  the queue silently. `Command::CancelTranscription` is the one way out.
-- **Why deferred:** there is no likely panic. Every fallible path in
-  `recognise` and `read_all` returns `Err`, and ggml aborts the process rather
-  than unwinding. The honest fix — `catch_unwind` around the job, or sending
-  `Finished` from a guard that runs on unwind — is machinery for a case that
-  has never happened, and the cancel already recovers it. (Since the job
-  thread is no longer joined, a panic at least reaches stderr now instead of
-  being swallowed by `Drop`'s `let _ = join()`.)
-- **When to revisit:** if a panic is ever *seen* here, or if the job thread
-  grows a path that can panic on data — a slice index, an `unwrap` on
-  something whisper returned — rather than only on programmer error.
+64. ~~**A panic inside a transcription job would wedge the queue for the
+  session.**~~ **Fixed in P3 Task 3.2**, `video-coach-media/src/job.rs`. The
+  deferral said to revisit this "if the job thread grows a path that can panic
+  on data", and vision is that path: an analysis indexes tensors and slices on
+  what it decoded, and it shares the one running slot with transcription and
+  tracking (spec B2), so a job that never finished would now stop all three.
+  Every job thread starts through `job::spawn`, which sends the body's own
+  terminal message or `JobMessage::panicked` carrying the panic's text, and
+  then drops the sender. Left here as the record of why it waited.
 
 65. **A cancelled whisper run keeps eight threads busy for ~12 s after the
   coach has moved on.** The abort callback is consulted once per encode and
@@ -838,3 +830,31 @@ Each entry: what, why deferred, when to revisit.
   measurement comes first. It is not blocked on anything.
 - **When to revisit:** as soon as P3's measurement is done, or sooner if the
   coach asks.
+
+78. **App settings for the things an export writes.** The coach (2026-09-24):
+  "add to the backlog an appsettings? we don't need a screen for it yet. maybe we
+  already have it. e.g. the srt file gen, the other chapter track, etc. these are
+  general app config settings to be turned off or on."
+- **What exists already, and where.** Two homes, deliberately: per-project in
+  `Preferences` inside `project.json` (`scan_volume`, the preview volumes, the
+  last export resolution, quality and scoreboard mode, `pip_for_new_recordings`)
+  and machine-wide in `$XDG_CONFIG_HOME/coach-cuts/state.json` (the last project,
+  the speech model, the window size). **Machine-wide is the cheap one:** a field
+  added to `Preferences` is a `formatVersion` bump every time, which is why the
+  whisper model picker went to `state.json` in the first place.
+- **What would become a setting:** whether an export writes the `.srt` sidecar,
+  the `.chapters.txt` list and the embedded `tx3g` track; whether it writes the
+  file tags; possibly the reel's default lead-in and tail (20 s / 6 s today,
+  constants), and the avatar's pulse constants. All are "on" today with no way
+  to say otherwise.
+- **The decisions to take first:** which of those are a property of the *machine*
+  (this coach never wants a sidecar) versus of the *project* (this match is for
+  YouTube, that one is for the parents' TV); and whether a setting that changes
+  what a file contains belongs in the export sheet next to its own row rather
+  than in a settings screen at all.
+- **Why deferred:** no screen is wanted yet, and every one of these is currently
+  the right default. It becomes real the first time a default is wrong for a
+  coach, and then it should arrive with its home already decided rather than as
+  six checkboxes.
+- **When to revisit:** the first "can I turn that off", or when a second coach
+  uses the app.
