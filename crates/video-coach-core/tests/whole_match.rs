@@ -119,6 +119,6 @@ fn the_reel_keeps_a_chapter_per_entry() {
     let reel = compilation_plan(&p, &ExportTarget::Reel(ReelSide::All));
     assert_eq!(
         chapters(&reel),
-        [(0.0, "1 / 2 | Home goal"), (36.0, "2 / 2 | Home goal")]
+        [(0.0, "1 / 2 | Home goal"), (26.0, "2 / 2 | Home goal")]
     );
 }

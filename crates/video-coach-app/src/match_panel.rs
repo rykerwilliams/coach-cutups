@@ -47,7 +47,7 @@ pub struct MatchRowText {
     /// A start/stop the format has no period for
     /// ([`LabelledEvent::role_less`](video_coach_core::scoreboard::LabelledEvent::role_less)).
     pub role_less: bool,
-    /// A goal's span in the reel, `"−30 s / +6 s"`: its trims, or the
+    /// A goal's span in the reel, `"−20 s / +6 s"`: its trims, or the
     /// defaults (spec R3). `None` for anything but a goal.
     pub reel_span: Option<String>,
 }
@@ -74,7 +74,7 @@ pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
         .collect()
 }
 
-/// `"−30 s / +6 s"`: how far the goal's reel entry runs either side of it,
+/// `"−20 s / +6 s"`: how far the goal's reel entry runs either side of it,
 /// before the clamps (spec R2), which only the export sees.
 fn reel_span(goal: &MatchEventRecord) -> String {
     // To the tenth, and whole seconds without one, since the defaults are
@@ -530,11 +530,11 @@ mod tests {
             match_rows(p).into_iter().map(|r| r.reel_span).collect()
         };
         // The defaults, and no span on a start/stop.
-        assert_eq!(spans(&p), [None, Some("−30 s / +6 s".to_string())]);
+        assert_eq!(spans(&p), [None, Some("−20 s / +6 s".to_string())]);
         // A fractional trim reads to the tenth.
         p.set_reel_trim(goal, ReelEnd::End, Some((0, 104.5)))
             .unwrap();
-        assert_eq!(spans(&p)[1].as_deref(), Some("−30 s / +4.5 s"));
+        assert_eq!(spans(&p)[1].as_deref(), Some("−20 s / +4.5 s"));
     }
 
     #[test]

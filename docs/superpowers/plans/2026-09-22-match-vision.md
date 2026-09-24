@@ -313,7 +313,7 @@ Commit: `refactor: plan entries that carry no clip`.
    - core's `selected_clips` selects no clip for `Reel`;
    - app's `bus/export.rs` `label()` returns `REEL_LABEL = "All goals"`, which gives the file name `All goals - <project>.mp4` (E6).
 2. **`reel.rs`:**
-   - **Defaults:** `REEL_LEAD_IN = 30.0` and `REEL_TAIL = 6.0` (Q3's default).
+   - **Defaults:** `REEL_LEAD_IN = 20.0` and `REEL_TAIL = 6.0` (Q3; it shipped at 30.0 and the coach cut it to 20.0 on 2026-09-23).
    - **Which goals:** both goal kinds, in match order (`abs_seconds`, a stable sort).
    - **Each goal's span:** `start = max(0, goal − lead, prev_end on the same source)` and `end = min(duration, goal + tail)`. The lead and tail are the goal's own trims, or the defaults. `duration` is `SourceRef::duration_seconds`.
    - **A goal at or before the previous entry's end on the same source makes no entry.** Its moment is already in that entry, so the entry's end extends to `max(prev_end, min(duration, goal + tail))` instead, and the goal's own lead-in is ignored.
@@ -326,7 +326,7 @@ Commit: `refactor: plan entries that carry no clip`.
 4. `compilation_schedule` on `Reel` needs nothing new after Task 1.2: identity zoom, and the source time runs from `start` to `end`.
 
 **Test that must fail first:**
-- `a_goal_gets_thirty_seconds_before_and_six_after`.
+- `a_goal_gets_twenty_seconds_before_and_six_after`.
 - The clamps: at 0, at the source's end, and at the previous goal's end on the same source but not across sources.
 - **A goal inside the previous entry** (3 s after a goal, on the same source) makes no entry, extends the previous entry's end to its own tail, and the numbering reads `1 / 1`.
 - One side of a trim overrides only that side.
@@ -341,7 +341,7 @@ Commit: `refactor: plan entries that carry no clip`.
 - it is an `ExportTarget`, never a clip;
 - it holds confirmed goals only;
 - each entry is one `Play` segment, and a goal inside the previous entry extends it rather than making its own;
-- the defaults are 30 s and 6 s, and are never replaced by a shorter guess;
+- the defaults are 20 s and 6 s, and are never replaced by a shorter guess;
 - its PiP is the filler, and its audio is the game's alone.
 
 Commit: `feat(core): the goals reel's plan`.
@@ -421,7 +421,7 @@ Commit: `feat(app): export the goals reel; trim a goal's span`.
 
 **What to build:**
 1. **`MatchRowText` gains `abs: f64` and `kind: MatchEventKind`.** The goal rows, the scrubber's marks and the chapter jumps are all built from `match_rows`, so there is no separate chapter type.
-2. **The goal rows (R3).** Each goal row in the Match panel gets **"Reel starts here"** and **"Reel ends here"**, each with a reset, and shows its span (`−30 s / +6 s`).
+2. **The goal rows (R3).** Each goal row in the Match panel gets **"Reel starts here"** and **"Reel ends here"**, each with a reset, and shows its span (`−20 s / +6 s`).
    - `MatchRowText.reel_span: Option<String>` is computed in `match_panel.rs`, so it is tested headless.
    - The span sits on a second line under the goal row, because the 280 px column has no room beside it.
    - The buttons follow the row's existing `can-edit` gate.
@@ -688,7 +688,7 @@ Commit: `feat(app): the highlight tool and inspector`.
    - **[must work] Scrub lands.** On a Trace half, scrub to a few places. The readout and the picture agree (P0).
    - **Frame steps.** Paused, `.` and `,` move one frame forward and back, and the readout follows. They do nothing while playing.
    - **Reel row.** With goals tagged, the export sheet has **All goals** ("N goals · m:ss"). It is absent with none. Export… works in a project with goals and no clips.
-   - **Reel file.** `All goals - <project>.mp4` has one piece per goal, each about 36 s. Check that:
+   - **Reel file.** `All goals - <project>.mp4` has one piece per goal, each about 26 s. Check that:
      - the caption reads `n / total | Team goal | h-a`;
      - the board's score turns over on the goal's frame;
      - there is no webcam inset;

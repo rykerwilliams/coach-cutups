@@ -68,16 +68,16 @@ fn texts(plan: &CompilationPlan) -> Vec<&str> {
 }
 
 #[test]
-fn a_goal_gets_thirty_seconds_before_and_six_after() {
+fn a_goal_gets_twenty_seconds_before_and_six_after() {
     let mut p = project(&[1000.0]);
     p.append_match_event(HOME, 0, 100.0);
-    assert_eq!(p.match_events[0].reel_span(), (30.0, 6.0));
+    assert_eq!(p.match_events[0].reel_span(), (20.0, 6.0));
 
     let plan = reel(&p);
-    assert_eq!(spans(&plan), [(0, 70.0, 106.0)]);
+    assert_eq!(spans(&plan), [(0, 80.0, 106.0)]);
     let entry = &plan.entries[0];
     assert_eq!(entry.clip_id, None, "a reel entry has no clip");
-    assert_eq!((entry.start_frame, entry.frames), (0, 36 * 30));
+    assert_eq!((entry.start_frame, entry.frames), (0, 26 * 30));
 }
 
 #[test]
@@ -86,7 +86,9 @@ fn a_span_is_clamped_to_its_source() {
     p.append_match_event(HOME, 0, 10.0);
     p.append_match_event(AWAY, 0, 97.0);
 
-    assert_eq!(spans(&reel(&p)), [(0, 0.0, 16.0), (0, 67.0, 100.0)]);
+    // Both ends clamp: the first goal's lead-in would start at −10 s, and the
+    // second's tail would run to 103 s.
+    assert_eq!(spans(&reel(&p)), [(0, 0.0, 16.0), (0, 77.0, 100.0)]);
 }
 
 #[test]
@@ -95,8 +97,10 @@ fn a_span_starts_no_earlier_than_the_previous_one_ends_on_its_source() {
     p.append_match_event(HOME, 0, 100.0);
     p.append_match_event(AWAY, 0, 120.0);
 
+    // The second goal's own lead-in would start at 100 s, inside the first
+    // entry, so it starts where that one ends instead.
     let plan = reel(&p);
-    assert_eq!(spans(&plan), [(0, 70.0, 106.0), (0, 106.0, 126.0)]);
+    assert_eq!(spans(&plan), [(0, 80.0, 106.0), (0, 106.0, 126.0)]);
     assert_eq!(plan.entries[1].start_frame, plan.entries[0].frames);
 }
 
@@ -106,7 +110,7 @@ fn the_previous_span_on_another_source_does_not_clamp() {
     p.append_match_event(HOME, 0, 995.0);
     p.append_match_event(HOME, 1, 50.0);
 
-    assert_eq!(spans(&reel(&p)), [(0, 965.0, 1000.0), (1, 20.0, 56.0)]);
+    assert_eq!(spans(&reel(&p)), [(0, 975.0, 1000.0), (1, 30.0, 56.0)]);
 }
 
 /// Its moment is already on screen, so it extends that entry instead of
@@ -121,7 +125,7 @@ fn a_goal_inside_the_previous_entry_extends_it() {
         .unwrap();
 
     let plan = reel(&p);
-    assert_eq!(spans(&plan), [(0, 70.0, 109.0)]);
+    assert_eq!(spans(&plan), [(0, 80.0, 109.0)]);
     assert_eq!(
         texts(&plan),
         ["1 / 1 | Home goal"],
@@ -139,7 +143,9 @@ fn a_merged_goal_never_shortens_the_entry() {
         .unwrap();
     p.append_match_event(AWAY, 0, 110.0);
 
-    assert_eq!(spans(&reel(&p)), [(0, 70.0, 120.0)]);
+    // The merged goal's own tail would end at 116 s, before the first goal's
+    // trimmed end.
+    assert_eq!(spans(&reel(&p)), [(0, 80.0, 120.0)]);
 }
 
 #[test]
@@ -150,7 +156,8 @@ fn one_side_of_a_trim_overrides_only_that_side() {
     p.set_reel_trim(a, ReelEnd::Start, Some((0, 95.0))).unwrap();
     p.set_reel_trim(b, ReelEnd::End, Some((0, 502.0))).unwrap();
 
-    assert_eq!(spans(&reel(&p)), [(0, 95.0, 106.0), (0, 470.0, 502.0)]);
+    // `a` keeps the default tail, `b` the default lead-in.
+    assert_eq!(spans(&reel(&p)), [(0, 95.0, 106.0), (0, 480.0, 502.0)]);
 }
 
 /// Only a file edited by hand stores a trim that isn't a positive, finite
@@ -163,7 +170,7 @@ fn a_nonsense_stored_trim_falls_back_to_the_default() {
     for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
         p.match_events[0].reel_lead_in = Some(bad);
         p.match_events[0].reel_tail = Some(2.0);
-        assert_eq!(p.match_events[0].reel_span(), (30.0, 2.0), "{bad}");
+        assert_eq!(p.match_events[0].reel_span(), (20.0, 2.0), "{bad}");
         p.match_events[0].reel_lead_in = Some(4.0);
         p.match_events[0].reel_tail = Some(bad);
         assert_eq!(p.match_events[0].reel_span(), (4.0, 6.0), "{bad}");
@@ -182,7 +189,7 @@ fn a_goal_at_or_past_its_sources_end() {
 
     p.append_match_event(AWAY, 0, 100.0);
     let plan = reel(&p);
-    assert_eq!(spans(&plan), [(0, 70.0, 100.0)]);
+    assert_eq!(spans(&plan), [(0, 80.0, 100.0)]);
     assert_eq!(texts(&plan), ["1 / 1 | Away goal"]);
 }
 
@@ -197,7 +204,7 @@ fn goals_are_in_match_order_across_sources() {
     let plan = reel(&p);
     assert_eq!(
         spans(&plan),
-        [(0, 170.0, 206.0), (0, 870.0, 906.0), (1, 70.0, 106.0)]
+        [(0, 180.0, 206.0), (0, 880.0, 906.0), (1, 80.0, 106.0)]
     );
     assert_eq!(
         texts(&plan),
@@ -274,7 +281,7 @@ fn the_schedule_plays_each_span_at_identity_zoom() {
 
     let c = compilation_schedule(&p, &ExportTarget::Reel(ReelSide::All));
     assert_eq!(c.frames.len(), c.plan.total_frames());
-    assert_eq!(c.frames[0].source_time, 70.0);
+    assert_eq!(c.frames[0].source_time, 80.0);
     let last = c.frames.last().unwrap();
     assert!((last.source_time - (106.0 - 1.0 / 30.0)).abs() < 1e-9);
     assert!(c.frames.iter().all(|f| f.zoom == Zoom::IDENTITY));
@@ -306,7 +313,7 @@ fn a_sides_reel_numbers_its_own_goals() {
     p.append_match_event(HOME, 0, 900.0);
 
     let home = side(&p, ReelSide::Home);
-    assert_eq!(spans(&home), [(0, 70.0, 106.0), (0, 870.0, 906.0)]);
+    assert_eq!(spans(&home), [(0, 80.0, 106.0), (0, 880.0, 906.0)]);
     assert_eq!(
         texts(&home),
         ["1 / 2 | Rovers goal | 1-0", "2 / 2 | Rovers goal | 2-1"]
@@ -325,9 +332,9 @@ fn only_a_goal_in_the_same_reel_merges() {
     p.append_match_event(HOME, 0, 100.0);
     p.append_match_event(AWAY, 0, 103.0);
 
-    assert_eq!(spans(&reel(&p)), [(0, 70.0, 109.0)]);
-    assert_eq!(spans(&side(&p, ReelSide::Home)), [(0, 70.0, 106.0)]);
-    assert_eq!(spans(&side(&p, ReelSide::Away)), [(0, 73.0, 109.0)]);
+    assert_eq!(spans(&reel(&p)), [(0, 80.0, 109.0)]);
+    assert_eq!(spans(&side(&p, ReelSide::Home)), [(0, 80.0, 106.0)]);
+    assert_eq!(spans(&side(&p, ReelSide::Away)), [(0, 83.0, 109.0)]);
 }
 
 /// What a row counts is the reel's own goals, which a merge does not reduce.

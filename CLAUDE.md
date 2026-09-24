@@ -377,6 +377,7 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **The gate is also `video_coach_media::can_copy`,** a header read per file that the bus asks before it chooses a renderer. Every refusal names the file and says to choose **Scoreboard: burned in**.
 - **The scoreboard sidecar is `job.path.with_extension("srt")`** — `ExportJob::cues` as `core::cues::cues_to_srt`, written in `composite::export`'s `finish` **after** the rename, so it inherits the run's name cleaning and its `" (2)"` de-duplication and is the matching basename a player auto-loads. A failure is logged and reported as `ExportDone::sidecar: None`; a good `.mp4` is never thrown away over a text file, and a cancel, which never reaches the rename, leaves the last good export's `.srt` alone.
 - **`cues` says what belongs beside the output, including nothing.** `Some(cues)` writes them, `Some(empty)` writes none **and removes a stale one**, and `None` is a target that carries no sidecar at all, whose `.srt` is the coach's own file and no export's business. `write_sidecar`'s doc says why the removal is not optional.
+- **The same cues also ride *inside* the copy, as a `tx3g` track** — the sidecar is what VLC loads without being asked, the embedded track is what survives the file being sent on. It is a third `mp4mux` pad (`subtitle_%u`, `trak-timescale=1000`) fed from an `appsrc` of `text/x-raw,format=utf8`, **requested only when there are cues** and **written whole before the first source is opened**, then ended: a requested pad that runs dry stalls the muxer, so the track is never trickled. **`mp4mux` writes an empty sample between cues** (3,400 cues → 6,799 samples); that is the muxer's, not ours. Only the copy carries it — the encoded path is unchanged.
 
 **The export sheet's third picker is Scoreboard: Default / Burned into the picture / Separate track,** carried by `Command::Export`'s `scoreboard: Option<ScoreboardMode>` (`None` is Default) and remembered in `Preferences::last_export_scoreboard` (v11) by the same write-back as the other two.
 - **"Default" means the best available, never a silent trade.** It copies the whole match when `can_copy` agrees and burns the board in otherwise — a project of Matroska or HEVC sources re-encodes as it always did rather than failing at a gate the coach never asked for. Choosing **Separate track** by hand refuses instead, naming the file: there the coach asked for the copy. The sheet's one explanatory line follows the *effective* mode, so Default says so too.
@@ -408,7 +409,7 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Each entry is one `Play` segment**, `[goal − lead-in, goal + tail]` on the
   goal's source, clamped to the source and to the previous entry's end on it. A
   goal at or before that end makes no entry of its own: it extends that one.
-- **The defaults are 30 s and 6 s** (`REEL_LEAD_IN`, `REEL_TAIL`), overridden per
+- **The defaults are 20 s and 6 s** (`REEL_LEAD_IN`, `REEL_TAIL`), overridden per
   side by the goal's trim. Never replace them with a guess that could be
   shorter: a cut-off assist is the one failure the reel must not have.
 

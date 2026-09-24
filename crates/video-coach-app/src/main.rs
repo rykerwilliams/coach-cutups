@@ -662,7 +662,7 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
                     .into(),
                     // The clip's row is ticked only when the sheet was
                     // opened on it. The reel is never ticked by default: it
-                    // renders 36 s a goal, which is a long wait nobody asked
+                    // renders 26 s a goal, which is a long wait nobody asked
                     // for on an ordinary export. Nor is the whole match,
                     // which is the longest render there is (spec W1).
                     ticked: match row.target {

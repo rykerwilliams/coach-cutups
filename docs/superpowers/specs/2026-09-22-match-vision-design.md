@@ -151,7 +151,7 @@ A plan with fewer than two entries gets no chapters.
 
 - One run, one progress model and one cancel serve every target, as today.
 - **The file name** follows spec E6: `<label> - <project>.mp4`.
-- **The row is not ticked by default** (the user, 2026-09-22): the reel renders about 36 s a goal, which an ordinary export should not pay for unasked. The coach ticks it.
+- **The row is not ticked by default** (the user, 2026-09-22): the reel renders about 26 s a goal, which an ordinary export should not pay for unasked. The coach ticks it.
 - **The Export… button is enabled whenever the sheet would have a row** (`export_targets` is not empty), not on "the project has clips". A project with goals and no clips, which every ground-truth project is, can export its reel.
 
 **R1b. A reel can hold one team's goals** (the user, 2026-09-22). `Reel` carries a side: all goals, the home team's, or the away team's.
@@ -163,8 +163,8 @@ A plan with fewer than two entries gets no chapters.
 
 **R2. Each goal is one plan entry, with one `Play` segment.** The segment spans `[goal − lead_in, goal + tail]` on the goal's own source.
 
-- **Defaults:** `REEL_LEAD_IN = 30 s` and `REEL_TAIL = 6 s`, overridden per goal, each side independently (R3).
-- **30 s is the generous default the user asked for.** It covers the build-up and the assist of any ordinary youth move, and the coach trims it down, which is cheaper than finding footage that was cut off. It is never replaced by a guess that could be shorter (see Deferred): a cut-off assist is the one failure the reel must not have.
+- **Defaults:** `REEL_LEAD_IN = 20 s` and `REEL_TAIL = 6 s`, overridden per goal, each side independently (R3). It was 30 s until the coach watched a reel (2026-09-23).
+- **The lead-in is generous on purpose.** It covers the build-up and the assist of any ordinary youth move, and the coach trims it down, which is cheaper than finding footage that was cut off. It is never replaced by a guess that could be shorter (see Deferred): a cut-off assist is the one failure the reel must not have.
 - **Clamps:**
   - The segment is clamped to `[0, duration]` of its source. A segment cannot cross a source boundary, as for clips. Since every Trace file is one half, a period boundary is the only boundary it could cross anyway.
   - **A segment never starts before the previous goal's segment ends on the same source.** Two goals a minute apart would otherwise replay the same footage.
@@ -176,7 +176,7 @@ A plan with fewer than two entries gets no chapters.
 
 **R3. The trim is stored on the goal.** It is two fields on the goal's record, `reel_lead_in` and `reel_tail`, each an `Option<f64>` of seconds relative to the goal and `None` for the default, so setting one side leaves the other following the default. Being relative to the goal, they survive a source move or relink along with the goal. They are set from the scan position, which is where the coach is looking:
 
-- The Match panel's goal row gets **"Reel starts here"** and **"Reel ends here"**, each with a reset, and shows the current span ("−30 s / +6 s").
+- The Match panel's goal row gets **"Reel starts here"** and **"Reel ends here"**, each with a reset, and shows the current span ("−20 s / +6 s").
 - The position is captured by the caller at the click, per the bus contract.
 - The command refuses a start that isn't before the goal, an end that isn't after it, and a position on a different source from the goal.
 - **Undo:** trims are part of `MatchEventRecord`, so they ride on Phase 9's existing `EditMatchEvents` whole-list snapshot and its purge on source moves. No new undo action is needed.
@@ -673,7 +673,7 @@ The Koshkina & Elder pipeline is CC BY-NC and rejected [spike §3].
 
 - **Goals inside a clip export as chapters** (C2). A goal chapter would split its clip's chapter. Q6 asks.
 - **Previewing a reel entry in the app.** "Reel starts here" is set from the scan picture, which is the footage itself.
-- **An automatic guess at the move's start** (the last stoppage, or a change of possession) **and assist labels ("assist #7").** The 30 s default and the coach's trims already meet the build-up requirement, and a guess that can come out *shorter* is the one way to cut an assist out silently. Stoppage times are also not stored (D6), so a guess needs either a stored signal list or a re-analysis. Change of possession and assists need ball tracking, which the ball's few pixels in the wide framing make doubtful, and jersey numbers. **Revisit** only with an asymmetric bar: the guess starts at or before the coach's own trimmed start on ≥ 95% of goals, measured against trims collected on tagged matches. Otherwise it may only ever lengthen the default.
+- **An automatic guess at the move's start** (the last stoppage, or a change of possession) **and assist labels ("assist #7").** The 20 s default and the coach's trims already meet the build-up requirement, and a guess that can come out *shorter* is the one way to cut an assist out silently. Stoppage times are also not stored (D6), so a guess needs either a stored signal list or a re-analysis. Change of possession and assists need ball tracking, which the ball's few pixels in the wide framing make doubtful, and jersey numbers. **Revisit** only with an asymmetric bar: the guess starts at or before the coach's own trimmed start on ≥ 95% of goals, measured against trims collected on tagged matches. Otherwise it may only ever lengthen the default.
 - **Which side scored, from the kit that kicks off** (D5). The team that kicks off conceded, so the formation check could label a goal row "Home goal?". Dropped by the user (Q9): the coach confirms with Z or X while watching the goal, so the label saves no keystroke, and it would cost a stored kit colour, a format bump, a kit-to-side mapping, a scoring row and a bar. Revisit if a confirm path appears that doesn't involve watching the goal.
 - **Detecting the painted halfway line** (D5). Revisit if the kits' separation proves ambiguous.
 - **A kit-colour tie-break in the tracker** (T2). Same-kit crossings, the common switch, can't use it. Revisit if G4's tracking bar fails on opposite-kit identity switches.
@@ -696,7 +696,7 @@ The questions keep their numbers, so earlier references stay valid. Each open on
 - **Q2. Should a highlight show in every clip that covers its moment** (H1), or should a clip be able to hide one?
   **Default (the plan proceeds on this unless the user says otherwise):** it shows in every clip that covers its moment. Hiding one per clip stays in Deferred.
 - **Q3. Is the default reel cut right,** 30 s before each goal and 6 s after? It is the only automatic cut; the coach trims each goal from there.
-  **Default (the plan proceeds on this unless the user says otherwise):** 30 s and 6 s (R2).
+  **Answered (2026-09-23):** it shipped at 30 s and 6 s; the coach watched a reel and called the goal cuts long, so the lead-in is now **20 s** and the tail stays 6 s (R2).
 - **Q5. Where do the reel and the exports get watched?** VLC and mpv show `chpl` chapters. iPhones need a QuickTime chapter track, which is a real piece of work. YouTube needs timestamps in the description.
   **Default (the plan proceeds on this unless the user says otherwise):** `chpl` only (C3, C4). QuickTime `chap` tracks and YouTube chapter text stay in Deferred.
 - **Q6. Match events as chapters in exported videos, and a whole-match export.** You asked for match events as chapters in exported videos. As specced, the goals reel gets a chapter per goal and a clip export gets a chapter per clip; periods (kick-off, half-time) never become chapters in a file (C2). Is that enough, or do you want:

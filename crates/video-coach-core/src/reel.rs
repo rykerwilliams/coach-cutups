@@ -23,7 +23,11 @@ use crate::timeline::{PlaybackSegment, SegmentKind};
 /// youth move, and the coach trims it down, which is cheaper than finding
 /// footage that was cut off. **Never replace it with a guess that could be
 /// shorter**: a cut-off assist is the one failure the reel must not have.
-const REEL_LEAD_IN: f64 = 30.0;
+///
+/// It was 30 s until the coach watched a reel and called the cuts long
+/// (2026-09-23). 20 s still reaches the halfway line on this footage; a move
+/// that starts earlier is what the goal's own "Reel starts here" is for.
+const REEL_LEAD_IN: f64 = 20.0;
 
 /// How long a goal's entry runs after the goal, unless its
 /// [`MatchEventRecord::reel_tail`] says otherwise.
