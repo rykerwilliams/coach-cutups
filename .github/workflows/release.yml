@@ -8,9 +8,10 @@ name: release
 # release. The release process is in CLAUDE.md.
 #
 # The notes come from CHANGELOG.md: the version's section, cut out by
-# scripts/release-notes.sh. The `version` job runs the same script, so a
-# version with no changelog section fails in seconds instead of publishing
-# empty notes.
+# scripts/release-notes.sh -- so the published notes and the docs site, which
+# includes the same file, cannot disagree. The `version` job runs the script
+# ungated, so a version with no changelog section fails in seconds rather than
+# after the whole pipeline, and a dispatch proves it too.
 #
 # Separate from rust.yml because a tags trigger there would rerun every job
 # on each tag; it gates on rust.yml instead, by calling it.
@@ -47,13 +48,10 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 |
             jq -r '.packages[] | select(.name == "video-coach-app") | .version')
           echo "version=$version" >> "$GITHUB_ENV"
-      # Ungated, so a dispatch proves it too: the release job cuts this same
-      # section, and an empty one would publish a release with no notes.
-      - name: Check the changelog has a section for it
-        run: scripts/release-notes.sh "$version" > /dev/null
       - name: Check the tag matches the workspace version
         # The ref, not the event: a dispatch from a branch has no tag to
-        # compare, and passes.
+        # compare, and passes. First of the two checks, so a mistyped tag is
+        # reported as a mistyped tag rather than as a missing changelog section.
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           if [[ $GITHUB_REF_NAME != "v$version" ]]; then
@@ -61,6 +59,8 @@ jobs:
             exit 1
           fi
           echo "tag $GITHUB_REF_NAME matches the workspace version"
+      - name: Check the changelog has a section for it
+        run: scripts/release-notes.sh "$version" > /dev/null
 
   package:
     name: package

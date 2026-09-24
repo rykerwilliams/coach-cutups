@@ -1,15 +1,12 @@
 # Changelog
 
-Everything worth knowing about each version of Coach Cuts, in plain language:
-what you can do that you couldn't before, and what was fixed.
-
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Versions 0.1.0 to 0.5.0 were built and installed by hand and never published as
-releases, so there is nothing to download for them and their headings carry no
-link. Their dates are the day each one was cut. The first published release is
-0.6.0.
+releases, so there is nothing to download for them. Their dates are the day each
+one was cut, and 0.1.1's handful of changes are listed under 0.1.0. The first
+published release is 0.6.0.
 
 ## [Unreleased]
 
@@ -22,11 +19,6 @@ link. Their dates are the day each one was cut. The first published release is
   (Uploads ignore the chapters stored inside the file, which is why the list
   exists.) Chapters closer together than ten seconds are left out, because
   YouTube refuses the whole list otherwise.
-- **The scoreboard file uploads to YouTube as a subtitle track.** The `.srt`
-  that exports beside a copied whole match can be attached to a YouTube upload,
-  and the clock and score then show there the way they do in VLC. So a whole
-  match can go up as a straight copy, with the board riding along beside it
-  instead of being burned into the picture.
 
 ## [0.5.0] - 2026-09-24
 
@@ -43,9 +35,10 @@ link. Their dates are the day each one was cut. The first published release is
 - **A colour picker for team kits.** The swatches in **Set up teams…** now open
   a picker with a row of common kit colours, a hue strip and a shade area. You
   can still type a hex code, and the picker follows it.
-- **Every exported file says what it is.** The video carries its title, the
-  final score, both teams and the date of the match, so a video player or an
-  upload can show them without you typing anything.
+- **Every exported file says what it is.** The video carries its title and the
+  day the footage was recorded and, once you have set up teams and tagged
+  kick-off, the final score and both team names — so a video player or an upload
+  can show them without you typing anything.
 
 ### Changed
 
@@ -57,21 +50,22 @@ link. Their dates are the day each one was cut. The first published release is
 ### Added
 
 - **The whole match exports as a straight copy of your footage.** It finishes in
-  a minute or two instead of an hour, at about a third of the size, with nothing
+  well under a minute instead of an hour, at about a quarter of the size, with nothing
   lost — the original picture and sound are copied rather than recorded again.
   Drawings and highlights can't ride a copy, and the export sheet says so.
 - **The scoreboard as a subtitle track.** A copied match comes with the clock
   and score as subtitles — both inside the file and as an `.srt` beside it — so
   VLC shows them as the match goes and Subtitle → Sub Track switches them off.
-  A new **Scoreboard** picker in the export sheet chooses between that and the
-  old board burned into the picture.
+  The `.srt` can also be attached to a YouTube upload, where the board shows the
+  same way. A new **Scoreboard** picker in the export sheet chooses how the board
+  travels.
 
 ### Fixed
 
-- **Exports are much smaller at every quality.** The encoder had been running
-  with no discipline about file size: a match at Medium is now about 2.7 GB
-  where it was about 10 GB, and at High about 4.5 GB where it was about 19 GB.
-  The picture, and the burned-in scoreboard text, are as crisp as before.
+- **Exports are about half the size at every quality.** The encoder had been
+  running with no discipline about file size — a 56-minute match at High came out
+  at about 7.9 GB. It is now about 4.5 GB, and about 2.7 GB at Medium. The
+  picture, and the burned-in scoreboard text, are as crisp as before.
 - **Machines with no hardware video encoding were ignoring the quality you
   picked.** They exported everything at roughly the same low quality whatever
   you chose. Low, Medium and High now each mean something on those machines too.
@@ -106,8 +100,8 @@ link. Their dates are the day each one was cut. The first published release is
   its row in the Match panel.
 - **Chapters in every exported file,** so you can jump straight to a clip or a
   goal in a video player.
-- **Goal and period marks on the scrubber,** in the scoring team's colour, with
-  `[` and `]` to jump from one to the next.
+- **Goal and period marks on the scrubber,** each goal in the scoring team's
+  colour, with `[` and `]` to jump from one to the next.
 - **Player highlights.** Press **H**, pause, and drag a box around a player: a
   ring appears at their feet with a label you can type into. Place another box
   further on and the ring glides between them — while you watch, in previews and

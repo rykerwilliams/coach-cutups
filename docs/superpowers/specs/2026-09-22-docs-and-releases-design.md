@@ -90,11 +90,11 @@ docs/book/
 - **Format:**
   - `## [Unreleased]` on top, then one `## [x.y.z] - YYYY-MM-DD` per release, newest first;
   - the standard groups inside each: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`;
-  - link references at the bottom: `[x.y.z]: …/compare/vPREV...vx.y.z`, `[Unreleased]: …/compare/vX...HEAD`, and for the first release `…/releases/tag/v0.1.0`.
+  - **no link-reference block** (amended 2026-09-24): the versions in the file predate any tag, so every link would be dead, and the Releases page already lists what can be downloaded.
 - **Written for coaches:** what's new, what's fixed, in plain language. It is not a commit log.
 - **v0.1.0 is curated by hand:** the first Linux release, "what Coach Cuts does", grouped under `Added`.
 - **After that, entries accrue under `[Unreleased]`.** A commit that changes what a user sees adds a line there, as Keep a Changelog intends. CLAUDE.md states the rule, so both agent sessions follow it.
-- **A release** renames `[Unreleased]` to `[x.y.z] - <date>`, adds a fresh empty `[Unreleased]`, fixes the link references and bumps `[workspace.package] version`, all in one commit.
+- **A release** renames `[Unreleased]` to `[x.y.z] - <date>`, adds a fresh empty `[Unreleased]` and bumps `[workspace.package] version`, all in one commit.
 - **Choosing the number (semver, pre-1.0):**
   - a minor bump (`0.x.0`) for new features, or for a change that breaks an existing project;
   - a patch bump (`0.x.y`) for fixes and small additions.

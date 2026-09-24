@@ -60,14 +60,14 @@ The plan was written against `origin/main` = `1213305`, when the workspace said 
      - **Sources:** the README's "What it does" and the hands-on checklist: projects, scanning several sources, recording commentary with drawing and zoom, clips, tags, notes, filtering and undo, the scoreboard and match clock, transcripts, export, and the `.deb`.
      - **What a coach can do, not how:** no GStreamer, no VA-API. One line may name the platform: Ubuntu 24.04 / Linux Mint 22, x86-64.
    - **Every section:** grouped under Keep a Changelog headings (`Added`, `Changed`, `Fixed`), plain language, and **inline links only** — a section is cut out whole for the release notes, and a reference-style link would lose its definition.
-   - **Link references at the bottom:** `[Unreleased]: …/compare/v0.5.0...HEAD`, then one `…/releases/tag/vX.Y.Z` per released version, and `…/compare/vA...vB` is not used (there are no earlier tags to compare against).
+   - **No link-reference block, ever.** Every version before 0.6.0 links to a tag that will never exist, and the terminator the script would need for such a block is dead code (a release is always cut from the newest section, which the next `## ` heading ends). Headings therefore render with literal brackets, which is ordinary Keep a Changelog output for an unlinked version, and the preamble says why. The Releases page is the navigation.
    - **Honesty about the dates:** these versions were never published. The changelog records when each was cut, which is what the commit dates say; don't invent release dates.
 2. **`scripts/release-notes.sh <version>`** prints the body of `## [<version>]`.
    - **The heading match is literal:** `index($0, "## [" v "]") == 1`, never a regex.
    - The body runs to the next `## ` heading or the first link-reference line (`[…]: `).
    - It reads `CHANGELOG.md` relative to the script's own directory.
    - It exits non-zero on a missing section, or on one that is empty or whitespace-only.
-   - **Tests:** the real file; a missing version; an empty section; a whitespace-only section; the last section before the link references.
+   - **Tests:** the real file; a missing version; an empty section; a whitespace-only section; the last section, which runs to the end of the file.
 3. **`release.yml` changes:**
    - **`version` job:** one ungated step computes `version` from `cargo metadata` (moved out of the tag step) and always runs `scripts/release-notes.sh "$version" > /dev/null`. Only the tag comparison stays tag-gated.
    - **`release` job:** the **first** step is `actions/checkout@v4`, before `download-artifact`, because checkout empties a non-git workspace. Then `scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md`, and `gh release create … --notes-file notes.md` in place of `--generate-notes`.
@@ -83,7 +83,7 @@ The plan was written against `origin/main` = `1213305`, when the workspace said 
   - Leave the rest of the README alone; D2 reshapes it.
 - **CLAUDE.md's Releasing bullet** is rewritten tight, since agents read it every session. **It is not edited on this branch** — CLAUDE.md is the Linux session's, whose agents edit it several times a day. Draft the replacement text into `/tmp/claude-1000/.../scratchpad/claude-md-releasing.md`; the orchestrator sends it to that session to apply. It covers:
   - **Choosing the number by semver.** While pre-1.0, a feature or a `formatVersion` bump means a minor bump.
-  - **One commit:** `[Unreleased]` becomes `## [x.y.z] - YYYY-MM-DD`; add a fresh `[Unreleased]`; fix the link references; bump `[workspace.package] version`. The user reads the section (`scripts/release-notes.sh x.y.z`) before saying go.
+  - **One commit:** `[Unreleased]` becomes `## [x.y.z] - YYYY-MM-DD`; add a fresh `[Unreleased]`; bump `[workspace.package] version`. The user reads the section (`scripts/release-notes.sh x.y.z`) before saying go.
   - **Then:** merge to `main`; `git tag v<version> <sha> && git push origin v<version>`.
   - **The rule:** a commit that changes what a coach sees adds a plain-language line under `[Unreleased]`, with inline links only, **and updates the user-guide page it affects** (`docs/book/src/guide/`, once D2 lands).
   - Keep the existing facts about dispatch and the cache that still hold.
@@ -124,7 +124,7 @@ The plan was written against `origin/main` = `1213305`, when the workspace said 
   - `[output.html]`: `site-url = "/coach-cutups/"`, `git-repository-url`, and `edit-url-template = "https://github.com/rykerwilliams/coach-cutups/edit/main/docs/book/{path}"`.
 - **`src/SUMMARY.md`:** Introduction, a Guide section (one placeholder chapter until D2), Changelog, Developers.
 - **`index.md`:** what Coach Cuts is, in two paragraphs, and a link to the latest release.
-- **`changelog.md`:** only `{{#include ../../../CHANGELOG.md}}`. Check that the link references render.
+- **`changelog.md`:** only `{{#include ../../../CHANGELOG.md}}`. Check that the file's own `# Changelog` heading doesn't collide with the chapter title.
 - **`developers.md`:**
   - the four crates, one sentence each;
   - links to the Linux port spec, `README.md#build-from-source`, `CLAUDE.md` and the `docs/superpowers` tree, as **`https://github.com/rykerwilliams/coach-cutups/blob|tree/main/…` URLs** (relative repo links would be rewritten to `.html` and 404);
