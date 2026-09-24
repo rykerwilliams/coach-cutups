@@ -1002,9 +1002,14 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** with the New match… flow, or the first time the coach
   says the picker is slowing them down again.
 
-86. **A cut that spans matches — the same thing across several projects.** The
-  coach (2026-09-24), on the back of #85: *"especially good to get clips of the
-  'same thing' across different game projects?"* — every corner of the season,
+86. **The basket: a cut that spans matches.** The coach (2026-09-24), on the
+  back of #85, and then more precisely: *"so i would be in project a, do a
+  corner kick clip and then enqueue it, then go to project 2"* — and pressing
+  Start gives **one video of all the pieces**, in the order they were added,
+  each carrying its own match's scoreboard and clock. That is what they picked
+  over "one file per project", which is #77's queue. **The two are different
+  features that share machinery: #77 runs several jobs, this builds one job from
+  several projects.** Original framing: *"especially good to get clips of the 'same thing' across different game projects?"* — every corner of the season,
   one player's goals across three matches, every time a press worked. Today a
   clip belongs to a project and an export is built from one project's plan, so
   the answer is export three reels and join them elsewhere.
@@ -1025,8 +1030,14 @@ Each entry: what, why deferred, when to revisit.
   coach nominates, the recents list, something explicit like a "season"); whether
   the result is an export or a saved compilation that can be re-exported; and
   whether the scoreboard is drawn per entry from its own match or dropped.
-- **Why deferred:** it needs #85's library view to exist first, and it wants the
-  music (#84) and the queue (#77) to have settled, since all three are about
-  work that outlives one open project.
-- **When to revisit:** after the New match… flow and the recents drawer, or when
-  the coach first asks for "every corner this season" out loud.
+- **What the coach's own workflow needs, which is less than the library.** They
+  described adding pieces **as they work**: make the clip in the project they
+  are in, put it in the basket, move on. That needs no view over other projects
+  at all — the basket is a list the app holds while the coach moves between
+  projects, and each entry is a self-contained piece captured when it was added.
+  The library (#85 grown a level) is what you need to go *looking* for pieces
+  you made months ago; it is the second half, not the first.
+- **Why deferred:** only by order. The first half — a basket filled as you go,
+  exported as one video — is buildable now and is the smaller feature.
+- **When to revisit:** after #77's queue, whose machinery it shares, or sooner
+  if the coach starts gathering corners before the queue exists.
