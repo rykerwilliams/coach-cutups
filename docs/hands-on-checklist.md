@@ -8,7 +8,7 @@ Work down the list in order. It follows a normal session: install, open a projec
 
 ## 1. Install
 
-- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.4.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
+- [ ] **Install the package.** Run `sudo apt install ~/Downloads/coach-cuts_0.5.0_amd64.deb`. It replaces the copy you have. **Right:** apt finishes without errors. (To build one yourself instead, run `packaging/build-deb.sh` in the `coach-cutups` folder; the result lands in `target/debian/`.)
 - [ ] **[must work] In the menu.** Open the Mint menu and type "Coach Cuts". **Right:** it's listed with its own icon, not a blank or generic one. Launch it. **Right:** the running window shows the same icon in the panel. If you pin the launcher to the panel, the open window groups onto that pin instead of appearing as a second, separate button.
 
 ## 2. First launch and your project
@@ -187,6 +187,18 @@ New in 0.4.0. The export sheet has a third picker, **Scoreboard**, under Resolut
 - [ ] **Burned in, on purpose.** Set **Scoreboard** to **Burned into the picture** and export the whole match again. **Right:** it re-encodes (the slow way), the board is in the picture, and there's no `.srt` beside it — the old one is cleaned up.
 - [ ] **Clips are unchanged.** Export a clip with **Separate track** chosen. **Right:** the clip still has its scoreboard burned in — a clip can't carry a subtitle track — and no `.srt` appears beside it.
 - [ ] **File sizes.** The quality levels changed: at **Medium** a match is about 2.7 GB where it used to be 10 GB, and **High** about 4.5 GB where it was 19 GB. **Right:** the picture still looks good to you, and the burned-in scoreboard text is crisp. Say if Medium looks worse than you expect.
+
+## 14. Typing in events, and picking team colours
+
+New in 0.5.0. **Do this on a copy of a tagged project the first time**: edits apply as you make them, and there is no Cancel (Ctrl+Z undoes them once the sheet is closed).
+
+- [ ] **[must work] Paste a list.** Open **Edit events…** in the Match panel, and paste lines into the box at the bottom — `2 14:05 home goal`, one per line, `#` for a comment. **Right:** each line is echoed back as understood (✓), already there (•) or refused with the reason (✗), the button says how many will be added, and pressing it adds them all as **one** Ctrl+Z.
+- [ ] **The kick-off trap.** Put a line reading `2 14:05 kickoff` in the box. **Right:** it is refused with an explanation, not accepted. A restart after a goal isn't a period boundary, and treating it as one would shift the match clock for the rest of the game. (Your `kickoffs.txt` lines are exactly this case.)
+- [ ] **Fix one event.** Click a row: it opens as a single line you can retype — the video number, the time, and the kind as a word. **Right:** Enter applies it, the list re-sorts, and **Esc** cancels instead of saving. A goal's reel trims survive a re-time.
+- [ ] **Times need a colon.** Type `900` as a time. **Right:** refused, with a hint that a time looks like `15:00` — a bare number could be seconds or a typo, and guessing wrong puts an event minutes out.
+- [ ] **Go to one.** The **→** on a row jumps the video to that moment and closes the sheet. **Right:** whatever you'd pasted into the box is still there when you reopen it.
+- [ ] **[must work] Team colours.** In **Set up teams…**, click a colour swatch. **Right:** a picker opens under it with a row of kit colours, a hue strip and a shade area. Picking writes the hex box, typing a hex moves the picker, and **Esc** closes the picker before it closes the sheet. Save, then preview a clip: the scoreboard is the colour you picked.
+- [ ] **Your call:** whether the 14 kit colours cover the clubs you film, and whether the editor's list should be sorted any other way.
 
 ---
 
