@@ -5,6 +5,13 @@
 //! on events with a timeout — never on a sleep — and use
 //! [`Harness::shutdown`] as a barrier when they need to assert that something
 //! did **not** happen.
+//!
+//! [`truth`] and [`score`] are the match-vision measurement tooling, driven by
+//! the `#[ignore]`d `ground_truth` test alone: they read the coach's tagged
+//! matches **read-only** and grade detections against them.
+
+pub mod score;
+pub mod truth;
 
 use std::fmt;
 use std::ops::Range;

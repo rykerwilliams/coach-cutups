@@ -4909,6 +4909,7 @@ dependencies = [
  "gstreamer-gl-egl",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "uuid",
  "video-coach-app",
  "video-coach-core",

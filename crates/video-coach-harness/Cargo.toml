@@ -13,6 +13,7 @@ video-coach-media = { path = "../video-coach-media", features = ["fixtures"] }
 gstreamer.workspace = true
 gstreamer-gl.workspace = true
 gstreamer-gl-egl.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
