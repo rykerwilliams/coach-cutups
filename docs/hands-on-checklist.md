@@ -190,7 +190,7 @@ New in 0.4.0. The export sheet has a third picker, **Scoreboard**, under Resolut
 - [ ] **Your call:** the wording of the reel's chapter lines, and whether "Start" is the right name for the line added at `0:00` when a film's first chapter is further in.
 - [ ] **Burned in, on purpose.** Set **Scoreboard** to **Burned into the picture** and export the whole match again. **Right:** it re-encodes (the slow way), the board is in the picture, and there's no `.srt` beside it — the old one is cleaned up.
 - [ ] **Clips are unchanged.** Export a clip with **Separate track** chosen. **Right:** the clip still has its scoreboard burned in — a clip can't carry a subtitle track — and no `.srt` appears beside it.
-- [ ] **File sizes.** The quality levels changed: at **Medium** a match is about 2.7 GB where it used to be 10 GB, and **High** about 4.5 GB where it was 19 GB. **Right:** the picture still looks good to you, and the burned-in scoreboard text is crisp. Say if Medium looks worse than you expect.
+- [ ] **File sizes.** The quality levels changed. Your own 56-minute match exported at **High** was **7.9 GB** before; the same setting now lands around **4.5 GB**, and **Medium** around **2.7 GB** (it was about 4 GB). **Right:** the picture still looks good to you, and the burned-in scoreboard text is crisp. Say if Medium looks worse than you expect.
 
 ## 14. Typing in events, and picking team colours
 
