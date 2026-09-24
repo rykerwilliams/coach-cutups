@@ -115,6 +115,32 @@ pub enum Command {
         source_seconds: f64,
     },
     DeleteMatchEvent(Uuid),
+    /// Retype one event, from the editor's row field: `line` is one line of
+    /// the grammar in `core::match_entry`, read here against the record it
+    /// names so the field's `✕` mark and this command reach the same verdict
+    /// from the same call (spec C1).
+    ///
+    /// **The time is typed, not captured.** The caller-captured rule exists
+    /// so queue delay can't move an event the coach tagged at the playhead;
+    /// the editor never reads the playhead at all, so there is no position
+    /// for a delay to stale (spec C2).
+    EditMatchEvent {
+        id: Uuid,
+        line: String,
+    },
+    /// A pasted block, added as one undo step (spec C3). `text` is the box's
+    /// own text and `default_source` the picker's choice for a line with no
+    /// video number, exactly as `core::match_entry::parse_batch` takes them:
+    /// **the bus parses, rather than being handed events to trust**, so the
+    /// duration bound, the duplicate rule and the incremental start/stop cap
+    /// are read once, from core, against the project as it is when the
+    /// command lands. The lines that don't land are named in one notice.
+    ///
+    /// Typed times, as `EditMatchEvent`'s are.
+    AddMatchEvents {
+        text: String,
+        default_source: usize,
+    },
     /// Set one end of `goal`'s reel entry at `at`, the scan position captured
     /// by the caller at the click as `(source_index, source_seconds)`, or
     /// reset it to the default with `None` (match vision spec R3). An undo
@@ -813,6 +839,11 @@ impl Bus {
                 source_seconds,
             } => self.tag_match_event(kind, source_index, source_seconds),
             Command::DeleteMatchEvent(id) => self.delete_match_event(id),
+            Command::EditMatchEvent { id, line } => self.edit_match_event(id, &line),
+            Command::AddMatchEvents {
+                text,
+                default_source,
+            } => self.add_match_events(&text, default_source),
             Command::SetReelTrim { goal, end, at } => self.set_reel_trim(goal, end, at),
             Command::SetScoreboard(config) => self.set_scoreboard(config),
             Command::SetHighlightKey {

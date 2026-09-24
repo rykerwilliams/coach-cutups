@@ -796,3 +796,14 @@ Each entry: what, why deferred, when to revisit.
   kept, so it takes effect if the earlier goal is deleted or trimmed.
 - **When to revisit:** if a coach reports a trim that "does nothing", or when
   the Match panel grows a view of the reel's actual entries.
+
+75. **A skip burst's replay margin failed once, by 54 ms.** One run of
+  `a_skip_burst_while_playing_lands_where_replay_puts_it`
+  (`crates/video-coach-harness/tests/recording.rs`) failed with "replay reaches
+  7.5019 before the pause anchored at 7.4479". The same suite reran 12/12
+  green, and two full workspace runs either side were green. Seen while the
+  match-event editor's commands landed, which touch no transport code.
+- **Why deferred:** once, under a loaded machine, on a timing margin rather
+  than a logic error. It is not BACKLOG #70 (that is the whisper teardown).
+- **When to revisit:** if it recurs, or if a coach reports a take whose replay
+  drifts from where they paused. Start by printing the margin on failure.

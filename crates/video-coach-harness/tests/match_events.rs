@@ -11,7 +11,8 @@ use tempfile::TempDir;
 use video_coach_app::bus::{Command, Event, UserError};
 use video_coach_core::project::Project;
 use video_coach_core::scoreboard::{
-    MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig, TeamConfig,
+    ClockDisplay, MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig,
+    ScoreboardContext, TeamConfig,
 };
 use video_coach_core::store;
 use video_coach_core::stroke::Rgba;
@@ -167,6 +168,150 @@ fn a_team_without_a_name_is_refused_and_the_setup_stands() {
     let rest = h.shutdown();
     no_project_changed(&rest);
     assert_eq!(p.saved().scoreboard, Some(scoreboard()));
+}
+
+/// How many `ProjectChanged`s the bus has published so far, consumed or not.
+fn changes(h: &Harness) -> usize {
+    h.log()
+        .iter()
+        .filter(|e| matches!(e, Event::ProjectChanged(_)))
+        .count()
+}
+
+/// A pasted block is **one** save, one `ProjectChanged` and one undo step,
+/// however many events it holds: `edit_match_events` snapshots the whole list
+/// around the closure, so five appends inside one are one of each (spec C3).
+#[test]
+fn a_pasted_batch_is_one_undo_step() {
+    let (mut h, p) = Proj::open(&["a.webm", "b.webm"]);
+    h.send(tag(MatchEventKind::HomeGoal, 0, 0.1));
+    let before = events(&h.wait_changed().project);
+
+    h.send(Command::AddMatchEvents {
+        text: "# the first half\n\
+               1 0:00.5 start\n\
+               1 0:01.9 home goal\n\
+               2 0:00.2 away goal\n\
+               2 0:01.0 home goal\n\
+               2 0:01.9 end\n"
+            .into(),
+        default_source: 0,
+    });
+    let after = events(&h.wait_changed().project);
+
+    assert_eq!(after[..1], before[..]);
+    let pasted: Vec<(MatchEventKind, usize, f64)> = after[1..]
+        .iter()
+        .map(|m| (m.kind, m.source_index, m.source_seconds))
+        .collect();
+    assert_eq!(
+        pasted,
+        vec![
+            (MatchEventKind::StartStop, 0, 0.5),
+            (MatchEventKind::HomeGoal, 0, 1.9),
+            (MatchEventKind::AwayGoal, 1, 0.2),
+            (MatchEventKind::HomeGoal, 1, 1.0),
+            (MatchEventKind::StartStop, 1, 1.9),
+        ],
+        "the block's five lines, in input order"
+    );
+    assert_eq!(events(&p.saved()), after);
+
+    // One step back takes the whole block with it.
+    h.send(Command::Undo);
+    assert_eq!(events(&h.wait_changed().project), before);
+    assert_eq!(
+        changes(&h),
+        3,
+        "the tag, the batch and the undo: one publish each"
+    );
+
+    h.shutdown();
+    assert_eq!(events(&p.saved()), before);
+}
+
+/// Best-effort, not all-or-nothing: the lines that can't land are named in
+/// one notice and the rest are added (spec V4). Per-line detail is the echo's
+/// job, before Add is pressed; this is the aggregate.
+#[test]
+fn a_partly_refused_batch_adds_the_rest() {
+    let (mut h, p) = Proj::open(&["a.webm", "b.webm"]);
+    h.send(tag(MatchEventKind::HomeGoal, 0, 0.3));
+    h.wait_changed();
+    h.send(tag(MatchEventKind::AwayGoal, 1, 1.0));
+    let before = events(&h.wait_changed().project);
+
+    h.send(Command::AddMatchEvents {
+        text: "1 0:00.3 home goal\n\
+               2 0:01.0 away goal\n\
+               2 5:00 home goal\n\
+               2 9:00.0 away goal\n\
+               1 0:01.5 away goal\n\
+               2 0:00.2 home goal\n\
+               1 0:01.9 start\n"
+            .into(),
+        default_source: 0,
+    });
+    let after = events(&h.wait_changed().project);
+    assert_eq!(after.len(), before.len() + 3, "{after:#?}");
+    assert_eq!(after[..2], before[..]);
+
+    let err = h.wait_for_error();
+    let UserError::Scoreboard(msg) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(msg.starts_with("3 of 7 added"), "{msg}");
+    assert!(msg.contains("2 already tagged"), "{msg}");
+    assert!(msg.contains("b.webm is "), "{msg}");
+
+    h.shutdown();
+    assert_eq!(events(&p.saved()), after);
+}
+
+/// A retyped row moves the record — same id — and the match clock moves with
+/// it, because the clock is read from the events on every call and nothing
+/// caches them (spec V6, N).
+#[test]
+fn an_edit_moves_an_event_and_the_clock_follows() {
+    let (mut h, p) = Proj::open(&["a.webm", "b.webm"]);
+    h.send(Command::SetScoreboard(scoreboard()));
+    h.wait_changed();
+    h.send(tag(MatchEventKind::StartStop, 0, 0.1));
+    h.wait_changed();
+    h.send(tag(MatchEventKind::StartStop, 0, 1.0));
+    let tagged = h.wait_changed().project;
+
+    // The clock a frame 0.5 s after the tagged end reads.
+    let clock = |p: &Project| {
+        ScoreboardContext::for_project(p)
+            .unwrap()
+            .state_at(0, 1.5)
+            .unwrap()
+            .clock
+    };
+    assert!(matches!(clock(&tagged), ClockDisplay::OnBreak(_)));
+
+    let half_time = tagged.match_events[1].id;
+    h.send(Command::EditMatchEvent {
+        id: half_time,
+        line: "2 0:01.5 period".into(),
+    });
+    let moved = h.wait_changed().project;
+    assert_eq!(moved.match_events[1].id, half_time, "the record moved");
+    assert_eq!(moved.match_events[1].source_index, 1);
+    assert_eq!(moved.match_events[1].source_seconds, 1.5);
+    assert!(
+        matches!(clock(&moved), ClockDisplay::Running { .. }),
+        "the same frame is now inside the first half"
+    );
+
+    h.send(Command::Undo);
+    let back = h.wait_changed().project;
+    assert_eq!(events(&back), events(&tagged));
+    assert!(matches!(clock(&back), ClockDisplay::OnBreak(_)));
+
+    h.shutdown();
+    assert_eq!(events(&p.saved()), events(&tagged));
 }
 
 /// A source move remaps the stored records but not the snapshots on the undo

@@ -21,7 +21,9 @@
 //! meant.
 
 use crate::project::Project;
-use crate::scoreboard::{MatchEventKind, MatchEventRecord, ScoreboardConfig};
+use crate::scoreboard::{
+    MatchEventKind, MatchEventRecord, ScoreboardConfig, START_STOP_CAP_REFUSAL,
+};
 
 /// How near an existing event of the same kind on the same source a *pasted*
 /// line has to be to count as the same event, in seconds.
@@ -448,11 +450,7 @@ pub fn parse_batch(project: &Project, default_source: usize, text: &str) -> Batc
                 let capped = event.kind == MatchEventKind::StartStop
                     && cap.is_some_and(|cap| start_stops >= cap);
                 if capped {
-                    BatchVerdict::Refused(
-                        "every period of this match format is already tagged; \
-                         change the format to tag more"
-                            .into(),
-                    )
+                    BatchVerdict::Refused(START_STOP_CAP_REFUSAL.into())
                 } else {
                     if event.kind == MatchEventKind::StartStop {
                         start_stops += 1;

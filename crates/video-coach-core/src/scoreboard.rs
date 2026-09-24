@@ -682,6 +682,12 @@ impl ScoreboardContext {
 
 // --------------------------------------------------------------- mutations
 
+/// What a start/stop past [`Project::start_stops_at_cap`] is refused with, in
+/// one place: the key, the paste box and a retyped row all reach the same cap
+/// and must say the same thing about it.
+pub const START_STOP_CAP_REFUSAL: &str =
+    "every period of this match format is already tagged; change the format to tag more";
+
 impl Project {
     /// Tag a match event at `(source_index, source_seconds)` and return its id.
     ///
@@ -827,7 +833,8 @@ impl Project {
     /// is stored once there is one.
     ///
     /// The Match panel disables the start/stop action on this and the command
-    /// refuses out loud if it is reached anyway — one rule, in one place.
+    /// refuses out loud if it is reached anyway — one rule, in one place, said
+    /// in one sentence ([`START_STOP_CAP_REFUSAL`]).
     pub fn start_stops_at_cap(&self) -> bool {
         self.scoreboard
             .as_ref()
