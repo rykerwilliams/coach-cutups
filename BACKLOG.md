@@ -826,14 +826,15 @@ Each entry: what, why deferred, when to revisit.
   muxer." Today an export run belongs to the open project and starts at once
   (`bus/export.rs`'s `Active`/`ExportRun`), so exporting three matches means
   sitting through three of them.
-- **Why deferred:** it is a real feature, not a fix. The queue outlives the open
-  project, so a queued job has to carry its own snapshot — the plan, the
-  sources' paths, the scoreboard, the cues and the tags — rather than reading a
-  project that may since have changed or closed; it needs somewhere to live
-  across a restart, a way to show progress for a project that isn't open, and a
-  rule for what a queued job does when its footage moves. That is a spec, not a
-  patch.
-- **When to revisit:** once the coach has more than two matches in flight, or
-  the first time they ask again. Start from the fact that `ExportJob` is already
-  a self-contained value: the queue is a list of them plus a folder to write to,
-  and the hard part is building one without the project open.
+- **The shape, agreed with the coach:** an `ExportJob` is already a
+  self-contained value — the plan, the sources' paths, the scoreboard, the
+  cues, the tags — so **enqueue is "build the jobs now, run them later"**, and
+  the queue is a list of them. The work is: don't tie the run loop to the open
+  project; a panel listing what is waiting, by project name, with Start and
+  remove; and one job's failure (footage moved, disk full) failing only itself.
+  A first version keeps the queue in memory — closing the app loses it — and
+  doesn't let a queued job be edited.
+- **Why deferred:** only by the coach's own order (2026-09-24): the detection
+  measurement comes first. It is not blocked on anything.
+- **When to revisit:** as soon as P3's measurement is done, or sooner if the
+  coach asks.
