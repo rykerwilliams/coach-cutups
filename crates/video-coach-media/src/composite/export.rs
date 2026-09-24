@@ -42,6 +42,7 @@ use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::highlight::{highlight_shapes, PlayerHighlight};
 use video_coach_core::layout::pip_rect;
+use video_coach_core::metadata::FileTags;
 use video_coach_core::project::{Clip, Quality, Resolution};
 use video_coach_core::scoreboard::ScoreboardContext;
 
@@ -49,8 +50,8 @@ use super::audio::Mixer;
 use super::decode::Decoder;
 use super::{
     audio, avatar, fit_rect, frame_time, head, install_geometry, install_overlay_pad, install_zoom,
-    overlay_branch, premultiplied_over, push_buffer, rounded, stamp, stamp_buffer, CompositeError,
-    Gl, Layout, PadRect, Schedule, Stopper, Watch, POLL, QUEUED,
+    overlay_branch, premultiplied_over, push_buffer, rounded, stamp, stamp_buffer, tags,
+    CompositeError, Gl, Layout, PadRect, Schedule, Stopper, Watch, POLL, QUEUED,
 };
 use crate::chapters::{self, ChapterOutcome};
 use crate::overlay::{OverlayFrame, OverlayRenderer};
@@ -136,6 +137,12 @@ pub struct ExportJob {
     pub cues: Option<Vec<Cue>>,
     /// Which renderer writes it, and everything only that one reads.
     pub render: Render,
+    /// What the file says about itself in its header
+    /// (`video_coach_core::metadata::file_tags`), written by whichever
+    /// renderer runs. An empty field writes no tag, so
+    /// [`FileTags::default`](video_coach_core::metadata::FileTags::default) is
+    /// an untagged file.
+    pub tags: FileTags,
 }
 
 /// What one entry needs beside its `PlanEntry`, which carries the edit but
@@ -1092,6 +1099,10 @@ impl Encoder {
             "reserved-max-duration",
             reserved_duration(job.compilation.frames.len()),
         );
+        // Before `PLAYING`: the header is laid out at the first buffer, and
+        // the reserve is grown to fit the tags rather than spent on them
+        // ([`tags`](super::tags)).
+        tags::apply(&mux, &job.tags);
         by_name("out").set_property("location", part);
 
         let eos = gl.install(&pipeline, watch, |_| {});
@@ -1280,6 +1291,7 @@ mod tests {
             .collect();
         let clip = clip();
         let job = ExportJob {
+            tags: FileTags::default(),
             compilation: fixtures::one_entry(&clip, frames, ""),
             sources: vec![source],
             path: path.clone(),

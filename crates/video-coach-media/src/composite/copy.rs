@@ -84,11 +84,12 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use video_coach_core::cues::Cue;
 use video_coach_core::export::OUTPUT_FPS;
+use video_coach_core::metadata::FileTags;
 
 use super::export::{
     reserve_remaining, reserved_duration, ExportError, ExportJob, ExportMessage, Render, Rendered,
 };
-use super::{frame_time, watch_bus, Stopper, Watch, POLL};
+use super::{frame_time, tags, watch_bus, Stopper, Watch, POLL};
 use crate::player::{seconds, seconds_to_clock, Diagnostics};
 
 /// How long a file has to declare its streams before the copy gives up.
@@ -197,7 +198,7 @@ pub(super) fn copy(
     // `None` is "leave the scoreboard beside this output alone" (spec T1); it
     // is no more a track here than it is a sidecar.
     let cues = job.cues.as_deref().unwrap_or_default();
-    let out = Output::start(part, total, audio_rate, cues, &watch)?;
+    let out = Output::start(part, total, audio_rate, cues, &job.tags, &watch)?;
     let mut percent = 0;
     for (entry, file) in job.compilation.plan.entries.iter().zip(&files) {
         // **The plan says where this source starts**, and so do the chapters
@@ -605,6 +606,7 @@ impl Output {
         total: usize,
         audio_rate: Option<u32>,
         cues: &[Cue],
+        file_tags: &FileTags,
         watch: &Watch,
     ) -> Result<Output, ExportError> {
         let pipeline = gst::Pipeline::new();
@@ -613,6 +615,9 @@ impl Output {
         // layout `chapters::splice` needs, by the encoded export's formula
         // (spec L4). `faststart` would write the whole `mdat` to `$TMPDIR`.
         mux.set_property("reserved-max-duration", reserved_duration(total));
+        // Header boxes beside the tracks: not a byte of any copied sample
+        // changes, and the reserve is untouched ([`tags`](super::tags)).
+        tags::apply(&mux, file_tags);
         let sink = make("filesink")?;
         sink.set_property("location", part);
         add_many(&pipeline, &[&mux, &sink])?;

@@ -34,6 +34,7 @@ pub(crate) mod copy;
 mod decode;
 pub mod export;
 pub mod preview;
+mod tags;
 #[cfg(test)]
 mod tests;
 

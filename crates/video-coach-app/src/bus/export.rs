@@ -28,18 +28,22 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
+use gstreamer::glib;
 use uuid::Uuid;
 use video_coach_core::audio::audio_regions;
 use video_coach_core::cues::{scoreboard_cues, Cue};
 use video_coach_core::export::{compilation_schedule, Compilation, RateWindow, OUTPUT_FPS};
+use video_coach_core::metadata::{
+    clip_label, file_tags, reel_label, CalendarDate, ALL_CLIPS_LABEL, WHOLE_MATCH_LABEL,
+};
 use video_coach_core::plan::{
     compilation_plan, default_scoreboard_mode, ExportTarget, ScoreboardMode,
 };
-use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution};
+use video_coach_core::project::{Preferences, Project, Quality, Resolution};
 use video_coach_core::reel::{reel_goals, ReelSide};
-use video_coach_core::scoreboard::{team_name, ScoreboardContext};
+use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
 use video_coach_media::{
@@ -47,17 +51,6 @@ use video_coach_media::{
 };
 
 use super::{Bus, Event, Input, Open, UserError};
-
-/// What the every-clip target is called, in the sheet and in its file name.
-const ALL_CLIPS_LABEL: &str = "All clips";
-/// What a reel of both sides' goals is called, in the sheet and in its file
-/// name. One side's is named after the team ([`reel_label`]).
-const REEL_LABEL: &str = "All goals";
-/// What the whole-match export is called, in the sheet and in its file name.
-const WHOLE_MATCH_LABEL: &str = "Whole match";
-
-/// What a clip with no name of its own is called.
-const UNTITLED: &str = "Untitled";
 
 /// Where one target of a run has got to.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,27 +185,6 @@ pub fn export_targets(project: &Project, selected: Option<Uuid>) -> Vec<ExportTa
         ));
     }
     rows
-}
-
-/// What a reel is called, in the sheet and in its file name (spec R1b): the
-/// side's configured team name ("Rovers goals"), or "Home goals" / "Away
-/// goals" where no scoreboard is set up. Both sides' is [`REEL_LABEL`].
-fn reel_label(project: &Project, side: ReelSide) -> String {
-    let home = match side {
-        ReelSide::All => return REEL_LABEL.to_owned(),
-        ReelSide::Home => true,
-        ReelSide::Away => false,
-    };
-    format!("{} goals", team_name(project.scoreboard.as_ref(), home))
-}
-
-/// What a clip is called in a file name and in a refusal: its own name, or
-/// [`UNTITLED`] when it hasn't been given one.
-fn clip_label(clip: &Clip) -> &str {
-    match clip.name.trim() {
-        "" => UNTITLED,
-        name => name,
-    }
 }
 
 /// `<label> - <project>.mp4` (spec E6), with the two characters a file name
@@ -607,6 +579,29 @@ fn carry_scoreboard(
     }
 }
 
+/// The day to tag an export with: the first game video's own modification
+/// time, read here because the bus is what knows the paths and media has no
+/// business stat-ing files.
+///
+/// **The footage's date, not the export's** (a user decision): this coach's
+/// game videos are downloads, so the file's mtime is within a day of the
+/// match, which is the date anyone reading the file wants. `None` — no
+/// sources, an unreadable file, a time before 1970 — writes no date at all
+/// rather than today's.
+///
+/// The day a timestamp falls on is the reader's own, so it is resolved in the
+/// local zone here; `video_coach_core` has no clock and takes the answer.
+fn source_date(sources: &[PathBuf]) -> Option<CalendarDate> {
+    let modified = std::fs::metadata(sources.first()?).ok()?.modified().ok()?;
+    let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let local = glib::DateTime::from_unix_local(i64::try_from(seconds).ok()?).ok()?;
+    Some(CalendarDate {
+        year: local.year(),
+        month: u32::try_from(local.month()).ok()?,
+        day: u32::try_from(local.day_of_month()).ok()?,
+    })
+}
+
 /// The files a copy of `compilation` would join, in entry order: what
 /// `composite::copy` reads from the same two fields of the job.
 fn copy_files(compilation: &Compilation, sources: &[PathBuf]) -> Vec<PathBuf> {
@@ -713,6 +708,7 @@ fn job(
                     .map(|file| open.folder.join(file)),
             }),
         },
+        tags: file_tags(&open.project, target, source_date(&sources)),
         compilation,
         sources,
         path: exports.join(file_name(label, &open.project.name)),

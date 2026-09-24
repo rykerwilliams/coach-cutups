@@ -23,6 +23,7 @@ use video_coach_core::avatar::avatar_box;
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec, OUTPUT_FPS};
 use video_coach_core::layout::{bar_rect, pip_rect, scoreboard_rects, Rect as LayoutRect};
+use video_coach_core::metadata::FileTags;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{
     Clip, Inset, Preferences, Project, Quality, Resolution, SourceRef,
@@ -33,8 +34,8 @@ use video_coach_core::scoreboard::{
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::zoom::Zoom;
 use video_coach_media::fixtures::{
-    self, block_centre, counter_video, counter_video_with, decode_counters, ffprobe, one_entry,
-    read_counter, CounterKind, CounterQuirks, COUNTER_BITS,
+    self, assert_export_tags, block_centre, counter_video, counter_video_with, decode_counters,
+    ffprobe, one_entry, read_counter, sample_export_tags, CounterKind, CounterQuirks, COUNTER_BITS,
 };
 use video_coach_media::{
     ChapterOutcome, Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage,
@@ -130,6 +131,7 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
 fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
     let clip = clip(0.0, frames.len() as f64 / f64::from(OUTPUT_FPS), Vec::new());
     ExportJob {
+        tags: FileTags::default(),
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
         path,
@@ -346,6 +348,7 @@ fn fiducial(kind: CounterKind) {
     let path = dir.path().join("out.mp4");
     let audio = audio_regions(&compilation, &Preferences::default());
     let done = export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![src.path.clone()],
         path: path.clone(),
@@ -452,6 +455,7 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
     let path = dir.path().join("out.mp4");
     let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![wide, narrow],
         path: path.clone(),
@@ -781,6 +785,7 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
     let path = dir.join(format!("out-{show_pip}.mp4"));
     (
         ExportJob {
+            tags: FileTags::default(),
             compilation: one_entry(&clip, frames, "1 / 2 | Demo"),
             sources: vec![source],
             path: path.clone(),
@@ -941,6 +946,7 @@ fn the_export_burns_in_the_scoreboard() {
         .collect();
     let path = dir.path().join("out.mp4");
     export(ExportJob {
+        tags: FileTags::default(),
         compilation: one_entry(&clip, frames, ""),
         sources: vec![source],
         path: path.clone(),
@@ -1060,6 +1066,7 @@ fn an_avatar_clip_pulses_in_the_export() {
     let compilation = one_entry(&clip, frames, "");
     let total = compilation.frames.len();
     export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![source],
         path: path.clone(),
@@ -1154,6 +1161,7 @@ fn an_avatar_and_a_camera_clip_export_together() {
     let path = dir.path().join("out.mp4");
     let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![source],
         path: path.clone(),
@@ -1230,6 +1238,7 @@ fn avatar_export(
     let compilation = one_entry(&clip, frames, "");
     let total = compilation.frames.len();
     export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![source],
         path: path.clone(),
@@ -1306,6 +1315,7 @@ fn sounded_job(
     let compilation = fixtures::one_clip(&clip, source_duration);
     let audio = audio_regions(&compilation, &Preferences::default());
     ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![source],
         path,
@@ -1506,6 +1516,7 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
     let path = dir.path().join("out.mp4");
     let audio = audio_regions(&compilation, &Preferences::default());
     export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![source],
         path: path.clone(),
@@ -1607,6 +1618,7 @@ fn cancel_leaves_nothing_and_keeps_an_existing_file() {
     let mut stopped = false;
     let result = export_with(
         ExportJob {
+            tags: FileTags::default(),
             // A target that carries a sidecar, so the cancel is what leaves
             // the old one alone rather than the job never having one.
             cues: Some(Vec::new()),
@@ -1690,6 +1702,7 @@ fn a_compilation_gets_a_chapter_per_entry() {
     let sidecar = dir.path().join("out.srt");
     std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
     let done = export(ExportJob {
+        tags: FileTags::default(),
         compilation,
         sources: vec![src.path.clone()],
         path: path.clone(),
@@ -1732,4 +1745,73 @@ fn a_compilation_gets_a_chapter_per_entry() {
     }
     counters_match(&decode_counters(&path), &expected_counters);
     duration_is_the_schedule_s(&path, expected_counters.len());
+}
+
+/// The encoded export tags its file, and chaptering it afterwards still works.
+///
+/// **The two share the `moov`**, which is why they are checked together: the
+/// tags go into `moov/udta` when the muxer lays the reserved header out, and
+/// `chapters::splice` then appends `chpl` to that same `udta` out of the
+/// `free` box behind it. Measured, the tags cost that `free` box nothing —
+/// `mp4mux` grows the reserved header to fit them — and this is the standing
+/// proof of it.
+#[test]
+fn an_encoded_export_tags_its_file_and_still_chapters_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(dir.path(), CounterKind::H264Mp4BFrames);
+    let clips: Vec<Clip> = ["Build-up", "Finish"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Clip {
+            name: name.into(),
+            sort_index: i as i64,
+            ..clip(i as f64, 0.51, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[f64::from(src.frames) / f64::from(src.fps)]);
+    let expected: Vec<(f64, String)> = compilation.plan.chapters.clone();
+    assert_eq!(expected.len(), 2);
+
+    let path = dir.path().join("out.mp4");
+    let done = export(ExportJob {
+        tags: sample_export_tags(),
+        compilation,
+        sources: vec![src.path.clone()],
+        path: path.clone(),
+        cues: None,
+        render: Render::Encode(Encode {
+            audio: Vec::new(),
+            entries: clips
+                .into_iter()
+                .map(|clip| {
+                    Some(EntryMedia {
+                        recording: PathBuf::new(),
+                        clip,
+                    })
+                })
+                .collect(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+            scoreboard: None,
+            highlights: Vec::new(),
+            avatar: None,
+        }),
+    })
+    .unwrap();
+
+    assert_export_tags(&path);
+    assert_eq!(done.chapters, ChapterOutcome::Written(2));
+    assert!(
+        done.reserve_remaining > 0.0,
+        "the tags ate the moov reserve"
+    );
+    let got = ffprobe_chapters(&path);
+    assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");
+    for ((at, title), (want_at, want_title)) in got.iter().zip(&expected) {
+        assert_eq!(title, want_title);
+        assert!(
+            (at - want_at).abs() < 0.001,
+            "{title:?} starts at {at}, not {want_at}"
+        );
+    }
 }

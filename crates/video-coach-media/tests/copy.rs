@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 use gstreamer as gst;
 use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{compilation_schedule, Compilation};
+use video_coach_core::metadata::FileTags;
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Project, SourceRef};
 use video_coach_media::fixtures::{
-    counter_video_with, decode_counters, ffprobe, CounterKind, CounterQuirks,
+    assert_export_tags, counter_video_with, decode_counters, ffprobe, sample_export_tags,
+    CounterKind, CounterQuirks,
 };
 use video_coach_media::{ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render};
 
@@ -85,6 +87,7 @@ fn whole_match_with(
 /// no track requested.
 fn job(m: &Match, path: PathBuf) -> ExportJob {
     ExportJob {
+        tags: FileTags::default(),
         compilation: m.compilation.clone(),
         sources: m.files.clone(),
         path,
@@ -292,6 +295,7 @@ fn a_copy_of_two_sources_is_lossless_and_chaptered() {
 
     let path = dir.path().join("out.mp4");
     let done = copy(ExportJob {
+        tags: FileTags::default(),
         cues: Some(cues.clone()),
         ..job(&m, path.clone())
     })
@@ -389,6 +393,7 @@ fn a_single_source_is_copied_with_no_chapters() {
     let path = dir.path().join("out.mp4");
 
     let done = copy(ExportJob {
+        tags: FileTags::default(),
         cues: Some(cues.clone()),
         ..job(&m, path.clone())
     })
@@ -663,4 +668,69 @@ fn a_cancel_during_the_header_pass_leaves_nothing() {
         !dir.path().join("out.mp4.part").exists(),
         "a cancelled copy left its .part"
     );
+}
+
+/// The copy tags its file, without costing it a byte of the streams or the
+/// chapters behind it.
+///
+/// **Tags are header boxes**, so the proof that they are free is the rest of
+/// the file being what it was: the same `stsd`, the same packet count, the
+/// same frames in the same order, and the chapters still spliced into the
+/// `moov` the tags share. Measured, `mp4mux` grows the reserved header to fit
+/// them rather than spending the `free` box `chapters::splice` eats into.
+#[test]
+fn a_tagged_copy_is_still_lossless_and_still_chaptered() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = whole_match(
+        dir.path(),
+        &[("first half", 640, 360, 45), ("second half", 640, 360, 30)],
+    );
+    let inputs: Vec<(String, String, i64, i64, i64)> =
+        m.files.iter().map(|f| video_stream(f)).collect();
+    let expected: Vec<(f64, String)> = m.compilation.plan.chapters.clone();
+    assert_eq!(expected.len(), 2, "one chapter per source: {expected:?}");
+
+    let path = dir.path().join("out.mp4");
+    let done = copy(ExportJob {
+        tags: sample_export_tags(),
+        ..job(&m, path.clone())
+    })
+    .unwrap();
+    assert_eq!(done.encoder, "copy");
+    assert!(
+        done.reserve_remaining > 0.0,
+        "the tags ate the moov reserve"
+    );
+
+    assert_export_tags(&path);
+
+    // Still the sources' own packets, described the way they described
+    // themselves.
+    let (codec, profile, w, h, packets) = video_stream(&path);
+    assert_eq!(
+        (codec.as_str(), profile.as_str(), w, h),
+        (
+            inputs[0].0.as_str(),
+            inputs[0].1.as_str(),
+            inputs[0].2,
+            inputs[0].3
+        ),
+        "the copy re-described the video"
+    );
+    assert_eq!(
+        packets,
+        inputs.iter().map(|i| i.4).sum::<i64>(),
+        "the copy is not packet for packet"
+    );
+    assert_eq!(decode_counters(&path), want(&m));
+
+    let got = chapters(&path);
+    assert_eq!(got.len(), expected.len(), "chapters read back: {got:?}");
+    for ((at, title), (want_at, want_title)) in got.iter().zip(&expected) {
+        assert_eq!(title, want_title);
+        assert!(
+            (at - want_at).abs() < 0.001,
+            "{title:?} starts at {at}, not {want_at}"
+        );
+    }
 }

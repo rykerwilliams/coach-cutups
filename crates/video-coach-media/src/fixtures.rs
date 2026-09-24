@@ -24,6 +24,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use video_coach_core::export::{compilation_schedule, Compilation, FrameSpec};
+use video_coach_core::metadata::{CalendarDate, FileTags};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Clip, Project, SourceRef};
 
@@ -862,4 +863,53 @@ pub fn ffprobe(path: &Path, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).expect("ffprobe wrote JSON")
+}
+
+// --------------------------------------------------- an export's header tags
+
+/// What both renderers' tag tests write and read back. The version is not the
+/// crate's: a distinctive one proves the `encoder` tag in the file is ours and
+/// not `x264enc`'s own, which arrives as a tag event on the same muxer.
+pub fn sample_export_tags() -> FileTags {
+    FileTags {
+        title: "Rovers v Athletic — whole match".into(),
+        description: "Whole match, from the Coach Cuts project “Saturday”.".into(),
+        comment: "Rovers 2 - 1 Athletic".into(),
+        keywords: vec!["Rovers".into(), "Athletic".into()],
+        encoder: "Coach Cuts 9.9.9".into(),
+        date: Some(CalendarDate {
+            year: 2026,
+            month: 9,
+            day: 21,
+        }),
+    }
+}
+
+/// Asserts `path` carries [`sample_export_tags`], as `ffprobe -show_format` reads the
+/// `moov/udta` boxes and as the XMP packet carries the description.
+///
+/// **`description` is the one tag `ffprobe -show_format` does not surface**
+/// (measured, GStreamer 1.24.2): `mp4mux` writes no `desc` atom for it and
+/// puts it in the XMP `uuid` box instead, which is where this looks. The date
+/// reads back unpadded because `©day` holds whatever `mp4mux` formatted the
+/// `GDate` as.
+pub fn assert_export_tags(path: &Path) {
+    let tags = &ffprobe(path, &["-show_format"])["format"]["tags"];
+    let want = sample_export_tags();
+    let got = |key: &str| tags[key].as_str().unwrap_or_default().to_owned();
+    assert_eq!(got("title"), want.title);
+    assert_eq!(got("comment"), want.comment);
+    // GStreamer joins a multi-valued tag with ", ".
+    assert_eq!(got("keywords"), "Rovers, Athletic");
+    assert_eq!(got("encoder"), want.encoder);
+    assert_eq!(got("date"), "2026-9-21");
+
+    let bytes = std::fs::read(path).expect("the export is readable");
+    let xmp = format!("<dc:description>{}", want.description);
+    assert!(
+        bytes
+            .windows(xmp.len())
+            .any(|window| window == xmp.as_bytes()),
+        "the description is not in the file's XMP packet"
+    );
 }

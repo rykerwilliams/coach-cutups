@@ -373,6 +373,14 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. **Chapters never cost an export:** any layout problem found before the write (no room, no `moov`, a box that doesn't fit) keeps the file whole without chapters, and `bus: exported …` says why. Only an I/O error opening the file or in the positioned write itself fails it.
 - **`ffprobe` is the chapter test's reader** (`qtdemux` doesn't read `chpl`), so `ffmpeg` is a **test-only** build dependency: the test fails without it, never skips, and the `.deb` doesn't depend on it.
 
+**Every exported MP4 says what it is, in its header** (`core::metadata::file_tags` → `media/src/composite/tags.rs`). The words live in **core**, beside the chapter and caption wording, as one pure function of the project, the export target and a date; media only sets them on `mp4mux`'s `GstTagSetter` before `PLAYING`, on **both** renderers. `ExportJob::tags` carries them, and `FileTags::default()` is an untagged file.
+- **What actually reaches the file, measured on GStreamer 1.24.2** (mux, then `ffprobe -show_format`): `title`, `comment` (the final score), `keywords` (both team names, which GStreamer joins `", "`) and `encoder` (`Coach Cuts <version>`) land in `moov/udta` and read back by name; `date` lands in `©day`, unpadded, as `2026-9-21`; **`description` lands only in the XMP `uuid` box** as `<dc:description>` — `mp4mux` writes no `desc` atom, and nothing else on this muxer carries a description. **`datetime` is ignored**: it sets neither a tag nor `mvhd`'s creation time, so the date is a `glib::Date`.
+- **The date is the footage's, not the export's** (a user decision): the first source file's mtime, read in the bus (`source_date`) because the bus knows the paths and media has no business stat-ing files. Resolved in the local zone there and handed to core as a `CalendarDate`; no date available writes no date.
+- **The tag merge mode is `Keep`.** The encoder pushes an `ENCODER` tag of its own ("x264") into the same muxer; `Keep` is what leaves ours standing.
+- **Tags cost the copy no losslessness and the chapters no room** (measured). They are header boxes beside the tracks, so not a sample changes; and `mp4mux` grows the reserved `moov` to fit them rather than spending the sample-table headroom — with tags, without them, and with a 40 KB payload, `reserved-duration-remaining` came back identical and the `free` box after `moov` that `chapters::splice` eats into stayed exactly 842 bytes.
+- **Where a tag can't be told the truth it is left out, never guessed.** No scoreboard — or a kick-off not tagged yet — means no `comment`, and no teams means no `keywords` and a title that says what the export is rather than inventing "Home v Away".
+- **The export target's labels live in core too** (`metadata::{ALL_CLIPS_LABEL, REEL_LABEL, WHOLE_MATCH_LABEL, UNTITLED, clip_label, reel_label}`), because the sheet row, the file name and the title are the same words: renaming a target renames it in all three.
+
 **The whole match in track mode is a stream copy, not an encode** (`media/src/composite/copy.rs`). `ExportJob::render` picks the renderer — `Render::Encode` carries everything only the encoder reads, so a copy can't be handed a resolution or a cue-drawing scoreboard — and `composite::export::run` branches on it once, at the top; the `.part`, the chapters, the rename and the delete-on-failure stay in `run`, shared. **There is no `concat`:** Rust owns the ordering, one source at a time, as the encode path's pump does — two `concat`s, one per track, switch source independently and deadlocked one run in three under load. How the copy does it — the re-based segments, the `async=false` sinks, the header-reading caps gate, the single wait and its memory bound — is in that module's header, which is the one place it belongs.
 - **The gate is also `video_coach_media::can_copy`,** a header read per file that the bus asks before it chooses a renderer. Every refusal names the file and says to choose **Scoreboard: burned in**.
 - **The scoreboard sidecar is `job.path.with_extension("srt")`** — `ExportJob::cues` as `core::cues::cues_to_srt`, written in `composite::export`'s `finish` **after** the rename, so it inherits the run's name cleaning and its `" (2)"` de-duplication and is the matching basename a player auto-loads. A failure is logged and reported as `ExportDone::sidecar: None`; a good `.mp4` is never thrown away over a text file, and a cancel, which never reaches the rename, leaves the last good export's `.srt` alone.
@@ -401,6 +409,31 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
   `draw_label` centres and does not clip, so an unfitted label spills out of
   both ends of its cell. The columns are sized so nothing realistic shrinks;
   fitting is what makes a spill impossible rather than unlikely.
+
+**Match events are tagged at the playhead or typed, in one grammar.** `z` /
+`x` / `v` tag where the game video is; the editor sheet ("Edit events…" in the
+Match panel) takes the same events as lines — `2 14:05 home goal` — in a row's
+field and in its paste box alike, both read by `core::match_entry`
+(`parse_line`, `parse_batch`, `format_line`, `edit_from_line`).
+- **A time has a colon, and a leading bare integer is a video number** — never
+  a time. `900 home goal` is refused as *"there is no video 900"*, because a
+  bare number read as seconds puts an event minutes out in silence.
+- **Kick-off words are refused, not read as period boundaries.** `kickoff`,
+  `kick`, `ko`, `restart`, `whistle` each get a refusal naming the damage:
+  `interpret` is positional, so one spurious start/stop moves every later
+  period and the clock burned into every export. `kickoffs.txt` is by
+  definition a list of *restarts*, and pasting it must add nothing.
+- **The sheet's rows are rebuilt by its own committed edit and never from
+  `show_project`** (`main.rs`'s `editor_rebuild` flag): a transcript landing
+  (`bus/transcribe.rs`) and a source found missing (`bus/transport.rs`) both
+  publish `ProjectChanged` with no command behind them, and a `LineEdit` inside
+  a `for` can only be bound one way — a rebuild would overwrite what is being
+  typed. Every commit drops focus, because `for` reuses its items by index and
+  a re-timed event moves.
+- **A sheet with fields folds its `editing` into the window's `text-editing`**
+  (`app.slint`), or Esc never leaves the field: the sheet's key guard tests
+  `!text-editing`, so without the fold the first Esc closes the sheet and
+  throws away a half-typed paste.
 
 **The goals reel** (`video-coach-core/src/reel.rs`, spec R).
 - **It is an `ExportTarget` (`Reel`), never a clip.** Its entries have

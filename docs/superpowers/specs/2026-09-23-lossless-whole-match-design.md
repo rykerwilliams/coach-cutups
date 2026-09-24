@@ -282,6 +282,14 @@ Of these, only **player highlights** are a loss against today's burned whole mat
 
 The sheet says it in one line under the picker (**M1**): *"The whole match is copied, not re-encoded: player highlights and pen drawings can't ride a copy."*
 
+**What a copy *does* carry beyond the pixels: the header tags** (added 2026-09-24). Every export, copied or encoded, gets `core::metadata::file_tags` set on the muxer's `GstTagSetter` before `PLAYING`: a title (`"Rovers v Athletic — whole match"`), a description naming the project, the final score as the `comment`, both team names as `keywords`, `Coach Cuts <version>` as the `encoder`, and the first source file's modification date as `date`.
+
+They cost this design nothing, and that is measured rather than assumed:
+
+- **They are header boxes beside the tracks**, so the copy stays packet for packet — `a_tagged_copy_is_still_lossless_and_still_chaptered` asserts the same `stsd`, the same packet count and the same decoded frames as the untagged copy.
+- **They do not touch the `moov` reserve the chapter splice depends on** (**L4**). `mp4mux` grows the reserved header to fit them: with tags, without them, and with a 40 KB tag payload, `reserved-duration-remaining` came back identical and the `free` box after `moov` — the one `chapters::splice` shrinks — stayed exactly 842 bytes. The XMP packet lands in its own `uuid` box *after* that `free`, so the splice sees the layout it always saw.
+- **With no scoreboard there are simply fewer tags** (**E5**), on the same rule as the cues: no `comment`, no `keywords`, and a title from what the export is rather than "Home v Away".
+
 ### E. Edge cases
 
 **E1. One source only.** The row is present and the copy still earns its place: it adds the scoreboard sidecar, and the match's tagged chapters if there are any. One source is simply one turn of the loop. Nothing special-cases it.
@@ -320,9 +328,9 @@ The sheet says it in one line under the picker (**M1**): *"The whole match is co
 
 | Crate | Holds |
 |---|---|
-| `video-coach-core` | `Cue`, `scoreboard_cues`, `cues_to_srt`, `ScoreboardMode`, `default_scoreboard_mode`, `Preferences::last_export_scoreboard`, the v11 bump. All pure; no media dependency. |
-| `video-coach-media` | `composite/copy.rs`: the copy graph, the caps gate, the progress probe, the `tx3g` scoreboard track. `ExportJob::{cues, render}`, `ExportDone::sidecar`, the sidecar write and the stale-sidecar removal. `chapters::splice` unchanged; `overlay.rs` unchanged. |
-| `video-coach-app` | The sheet's third picker and its one explanatory line, blanking `job.scoreboard` in track mode, filling `job.cues`, clearing the rate window between targets, writing the choice back to `Preferences`. |
+| `video-coach-core` | `Cue`, `scoreboard_cues`, `cues_to_srt`, `ScoreboardMode`, `default_scoreboard_mode`, `Preferences::last_export_scoreboard`, the v11 bump, and `metadata::file_tags` with the target labels it words titles from. All pure; no media dependency. |
+| `video-coach-media` | `composite/copy.rs`: the copy graph, the caps gate, the progress probe, the `tx3g` scoreboard track. `ExportJob::{cues, render, tags}`, `ExportDone::sidecar`, the sidecar write and the stale-sidecar removal, `composite/tags.rs` (the `GstTagSetter` half, and what `mp4mux` measurably writes). `chapters::splice` unchanged; `overlay.rs` unchanged. |
+| `video-coach-app` | The sheet's third picker and its one explanatory line, blanking `job.scoreboard` in track mode, filling `job.cues` and `job.tags` (with the first source's mtime as the date), clearing the rate window between targets, writing the choice back to `Preferences`. |
 | `video-coach-harness` | The end-to-end run over the bus: tick the whole match in track mode, get a copied file with chapters and a sidecar. |
 
 Nothing moves between crates, and no new dependency appears in any of them.
