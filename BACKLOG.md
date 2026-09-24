@@ -757,6 +757,12 @@ Each entry: what, why deferred, when to revisit.
   load is already in flight (READY, going up), and a first load starts from a
   stopped player — unless two loads were issued back to back at open, when the
   second would wait up to `LOAD_SETTLE` (5 s) on the first.
+- **Recurred locally, 2026-09-24**, on the same symptom and a different test in
+  the same file: `a_skip_burst_then_a_scrub_release_never_sticks` timed out
+  "waiting for settled at 0 in source 0" with `ProjectOpened` still unconsumed,
+  during a full `cargo test --workspace` on a machine also running a release
+  build. The same suite reran green. So it is the **open**, not the skip burst,
+  and it is not CI-only.
 - **When to revisit:** if it recurs on CI, or if a video ever fails to appear
   when a project opens. Capture `GST_DEBUG=*:3,playbin3:5,urisourcebin:5` on
   the failing run; check whether two loads were in flight at open.
@@ -967,3 +973,31 @@ Each entry: what, why deferred, when to revisit.
 - **When to revisit:** when the coach says which of the three shapes they want.
   (a) is buildable immediately and is the one that promises nothing on anyone
   else's behalf.
+
+85. **Recent projects, and a drawer to switch between them.** The coach
+  (2026-09-24): "'recent projects' menu or similar? also could have a project
+  drawer to switch between recents? good for working with several project and
+  going back and forth." They have three tagged matches in two clubs and move
+  between them; today every switch is **Open Project…** and a folder picker.
+- **Most of it exists.** `bus/state.rs` already keeps `last_project` in
+  `state.json` (machine-wide, no format bump) and `restore_last_project` opens
+  it at launch. A recents list is that field grown into a short `Vec<PathBuf>`,
+  written where it is written now — in `open_project`, which is the one place a
+  project is opened.
+- **The list needs a name per entry, and the folder is the wrong one.** Two of
+  the coach's projects are called `20260917-canfield` and
+  `2016B vs Hudson 2026-09-19`; a drawer wants the project's own `name` and
+  ideally its teams. Either store the name beside the path when it is opened
+  (cheap, can go stale) or `store::read` each entry when the drawer opens (a
+  handful of small reads, always right — and it is how a missing project gets
+  greyed out rather than failing on click).
+- **The drawer is the bigger half:** where it lives (a panel beside the sources,
+  or a sheet), what a row shows, and what happens to unsaved state on a switch —
+  today a project change goes through `open_project`, which is already the
+  all-or-nothing path, so the switch itself is not the risk.
+- **Why deferred:** nothing is blocked; it is friction, not a gap. It is also
+  the natural companion to the **New match…** flow
+  (`docs/superpowers/specs/2026-09-24-new-match-flow-design.md`), which creates
+  the projects this would switch between — build them in that order.
+- **When to revisit:** with the New match… flow, or the first time the coach
+  says the picker is slowing them down again.
