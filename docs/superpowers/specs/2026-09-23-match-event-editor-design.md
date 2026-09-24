@@ -41,7 +41,11 @@ Out of scope, and unchanged by this work: the scoreboard's setup sheet, the reel
 
 The Match panel is a column in the right-hand stack, under the clip inspector and the tag overview. Its event list is already capped at `min(168px, lines * 28px)` "so a long match scrolls rather than pushing the inspector out of the column" (`app.slint:893-896`), and a goal's row is *two* 28 px lines because the reel buttons did not fit on one. A paste box plus a per-line echo plus an editable row does not go in that column without evicting the inspector from it.
 
-So: **a modal sheet**, built the way the other two are. There is no generic sheet component — the export sheet (`app.slint:3512-3536`), the setup sheet (`app.slint:3539-3576`) and the error dialog (`app.slint:3579-3616`) are three copies of one shape: a full-window scrim `Rectangle { background: #000000a0; }` with an empty `TouchArea` to swallow clicks, and a fixed-width component that sizes itself by `sheet.preferred-height` (`app.slint:1339`, `app.slint:1587`). `MatchEditorSheet` is a fourth, at **640 px** (the setup sheet is 520, the export sheet 480): the widest thing in it is an echo line's sentence, not a table. Its two lists get heights of their own in the house idiom (`app.slint:896`, `app.slint:1356-1359`).
+So: **a modal sheet**, built the way the other two are — and **there is now one component for that shape**, because this was the fourth copy of it. `Scrim` is the full-window dim plus the empty `TouchArea` that swallows clicks meant for the window behind; `Sheet` is the card: `card-width`, a `title` in the one size and weight, and a `VerticalLayout` body its caller fills as children. The export sheet, the setup sheet, the editor and the error dialog are all `Scrim { … }` around a `Sheet`, and nothing but `Sheet` says `#000000a0`, `border-radius: 8px` or `padding: 20px` any more.
+
+`MatchEditorSheet` is a `Sheet` at **640 px** (the setup sheet is 520, the export sheet 480, the error dialog 440): the widest thing in it is an echo line's sentence, not a table. Its two lists get heights of their own in the house idiom (`app.slint:896`).
+
+*One sheet is not a plain `inherits Sheet`:* the setup sheet's colour picker hangs over the card as an absolutely-positioned sibling, and `@children` would put it in the body's layout. That one wraps a `Sheet` in a `Rectangle` instead, taking its size from the card, and keeps the popup beside it.
 
 Top to bottom: the **event list** (the correction tool), the **paste box** with its default-video picker, the **echo list** and its summary, one **message line** (**C5**), and **Done**.
 
@@ -57,19 +61,29 @@ The addition: **the setup sheet's Esc closes the sheet outright, even from insid
 
 ```slint
 if (root.editor-open) {
-    if (pressed && event.text == Key.Escape && !root.text-editing) {
-        root.close-match-editor();
-        return accept;
+    if (pressed && event.text == Key.Escape) {
+        // Esc in a row's field cancels: the seeded line back, then out.
+        if (root.match-editor-line-focused) {
+            root.reseed-match-line();
+            keys.focus();
+            return accept;
+        }
+        if (!root.text-editing) {
+            root.close-match-editor();
+            return accept;
+        }
     }
     return reject;
 }
 ```
 
-and the first Esc is then handled by the window's existing cascade (`app.slint:2439-2445`), which calls `keys.focus()` — the same call the export sheet's close already makes (`app.slint:3533-3535`) — committing the field and leaving it. The next Esc closes the sheet.
+with one more branch before the `!root.text-editing` test: **Esc in the row's field cancels rather than commits.** Leaving a field commits it — that is the window's cascade, and the only way out of the notes field by keyboard — so Esc there would mean "commit", which Esc means nowhere else in this app. The guard therefore puts the seeded line back (`reseed-match-line()`, `main.rs`) and *then* drops focus, so the commit that follows edits nothing. Esc in the **paste box** falls through to the cascade unchanged: its text is the session's, and leaving the field neither commits nor discards it. The next Esc, with nothing focused, closes the sheet.
+
+That the row's field has focus is a property of its own (`line-focused`, out of the sheet and onto the window), because **T3** needs it too.
 
 **That `!root.text-editing` only works if the editor's own `editing` is folded into it.** `text-editing` is `name-edit.has-focus || inspector.editing || highlights.editing` (`app.slint:2071`); the sheet exposes `out property <bool> editing` exactly as `Inspector` (`app.slint:437-438`) and `HighlightsPanel` (`app.slint:1030`) do, and it joins that `||`. Without the fold, `text-editing` is false inside the sheet, the guard closes on the first Esc, and the "Esc leaves the field first" path is dead code.
 
-**P4. The editor is gated where the panel's own actions are.** The button is enabled on `has-project && can-play && !recording && !previewing` — the panel's existing `can-edit` — **and additionally on the project having at least one source**, since an event has to point at a video. Its commands are *not* added to the bus's recording allow-list; see **C4**.
+**P4. The editor is gated where the panel's own actions are.** The button is enabled on the panel's existing `can-edit` — `can-play && !recording && !previewing` — and that is the whole gate: `can-play` is false until the project has a source, so "the project has a video to point at" is already in it. (`open_match_editor` still returns early on an empty source list; that is a backstop, not a second rule.) Its commands are *not* added to the bus's recording allow-list; see **C4**.
 
 **P5. Edits apply as they are committed; there is no Save.** The sheet's one button is **Done**. Each committed row edit is one bus command and one undo step; the paste's Add is one command and one undo step. Nothing is staged.
 
@@ -96,24 +110,30 @@ and the first Esc is then handled by the window's existing cascade (`app.slint:2
 2 14:05.0 home goal
 ```
 
-seeded by `match_entry::format_line(&project, record)`, committed through `match_entry::parse_line` — the function the paste box calls on every one of its lines. A `✕` marks a line that does not parse, the way `SetupField` marks a bad field (`app.slint:1508-1513`), and nothing is sent until it does.
+seeded by `match_entry::format_line(kind, source_index, source_seconds)`, and read back by **`bus::editor_line`** — the grammar's `edit_from_line` plus the one rule the grammar does not own, the start/stop cap (**V4**). A `✕` marks a line that will not land, the way `SetupField` marks a bad field (`app.slint:1508-1513`), and nothing is sent until it does.
+
+**The mark and the command call the same function**, cap and all, so a line cannot read good and then be refused — which is what happened when the cap lived in the command alone: retyping a goal as `period` in a format whose start/stops are full showed a tick and got a notice.
 
 There is no combo box for the video, none for the kind, and no fourth column. A kind is a word; a video is a number; both are in the line.
 
 **The reel span is not shown here.** It is on the panel's goal rows, beside the buttons that set it, and repeating it in the sheet would be a second rendering of a number the sheet cannot change (**T9**).
 
-**T3. The rows are rebuilt by the editor's own committed edit, and by nothing else.** This is an invariant with teeth, not an observation: **"the editor is the only writer" is false.** Two writers publish `ProjectChanged` from outside any command the sheet sent, and both can land while the sheet is open:
+**T3. The rows follow the project, except while the row's field has focus.** The hazard is exact and narrow: a `LineEdit` inside a `for` can only be bound one way — the warning Slint's own code carries here (`app.slint:1488-1489`: "a `text:` binding breaks the moment the user types into it") — so re-seeding that field while the coach is typing in it would overwrite what he typed. Nothing else in the sheet has that problem: the paste box is a window property the rebuild never touches, and the read-only rows want to be current.
 
-- a **transcript arriving** for a clip (`crates/video-coach-app/src/bus/transcribe.rs:451-462`), which lands on a background job's schedule;
-- a **source found missing** after a player error, whose `refresh_missing()` publishes (`crates/video-coach-app/src/bus/transport.rs:365-367`).
+So `show_project` rebuilds the editor's rows on **every** `ProjectChanged` while the sheet is open, and skips only while `match-editor-line-focused` is set. That state lasts exactly as long as the coach's hands are in the field, because every commit drops focus (**T4**) — and so do the sheet's two list-changing buttons, a row's `×` and Add, which take focus off the field first as every other button in this app does (a click does not take it by itself).
 
-A rebuild on either would overwrite the field the coach is typing in, because a `LineEdit` inside a `for` can only be bound one way — the warning Slint's own code carries here (`app.slint:1488-1489`: "a `text:` binding breaks the moment the user types into it", repeated for `ComboBox.current-index`).
+*Why not "only after a command of the sheet's own":* because the editor is not the only writer, and the sheet's own writes are not the only thing that reaches the rows.
 
-So `show_project` (`main.rs:2018-2075`) never touches the sheet's rows. `main.rs` keeps one flag, set when the sheet sends `EditMatchEvent`, `AddMatchEvents` or `DeleteMatchEvent`; `show_project` rebuilds the editor's rows only when it is set, and clears it. The sheet's open path rebuilds them once. One bool and one branch, and the rule is mechanical rather than careful.
+- The sheet can have **two commands in flight** — commit a row, then click Add — and a one-shot flag is consumed by the first publish, so the second's events never reach the list.
+- A command the bus **refuses** publishes nothing at all, so a flag set when it was sent stays set, and the next unrelated publish — a transcript arriving (`bus/transcribe.rs`), a source found missing (`bus/transport.rs`) — rebuilds the rows under a field being typed in. That is the very hazard the rule exists to prevent, reached by the mechanism meant to prevent it.
+
+The invariant is the focus, so the code tests the focus.
 
 **T4. Order is match order, and a commit that changes it drops focus.** A row whose time moves past another jumps to its new place, and the edited row stays *selected*, so the coach sees where it went. Stored order would hide the one thing the list exists to show, which is whether the start/stops come out in a sane sequence.
 
-**Selection is not focus.** Slint's `for` reuses items by index, so an event that moves from index 3 to index 0 leaves the focused `LineEdit` sitting over whatever is at index 3 now — and the next keystroke edits a different event. So **every commit drops focus back to the sheet** (`keys.focus()`), unconditionally rather than only when the order changed: one rule, no ordering comparison, and nothing to get wrong. Enter commits and leaves the field; focus loss commits; Esc reverts the text to the seeded line and leaves the field (the window's cascade, **P3**).
+**Selection is not focus.** Slint's `for` reuses items by index, so an event that moves from index 3 to index 0 leaves the focused `LineEdit` sitting over whatever is at index 3 now — and the next keystroke edits a different event. So **every commit drops focus back to the sheet** (`keys.focus()`), unconditionally rather than only when the order changed: one rule, no ordering comparison, and nothing to get wrong. Enter commits and leaves the field; focus loss commits; Esc puts the seeded line back and leaves the field (**P3**).
+
+**Enter therefore commits twice**, and that is fine rather than guarded: the focus drop commits the same line again, the bus reads it against the record the first command already moved, gets the same event, and `edit_match_events` drops it — no save, no undo step, no publish (`bus/scoreboard.rs`). There is no UI-side "did it move?" pre-check; one existed, and it was a second copy of the bus's own reasoning serving a flag that no longer exists (**T3**).
 
 **T5. How a line's time is typed, and what is refused.**
 
@@ -157,13 +177,13 @@ Changing home goal ↔ away goal keeps the trims; goal → start/stop clears bot
 
 - **Comments and blanks.** `#` starts a comment to the end of the line; a line that is empty after stripping it is ignored silently, contributing no echo row. This is `kickoffs.txt`'s convention (`docs/superpowers/plans/2026-09-22-match-vision.md:216-219`).
 - **Fields are separated by whitespace,** in this order:
-  - an optional **video number**, 1-based. **A leading bare integer is always a video number** — never a time, never a word. It is the only thing that can be first apart from a time, and a time has a colon, so there is nothing to disambiguate. A number outside `1..=source_videos.len()` gets its own refusal, *"there is no video 3"*, rather than being reinterpreted as anything else.
+  - an optional **video number**, 1-based. **A leading bare integer is always a video number** — never a time, never a word: **T5**'s colon rule is what makes that unambiguous. A number outside `1..=source_videos.len()` gets its own refusal rather than being reinterpreted as anything else.
   - a **time**, in exactly the shapes **T5** accepts — a colon required, tenths optional.
   - the **rest of the line**, which names the kind (**B2**).
 - **A line with no video number uses the sheet's default**, a `ComboBox` above the box reading "Lines with no number are: `1 · <name>`", defaulting to the first source (`SourceRef.display_name`, `crates/video-coach-core/src/project.rs:123`). Every echo row names the video it resolved to, so a wrong default is visible before Add.
 - **The kind is required.** A line with a time and nothing else is refused with *"no event word"*. See **B6** for why that is the right answer for `kickoffs.txt` rather than an annoyance.
 
-`900 home goal` is therefore refused as *"there is no video 900 — a time needs a colon (15:00)"*, which is the whole point of the colon rule: the misreading is named, not performed.
+`900 home goal` is therefore refused as *"there is no video 900 — a time needs a colon (15:00)"*, which is the whole point of the colon rule: the misreading is named, not performed. **The hint rides every video refusal**, not only a number big enough to look like seconds — a coach who types `14` meaning fourteen minutes into a two-video project is exactly the reader it is for, and "there is no video 14" alone tells him nothing about what to do.
 
 **B2. The vocabulary, matched over the whole remainder.** The remainder is lowercased, `-`, `_` and `,` become spaces, and runs of space collapse. Then the tokens are looked up:
 
@@ -209,7 +229,15 @@ The summary line above the button reads *"7 events to add · 1 already tagged ·
 
 **B4. A paste merges; it never replaces.** Nothing is deleted by adding. A replacing paste would throw away the ids, and with them the reel trims the coach had set on the goals it overwrote (**T6**). Deleting is the list's job.
 
-**B5. After Add, the box keeps only the lines that were not added.** The added lines go; the duplicates and the refusals stay, with their echo, so the coach fixes them in place and presses Add again. That makes the box self-clearing and the whole operation idempotent — pasting the same block twice adds nothing the second time (**V3**).
+**B5. After Add, the box keeps the refused lines and nothing else.**
+
+- The **added** lines go: they are in the project.
+- The **duplicates** go too. A line skipped as `already tagged` is not something editing can fix — the event it names is already there — so keeping it would ask the coach to clear a line whose only fault is being right. The notice (**C5**) says how many were skipped; the box is for work left to do.
+- The **refusals** stay, with their echo, so the coach fixes them in place and presses Add again.
+
+**The bus's own parse decides what is left**, and hands it back as `Event::MatchPasteLeftover`. The UI must not strip the box itself: it re-reads the block against a snapshot that may be a command behind, and a line the bus read differently would then be in neither the box nor the project — typed text lost with nothing to show for it.
+
+Pasting the same block twice therefore adds nothing the second time and leaves the box empty (**V3**).
 
 **B6. The relationship to `kickoffs.txt`: aligned, deliberately not subsumed.** The ground-truth convention is one line per post-goal restart, `<1-based source> <mm:ss>`, with `#` for comments. This grammar is that line **plus a kind word**, and it keeps the `#`, the 1-based number and the `mm:ss` exactly — so a coach can paste the file in, see every line refused for the same stated reason, and add the kind words to the ones that really are period boundaries.
 
@@ -264,7 +292,7 @@ The **"Reads as"** part of each row is the whole feedback mechanism, and it is l
 
 **V4. The start/stop cap is counted the same way, across the batch.** `Project::start_stops_at_cap` is *"the one rule"* the panel and the command share (`scoreboard.rs:790-801`, `bus/scoreboard.rs:45-52`). A pasted start/stop is checked against **`existing + accepted-so-far`**, so a batch that would push past the format's last period has its excess lines refused and the rest added, with the existing message (*"every period of this match format is already tagged; change the format to tag more"*). Best-effort, not all-or-nothing: a list of twelve goals and one stray period line should add the twelve.
 
-The same rule applies to a row edit: retyping a goal as a start/stop at the cap is refused; moving a start/stop cannot break the cap, since the count is unchanged.
+The same rule applies to a row edit: retyping a goal as a start/stop at the cap is refused; moving a start/stop cannot break the cap, since the count is unchanged. **The row's field shows it before the line is sent**, because the mark and the command are one call (**T2**).
 
 **V5. The two cap numbers deliberately differ, and neither is wrong.**
 
@@ -301,9 +329,9 @@ So with `auto_back_anchor_p1` set, the last stored start/stop is **under the cap
 
 | Crate | Contents |
 |---|---|
-| `video-coach-core` | A new module `match_entry.rs`: `parse_time` / `format_time`, `parse_line` / `format_line` / `edit_from_line`, the kind vocabulary (with the refused kick-off words), `PendingMatchEvent`, `Batch { events, lines, leftover }` and `parse_batch(&Project, default_source, text)` — including the duration bound, the duplicate rule and the incremental cap count, so the echo and the command reach the same verdict from the same code. In `scoreboard.rs`: `Project::edit_match_event`. `SAME_EVENT_SECONDS`. No new dependency: the audit still lists exactly `serde`, `serde_json`, `thiserror`, `uuid`. |
+| `video-coach-core` | A new module `match_entry.rs`: `parse_time` / `format_time`, `parse_line` / `format_line(kind, source_index, source_seconds)` / `edit_from_line`, the kind vocabulary (with the refused kick-off words), `PendingMatchEvent`, `Batch { events, lines, leftover }` and `parse_batch(&Project, default_source, text)` — including the duration bound, the duplicate rule and the incremental cap count, so the echo and the command reach the same verdict from the same code. In `scoreboard.rs`: `Project::edit_match_event`, `#[must_use]`. `SAME_EVENT_SECONDS`. No new dependency: the audit still lists exactly `serde`, `serde_json`, `thiserror`, `uuid`. |
 | `video-coach-media` | Nothing. |
-| `video-coach-app` | Bus: `EditMatchEvent` and `AddMatchEvents` in `bus/scoreboard.rs`, both through `edit_match_events`, with the aggregate `UserError::Scoreboard` notice. `match_panel.rs`: the two new `MatchRowText` fields, the echo-line wording and the summary line, tested headless as the rest of that module is. UI: `MatchEditorSheet`, the `editor-open` guard in `handle-key`, the `editing` fold into `text-editing`, the "Edit events…" button, and the sheet's rebuild flag in `main.rs`. |
+| `video-coach-app` | Bus: `EditMatchEvent` and `AddMatchEvents` in `bus/scoreboard.rs`, both through `edit_match_events`, with the aggregate `UserError::Scoreboard` notice and `Event::MatchPasteLeftover`. `bus::editor_line` reads one row line — the grammar plus the cap — for the command *and* for the field's mark (**T2**). `match_panel.rs`: the two new `MatchRowText` fields, the echo-line wording and the summary line, tested headless as the rest of that module is. UI: the shared `Scrim` / `Sheet` (**P1**), `MatchEditorSheet`, the `editor-open` guard in `handle-key`, the `editing` and `line-focused` folds, and the "Edit events…" button. |
 | `video-coach-harness` | Batch add as one undo step, a partly-refused batch, and an edit that moves an event and moves the clock with it. |
 
 **`format_time` is core's, and `format::format_hms_tenths` stays where it is.** The app already has the renderer this sheet wants — `format_hms_tenths` produces `M:SS.t` and `H:MM:SS.t`, floored (`crates/video-coach-app/src/format.rs:21-30`) — but `format.rs` imports `gstreamer::glib` for `finish_at` (`format.rs:3`), and core declares no media dependency, so the module cannot move. Core needs its own because `parse_batch` builds echo text. So there are two, both flooring, with one test in the app crate asserting they agree over a table of values. Two five-line functions that a test pins together is a smaller thing than a crate split, and a smaller thing than sending formatted strings from the app into core's parser.
@@ -319,14 +347,15 @@ The parser is pure and lives in core, so every line of the grammar is tested on 
   - **The kick-off words** — `kickoff`, `kick`, `ko`, `restart`, `whistle` — are refused, and the reason names the period shift. A test that one of them **never** yields `StartStop`.
   - Team names: a one-word name, a **two-word name matched as a contiguous run**, a name with a trailing ignored word, and a name **not** matched when one team's name contains the other's.
   - The video number: present, absent (the default), **out of range giving "there is no video N" rather than a time**, and a leading integer with no time after it.
-  - `parse_line` / `format_line` round trip for each kind, and `edit_from_line` carrying the stored seconds when the time token is unchanged and the parsed seconds when it is not.
-  - `parse_batch`: the duration bound, the duplicate rule at exactly `SAME_EVENT_SECONDS`, **a block containing the same line twice adding it once**, the cap counted incrementally across the batch, and `leftover` holding exactly the lines that were not added.
+  - `parse_line` / `format_line` round trip for each kind; `edit_from_line` carrying the stored seconds when the time token is unchanged and the parsed seconds when it is not, **including when the video number changed under an unchanged time** (the stored sub-tenth seconds move to the other source); and **the kick-off words refused through `edit_from_line`**, not only through `parse_line` — the row's field is the same grammar.
+  - `parse_batch`: the duration bound, the duplicate rule at exactly `SAME_EVENT_SECONDS`, **a block containing the same line twice adding it once**, the cap counted incrementally across the batch, and `leftover` holding exactly the **refused** lines — not the duplicates (**B5**).
 - **Core (`scoreboard.rs`):** `edit_match_event` keeps the id and the stored position; clears both trims on goal → start/stop and keeps them on home ↔ away; returns false for an unknown id; a re-timed event reorders `labelled_events` and can change its role; **re-timing the earliest start/stop under `auto_back_anchor_p1` moves every later clock reading**.
 - **App (`match_panel.rs`, headless):** `match_rows` carries the source index and the in-source time; the echo lines and the summary wording for all three verdicts; the over-cap warning reused unchanged; `format_time` and `format_hms_tenths` agree.
 - **Harness (`tests/match_events.rs`):**
   - a batch of N publishes **one** `ProjectChanged`, and one `Undo` restores the whole prior list;
-  - a batch with some lines refused adds the rest, emits one `UserError::Scoreboard` notice, and the saved project matches;
-  - `EditMatchEvent` moves an event, the scoreboard's state at a later instant changes accordingly, and one `Undo` restores it.
+  - a batch with some lines refused adds the rest, emits one `UserError::Scoreboard` notice and one `MatchPasteLeftover` holding the refused lines alone, and the saved project matches;
+  - `EditMatchEvent` moves an event, the scoreboard's state at a later instant changes accordingly, and one `Undo` restores it;
+  - **a row retyped as a start/stop at the cap is refused and the record stands**, while moving a start/stop at the cap is not.
 
   *Not tested here:* that a batch adding nothing publishes nothing, and that a batch is dropped while recording. Both are properties of machinery these commands only pass through — `edit_match_events`' no-op guard (`bus/scoreboard.rs:112-115`) and the allow-list's deny-by-default `matches!` (`bus/mod.rs:762-793`) — each already pinned by its own tests. Re-testing them per command buys nothing and makes adding a command more expensive than it is.
 - **Manual (batched, needs the user's eyes):**

@@ -38,12 +38,11 @@ use video_coach_app::zoom_input::{self, DragPan, Viewport};
 use video_coach_core::avatar;
 use video_coach_core::highlight::{highlight_shapes, HighlightEdit};
 use video_coach_core::layout::{self, avatar_self_view_rect, self_view_rect, STROKE_LINE_WIDTH};
-use video_coach_core::match_entry::{self, LineVerdict};
+use video_coach_core::match_entry::{self, PendingMatchEvent};
 use video_coach_core::plan::{ExportTarget, ScoreboardMode};
 use video_coach_core::project::{Clip, Inset, Project, Quality, Resolution};
 use video_coach_core::scoreboard::{
-    MatchEventKind, MatchEventRecord, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext,
-    TeamConfig,
+    MatchEventKind, MatchFormat, ReelEnd, ScoreboardConfig, ScoreboardContext, TeamConfig,
 };
 use video_coach_core::stroke::{Rgba, Stroke};
 use video_coach_core::tag::{normalize_tags, tag_suggestions, tag_summaries, take_suggestion};
@@ -164,9 +163,6 @@ struct UiState {
     /// The window holds the labels and the ticks; the targets are here, since
     /// it has no type for one.
     export_targets: Vec<ExportTarget>,
-    /// The match editor sent a command, so the next project change may rebuild
-    /// its rows — and no other may (spec T3, `show_match_editor`).
-    editor_rebuild: bool,
     /// The scoreboard the Match panel's clock is read from (Phase 9 S2).
     /// Rebuilt on every project change and **never carried across one**: a
     /// source add, move, remove or relink moves the offsets it froze.
@@ -244,7 +240,6 @@ impl Default for UiState {
             notice_until: None,
             preview_duration: None,
             export_targets: Vec::new(),
-            editor_rebuild: false,
             scoreboard: None,
             transcription: Transcription::default(),
             avatar_shown: None,
@@ -785,15 +780,11 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             bus.borrow().send(Command::ScrubRelease { abs });
         }
     });
-    // The panel's `×` and the editor's alike. It sets the editor's rebuild
-    // flag either way: with the sheet shut the rebuild it asks for is of a
-    // list nothing is looking at, and the flag has to be set when the sheet
-    // is open (spec T3).
+    // The panel's `×` and the editor's alike.
     window.on_delete_match_event({
         let bus = bus.clone();
         move |id| {
             if let Some(id) = parse_id(&id) {
-                editor_wrote();
                 bus.borrow().send(Command::DeleteMatchEvent(id));
             }
         }
@@ -928,9 +919,9 @@ fn wire_match(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
 /// The match event editor (spec T, B): the sheet's rows, its row field and
 /// its paste box.
 ///
-/// Every rule of the grammar is core's `match_entry`, which the bus reads the
-/// same text with: what is here is the seeding, the marks and the one flag
-/// that says the rows may be rebuilt.
+/// Every verdict is the bus's own (`bus::editor_line`, `core::match_entry`),
+/// so a field marked good is never refused; what is here is the seeding and
+/// the marks.
 fn wire_match_editor(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     window.on_open_match_editor({
         let weak = window.as_weak();
@@ -947,48 +938,31 @@ fn wire_match_editor(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         move |id| {
             let Some(w) = weak.upgrade() else { return };
             w.set_match_editor_selected(id.clone());
-            let line = UI.with_borrow(|ui| {
-                let project = &ui.snapshot.as_ref()?.project;
-                let row = match_panel::match_rows(project)
-                    .into_iter()
-                    .find(|row| row.id.to_string() == id.as_str())?;
-                Some(match_panel::editor_row_line(project, &row))
-            });
-            w.set_match_editor_line(line.unwrap_or_default().into());
+            seed_match_line(&w, &id);
         }
     });
-    // The field's ✕, and the guard on its commit: core reads the line against
-    // the record it names, exactly as the bus will (spec T5).
-    window.on_valid_match_line(|id, line| {
-        matches!(editor_verdict(&id, &line), Some(LineVerdict::Event(_)))
+    // Esc in the row's field cancels rather than commits (spec P3): the field
+    // goes back to the line it was seeded with, and the window then drops
+    // focus, which commits that same line — an edit of nothing.
+    window.on_reseed_match_line({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                let id = w.get_match_editor_selected();
+                seed_match_line(&w, &id);
+            }
+        }
     });
+    // The field's ✕, and the guard on its commit: the bus's own reader, so a
+    // line it will refuse — the start/stop cap included — is marked before it
+    // is ever sent (spec T5, V4).
+    window.on_valid_match_line(|id, line| matches!(editor_verdict(&id, &line), Some(Ok(_))));
     window.on_edit_match_event({
         let (weak, bus) = (window.as_weak(), bus.clone());
         move |id, line| {
             let Some(w) = weak.upgrade() else { return };
             let Some(id) = parse_id(&id) else { return };
-            // A line that doesn't move the event is not an edit. The field
-            // commits on Enter *and* on the focus that commit drops, so the
-            // same line arrives twice; the bus would drop the second as a
-            // no-op, but the rebuild flag below would be left set on a
-            // publish that never comes.
-            let moves = UI.with_borrow(|ui| {
-                let project = &ui.snapshot.as_ref()?.project;
-                let record = project.match_events.iter().find(|m| m.id == id)?;
-                let event = match editor_line_verdict(project, record, &line) {
-                    LineVerdict::Event(event) => event,
-                    _ => return Some(false),
-                };
-                Some(
-                    (event.kind, event.source_index, event.source_seconds)
-                        != (record.kind, record.source_index, record.source_seconds),
-                )
-            });
-            if moves != Some(true) {
-                return;
-            }
             w.set_match_editor_message(SharedString::new());
-            editor_wrote();
             bus.borrow().send(Command::EditMatchEvent {
                 id,
                 line: line.to_string(),
@@ -999,35 +973,25 @@ fn wire_match_editor(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let (weak, bus) = (window.as_weak(), bus.clone());
         move || {
             let Some(w) = weak.upgrade() else { return };
-            let text = w.get_match_editor_paste().to_string();
-            let default_source = w.get_match_editor_source().max(0) as usize;
-            // The box keeps the lines that didn't land (spec B5). They are
-            // read here against the snapshot the echo was drawn from; the bus
-            // reads the same text again when the command lands, and its
-            // answer is the one that writes.
-            let leftover = UI.with_borrow(|ui| {
-                let project = &ui.snapshot.as_ref()?.project;
-                let batch = match_entry::parse_batch(project, default_source, &text);
-                Some((batch.leftover, batch.events.len()))
-            });
-            let Some((leftover, adding)) = leftover else {
-                return;
-            };
-            if adding == 0 {
-                return;
-            }
-            w.set_match_editor_paste(leftover.into());
+            // The box is left exactly as the bus's own parse leaves it, which
+            // arrives as `Event::MatchPasteLeftover` (spec B5). Stripping the
+            // lines this side thought had been added would lose any the bus
+            // read differently: they would be in neither the box nor the
+            // project.
             w.set_match_editor_message(SharedString::new());
-            editor_wrote();
             bus.borrow().send(Command::AddMatchEvents {
-                text,
-                default_source,
+                text: w.get_match_editor_paste().to_string(),
+                default_source: w.get_match_editor_source().max(0) as usize,
             });
         }
     });
-    // The paste box's echo, re-read on every keystroke: it takes the text and
-    // the picker so the binding that calls it re-evaluates as they change.
-    window.on_check_paste(|text, default_source| {
+    // The paste box's echo, re-read on every keystroke: it takes the text,
+    // the picker and the project's revision, so the binding that calls it
+    // re-evaluates as any of the three change. It is declared `pure` and
+    // reads the project, which is what the revision is for — without it,
+    // deleting a row with its `×` would leave the echo saying "already
+    // tagged" and Add disabled with no way back.
+    window.on_check_paste(|text, default_source, _revision| {
         UI.with_borrow(|ui| {
             let Some(s) = ui.snapshot.as_ref() else {
                 return PasteEcho::default();
@@ -1052,35 +1016,40 @@ fn wire_match_editor(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     });
 }
 
-/// One row's line as the bus will read it: the seed rebuilt from the record,
-/// so an edit that leaves the time alone keeps the stored seconds
-/// (`match_entry::edit_from_line`, spec T5).
-fn editor_line_verdict(project: &Project, record: &MatchEventRecord, line: &str) -> LineVerdict {
-    let seed = match_entry::format_line(project, record);
-    match_entry::edit_from_line(
-        project,
-        record.source_index,
-        &seed,
-        line,
-        record.source_seconds,
-    )
-}
-
-/// The same, for a row named by the id its field carries; `None` when there is
-/// no such event, which leaves the field unmarked.
-fn editor_verdict(id: &str, line: &str) -> Option<LineVerdict> {
+/// How the bus will read one line of the row field, for the row named by the
+/// id the field carries; `None` when there is no such event, which leaves the
+/// field unmarked.
+fn editor_verdict(id: &str, line: &str) -> Option<Result<PendingMatchEvent, String>> {
     let id = parse_id(id)?;
     UI.with_borrow(|ui| {
         let project = &ui.snapshot.as_ref()?.project;
         let record = project.match_events.iter().find(|m| m.id == id)?;
-        Some(editor_line_verdict(project, record, line))
+        Some(bus::editor_line(project, record, line))
     })
 }
 
-/// The editor sent a command that may change the event list, so the next
-/// `ProjectChanged` may rebuild its rows (spec T3).
-fn editor_wrote() {
-    UI.with_borrow_mut(|ui| ui.editor_rebuild = true);
+/// Fills the row field with the selected event as a line — core's own
+/// rendering, which `bus::editor_line` rebuilds as the seed when the line
+/// comes back, so an edit that leaves the time alone keeps the stored seconds
+/// to the last decimal. Empty for an id with no event behind it.
+fn seed_match_line(w: &AppWindow, id: &str) {
+    let line = parse_id(id).and_then(|id| {
+        UI.with_borrow(|ui| {
+            let record = ui
+                .snapshot
+                .as_ref()?
+                .project
+                .match_events
+                .iter()
+                .find(|m| m.id == id)?;
+            Some(match_entry::format_line(
+                record.kind,
+                record.source_index,
+                record.source_seconds,
+            ))
+        })
+    });
+    w.set_match_editor_line(line.unwrap_or_default().into());
 }
 
 /// Where the game video is, as the source and offset a command that places
@@ -1275,14 +1244,14 @@ fn open_match_editor(w: &AppWindow) {
 
 /// The editor's rows, and the selected row's line re-seeded from its record.
 ///
-/// **Called from the open path and from a rebuild the editor itself asked
-/// for, and from nowhere else** (spec T3). A `LineEdit` inside a `for` can
-/// only be bound one way, so a rebuild under a field being typed in would
-/// overwrite it — and two writers publish `ProjectChanged` with no command of
-/// the sheet's behind them: a transcript arriving for a clip
-/// (`bus/transcribe.rs`) and a source found missing after a player error
-/// (`bus/transport.rs`). Re-seeding here is safe because every commit drops
-/// focus (spec T4), so the field this touches is never the one in use.
+/// **The one thing that must not happen is a rebuild under the row's field
+/// while it is being typed in** (spec T3): a `LineEdit` inside a `for` can
+/// only be bound one way, so re-seeding it would overwrite what is in it. So
+/// `show_project` calls this on every project change *except* while that
+/// field has focus — which is a state the coach's hands are in and nothing
+/// else, since every commit drops focus (spec T4). Not "only after the
+/// editor's own command": the sheet can have two commands in flight, and a
+/// command the bus refuses publishes nothing at all.
 fn show_match_editor(w: &AppWindow, project: &Project) {
     let rows = match_panel::match_rows(project);
     let model: Vec<MatchEditorRow> = rows
@@ -1300,7 +1269,7 @@ fn show_match_editor(w: &AppWindow, project: &Project) {
     let selected = parse_id(&w.get_match_editor_selected())
         .and_then(|id| rows.iter().find(|row| row.id == id));
     match selected {
-        Some(row) => w.set_match_editor_line(match_panel::editor_row_line(project, row).into()),
+        Some(row) => w.set_match_editor_line(match_panel::editor_row_line(row).into()),
         None => {
             w.set_match_editor_selected(SharedString::new());
             w.set_match_editor_line(SharedString::new());
@@ -2197,6 +2166,9 @@ fn on_event(w: &AppWindow, event: Event) {
             t.state = state;
             show_transcription(w, ui);
         }),
+        // What the bus's own parse left in the paste box (spec B5): the
+        // refused lines, for the coach to fix in place and add again.
+        Event::MatchPasteLeftover(text) => w.set_match_editor_paste(text.into()),
         // Never the modal dialog: it would swallow a recording's transport
         // keys.
         Event::Error(e) if e.is_notice() => {
@@ -2345,12 +2317,9 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         .collect();
     w.set_tag_rows(ModelRc::new(VecModel::from(tags)));
     show_match(w, project);
-    // The editor's rows are rebuilt by its **own** committed edit and by
-    // nothing else (spec T3): a transcript landing and a source found missing
-    // both publish a project change with no command of the sheet's behind
-    // them, and a rebuild under a field being typed in would overwrite it.
-    // One bool and one branch, so the rule is mechanical rather than careful.
-    if UI.with_borrow_mut(|ui| std::mem::take(&mut ui.editor_rebuild)) {
+    // The editor's rows follow the project like every other list, and are
+    // left alone only while the row's field has focus (spec T3).
+    if w.get_match_editor_open() && !w.get_match_editor_line_focused() {
         show_match_editor(w, project);
     }
     show_highlights(w, project);
@@ -2362,6 +2331,13 @@ fn show_project(w: &AppWindow, snapshot: Snapshot) {
         ui.scoreboard = ScoreboardContext::for_project(&snapshot.project);
         ui.snapshot = Some(snapshot);
     });
+    // Last, once the snapshot every `pure` callback reads is the new one:
+    // the editor's echoes are read from the project, and this is what tells
+    // their bindings to ask again. Without it the paste box's own text and
+    // picker have not moved, so the echo would stand on the answer it gave
+    // before a row was deleted with its `×` — "already tagged", with Add
+    // disabled and no way back (spec B3).
+    w.set_project_revision(w.get_project_revision() + 1);
     show_clip(w);
 }
 

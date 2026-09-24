@@ -230,14 +230,22 @@ fn a_leading_bare_integer_is_always_a_video_number() {
         LineVerdict::Event(e) => assert_eq!(e.source_index, 1),
         other => panic!("{other:?}"),
     }
-    assert_eq!(refusal(&p, "3 14:05 home goal"), "there is no video 3");
-    assert_eq!(refusal(&p, "0 14:05 home goal"), "there is no video 0");
-
-    // 900 is refused as the video it claims to be; the misreading (15:00) is
-    // named rather than performed.
-    let big = refusal(&p, "900 home goal");
-    assert!(big.contains("there is no video 900"), "{big}");
-    assert!(big.contains("colon"), "{big}");
+    // Refused as the video it claims to be, and the misreading it might have
+    // been (a time) is named rather than performed — on every number, not
+    // only one big enough to look like seconds: `14` in a two-video project
+    // is a coach who meant fourteen minutes.
+    for (line, number) in [
+        ("3 14:05 home goal", "3"),
+        ("0 14:05 home goal", "0"),
+        ("14 home goal", "14"),
+        ("900 home goal", "900"),
+    ] {
+        let reason = refusal(&p, line);
+        assert_eq!(
+            reason,
+            format!("there is no video {number} — a time needs a colon (15:00)"),
+        );
+    }
 
     // A number and nothing else is a video number with no time after it.
     assert_eq!(refusal(&p, "2 home goal"), "no time (use m:ss)");
@@ -267,7 +275,10 @@ fn a_line_and_a_record_round_trip_through_each_other() {
         (START_STOP, "2 14:05.0 period"),
     ] {
         let stored = record(kind, 1, 845.0);
-        assert_eq!(format_line(&p, &stored), text);
+        assert_eq!(
+            format_line(stored.kind, stored.source_index, stored.source_seconds),
+            text
+        );
         assert_eq!(
             event(&p, text),
             PendingMatchEvent {
@@ -283,7 +294,7 @@ fn a_line_and_a_record_round_trip_through_each_other() {
 fn changing_only_the_kind_keeps_the_stored_seconds() {
     let p = project_with_sources(&[3000.0]);
     let stored = record(HOME, 0, 14.06);
-    let seed = format_line(&p, &stored);
+    let seed = format_line(stored.kind, stored.source_index, stored.source_seconds);
     assert_eq!(seed, "1 0:14.0 home goal");
 
     // The line displays floored tenths, so re-parsing it would re-round 14.06.
@@ -304,6 +315,54 @@ fn changing_only_the_kind_keeps_the_stored_seconds() {
     // Even when it renders the same instant: the token is not byte-identical.
     match edit_from_line(&p, 0, &seed, "1 0:14 home goal", stored.source_seconds) {
         LineVerdict::Event(e) => assert_eq!(e.source_seconds, 14.0),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The row's field is the paste box's grammar, so every refusal the box makes
+/// is a refusal it makes too — the kick-off words included, which are the
+/// ones most likely to be in the coach's own notes.
+#[test]
+fn a_retyped_row_refuses_the_kick_off_words_as_the_paste_box_does() {
+    let p = project_with_sources(&[3000.0]);
+    let stored = record(HOME, 0, 845.0);
+    let seed = format_line(stored.kind, stored.source_index, stored.source_seconds);
+    for word in ["kickoff", "kick-off", "ko", "restart", "whistle"] {
+        let typed = format!("1 14:05.0 {word}");
+        match edit_from_line(&p, 0, &seed, &typed, stored.source_seconds) {
+            LineVerdict::Refused(reason) => assert!(
+                reason.contains("move every later period"),
+                "{typed:?}: {reason}"
+            ),
+            other => panic!("{typed:?} should be refused, got {other:?}"),
+        }
+    }
+}
+
+/// Moving a row to another video **keeps the stored seconds**: the time token
+/// is what the carry-over is decided on, and it hasn't changed. So an event
+/// stored at 14.06 lands on the other video at 14.06, not at the 14.0 the
+/// line shows.
+#[test]
+fn moving_a_row_to_another_video_carries_the_stored_seconds() {
+    let p = project_with_sources(&[3000.0, 3000.0]);
+    let stored = record(HOME, 0, 14.06);
+    let seed = format_line(stored.kind, stored.source_index, stored.source_seconds);
+    assert_eq!(seed, "1 0:14.0 home goal");
+
+    match edit_from_line(&p, 0, &seed, "2 0:14.0 home goal", stored.source_seconds) {
+        LineVerdict::Event(e) => {
+            assert_eq!(e.source_index, 1);
+            assert_eq!(e.source_seconds, 14.06);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Retyping the time as well is a time the coach chose, on either video.
+    match edit_from_line(&p, 0, &seed, "2 0:20.0 home goal", stored.source_seconds) {
+        LineVerdict::Event(e) => {
+            assert_eq!(e.source_index, 1);
+            assert_eq!(e.source_seconds, 20.0);
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -337,7 +396,7 @@ fn a_pasted_block_echoes_every_line_in_input_order() {
         other => panic!("{other:?}"),
     }
     assert_eq!(added(&batch), vec![200.0, 845.0]);
-    // Only the line that did not add comes back.
+    // Only the refused line comes back, for the coach to fix in place.
     assert_eq!(batch.leftover, "2 1405 home");
 }
 
@@ -352,7 +411,9 @@ fn a_line_already_tagged_is_skipped_within_a_second_either_side() {
             "{line:?} is the same event"
         );
         assert!(batch.events.is_empty());
-        assert_eq!(batch.leftover, line);
+        // And it does not come back in the box: the event it names is in
+        // the project already, so there is nothing to fix by editing it.
+        assert_eq!(batch.leftover, "");
     }
     // Just outside, and on the other side of the kind, it is a new event.
     for line in ["3:18.9 home goal", "3:21.1 home goal", "3:20 away goal"] {
@@ -375,7 +436,7 @@ fn the_same_line_twice_in_one_block_adds_once() {
         batch.lines[1].verdict,
         BatchVerdict::AlreadyTagged(_)
     ));
-    assert_eq!(batch.leftover, "3:20 home goal");
+    assert_eq!(batch.leftover, "", "the block landed; nothing to fix");
 }
 
 #[test]

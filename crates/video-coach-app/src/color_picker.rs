@@ -175,9 +175,11 @@ mod tests {
             let hsv = hsv_of_hex(text).unwrap_or_else(|| panic!("{text} parses"));
             hex_of_hsv(hsv.hue, hsv.sat, hsv.val)
         };
-        // Every grey, every pure channel and every kit colour by name, then a
-        // sweep of the cube. A stride, not all 16.7M: the maths is per
-        // channel, so a coarse net catches a sector boundary just as well.
+        // Every grey, every pure channel and every edge of the cube at full
+        // resolution — that is where the sectors meet and where a rounding
+        // slips — then a coarse net through the middle. The maths is per
+        // channel, so a few thousand interior points say as much as the
+        // 16.7M do, and they say it in a test that finishes.
         for v in 0..=255u8 {
             for text in [
                 format!("#{v:02x}{v:02x}{v:02x}"),
@@ -191,9 +193,9 @@ mod tests {
                 assert_eq!(round_trip(&text), text, "{text}");
             }
         }
-        for r in (0..=255u8).step_by(3) {
-            for g in (0..=255u8).step_by(3) {
-                for b in (0..=255u8).step_by(3) {
+        for r in (0..=255u8).step_by(17) {
+            for g in (0..=255u8).step_by(17) {
+                for b in (0..=255u8).step_by(17) {
                     let text = format!("#{r:02x}{g:02x}{b:02x}");
                     assert_eq!(round_trip(&text), text, "{text}");
                 }

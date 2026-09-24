@@ -21,6 +21,10 @@ mod state;
 mod transcribe;
 mod transport;
 
+/// How the match editor's row field reads one line — the field's `✕` mark and
+/// the command it guards, from one call (spec T5).
+pub use scoreboard::editor_line;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -134,7 +138,9 @@ pub enum Command {
     /// **the bus parses, rather than being handed events to trust**, so the
     /// duration bound, the duplicate rule and the incremental start/stop cap
     /// are read once, from core, against the project as it is when the
-    /// command lands. The lines that don't land are named in one notice.
+    /// command lands. The lines that don't land are named in one notice, and
+    /// the refused ones come back as [`Event::MatchPasteLeftover`] — what the
+    /// box keeps.
     ///
     /// Typed times, as `EditMatchEvent`'s are.
     AddMatchEvents {
@@ -386,6 +392,15 @@ pub enum Event {
     /// Always sent after that change's `ProjectChanged`, which drops a
     /// selection whose clip is gone.
     Select(Uuid),
+    /// What the match editor's paste box is left holding after an
+    /// [`Command::AddMatchEvents`]: the block's refused lines, joined back up
+    /// (spec B5). Sent for every such command, whether anything landed or not.
+    ///
+    /// **The bus's own parse decides it**, not the UI's: the box is read here
+    /// against the project as the command lands, and a UI that stripped the
+    /// lines it thought had been added would lose any the bus read
+    /// differently — they would be in neither the box nor the project.
+    MatchPasteLeftover(String),
     /// A failure, or a notice (see [`UserError::is_notice`]).
     Error(UserError),
 }

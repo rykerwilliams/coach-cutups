@@ -869,10 +869,6 @@ component MatchPanel inherits VerticalLayout {
     in property <bool> can-edit;
     /// How many lines the list has, a goal's row being two: its height.
     in property <int> lines;
-    /// The project has a video to tag against, which the editor's every line
-    /// names by number (spec P4). The panel's own actions need one too, but
-    /// only by way of `can-edit`, which a project with no source never has.
-    in property <bool> has-source;
     callback tag(MatchTag);
     callback seek(string);
     callback remove(string);
@@ -892,7 +888,7 @@ component MatchPanel inherits VerticalLayout {
         }
         Button {
             text: "Edit events…";
-            enabled: root.can-edit && root.has-source;
+            enabled: root.can-edit;
             clicked => { root.edit-events(); }
 
             Tooltip {
@@ -1375,13 +1371,63 @@ component TargetChoice inherits Rectangle {
     }
 }
 
+/// What every modal in this app sits on: the window behind dimmed, and a
+/// `TouchArea` that swallows the clicks meant for it. Its one child is the
+/// sheet, which centres itself as any sized child of a `Rectangle` does.
+component Scrim inherits Rectangle {
+    background: #000000a0;
+
+    TouchArea { }
+
+    @children
+}
+
+/// The card every modal in this app is drawn as: a fixed width, a height of
+/// whatever it holds, the house chrome and the heading.
+///
+/// There are four of these -- export, match setup, the match event editor and
+/// the error dialog -- and this is the one shape they are. A sheet sets its
+/// width and its title and lays its own body out as children; everything else
+/// is here, once.
+component Sheet inherits Rectangle {
+    /// The card's width. Wide enough for the widest thing in it, and no
+    /// wider: the height follows the content.
+    in property <length> card-width;
+    /// The heading, in the one size and weight the sheets use. Empty for a
+    /// sheet with no heading -- the error dialog, whose text is its own.
+    in property <string> title;
+    /// The body's row spacing, for the one sheet that wants more air.
+    in property <length> body-spacing: 10px;
+
+    width: root.card-width;
+    height: body.preferred-height;
+    background: Palette.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    body := VerticalLayout {
+        padding: 20px;
+        spacing: root.body-spacing;
+
+        if root.title != "": Text {
+            text: root.title;
+            color: Palette.foreground;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        @children
+    }
+}
+
 /// The export sheet (Phase 8 E8), the **only** export UI: what to render, at
 /// what size and quality, and how the run is going. The window opens it; it
 /// reports ticks, Export, Cancel and Close.
 ///
 /// A run goes on behind a closed sheet, and reopening it shows where that run
 /// has got to: the rows come from the bus's events, not from the sheet.
-component ExportSheet inherits Rectangle {
+component ExportSheet inherits Sheet {
     in property <[TargetRow]> targets;
     /// Something is ticked, so there is something to export.
     in property <bool> any-ticked;
@@ -1405,149 +1451,133 @@ component ExportSheet inherits Rectangle {
     callback cancel();
     callback close();
 
-    width: 480px;
-    height: sheet.preferred-height;
-    background: Palette.background;
-    border-radius: 8px;
-    border-width: 1px;
-    border-color: Palette.border;
+    card-width: 480px;
+    title: "Export";
 
-    sheet := VerticalLayout {
-        padding: 20px;
-        spacing: 10px;
-
-        Text {
-            text: "Export";
-            color: Palette.foreground;
-            font-size: 16px;
-            font-weight: 600;
+    FieldLabel { text: "What to export"; }
+    // A height of its own: a project with many tags scrolls the list
+    // rather than growing the sheet past the window.
+    ListView {
+        height: min(210px, max(30px, root.targets.length * 30px));
+        for row[index] in root.targets: TargetChoice {
+            label: row.label;
+            detail: row.detail;
+            ticked: row.ticked;
+            enabled: !root.exporting;
+            clicked => { root.tick(index, !row.ticked); }
         }
+    }
 
-        FieldLabel { text: "What to export"; }
-        // A height of its own: a project with many tags scrolls the list
-        // rather than growing the sheet past the window.
-        ListView {
-            height: min(210px, max(30px, root.targets.length * 30px));
-            for row[index] in root.targets: TargetChoice {
-                label: row.label;
-                detail: row.detail;
-                ticked: row.ticked;
-                enabled: !root.exporting;
-                clicked => { root.tick(index, !row.ticked); }
-            }
-        }
+    HorizontalLayout {
+        spacing: 16px;
 
-        HorizontalLayout {
-            spacing: 16px;
-
-            VerticalLayout {
-                spacing: 4px;
-                FieldLabel { text: "Resolution"; }
-                ComboBox {
-                    // 2160p is in the project format but not offered (E8).
-                    model: ["720p", "1080p"];
-                    enabled: !root.exporting;
-                    current-index <=> root.resolution;
-                }
-            }
-            VerticalLayout {
-                spacing: 4px;
-                FieldLabel { text: "Quality"; }
-                ComboBox {
-                    model: ["Low", "Medium", "High"];
-                    enabled: !root.exporting;
-                    current-index <=> root.quality;
-                }
-            }
-        }
-
-        // Its own row rather than a third column: "Burned into the picture"
-        // doesn't fit a third of this sheet.
         VerticalLayout {
             spacing: 4px;
-            FieldLabel { text: "Scoreboard"; }
+            FieldLabel { text: "Resolution"; }
             ComboBox {
-                model: ["Default", "Burned into the picture", "Separate track"];
+                // 2160p is in the project format but not offered (E8).
+                model: ["720p", "1080p"];
                 enabled: !root.exporting;
-                current-index <=> root.scoreboard;
-            }
-            // The only place the trade is spelled out, and it follows the
-            // **effective** mode rather than the picked one: the whole match
-            // is copied on Default too, and a coach told nothing has taken
-            // the trade without being asked (spec M1, N). Only the whole
-            // match is ever copied, so only its tick matters here.
-            if root.whole-match-ticked && root.scoreboard != 1: Text {
-                text: "The whole match is copied, not re-encoded: player highlights and pen drawings can't ride a copy.";
-                color: Palette.alternate-foreground;
-                font-size: 11px;
-                wrap: word-wrap;
+                current-index <=> root.resolution;
             }
         }
-
-        if root.run.length > 0: FieldLabel { text: "Run"; }
-        if root.run.length > 0: ListView {
-            height: min(140px, root.run.length * 28px);
-            for row in root.run: HorizontalLayout {
-                height: 28px;
-                padding-left: 6px;
-                padding-right: 6px;
-                spacing: 8px;
-
-                Text {
-                    text: row.label;
-                    color: Palette.foreground;
-                    overflow: elide;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                // Only while it renders; the status word stands in otherwise.
-                if row.rendering: VerticalLayout {
-                    alignment: center;
-                    ProgressIndicator {
-                        width: 120px;
-                        progress: row.progress;
-                    }
-                }
-                Text {
-                    text: row.status;
-                    color: Palette.alternate-foreground;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                    min-width: 64px;
-                }
+        VerticalLayout {
+            spacing: 4px;
+            FieldLabel { text: "Quality"; }
+            ComboBox {
+                model: ["Low", "Medium", "High"];
+                enabled: !root.exporting;
+                current-index <=> root.quality;
             }
         }
-        // The one rendering of the estimate (E5): when the run ends, not how
-        // much of it is left.
-        if root.finish != "": Text {
-            text: root.finish;
+    }
+
+    // Its own row rather than a third column: "Burned into the picture"
+    // doesn't fit a third of this sheet.
+    VerticalLayout {
+        spacing: 4px;
+        FieldLabel { text: "Scoreboard"; }
+        ComboBox {
+            model: ["Default", "Burned into the picture", "Separate track"];
+            enabled: !root.exporting;
+            current-index <=> root.scoreboard;
+        }
+        // The only place the trade is spelled out, and it follows the
+        // **effective** mode rather than the picked one: the whole match
+        // is copied on Default too, and a coach told nothing has taken
+        // the trade without being asked (spec M1, N). Only the whole
+        // match is ever copied, so only its tick matters here.
+        if root.whole-match-ticked && root.scoreboard != 1: Text {
+            text: "The whole match is copied, not re-encoded: player highlights and pen drawings can't ride a copy.";
             color: Palette.alternate-foreground;
             font-size: 11px;
+            wrap: word-wrap;
         }
+    }
 
-        HorizontalLayout {
-            alignment: end;
+    if root.run.length > 0: FieldLabel { text: "Run"; }
+    if root.run.length > 0: ListView {
+        height: min(140px, root.run.length * 28px);
+        for row in root.run: HorizontalLayout {
+            height: 28px;
+            padding-left: 6px;
+            padding-right: 6px;
             spacing: 8px;
 
-            if root.exporting: Button {
-                text: "Cancel export";
-                clicked => { root.cancel(); }
-
-                Tooltip {
-                    text: @markdown("Stop the run. The videos already written are kept.");
+            Text {
+                text: row.label;
+                color: Palette.foreground;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            // Only while it renders; the status word stands in otherwise.
+            if row.rendering: VerticalLayout {
+                alignment: center;
+                ProgressIndicator {
+                    width: 120px;
+                    progress: row.progress;
                 }
             }
-            Button {
-                text: "Close";
-                clicked => { root.close(); }
+            Text {
+                text: row.status;
+                color: Palette.alternate-foreground;
+                font-size: 11px;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                min-width: 64px;
             }
-            if !root.exporting: Button {
-                text: "Export";
-                primary: true;
-                enabled: root.any-ticked;
-                clicked => { root.start(); }
+        }
+    }
+    // The one rendering of the estimate (E5): when the run ends, not how
+    // much of it is left.
+    if root.finish != "": Text {
+        text: root.finish;
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+
+        if root.exporting: Button {
+            text: "Cancel export";
+            clicked => { root.cancel(); }
+
+            Tooltip {
+                text: @markdown("Stop the run. The videos already written are kept.");
             }
+        }
+        Button {
+            text: "Close";
+            clicked => { root.close(); }
+        }
+        if !root.exporting: Button {
+            text: "Export";
+            primary: true;
+            enabled: root.any-ticked;
+            clicked => { root.start(); }
         }
     }
 }
@@ -1566,9 +1596,11 @@ component SetupField inherits VerticalLayout {
     in property <bool> has-swatch;
     in property <color> swatch;
     in-out property <string> text;
-    /// The swatch was clicked: open the picker over this field. Where it
-    /// hangs is the sheet's business -- it knows which field this is.
-    callback pick();
+    /// The swatch was clicked: open the picker over this field. It carries
+    /// this field's bottom-left corner, in window coordinates, so the sheet
+    /// hangs the popup where the click was rather than off a table of which
+    /// field is which.
+    callback pick(length, length);
 
     spacing: 2px;
 
@@ -1599,7 +1631,10 @@ component SetupField inherits VerticalLayout {
 
                 touch := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { root.pick(); }
+                    clicked => {
+                        root.pick(root.absolute-position.x,
+                            root.absolute-position.y + root.height);
+                    }
                 }
                 Tooltip { text: @markdown("Pick a colour"); }
             }
@@ -1895,40 +1930,27 @@ component MatchSetupSheet inherits Rectangle {
     changed picker-text => { root.sync-from-text(); }
     changed picker-field => { root.sync-from-text(); }
 
-    /// Where the popup hangs: under the clicked field, left-aligned with it.
-    /// Bindings off the fields' own ids rather than coordinates handed up
-    /// from a click, so the anchor follows the layout -- and so opening the
-    /// picker by setting `picker-field` alone lands where a click would.
-    /// The two columns hold the same three fields in the same order, so the
-    /// row decides the y and only the column decides the x.
-    property <length> anchor-x:
-        (root.picker-field < 3 ? home-primary.absolute-position.x
-            : away-primary.absolute-position.x) - root.absolute-position.x;
-    property <length> anchor-y:
-        (root.picker-field == 0 || root.picker-field == 3
-            ? home-primary.absolute-position.y + home-primary.height
-        : root.picker-field == 1 || root.picker-field == 4
-            ? home-accent.absolute-position.y + home-accent.height
-        : home-text.absolute-position.y + home-text.height)
-        - root.absolute-position.y + 4px;
+    /// Where the popup hangs: under the swatch that was clicked, left-aligned
+    /// with its field. The click hands them up (`SetupField::pick`), so the
+    /// anchor follows the layout and this sheet keeps no table of which field
+    /// sits where.
+    property <length> anchor-x;
+    property <length> anchor-y;
 
-    width: 520px;
-    height: sheet.preferred-height;
-    background: Palette.background;
-    border-radius: 8px;
-    border-width: 1px;
-    border-color: Palette.border;
+    /// A swatch was clicked: which field it belongs to, and where its own
+    /// bottom-left corner is in window coordinates.
+    function open-picker(field: int, x: length, y: length) {
+        root.anchor-x = x - root.absolute-position.x;
+        root.anchor-y = y - root.absolute-position.y + 4px;
+        root.picker-field = field;
+    }
 
-    sheet := VerticalLayout {
-        padding: 20px;
-        spacing: 10px;
+    width: card.width;
+    height: card.height;
 
-        Text {
-            text: "Match setup";
-            color: Palette.foreground;
-            font-size: 16px;
-            font-weight: 600;
-        }
+    card := Sheet {
+        card-width: 520px;
+        title: "Match setup";
 
         HorizontalLayout {
             spacing: 16px;
@@ -1949,7 +1971,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.home-primary);
                     placeholder: "#rrggbb";
                     text <=> root.home-primary;
-                    pick => { root.picker-field = 0; }
+                    pick(x, y) => { root.open-picker(0, x, y); }
                 }
                 home-accent := SetupField {
                     label: "Accent";
@@ -1958,7 +1980,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.home-secondary);
                     placeholder: "#rrggbb";
                     text <=> root.home-secondary;
-                    pick => { root.picker-field = 1; }
+                    pick(x, y) => { root.open-picker(1, x, y); }
                 }
                 home-text := SetupField {
                     label: "Text";
@@ -1967,7 +1989,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.home-font);
                     placeholder: "#rrggbb";
                     text <=> root.home-font;
-                    pick => { root.picker-field = 2; }
+                    pick(x, y) => { root.open-picker(2, x, y); }
                 }
             }
             VerticalLayout {
@@ -1986,7 +2008,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.away-primary);
                     placeholder: "#rrggbb";
                     text <=> root.away-primary;
-                    pick => { root.picker-field = 3; }
+                    pick(x, y) => { root.open-picker(3, x, y); }
                 }
                 away-accent := SetupField {
                     label: "Accent";
@@ -1995,7 +2017,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.away-secondary);
                     placeholder: "#rrggbb";
                     text <=> root.away-secondary;
-                    pick => { root.picker-field = 4; }
+                    pick(x, y) => { root.open-picker(4, x, y); }
                 }
                 away-text := SetupField {
                     label: "Text";
@@ -2004,7 +2026,7 @@ component MatchSetupSheet inherits Rectangle {
                     ok: root.valid-hex(root.away-font);
                     placeholder: "#rrggbb";
                     text <=> root.away-font;
-                    pick => { root.picker-field = 5; }
+                    pick(x, y) => { root.open-picker(5, x, y); }
                 }
             }
         }
@@ -2116,11 +2138,11 @@ component MatchSetupSheet inherits Rectangle {
 /// (`core::match_entry`), read by the same parse, so there is no second way to
 /// say a thing.
 ///
-/// A fourth copy of the sheet shape, at 640px: the widest thing in it is an
-/// echo line's sentence, not a table. Nothing is staged -- each committed row
-/// and each Add is a bus command and an undo step -- so its one button is
-/// Done, and there is no Cancel (spec P5) and no add control (T7).
-component MatchEditorSheet inherits Rectangle {
+/// A `Sheet` at 640px: the widest thing in it is an echo line's sentence, not
+/// a table. Nothing is staged -- each committed row and each Add is a bus
+/// command and an undo step -- so its one button is Done, and there is no
+/// Cancel (spec P5) and no add control (T7).
+component MatchEditorSheet inherits Sheet {
     in property <[MatchEditorRow]> rows;
     /// The selected row's id, empty for none. The window owns it, so an event
     /// that goes takes the selection with it.
@@ -2152,16 +2174,25 @@ component MatchEditorSheet inherits Rectangle {
     /// closes, and a binding that goes with it would leave the window's
     /// shortcuts switched off -- `close-match-editor()` clears it instead.
     in-out property <bool> editing;
-    property <bool> line-focused;
+    /// The **row's** field has focus: the one state in which the rows above
+    /// must not be rebuilt (spec T3, `src/main.rs`). Out and up, and cleared
+    /// by `close-match-editor()`, for the same reason `editing` is.
+    in-out property <bool> line-focused;
     property <bool> paste-focused;
 
-    /// A row's line, as the bus will read it: the mark and the commit call the
-    /// same one, so a field can't read good and then be refused.
+    /// A row's line, as the bus will read it -- `bus::editor_line`, the very
+    /// call the command makes, cap and all, so a line marked good is never
+    /// refused.
     pure callback valid-line(string, string) -> bool;
-    /// The paste box's verdicts. It takes the text and the picker so the
-    /// binding re-evaluates on every keystroke (the tag field's suggestions
-    /// and the setup sheet's validators are the same shape).
-    pure callback check-paste(string, int) -> PasteEcho;
+    /// The paste box's verdicts. It takes the text, the picker and the
+    /// project's revision so the binding re-evaluates as any of them change:
+    /// it is `pure` but reads the project, and without the revision a row
+    /// deleted with its `×` would leave the echo standing on the answer it
+    /// gave before (the tag field's suggestions and the setup sheet's
+    /// validators are the same shape).
+    pure callback check-paste(string, int, int) -> PasteEcho;
+    /// The project changed, so every echo above has to be read again.
+    in property <int> revision;
     callback select(string);
     /// A row's line committed: nothing is sent until it parses.
     callback commit(string, string);
@@ -2170,7 +2201,7 @@ component MatchEditorSheet inherits Rectangle {
     callback add();
     callback close();
 
-    property <PasteEcho> echo: root.check-paste(root.paste, root.default-source);
+    property <PasteEcho> echo: root.check-paste(root.paste, root.default-source, root.revision);
 
     function refresh-editing() {
         root.editing = (root.selected != "" && root.line-focused) || root.paste-focused;
@@ -2178,6 +2209,12 @@ component MatchEditorSheet inherits Rectangle {
 
     /// Enter and losing focus both commit, as the inspector's fields do. A
     /// line that doesn't parse is marked and goes nowhere (spec T5).
+    ///
+    /// **Enter therefore commits twice**: the window drops focus on the
+    /// commit (spec T4) and the focus loss commits the same line again. The
+    /// second lands on the record the first already moved, reads back to the
+    /// same event, and the bus drops it -- no save, no undo step, no publish
+    /// (`bus::scoreboard::edit_match_event`).
     ///
     /// The selection test is what makes a *late* focus loss safe: the field
     /// lives inside the row loop, so selecting another row destroys it, and a
@@ -2189,239 +2226,223 @@ component MatchEditorSheet inherits Rectangle {
         }
     }
 
-    width: 640px;
-    height: sheet.preferred-height;
-    background: Palette.background;
-    border-radius: 8px;
-    border-width: 1px;
-    border-color: Palette.border;
+    card-width: 640px;
+    title: "Match events";
 
-    sheet := VerticalLayout {
-        padding: 20px;
-        spacing: 10px;
+    if root.rows.length == 0: Text {
+        text: "Nothing tagged yet. Paste a block below, or tag with Z, X and V while the game video plays.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+    // A height of its own, as the panel's list has: a long match scrolls
+    // rather than growing the sheet past the window. The selected row
+    // carries a field under it, which is a line and a half.
+    if root.rows.length > 0: ListView {
+        // 168px is the Match panel's own cap, and the three scrolling
+        // lists here are capped together so the sheet still fits a
+        // 700px window with a long match and a long echo in it.
+        height: min(168px, root.rows.length * 28px + (root.selected == "" ? 0px : 48px));
+        for row in root.rows: VerticalLayout {
+            Rectangle {
+                height: 28px;
+                border-radius: 4px;
+                background: row.id == root.selected ? Palette.selection-background : transparent;
 
-        Text {
-            text: "Match events";
-            color: Palette.foreground;
-            font-size: 16px;
-            font-weight: 600;
-        }
-
-        if root.rows.length == 0: Text {
-            text: "Nothing tagged yet. Paste a block below, or tag with Z, X and V while the game video plays.";
-            color: Palette.alternate-foreground;
-            font-size: 11px;
-            wrap: word-wrap;
-        }
-        // A height of its own, as the panel's list has: a long match scrolls
-        // rather than growing the sheet past the window. The selected row
-        // carries a field under it, which is a line and a half.
-        if root.rows.length > 0: ListView {
-            // 168px is the Match panel's own cap, and the three scrolling
-            // lists here are capped together so the sheet still fits a
-            // 700px window with a long match and a long echo in it.
-            height: min(168px, root.rows.length * 28px + (root.selected == "" ? 0px : 48px));
-            for row in root.rows: VerticalLayout {
-                Rectangle {
-                    height: 28px;
-                    border-radius: 4px;
-                    background: row.id == root.selected ? Palette.selection-background : transparent;
-
-                    // The whole row selects; the buttons in front take their
-                    // own clicks.
-                    TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.select(row.id); }
-                    }
-
-                    HorizontalLayout {
-                        padding-left: 4px;
-                        padding-right: 4px;
-                        spacing: 6px;
-
-                        Text {
-                            text: row.where-text;
-                            color: Palette.alternate-foreground;
-                            font-family: "monospace";
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: row.label;
-                            color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
-                            font-size: 11px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: "→";
-                                accessible-label: "Seek";
-                                clicked => { root.seek(row.id); }
-
-                                Tooltip {
-                                    text: @markdown("Play the game video from here. The picture is behind this sheet, so it closes.");
-                                }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: "×";
-                                accessible-label: "Delete";
-                                clicked => { root.remove(row.id); }
-
-                                Tooltip {
-                                    text: @markdown("Delete this event (undoable)");
-                                }
-                            }
-                        }
-                    }
+                // The whole row selects; the buttons in front take their
+                // own clicks.
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.select(row.id); }
                 }
 
-                // The selected row's one control: the event as a line of the
-                // paste box's grammar, retyped whole (spec T2). No combo box
-                // for the video, none for the kind: a kind is a word and a
-                // video is a number, and both are in the line.
-                if row.id == root.selected: HorizontalLayout {
-                    padding-top: 4px;
-                    padding-bottom: 8px;
-                    spacing: 4px;
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 6px;
 
-                    LineEdit {
+                    Text {
+                        text: row.where-text;
+                        color: Palette.alternate-foreground;
+                        font-family: "monospace";
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: row.label;
+                        color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
+                        font-size: 11px;
+                        overflow: elide;
+                        vertical-alignment: center;
                         horizontal-stretch: 1;
-                        text <=> root.line;
-                        accepted(text) => { root.commit-line(row.id, text); }
-                        changed has-focus => {
-                            root.line-focused = self.has-focus;
-                            root.refresh-editing();
-                            if (!self.has-focus) {
-                                root.commit-line(row.id, self.text);
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: "→";
+                            accessible-label: "Seek";
+                            clicked => { root.seek(row.id); }
+
+                            Tooltip {
+                                text: @markdown("Play the game video from here. The picture is behind this sheet, so it closes.");
                             }
                         }
                     }
-                    if !root.valid-line(row.id, root.line): VerticalLayout {
+                    VerticalLayout {
                         alignment: center;
-                        Text {
-                            text: "✕";
-                            color: #ff6b6b;
-                            font-size: 11px;
+                        Button {
+                            text: "×";
+                            accessible-label: "Delete";
+                            clicked => { root.remove(row.id); }
+
+                            Tooltip {
+                                text: @markdown("Delete this event (undoable)");
+                            }
                         }
                     }
                 }
             }
-        }
 
-        HorizontalLayout {
-            spacing: 8px;
-            FieldLabel {
-                text: "Paste events";
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
-            Text {
-                text: "Lines with no number are:";
-                color: Palette.alternate-foreground;
-                font-size: 11px;
-                vertical-alignment: center;
-            }
-            ComboBox {
-                width: 160px;
-                model: root.sources;
-                // Two-way: a one-way binding onto `current-index` is dropped
-                // the first time the popup opens, and the readout then lies.
-                current-index <=> root.default-source;
+            // The selected row's one control: the event as a line of the
+            // paste box's grammar, retyped whole (spec T2). No combo box
+            // for the video, none for the kind: a kind is a word and a
+            // video is a number, and both are in the line.
+            if row.id == root.selected: HorizontalLayout {
+                padding-top: 4px;
+                padding-bottom: 8px;
+                spacing: 4px;
+
+                LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.line;
+                    accepted(text) => { root.commit-line(row.id, text); }
+                    changed has-focus => {
+                        root.line-focused = self.has-focus;
+                        root.refresh-editing();
+                        if (!self.has-focus) {
+                            root.commit-line(row.id, self.text);
+                        }
+                    }
+                }
+                if !root.valid-line(row.id, root.line): VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "✕";
+                        color: #ff6b6b;
+                        font-size: 11px;
+                    }
+                }
             }
         }
-        TextEdit {
-            // Six lines of a block that may well be twenty: it scrolls, as
-            // the lists either side of it do.
-            height: 120px;
-            placeholder-text: "2 14:05 away goal";
-            text <=> root.paste;
-            changed has-focus => {
-                root.paste-focused = self.has-focus;
-                root.refresh-editing();
-            }
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        FieldLabel {
+            text: "Paste events";
+            vertical-alignment: center;
+            horizontal-stretch: 1;
         }
         Text {
-            text: "One event per line: an optional video number, a time with a colon, then what happened — \"home\", \"away\", \"period\". # starts a comment.";
+            text: "Lines with no number are:";
             color: Palette.alternate-foreground;
             font-size: 11px;
-            wrap: word-wrap;
+            vertical-alignment: center;
         }
-
-        // **Each line wraps rather than elides.** The kick-off refusal is a
-        // sentence explaining why a restart is not a period boundary, and
-        // eliding it hides the one thing the line is for. So this list has a
-        // height of its own rather than one counted in rows: how tall a row
-        // is depends on its sentence, and it scrolls.
-        if root.echo.lines.length > 0: ListView {
-            height: 120px;
-            for line in root.echo.lines: HorizontalLayout {
-                padding-left: 4px;
-                padding-top: 2px;
-                padding-bottom: 2px;
-                spacing: 6px;
-
-                Text {
-                    text: line.glyph;
-                    color: Palette.alternate-foreground;
-                    font-size: 11px;
-                    vertical-alignment: top;
-                }
-                Text {
-                    text: line.text;
-                    color: Palette.foreground;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                    horizontal-stretch: 1;
-                }
-            }
+        ComboBox {
+            width: 160px;
+            model: root.sources;
+            // Two-way: a one-way binding onto `current-index` is dropped
+            // the first time the popup opens, and the readout then lies.
+            current-index <=> root.default-source;
         }
+    }
+    TextEdit {
+        // Six lines of a block that may well be twenty: it scrolls, as
+        // the lists either side of it do.
+        height: 120px;
+        placeholder-text: "2 14:05 away goal";
+        text <=> root.paste;
+        changed has-focus => {
+            root.paste-focused = self.has-focus;
+            root.refresh-editing();
+        }
+    }
+    Text {
+        text: "One event per line: an optional video number, a time with a colon, then what happened — \"home\", \"away\", \"period\". # starts a comment.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
 
-        HorizontalLayout {
-            spacing: 8px;
+    // **Each line wraps rather than elides.** The kick-off refusal is a
+    // sentence explaining why a restart is not a period boundary, and
+    // eliding it hides the one thing the line is for. So this list has a
+    // height of its own rather than one counted in rows: how tall a row
+    // is depends on its sentence, and it scrolls.
+    if root.echo.lines.length > 0: ListView {
+        height: 120px;
+        for line in root.echo.lines: HorizontalLayout {
+            padding-left: 4px;
+            padding-top: 2px;
+            padding-bottom: 2px;
+            spacing: 6px;
+
             Text {
-                text: root.echo.summary;
+                text: line.glyph;
                 color: Palette.alternate-foreground;
                 font-size: 11px;
-                overflow: elide;
-                vertical-alignment: center;
+                vertical-alignment: top;
+            }
+            Text {
+                text: line.text;
+                color: Palette.foreground;
+                font-size: 11px;
+                wrap: word-wrap;
                 horizontal-stretch: 1;
             }
-            Button {
-                text: root.echo.button;
-                enabled: root.echo.adding > 0;
-                clicked => { root.add(); }
+        }
+    }
 
-                Tooltip {
-                    text: @markdown("Add every line marked ✓, in one undo step. The rest stay in the box.");
-                }
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.echo.summary;
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: root.echo.button;
+            enabled: root.echo.adding > 0;
+            clicked => { root.add(); }
+
+            Tooltip {
+                text: @markdown("Add every line marked ✓, in one undo step. The rest stay in the box.");
             }
         }
+    }
 
-        // The sheet's own notice line (spec C5): a refused command says so
-        // here, since the status bar is behind the scrim.
-        if root.message != "": Text {
-            text: root.message;
-            color: #ffcc00;
-            font-size: 11px;
-            wrap: word-wrap;
-        }
+    // The sheet's own notice line (spec C5): a refused command says so
+    // here, since the status bar is behind the scrim.
+    if root.message != "": Text {
+        text: root.message;
+        color: #ffcc00;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
 
-        HorizontalLayout {
-            alignment: end;
-            Button {
-                text: "Done";
-                primary: true;
-                clicked => { root.close(); }
+    HorizontalLayout {
+        alignment: end;
+        Button {
+            text: "Done";
+            primary: true;
+            clicked => { root.close(); }
 
-                Tooltip {
-                    text: @markdown("Close the editor. Every edit is already saved, and undoable with Ctrl+Z.");
-                }
+            Tooltip {
+                text: @markdown("Close the editor. Every edit is already saved, and undoable with Ctrl+Z.");
             }
         }
     }
@@ -2757,8 +2778,9 @@ export component AppWindow inherits Window {
     /// The editor sheet is up. UI state: the panel's button opens it, Done
     /// and Esc close it.
     in-out property <bool> match-editor-open;
-    /// Its rows, seeded when it opens and rebuilt by its **own** committed
-    /// edit and by nothing else (spec T3) -- `src/main.rs` owns that rule.
+    /// Its rows, seeded when it opens and rebuilt on every project change
+    /// except while the row's field has focus (spec T3) -- `src/main.rs`
+    /// owns that rule.
     in property <[MatchEditorRow]> match-editor-rows;
     /// The selected row, and that row's event as a line. Two-way down to the
     /// field, and re-seeded from the record on every rebuild.
@@ -2777,6 +2799,13 @@ export component AppWindow inherits Window {
     /// A field in the sheet has focus. Set by the sheet and cleared when it
     /// closes, since the binding goes with the element (see the sheet).
     property <bool> match-editor-editing;
+    /// The **row's** field has focus (see the sheet). Cleared with it, as
+    /// `match-editor-editing` is.
+    in-out property <bool> match-editor-line-focused;
+    /// Bumped by `src/main.rs` on every project change: the sheet's echoes
+    /// are read from the project through `pure` callbacks, and this is what
+    /// tells their bindings to ask again.
+    in-out property <int> project-revision;
 
     /// The latest notice (a device fallback, an unclean stop, an export
     /// done), shown in the transport bar without blocking; empty hides it.
@@ -2854,11 +2883,13 @@ export component AppWindow inherits Window {
     callback reel-trim(string, ReelTrim);
     /// `]` (true) or `[`: the next or previous chapter (spec C1).
     callback jump-chapter(bool);
-    /// Seed the editor's rows from the project and open it (spec T3): the
-    /// only place they are seeded from outside the editor's own edits.
+    /// Seed the editor's rows from the project and open it.
     callback open-match-editor();
     /// A row was clicked: seed its field with that event as a line.
     callback select-match-event(string);
+    /// Esc in the row's field: put the selected event's line back in it,
+    /// undoing whatever was typed (spec P3).
+    callback reseed-match-line();
     /// A row's field committed: the event's id and the line typed into it.
     callback edit-match-event(string, string);
     /// Add every line of the paste box that will add, as one undo step, and
@@ -2868,8 +2899,10 @@ export component AppWindow inherits Window {
     /// ✕ and the commit share it (spec T5).
     pure callback valid-match-line(string, string) -> bool;
     /// The paste box's block, read back line by line, against the picker's
-    /// default video.
-    pure callback check-paste(string, int) -> PasteEcho;
+    /// default video. The third argument is `project-revision`, which is
+    /// what makes a `pure` callback that reads the project re-run when it
+    /// changes.
+    pure callback check-paste(string, int, int) -> PasteEcho;
     /// Seed the setup sheet's fields from the project and open it; the sheet
     /// is opened nowhere else, so the fields are never stale.
     callback open-match-setup();
@@ -2971,6 +3004,7 @@ export component AppWindow inherits Window {
     /// good. The message goes with it (spec C5); the paste box's text stays.
     function close-match-editor() {
         root.match-editor-editing = false;
+        root.match-editor-line-focused = false;
         root.match-editor-message = "";
         root.match-editor-open = false;
         keys.focus();
@@ -3033,14 +3067,26 @@ export component AppWindow inherits Window {
         // unlike the setup sheet's, they are not re-seeded from the project
         // every time it opens: a half-typed paste is not something to throw
         // away on one Esc. So Esc only closes the sheet from *outside* a
-        // field; inside one the cascade below leaves the field first, and the
-        // next Esc closes (spec P3). The `reject` is also what delivers
-        // Ctrl+V to the paste box, since the Ctrl branch below is never
-        // reached from in here.
+        // field; inside one it leaves the field first, and the next Esc
+        // closes (spec P3). The `reject` is also what delivers Ctrl+V to the
+        // paste box, since the Ctrl branch below is never reached from in
+        // here.
         if (root.match-editor-open) {
-            if (pressed && event.text == Key.Escape && !root.text-editing) {
-                root.close-match-editor();
-                return accept;
+            if (pressed && event.text == Key.Escape) {
+                // **Esc in a row's field cancels**, which everywhere else in
+                // this app is what Esc means. Leaving the field commits it
+                // (the cascade below), so the line has to go back to what
+                // the row was seeded with *first*; the commit that follows
+                // then edits nothing.
+                if (root.match-editor-line-focused) {
+                    root.reseed-match-line();
+                    keys.focus();
+                    return accept;
+                }
+                if (!root.text-editing) {
+                    root.close-match-editor();
+                    return accept;
+                }
             }
             return reject;
         }
@@ -3888,10 +3934,10 @@ export component AppWindow inherits Window {
                                 // The bus refuses a scrub and an edit while
                                 // recording, and neither belongs to the game
                                 // video behind a preview.
+                                // It also gates the editor's button: an
+                                // event points at a video, and `can-play` is
+                                // false until the project has one (spec P4).
                                 can-edit: root.can-play && !root.recording && !root.previewing;
-                                // An event points at a video, so the editor
-                                // needs one to open (spec P4).
-                                has-source: root.sources.length > 0;
                                 // Off any field first, as every other button
                                 // does: a click doesn't take focus from one, and
                                 // the tag keys have to keep working after it.
@@ -4297,12 +4343,7 @@ export component AppWindow inherits Window {
         }
 
         // --- Export sheet: modal over the whole window (E8) ---
-        if root.export-sheet-open: Rectangle {
-            background: #000000a0;
-
-            // Swallows clicks meant for the window behind.
-            TouchArea { }
-
+        if root.export-sheet-open: Scrim {
             ExportSheet {
                 targets: root.export-targets;
                 any-ticked: root.export-any-ticked;
@@ -4324,12 +4365,7 @@ export component AppWindow inherits Window {
         }
 
         // --- Match setup sheet: modal over the whole window (Phase 9 S4) ---
-        if root.match-sheet-open: Rectangle {
-            background: #000000a0;
-
-            // Swallows clicks meant for the window behind.
-            TouchArea { }
-
+        if root.match-sheet-open: Scrim {
             MatchSetupSheet {
                 home-name <=> root.match-home-name;
                 home-primary <=> root.match-home-primary;
@@ -4368,12 +4404,7 @@ export component AppWindow inherits Window {
         }
 
         // --- Match event editor: modal over the whole window (spec P1) ---
-        if root.match-editor-open: Rectangle {
-            background: #000000a0;
-
-            // Swallows clicks meant for the window behind.
-            TouchArea { }
-
+        if root.match-editor-open: Scrim {
             MatchEditorSheet {
                 rows: root.match-editor-rows;
                 selected: root.match-editor-selected;
@@ -4382,9 +4413,13 @@ export component AppWindow inherits Window {
                 sources: root.match-editor-sources;
                 default-source <=> root.match-editor-source;
                 message: root.match-editor-message;
+                revision: root.project-revision;
                 editing <=> root.match-editor-editing;
+                line-focused <=> root.match-editor-line-focused;
                 valid-line(id, text) => { return root.valid-match-line(id, text); }
-                check-paste(text, source) => { return root.check-paste(text, source); }
+                check-paste(text, source, revision) => {
+                    return root.check-paste(text, source, revision);
+                }
                 select(id) => { root.select-match-event(id); }
                 // **Every commit drops focus** (spec T4), unconditionally
                 // rather than only when the order changed: Slint's `for`
@@ -4402,46 +4437,47 @@ export component AppWindow inherits Window {
                     root.seek-match-event(id);
                     root.close-match-editor();
                 }
-                remove(id) => { root.delete-match-event(id); }
-                add => { root.add-match-events(); }
+                // Off the row's field first, as every other button in this
+                // app does -- a click doesn't take focus from a field by
+                // itself. Both of these change the event list, and the rows
+                // are only rebuilt once that field is out of the way (spec
+                // T3); the focus loss commits whatever is in it, which is
+                // the rule everywhere else too (T4).
+                remove(id) => {
+                    keys.focus();
+                    root.delete-match-event(id);
+                }
+                add => {
+                    keys.focus();
+                    root.add-match-events();
+                }
                 close => { root.close-match-editor(); }
             }
         }
 
         // --- Error dialog: modal over the whole window ---
-        if root.error-message != "": Rectangle {
-            background: #000000a0;
+        //
+        // The fourth sheet, and the one with no heading: its message is the
+        // only thing it has to say.
+        if root.error-message != "": Scrim {
+            Sheet {
+                card-width: 440px;
+                body-spacing: 16px;
 
-            // Swallows clicks meant for the window behind.
-            TouchArea { }
+                Text {
+                    text: root.error-message;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
 
-            Rectangle {
-                width: 440px;
-                height: dialog.preferred-height;
-                background: Palette.background;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: Palette.border;
-
-                dialog := VerticalLayout {
-                    padding: 20px;
-                    spacing: 16px;
-
-                    Text {
-                        text: root.error-message;
-                        color: Palette.foreground;
-                        wrap: word-wrap;
-                    }
-
-                    HorizontalLayout {
-                        alignment: end;
-                        Button {
-                            text: "OK";
-                            primary: true;
-                            clicked => {
-                                root.error-message = "";
-                                keys.focus();
-                            }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "OK";
+                        primary: true;
+                        clicked => {
+                            root.error-message = "";
+                            keys.focus();
                         }
                     }
                 }

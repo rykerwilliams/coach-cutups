@@ -31,11 +31,12 @@ pub const CHAPTER_TOLERANCE: f64 = 0.5;
 pub struct MatchRowText {
     pub id: Uuid,
     pub kind: MatchEventKind,
-    /// Which source video it is tagged on, and how far into it: where the
-    /// editor's row reads it from ([`editor_row_where`]) and what the line in
-    /// its field says. The panel ignores both — they are here rather than in a
-    /// second builder, so the editor cannot order its list differently from
-    /// the panel, the scrubber's marks and `[` / `]` (spec T1).
+    /// Which source video it is tagged on, and how far into it: what the
+    /// editor's row reads ([`editor_row_where`]) and what the line in its
+    /// field says ([`editor_row_line`]). The panel ignores both — they are
+    /// here rather than in a second builder, so the editor cannot order its
+    /// list differently from the panel, the scrubber's marks and `[` / `]`
+    /// (spec T1).
     pub source_index: usize,
     pub source_seconds: f64,
     /// Where it sits on the concat timeline, in seconds.
@@ -92,25 +93,19 @@ fn reel_span(goal: &MatchEventRecord) -> String {
 
 // ------------------------------------------------- the match event editor
 //
-// The editor's every string, so the sheet holds none (spec T, B). The
-// verdicts are core's `match_entry`, which the bus parses the same text with:
-// the wording lives here and the rules live there, and the sheet's mark and
-// the command it sends can't reach different answers.
+// The editor's every string, so the sheet holds none (spec T, B). Only the
+// wording is here: a row's verdict is `bus::editor_line`'s and a pasted
+// line's is `core::match_entry`'s, so the sheet's mark and the command it
+// sends cannot reach different answers.
 
 /// The line the editor seeds a selected row's field with: core's
-/// [`format_line`] for that row's record.
+/// [`format_line`] of the three fields the row already carries.
 ///
 /// The bus rebuilds the same seed from the same record when the line comes
-/// back (`bus::scoreboard::edit_match_event`), so an edit that leaves the time
-/// alone keeps the stored seconds to the last decimal. Empty for a row with no
-/// record behind it, which [`match_rows`] never produces.
-pub fn editor_row_line(project: &Project, row: &MatchRowText) -> String {
-    project
-        .match_events
-        .iter()
-        .find(|m| m.id == row.id)
-        .map(|record| format_line(project, record))
-        .unwrap_or_default()
+/// back (`bus::editor_line`), so an edit that leaves the time alone keeps the
+/// stored seconds to the last decimal.
+pub fn editor_row_line(row: &MatchRowText) -> String {
+    format_line(row.kind, row.source_index, row.source_seconds)
 }
 
 /// A row's "where": the 1-based video number and the time into that video, the
@@ -621,9 +616,7 @@ mod tests {
         // One line per kind, and `period` for the start/stop, whose stored
         // record doesn't know which end of a half it is.
         assert_eq!(
-            rows.iter()
-                .map(|r| editor_row_line(&p, r))
-                .collect::<Vec<_>>(),
+            rows.iter().map(editor_row_line).collect::<Vec<_>>(),
             [
                 "1 0:30.0 home goal",
                 "2 0:00.0 period",
@@ -633,7 +626,10 @@ mod tests {
         // And it is core's own rendering, which the bus rebuilds as the seed.
         for row in &rows {
             let record = p.match_events.iter().find(|m| m.id == row.id).unwrap();
-            assert_eq!(editor_row_line(&p, row), format_line(&p, record));
+            assert_eq!(
+                editor_row_line(row),
+                format_line(record.kind, record.source_index, record.source_seconds)
+            );
         }
     }
 

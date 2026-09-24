@@ -21,18 +21,15 @@
 //! meant.
 
 use crate::project::Project;
-use crate::scoreboard::{
-    MatchEventKind, MatchEventRecord, ScoreboardConfig, START_STOP_CAP_REFUSAL,
-};
+use crate::scoreboard::{MatchEventKind, ScoreboardConfig, START_STOP_CAP_REFUSAL};
 
 /// How near an existing event of the same kind on the same source a *pasted*
 /// line has to be to count as the same event, in seconds.
 ///
 /// The list itself allows duplicates — two events at one instant are legal and
 /// keep their stored order — but a paste box's input is a block the coach may
-/// well paste twice, and [`Batch::leftover`] hands the failed lines back for a
-/// second Add. Two genuine goals inside one second do not happen; a doubled
-/// paste does.
+/// well paste twice. Two genuine goals inside one second do not happen; a
+/// doubled paste does, and a doubled line inside one paste does too.
 pub const SAME_EVENT_SECONDS: f64 = 1.0;
 
 /// An event the coach typed, ready for the bus to append. No id yet: the
@@ -61,9 +58,8 @@ pub enum LineVerdict {
 ///
 /// The leading field is unbounded — `75:20` is 4520 s in an 80-minute file —
 /// and every field after it is exactly two digits under 60, so `14:5:3` is
-/// refused rather than guessed at. **A colon is required**: there is no bare
-/// number in this grammar, in the row's field or in the paste box, because a
-/// leading bare integer is a video number (see the module doc).
+/// refused rather than guessed at. **A colon is required** — see the module
+/// doc for why.
 pub fn parse_time(text: &str) -> Option<f64> {
     let text = text.trim();
     let (whole, fraction) = match text.split_once('.') {
@@ -243,27 +239,22 @@ pub fn parse_line(project: &Project, default_source: usize, line: &str) -> LineV
     parse_line_with(project, default_source, line, None)
 }
 
-/// The canonical rendering of `record` as a line: what the row's field is
+/// The canonical rendering of an event as a line: what the row's field is
 /// seeded with, and what [`parse_line`] reads back into the same event.
 ///
 /// The start/stop word is the neutral `period`: a stored start/stop does not
 /// know whether it opens or closes a half — `interpret` decides that from the
 /// order — so the line cannot say.
-///
-/// It takes the project it belongs to because the video number is that
-/// project's 1-based numbering, the one [`parse_line`] resolves against; a
-/// renderer that took the record alone would be a second numbering to keep in
-/// step with the first.
-pub fn format_line(_project: &Project, record: &MatchEventRecord) -> String {
-    let kind = match record.kind {
+pub fn format_line(kind: MatchEventKind, source_index: usize, source_seconds: f64) -> String {
+    let kind = match kind {
         MatchEventKind::HomeGoal => "home goal",
         MatchEventKind::AwayGoal => "away goal",
         MatchEventKind::StartStop => "period",
     };
     format!(
         "{} {} {kind}",
-        record.source_index + 1,
-        format_time(record.source_seconds)
+        source_index + 1,
+        format_time(source_seconds)
     )
 }
 
@@ -304,8 +295,7 @@ fn body(line: &str) -> &str {
     line.split('#').next().unwrap_or("").trim()
 }
 
-/// A leading bare integer is **always** a video number — never a time, never a
-/// word. A time has a colon, so there is nothing to disambiguate.
+/// A leading bare integer is **always** a video number (the module doc).
 fn is_video_number(field: &str) -> bool {
     !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
 }
@@ -368,17 +358,17 @@ fn parse_line_with(
     })
 }
 
-/// "there is no video 3" — and, where the number is big enough that the coach
-/// may have meant seconds, why it was not read as a time. `900 home goal` is
-/// refused as a video, and the misreading it could have been (15:00) is named
-/// rather than performed.
+/// "there is no video 3 — a time needs a colon (15:00)": the number the coach
+/// typed, refused as the video it claims to be, and the misreading it might
+/// have been named rather than performed.
+///
+/// **The hint is always there**, not only on a number big enough to look like
+/// seconds: a coach who types `14` meaning fourteen minutes into a two-video
+/// project is the very reader it is for.
 fn refuse_video(number: &str) -> LineVerdict {
-    let looks_like_a_time = !matches!(number.parse::<u64>(), Ok(n) if n < 60);
-    LineVerdict::Refused(if looks_like_a_time {
-        format!("there is no video {number} — a time needs a colon (15:00)")
-    } else {
-        format!("there is no video {number}")
-    })
+    LineVerdict::Refused(format!(
+        "there is no video {number} — a time needs a colon (15:00)"
+    ))
 }
 
 // ----------------------------------------------------------------- batches
@@ -412,10 +402,15 @@ pub struct Batch {
     /// One echo record per line that has anything to say. Blank and
     /// comment-only lines are not here.
     pub lines: Vec<BatchLine>,
-    /// The lines that were not added, joined back into a block — what the box
-    /// keeps after Add, so the coach fixes them in place and presses Add
-    /// again. Blank and comment-only lines are dropped with the added ones, so
-    /// a block that lands whole leaves the box empty.
+    /// The **refused** lines, joined back into a block — what the box keeps
+    /// after Add, so the coach fixes them in place and presses Add again.
+    ///
+    /// Only the refusals: a line that was added is done with, and one skipped
+    /// as [`BatchVerdict::AlreadyTagged`] is not something editing can fix —
+    /// the event it names is in the project already, so keeping it would ask
+    /// the coach to clear a line whose only fault is being right. Blank and
+    /// comment-only lines go with them, so a block that nothing refuses
+    /// leaves the box empty.
     pub leftover: String,
 }
 
@@ -460,7 +455,7 @@ pub fn parse_batch(project: &Project, default_source: usize, text: &str) -> Batc
                 }
             }
         };
-        if !matches!(verdict, BatchVerdict::Added(_)) {
+        if matches!(verdict, BatchVerdict::Refused(_)) {
             leftover.push(line.trim_end());
         }
         batch.lines.push(BatchLine {

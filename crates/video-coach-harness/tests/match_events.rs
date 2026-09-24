@@ -256,6 +256,15 @@ fn a_partly_refused_batch_adds_the_rest() {
     assert_eq!(after.len(), before.len() + 3, "{after:#?}");
     assert_eq!(after[..2], before[..]);
 
+    // What the box is left holding is the bus's own parse, not the UI's
+    // (spec B5): the two lines it refused, and **not** the two it skipped as
+    // already tagged — a duplicate is not a line editing can fix.
+    let leftover = h.wait_map("the paste box's leftover", |e| match e {
+        Event::MatchPasteLeftover(text) => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(leftover, "2 5:00 home goal\n2 9:00.0 away goal");
+
     let err = h.wait_for_error();
     let UserError::Scoreboard(msg) = &err else {
         panic!("{err:?}");
@@ -312,6 +321,50 @@ fn an_edit_moves_an_event_and_the_clock_follows() {
 
     h.shutdown();
     assert_eq!(events(&p.saved()), events(&tagged));
+}
+
+/// The cap the key and the paste box share is the row field's too: retyping a
+/// goal as a period when the format's start/stops are all tagged is refused,
+/// and the record stands. `bus::editor_line` is the one call that decides it,
+/// so the field's `✕` is up before this is ever sent.
+#[test]
+fn a_row_retyped_as_a_start_stop_at_the_cap_is_refused() {
+    let (mut h, p) = Proj::open(&["a.webm"]);
+    h.send(Command::SetScoreboard(scoreboard()));
+    h.wait_changed();
+
+    // Soccer's four places, all taken, and one goal to retype.
+    for i in 0..4 {
+        h.send(tag(MatchEventKind::StartStop, 0, f64::from(i) * 0.1));
+        h.wait_changed();
+    }
+    h.send(tag(MatchEventKind::HomeGoal, 0, 1.5));
+    let tagged = events(&h.wait_changed().project);
+    let goal = tagged[4].id;
+
+    h.send(Command::EditMatchEvent {
+        id: goal,
+        line: "1 0:01.5 period".into(),
+    });
+    let err = h.wait_for_error();
+    assert!(
+        matches!(&err, UserError::Scoreboard(msg) if msg.contains("format")),
+        "{err:?}"
+    );
+
+    // The other half of the rule: moving a start/stop leaves the count alone,
+    // so the cap has nothing to say about it.
+    h.send(Command::EditMatchEvent {
+        id: tagged[0].id,
+        line: "1 0:01.9 period".into(),
+    });
+    let moved = events(&h.wait_changed().project);
+    assert_eq!(moved[0].source_seconds, 1.9);
+    assert_eq!(moved[4], tagged[4], "the goal is untouched");
+
+    let rest = h.shutdown();
+    no_project_changed(&rest);
+    assert_eq!(events(&p.saved()), moved);
 }
 
 /// A source move remaps the stored records but not the snapshots on the undo

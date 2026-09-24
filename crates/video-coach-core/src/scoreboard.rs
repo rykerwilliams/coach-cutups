@@ -790,6 +790,7 @@ impl Project {
     /// **No cap here**, as [`Project::append_match_event`] has none: the cap
     /// is the caller's, so a refusal is said out loud rather than silently
     /// doing nothing.
+    #[must_use = "an edit of an event that isn't there is a bug worth naming"]
     pub fn edit_match_event(
         &mut self,
         id: Uuid,
