@@ -317,12 +317,25 @@ pub fn parse_kickoffs(text: &str) -> Result<Vec<Restart>, TruthError> {
 fn mm_ss(text: &str) -> Option<f64> {
     let (minutes, seconds) = text.split_once(':')?;
     let minutes: u32 = minutes.parse().ok()?;
+    // The tenths are optional, because the app's own readout shows them while
+    // paused and a coach reading a restart off it writes down what they see.
+    let (whole, tenths) = match seconds.split_once('.') {
+        Some((whole, fraction)) => {
+            // One digit: `57.50` is a stopwatch habit, not this app's readout,
+            // and accepting it would invite `57.5000` and `57.500000001`.
+            if fraction.len() != 1 {
+                return None;
+            }
+            (whole, f64::from(fraction.parse::<u32>().ok()?) / 10.0)
+        }
+        None => (seconds, 0.0),
+    };
     // Two digits, and under a minute: `3:75` is a typo, not 4:15.
-    if seconds.len() != 2 {
+    if whole.len() != 2 {
         return None;
     }
-    let seconds: u32 = seconds.parse().ok()?;
-    (seconds < 60).then(|| f64::from(minutes) * 60.0 + f64::from(seconds))
+    let whole: u32 = whole.parse().ok()?;
+    (whole < 60).then(|| f64::from(minutes) * 60.0 + f64::from(whole) + tenths)
 }
 
 // ------------------------------------------------------- COACH_GROUND_TRUTH

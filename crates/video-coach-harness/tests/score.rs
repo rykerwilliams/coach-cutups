@@ -335,3 +335,16 @@ fn folders_name_matches_by_position_unless_labelled() {
     assert!(folders("A=/one:A=/two").is_err());
     assert!(folders("").is_err());
 }
+
+/// The app's readout shows tenths while paused, so a coach reading a restart
+/// off it writes down what they see. Whole seconds still parse.
+#[test]
+fn a_restart_may_carry_the_tenth_the_readout_showed() {
+    let restarts = parse_kickoffs("1 11:57.5\n2 3:04\n").expect("both lines parse");
+    assert_eq!(restarts[0].seconds, 717.5);
+    assert_eq!(restarts[1].seconds, 184.0);
+
+    for bad in ["1 11:57.50", "1 11:5.5", "1 11:60.5"] {
+        assert!(parse_kickoffs(bad).is_err(), "{bad} should be refused");
+    }
+}
