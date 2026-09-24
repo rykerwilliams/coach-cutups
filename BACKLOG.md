@@ -858,3 +858,22 @@ Each entry: what, why deferred, when to revisit.
   six checkboxes.
 - **When to revisit:** the first "can I turn that off", or when a second coach
   uses the app.
+
+79. **What the app does over a forwarded X11 display, and saying so.** The coach
+  asked (2026-09-24) whether it runs over remote X11. Expected answer: **no, by
+  construction** — `main.rs` selects Slint's Skia OpenGL renderer and fails
+  loudly otherwise, and that renderer needs **EGL** (CLAUDE.md's decode rules:
+  EGL is what lets GStreamer import decoded frames without a CPU copy; X11
+  forwarding offers indirect GLX). Even if it started, forwarding raw 1080p30
+  frames is gigabytes a minute with no hardware decode at the far end.
+- **What to do:** run it once over `ssh -X` and record **exactly** what happens —
+  a clear message naming the renderer, or a confusing crash. Then say it in the
+  README beside the other runtime requirements: this is a local application, and
+  remote use means streaming the screen (Sunshine/Moonlight, NoMachine, RustDesk
+  or VNC on the real session), not forwarding the display. If the failure is
+  confusing, make the message name EGL and point at that line.
+- **Why deferred:** nothing is broken; the gap is that a coach who tries it gets
+  no explanation.
+- **When to revisit:** with the next README pass, or the first time anyone asks
+  again. The docs session on `claude/docs` owns the README and is the natural
+  place for the wording once the behaviour is known.
