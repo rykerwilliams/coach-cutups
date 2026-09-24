@@ -118,10 +118,15 @@ pub struct CompilationPlan {
     pub entries: Vec<PlanEntry>,
     /// The file's chapters, `(start in output seconds, title)`, in order.
     ///
-    /// One per entry, titled with the entry's text bar line, for every target
-    /// but [`ExportTarget::WholeMatch`], whose chapters are the match's own
-    /// moments ([`crate::whole_match`], spec W3). Which it is belongs here,
-    /// with the plan, rather than in the splice that writes them.
+    /// One per entry, titled with the entry's text bar line, except that
+    /// [`ExportTarget::WholeMatch`]'s are the match's own moments
+    /// ([`crate::whole_match`], spec W3) and [`ExportTarget::Reel`]'s are its
+    /// goals worded for a list ([`crate::reel::reel_plan`]). Which it is
+    /// belongs here, with the plan, rather than in the splice that writes
+    /// them.
+    ///
+    /// They are also what [`crate::chapters::chapter_list`] turns into the
+    /// pasteable text file beside the output.
     ///
     /// A chapter starts at `start_frame / OUTPUT_FPS`, never at a sum of
     /// durations: per-entry quantization would put every later chapter up to
@@ -188,13 +193,10 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
     let all = project.clips.iter();
     let clips: Vec<&Clip> = match target {
-        ExportTarget::Reel(side) => {
-            let entries = crate::reel::reel_entries(project, *side);
-            return CompilationPlan {
-                chapters: entry_chapters(&entries),
-                entries,
-            };
-        }
+        // Entries and chapters together: a reel's chapters are worded from
+        // the goals its entries were cut around, not from their text bars
+        // ([`crate::reel::reel_plan`]).
+        ExportTarget::Reel(side) => return crate::reel::reel_plan(project, *side),
         ExportTarget::WholeMatch => {
             let entries = crate::whole_match::whole_match_entries(project);
             return CompilationPlan {

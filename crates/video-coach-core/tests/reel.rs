@@ -355,3 +355,128 @@ fn a_sides_goals_are_its_own() {
         (3, 2, 1)
     );
 }
+
+// -------------------------------------------------------------- chapters
+
+fn chapters(plan: &CompilationPlan) -> Vec<(f64, &str)> {
+    plan.chapters
+        .iter()
+        .map(|(at, title)| (*at, title.as_str()))
+        .collect()
+}
+
+/// A match tagged end to end over two 45-minute halves.
+fn tagged_match() -> Project {
+    let mut p = with_scoreboard(project(&[7000.0]));
+    for t in [0.0, 2700.0, 3000.0, 5700.0] {
+        p.append_match_event(MatchEventKind::StartStop, 0, t);
+    }
+    p
+}
+
+/// A reel's chapters are a second wording of its entries, not the text bar
+/// burned into them: a line of prose to read in a list.
+#[test]
+fn a_reels_chapters_read_as_prose_not_as_the_text_bar() {
+    let mut p = tagged_match();
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 500.0);
+
+    let plan = reel(&p);
+    assert_eq!(
+        texts(&plan),
+        ["1 / 2 | Rovers goal | 1-0", "2 / 2 | United goal | 1-1"],
+        "the burned-in caption is unchanged"
+    );
+    assert_eq!(
+        chapters(&plan),
+        [(0.0, "Goal 1 — Rovers 1-0"), (26.0, "Goal 2 — United 1-1")]
+    );
+}
+
+/// The period the goals move into is marked on the chapter that is already
+/// at the boundary: a reel's entries run back to back, so there is no gap
+/// between them to put a chapter of its own in.
+#[test]
+fn a_reel_marks_where_the_second_halfs_goals_begin() {
+    let mut p = tagged_match();
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 500.0);
+    p.append_match_event(HOME, 0, 3100.0);
+    p.append_match_event(HOME, 0, 4000.0);
+
+    assert_eq!(
+        chapters(&reel(&p)),
+        [
+            (0.0, "Goal 1 — Rovers 1-0"),
+            (26.0, "Goal 2 — United 1-1"),
+            (52.0, "Second half: Goal 3 — Rovers 2-1"),
+            (78.0, "Goal 4 — Rovers 3-1"),
+        ]
+    );
+}
+
+/// Quarters, and a marker that is neither a half nor the first boundary.
+#[test]
+fn a_marker_is_named_after_the_period_the_format_has() {
+    let mut p = with_scoreboard(project(&[7000.0]));
+    if let Some(c) = p.scoreboard.as_mut() {
+        c.format.regulation_periods = 4;
+        c.format.regulation_period_seconds = 12 * 60;
+    }
+    for t in [0.0, 720.0, 1000.0, 1720.0, 2000.0, 2720.0, 3000.0, 3720.0] {
+        p.append_match_event(MatchEventKind::StartStop, 0, t);
+    }
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(HOME, 0, 2100.0);
+    p.append_match_event(HOME, 0, 3100.0);
+
+    let plan = reel(&p);
+    let titles: Vec<&str> = chapters(&plan).into_iter().map(|c| c.1).collect();
+    assert_eq!(
+        titles,
+        [
+            "Goal 1 — Rovers 1-0",
+            "Third quarter: Goal 2 — Rovers 2-0",
+            "Fourth quarter: Goal 3 — Rovers 3-0",
+        ]
+    );
+}
+
+/// A reel whose goals all fall in one period gets no marker, and neither does
+/// its first entry — a boundary needs an entry on each side of it.
+#[test]
+fn one_period_of_goals_is_never_marked() {
+    let mut p = tagged_match();
+    p.append_match_event(HOME, 0, 3100.0);
+    p.append_match_event(HOME, 0, 4000.0);
+
+    assert_eq!(
+        chapters(&reel(&p)),
+        [(0.0, "Goal 1 — Rovers 1-0"), (26.0, "Goal 2 — Rovers 2-0")],
+        "the first entry opens the film, not a period"
+    );
+}
+
+/// With no scoreboard there are no periods to mark and no team names, exactly
+/// as the text bar has none.
+#[test]
+fn chapters_say_home_or_away_with_no_scoreboard() {
+    let mut p = project(&[7000.0]);
+    p.append_match_event(HOME, 0, 100.0);
+    p.append_match_event(AWAY, 0, 500.0);
+
+    assert_eq!(
+        chapters(&reel(&p)),
+        [(0.0, "Goal 1 — Home"), (26.0, "Goal 2 — Away")]
+    );
+}
+
+/// As for every other target, a single entry gets no chapters at all: one
+/// chapter only repeats the file.
+#[test]
+fn a_one_goal_reel_has_no_chapters() {
+    let mut p = tagged_match();
+    p.append_match_event(HOME, 0, 100.0);
+    assert!(reel(&p).chapters.is_empty());
+}

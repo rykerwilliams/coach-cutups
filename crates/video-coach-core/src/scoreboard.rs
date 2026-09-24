@@ -671,6 +671,26 @@ impl ScoreboardContext {
         self.state_at_abs(self.source_offsets[source_index.min(last)] + source_time)
     }
 
+    /// Which period the instant at `(source_index, source_time)` falls in:
+    /// the last period start at or before it, or `None` before the first one
+    /// (which subsumes "nothing tagged"), exactly as
+    /// [`scoreboard_state`] picks it.
+    ///
+    /// The goals reel's chapters ask, to mark where the period changes from
+    /// one goal to the next ([`crate::reel`]). Nothing else does: everything
+    /// else reads the period off the clock the board already draws.
+    pub fn period_at(&self, source_index: usize, source_time: f64) -> Option<u32> {
+        let last = self.source_offsets.len() - 1;
+        let now_abs = self.source_offsets[source_index.min(last)] + source_time;
+        interpret(&self.events, &self.config)
+            .iter()
+            .rev()
+            .find_map(|e| match e.role {
+                PeriodRole::Start(p) if e.abs_seconds <= now_abs => Some(p),
+                _ => None,
+            })
+    }
+
     /// The scoreboard at `now_abs` seconds on the virtual-concat timeline, for
     /// a caller that already has one — the scan readout, which would otherwise
     /// split an absolute position only for [`state_at`](Self::state_at) to add

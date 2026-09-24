@@ -235,7 +235,7 @@ impl Active {
                 eprintln!(
                     "bus: exported {}: {} frames in {seconds:.1} s ({:.1} fps), \
                      decoder {:?}, glupload caps {:?}, encoder {}, chapters {:?}, \
-                     sidecar {:?}, moov reserve left {:.1} s",
+                     sidecar {:?}, chapter list {:?}, moov reserve left {:.1} s",
                     done.path.display(),
                     target.frames,
                     target.frames as f64 / seconds,
@@ -244,6 +244,7 @@ impl Active {
                     done.encoder,
                     done.chapters,
                     done.sidecar,
+                    done.chapter_list,
                     done.reserve_remaining
                 );
                 TargetState::Done(done.path)

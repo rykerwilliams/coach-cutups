@@ -391,6 +391,10 @@ fn a_single_source_is_copied_with_no_chapters() {
         text: "Rovers 0 - 0 Athletic · 00:00".into(),
     }];
     let path = dir.path().join("out.mp4");
+    // No chapters means no pasteable list either, and the one an earlier run
+    // left beside this path goes with them.
+    let chapter_list = dir.path().join("out.chapters.txt");
+    std::fs::write(&chapter_list, "0:00 an older cut\n").unwrap();
 
     let done = copy(ExportJob {
         tags: FileTags::default(),
@@ -403,6 +407,11 @@ fn a_single_source_is_copied_with_no_chapters() {
     assert_eq!(video_stream(&path).4, video_stream(&m.files[0]).4);
     assert_eq!(done.sidecar, Some(dir.path().join("out.srt")));
     assert!(chapters(&path).is_empty(), "a lone source got a chapter");
+    assert_eq!(done.chapter_list, None);
+    assert!(
+        !chapter_list.exists(),
+        "a copy with no chapters left the old list beside it"
+    );
     // Picture, sound and the scoreboard: a lone source is carried on the same
     // three tracks a joined one is.
     assert_eq!(streams(&path), 3, "a track went missing");
@@ -733,4 +742,42 @@ fn a_tagged_copy_is_still_lossless_and_still_chaptered() {
             "{title:?} starts at {at}, not {want_at}"
         );
     }
+}
+
+/// The pasteable chapter list lands beside the copied file too: it is
+/// `composite::export`'s `finish` that writes it, which both renderers go
+/// through, and this is the copy's half of that.
+///
+/// **The chapters are set by hand and the film is three seconds long**, as on
+/// the encoded path: the list is a pure function of `plan.chapters`
+/// (`video_coach_core::chapters::chapter_list`), so joining half an hour of
+/// footage to space three chapters ten seconds apart would buy nothing. The
+/// `chpl` box gets the same list, which is what proves the two readings of
+/// `plan.chapters` — the one inside the file and the one beside it — are of
+/// the same list.
+#[test]
+fn a_chapter_list_lands_beside_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut m = whole_match(
+        dir.path(),
+        &[("first half", 640, 360, 60), ("second half", 640, 360, 45)],
+    );
+    m.compilation.plan.chapters = vec![
+        (0.0, "Kick-off".into()),
+        (845.4, "Rovers goal 1-0".into()),
+        (1651.9, "Half time".into()),
+    ];
+    let path = dir.path().join("out.mp4");
+
+    let done = copy(job(&m, path.clone())).unwrap();
+
+    let chapter_list = dir.path().join("out.chapters.txt");
+    assert_eq!(done.chapter_list, Some(chapter_list.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&chapter_list).unwrap(),
+        "0:00 Kick-off\n14:05 Rovers goal 1-0\n27:31 Half time\n"
+    );
+    assert_eq!(decode_counters(&path), want(&m), "the copy lost frames");
+    let titles: Vec<String> = chapters(&path).into_iter().map(|c| c.1).collect();
+    assert_eq!(titles, ["Kick-off", "Rovers goal 1-0", "Half time"]);
 }

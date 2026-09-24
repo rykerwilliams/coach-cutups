@@ -109,8 +109,9 @@ fn a_match_with_no_events_gets_one_chapter_per_source() {
     assert!(whole(&project(&[100.0])).chapters.is_empty());
 }
 
-/// Other targets keep their chapter per entry (spec C2): a reel's are its
-/// goals' captions, whatever the match's events are.
+/// Other targets keep their chapter per entry (spec C2): a reel's are its own
+/// goals, whatever the match's events are. Their wording is a reel's, not the
+/// match's — `tests/reel.rs` is where it is pinned.
 #[test]
 fn the_reel_keeps_a_chapter_per_entry() {
     let mut p = project(&[1000.0]);
@@ -119,6 +120,6 @@ fn the_reel_keeps_a_chapter_per_entry() {
     let reel = compilation_plan(&p, &ExportTarget::Reel(ReelSide::All));
     assert_eq!(
         chapters(&reel),
-        [(0.0, "1 / 2 | Home goal"), (26.0, "2 / 2 | Home goal")]
+        [(0.0, "Goal 1 — Home"), (26.0, "Goal 2 — Home")]
     );
 }

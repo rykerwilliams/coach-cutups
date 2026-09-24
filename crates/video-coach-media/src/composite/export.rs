@@ -38,6 +38,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use video_coach_core::audio::{Region, AUDIO_SAMPLE_RATE};
+use video_coach_core::chapters::chapter_list;
 use video_coach_core::cues::{cues_to_srt, Cue};
 use video_coach_core::export::{Compilation, OUTPUT_FPS};
 use video_coach_core::highlight::{highlight_shapes, PlayerHighlight};
@@ -188,6 +189,10 @@ pub struct ExportDone {
     /// carried no cues, or the write failed, which is reported and never
     /// fatal.
     pub sidecar: Option<PathBuf>,
+    /// The pasteable chapter list written beside the file, or `None` — the
+    /// plan's chapters make no list YouTube would read (a stale one is then
+    /// removed), or the write failed, which is reported and never fatal.
+    pub chapter_list: Option<PathBuf>,
     /// What was left of the `moov` reserve at EOS, for the log line: see
     /// [`reserve_remaining`].
     pub reserve_remaining: f64,
@@ -403,6 +408,7 @@ fn finish(job: &ExportJob, part: &Path, rendered: Rendered) -> Result<ExportDone
         diagnostics: rendered.diagnostics,
         chapters,
         sidecar: write_sidecar(job),
+        chapter_list: write_chapter_list(job),
         reserve_remaining: rendered.reserve_remaining,
     })
 }
@@ -437,6 +443,54 @@ fn write_sidecar(job: &ExportJob) -> Option<PathBuf> {
         Err(e) => {
             eprintln!(
                 "export: could not write the scoreboard {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The plan's chapters beside the finished file, as the block of text a
+/// YouTube description takes: `<output>.chapters.txt`, from
+/// [`chapter_list`].
+///
+/// **A YouTube upload can't read the chapters inside the file** — `chpl` is
+/// for `ffprobe`, mpv and VLC — so the same list goes beside it as something
+/// to paste. `.chapters.txt` rather than a second use of the output's own
+/// extension slot: it says what it is, it sorts next to its video, and it
+/// can't be mistaken for (or collide with) the `.srt`. Like the `.srt` it is
+/// built from `job.path`, so it inherits the run's name cleaning and its
+/// `" (2)"` de-duplication.
+///
+/// **Every target that has chapters gets one**, not only the whole match: a
+/// compilation's chapters are its clips and a reel's are its goals, which are
+/// just as pasteable. There is no `None` case as [`ExportJob::cues`] has,
+/// because `.chapters.txt` is a name of ours: whatever is at that path beside
+/// an export of ours is an export of ours, so a run that has no list to write
+/// **removes** the stale one rather than leaving a chapter list that no
+/// longer describes the film. That is also what a plan whose chapters break
+/// YouTube's rules does ([`chapter_list`] returns `None`).
+///
+/// **A failure is reported, never fatal**, and like the `.srt` it runs only
+/// after the rename, so a cancelled or failed run neither writes nor removes
+/// anything.
+fn write_chapter_list(job: &ExportJob) -> Option<PathBuf> {
+    let path = job.path.with_extension("chapters.txt");
+    let Some(text) = chapter_list(&job.compilation.plan.chapters) else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!(
+                "export: could not remove the old chapter list {}: {e}",
+                path.display()
+            ),
+            _ => {}
+        }
+        return None;
+    };
+    match std::fs::write(&path, text) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!(
+                "export: could not write the chapter list {}: {e}",
                 path.display()
             );
             None

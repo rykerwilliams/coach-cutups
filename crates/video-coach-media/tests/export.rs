@@ -1701,6 +1701,10 @@ fn a_compilation_gets_a_chapter_per_entry() {
     let path = dir.path().join("out.mp4");
     let sidecar = dir.path().join("out.srt");
     std::fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nold score\n\n").unwrap();
+    // Three chapters half a second apart: a list YouTube would ignore, so
+    // none is written and the one left by an earlier run goes.
+    let chapter_list = dir.path().join("out.chapters.txt");
+    std::fs::write(&chapter_list, "0:00 an older cut\n").unwrap();
     let done = export(ExportJob {
         tags: FileTags::default(),
         compilation,
@@ -1732,6 +1736,11 @@ fn a_compilation_gets_a_chapter_per_entry() {
     assert!(
         !sidecar.exists(),
         "a burned export left the old scoreboard beside it"
+    );
+    assert_eq!(done.chapter_list, None);
+    assert!(
+        !chapter_list.exists(),
+        "an export with no pasteable list left the old one beside it"
     );
 
     let got = ffprobe_chapters(&path);
@@ -1814,4 +1823,44 @@ fn an_encoded_export_tags_its_file_and_still_chapters_it() {
             "{title:?} starts at {at}, not {want_at}"
         );
     }
+}
+
+/// The pasteable chapter list lands beside the encoded file, in the form a
+/// YouTube description parses.
+///
+/// **The chapters are set by hand and the film is a second long.** The list
+/// is a pure function of `plan.chapters`
+/// (`video_coach_core::chapters::chapter_list`), so what matters here is that
+/// media writes what core returns, at the right path, beside the video —
+/// rendering half an hour of footage to space three chapters ten seconds
+/// apart would buy the test nothing.
+#[test]
+fn a_chapter_list_lands_beside_the_encode() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(dir.path(), CounterKind::H264Mp4BFrames);
+    let path = dir.path().join("out.mp4");
+    let frames = (0..30)
+        .map(|n| FrameSpec {
+            entry: 0,
+            source_time: f64::from(n) / 30.0,
+            zoom: Zoom::IDENTITY,
+        })
+        .collect();
+    let mut job = job(src.path.clone(), frames, path.clone());
+    job.compilation.plan.chapters = vec![
+        (0.0, "Kick-off".into()),
+        (845.4, "Rovers goal 1-0".into()),
+        (1651.9, "Half time".into()),
+    ];
+    let done = export(job).unwrap();
+
+    let chapter_list = dir.path().join("out.chapters.txt");
+    assert_eq!(done.chapter_list, Some(chapter_list.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&chapter_list).unwrap(),
+        "0:00 Kick-off\n14:05 Rovers goal 1-0\n27:31 Half time\n"
+    );
+    // Beside the video it belongs to, and nowhere near the `.srt`'s name.
+    assert!(path.exists());
+    assert!(!dir.path().join("out.srt").exists());
 }
