@@ -13,6 +13,7 @@ pub mod event;
 pub mod export;
 pub mod highlight;
 pub mod layout;
+pub mod match_entry;
 pub mod plan;
 pub mod project;
 pub mod recording;

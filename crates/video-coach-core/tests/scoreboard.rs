@@ -881,3 +881,91 @@ fn a_chapter_drops_the_score_where_the_scoreboard_has_none() {
 
     assert_eq!(labels(chapter_events(&p)), ["A goal"]);
 }
+
+// ------------------------------------------------------- editing an event
+
+/// An edit moves the record; it never replaces it. The id is what the rows,
+/// the scrubber's marks and Go all key on, and the reel trims hang off the
+/// record so they follow the goal.
+#[test]
+fn editing_an_event_keeps_its_id_and_its_reel_trims_across_the_two_goals() {
+    let mut p = project_with_sources(&[600.0, 600.0]);
+    let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+    p.set_reel_trim(goal, ReelEnd::Start, Some((0, 88.0)))
+        .unwrap();
+    p.set_reel_trim(goal, ReelEnd::End, Some((0, 104.5)))
+        .unwrap();
+
+    assert!(p.edit_match_event(goal, MatchEventKind::AwayGoal, 1, 250.0));
+    assert_eq!(p.match_events.len(), 1);
+    let record = &p.match_events[0];
+    assert_eq!(record.id, goal);
+    assert_eq!(record.kind, MatchEventKind::AwayGoal);
+    assert_eq!((record.source_index, record.source_seconds), (1, 250.0));
+    // Relative trims, so they still mean the same twelve seconds before it.
+    assert_eq!(trims(&p, goal), (Some(12.0), Some(4.5)));
+}
+
+/// A goal that becomes a start/stop loses its trims: they are meaningless on
+/// one, and `set_reel_trim` refuses one.
+#[test]
+fn a_goal_that_becomes_a_start_stop_loses_its_reel_trims() {
+    let mut p = project_with_sources(&[600.0]);
+    let goal = p.append_match_event(MatchEventKind::HomeGoal, 0, 100.0);
+    p.set_reel_trim(goal, ReelEnd::Start, Some((0, 88.0)))
+        .unwrap();
+
+    assert!(p.edit_match_event(goal, MatchEventKind::StartStop, 0, 100.0));
+    assert_eq!(trims(&p, goal), (None, None));
+    assert!(!p.edit_match_event(Uuid::new_v4(), MatchEventKind::HomeGoal, 0, 1.0));
+}
+
+/// Re-timing an event moves it in match order, and a start/stop's role is its
+/// position — so the rows either side change wording as soon as it lands.
+#[test]
+fn a_re_timed_start_stop_takes_the_role_of_its_new_place() {
+    let mut p = project_with_sources(&[3000.0, 3000.0]);
+    p.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    let second = p.append_match_event(MatchEventKind::StartStop, 0, 2800.0);
+    p.append_match_event(MatchEventKind::StartStop, 1, 100.0);
+
+    let label_of = |p: &Project, id: Uuid| {
+        labelled_events(p)
+            .into_iter()
+            .find(|e| e.event.id == id)
+            .map(|e| e.label)
+            .unwrap()
+    };
+    assert_eq!(label_of(&p, second), "1H end");
+    // Past the third, it is the second half's start and the third is its end.
+    assert!(p.edit_match_event(second, MatchEventKind::StartStop, 1, 200.0));
+    assert_eq!(label_of(&p, second), "2H start");
+    assert_eq!(
+        labels(labelled_events(&p)),
+        ["1H start", "1H end", "2H start"],
+        "the roles are positional, so the list of labels never changes"
+    );
+}
+
+/// With the back-anchor on, period 1's start is derived from the earliest
+/// stored start/stop — so re-timing that one moves every later clock reading,
+/// and the clock in every export with it.
+#[test]
+fn re_timing_the_earliest_start_stop_moves_the_whole_back_anchored_clock() {
+    let mut p = project_with_sources(&[3000.0]);
+    let mut config = config(periods(2, 600));
+    config.auto_back_anchor_p1 = true;
+    p.scoreboard = Some(config.clone());
+    let first = p.append_match_event(MatchEventKind::StartStop, 0, 700.0);
+
+    // The derived kick-off sits one period before the stored end: 100 s.
+    assert_eq!(
+        clock(400.0, &config, &p.absolute_match_events()),
+        running(300.0)
+    );
+    assert!(p.edit_match_event(first, MatchEventKind::StartStop, 0, 800.0));
+    assert_eq!(
+        clock(400.0, &config, &p.absolute_match_events()),
+        running(200.0)
+    );
+}

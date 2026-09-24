@@ -769,6 +769,41 @@ impl Project {
         Ok(())
     }
 
+    /// Move or retype the event with `id`. Returns false if there is none.
+    ///
+    /// **It moves the record; it never replaces it.** The id is the key the
+    /// panel's rows, the scrubber's marks and Go all use; the reel trims hang
+    /// off the record and are stored relative to the goal precisely so they
+    /// follow it; and [`interpret`]'s tie-break is stored order, which a
+    /// delete-and-re-add would flip for two events sharing an instant.
+    ///
+    /// Clears the reel trims when the kind stops being a goal: they are
+    /// meaningless on a start/stop, and [`Project::set_reel_trim`] refuses
+    /// one. Home goal ↔ away goal keeps them.
+    ///
+    /// **No cap here**, as [`Project::append_match_event`] has none: the cap
+    /// is the caller's, so a refusal is said out loud rather than silently
+    /// doing nothing.
+    pub fn edit_match_event(
+        &mut self,
+        id: Uuid,
+        kind: MatchEventKind,
+        source_index: usize,
+        source_seconds: f64,
+    ) -> bool {
+        let Some(record) = self.match_events.iter_mut().find(|m| m.id == id) else {
+            return false;
+        };
+        if !kind.is_goal() {
+            record.reel_lead_in = None;
+            record.reel_tail = None;
+        }
+        record.kind = kind;
+        record.source_index = source_index;
+        record.source_seconds = source_seconds;
+        true
+    }
+
     /// Remove the event with `id` and return it, or `None` if there is none.
     pub fn delete_match_event(&mut self, id: Uuid) -> Option<MatchEventRecord> {
         let i = self.match_events.iter().position(|m| m.id == id)?;
