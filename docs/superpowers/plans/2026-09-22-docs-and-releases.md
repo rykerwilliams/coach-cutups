@@ -2,10 +2,20 @@
 
 **Date:** 2026-09-22
 **Spec:** `docs/superpowers/specs/2026-09-22-docs-and-releases-design.md`
-**Branch:** `claude/docs` (worktree `.claude/worktrees/docs`), off `origin/main` = `1213305`
-**Status:** Reviewed. Simplify and correctness passes applied.
+**Branch:** `claude/docs` (worktree `.claude/worktrees/docs`), rebased 2026-09-24 onto `claude/intelligent-lamport-m2indd` = `8dcf6d0`
+**Status:** Reviewed. Simplify and correctness passes applied. Amended 2026-09-24 for the state of the repo (see "What changed since the review").
 
 **Execution.** A fresh subagent runs each task, given this plan, the spec and `CLAUDE.md`. The orchestrator commits each task. It also does every outward step itself, because they are public: branch pushes, pushes to `main`, tags, and enabling Pages.
+
+## What changed since the review
+
+The plan was written against `origin/main` = `1213305`, when the workspace said `0.1.0` and the first release was to be `v0.1.0`. Two days of work on the Linux session's branch changed that:
+
+- **The workspace is at `0.5.0`**, through six bumps: `1e125ba` 0.1.1, `0bd18b3` 0.2.0, `b58bb89` 0.2.1, `5f0d7e7` 0.3.0, `9962dc0` 0.4.0, `d458762` 0.5.0. **No tag exists**, local or on origin, so *nothing has ever been published* — those bumps are history, not releases.
+- **The base is the Linux session's branch,** not `main`. `main` is six versions behind and the user installs from the branch. The Linux session will not fast-forward `main` on its own initiative; that is the user's call, and this plan's outward steps wait on it.
+- **Cargo.toml belongs to the Linux session.** It keeps bumping (0.6.0 is close). This branch never edits it.
+- **CLAUDE.md belongs to the Linux session too** — its agents edit it every session. The Releasing bullet is sent to that session as a diff rather than edited here.
+- **The changelog is therefore retrospective:** 0.1.0 through 0.5.0, written from the Linux session's own plain-language bullets (it has the user context), collapsing 0.1.0 and 0.1.1 into one initial-release entry because neither was published.
 
 ## Known facts
 
@@ -39,13 +49,19 @@
 
 ### Task 1: The changelog and release notes
 
-1. **`CHANGELOG.md`** in Keep a Changelog 1.1.0 format. The header names Keep a Changelog and Semantic Versioning.
-   - `## [Unreleased]` is empty.
-   - **`## [0.1.0] - 2026-09-22`** is the first Linux release, under `Added`, written for a coach in 10–20 lines.
+1. **`CHANGELOG.md`** in Keep a Changelog 1.1.0 format. The header names Keep a Changelog and Semantic Versioning. It is **retrospective**: six sections, newest first, from the Linux session's bullets (quoted below verbatim as the source of truth for what mattered to a coach).
+   - **`## [Unreleased]`** holds what is on the branch after `d458762`: a chapter list to paste into a YouTube description, and the scoreboard `.srt` confirmed to upload to YouTube as a subtitle track. Nothing else — the detection work is internal.
+   - **`## [0.5.0] - 2026-09-24`** — type or paste match events instead of tagging them live, and fix a wrong one by retyping a single line. A colour picker for team kits. Goal cuts start 20 s before the goal rather than 30. Every exported file is tagged with its title, the final score, both teams and the match's date.
+   - **`## [0.4.0] - 2026-09-23`** — the whole match exports as a straight copy of the original footage: minutes instead of an hour, a third of the size, no quality lost, with the scoreboard as a subtitle track beside and inside the file. Under `Fixed`: exports at every quality are much smaller (a match at Medium went from ~10 GB to ~2.7 GB) after the encoder was found to be running with no bitrate discipline, and software-only machines were quietly exporting at ~1.7 Mbit/s whatever quality was picked.
+   - **`## [0.3.0] - 2026-09-23`** — record with a picture of yourself instead of the webcam: the camera is never opened, and the picture pulses as you talk, live and in the finished video.
+   - **`## [0.2.1] - 2026-09-22`** — export the whole match with the clock and score burned in; a separate reel for each team's goals; chapters named for a viewer ("Kick-off", "Rovers goal 1-0", "Half time").
+   - **`## [0.2.0] - 2026-09-22`** — a goals reel: every goal as one video, each cut with the build-up before it, trimmed per goal. Chapters in every exported file. Goal and period marks on the scrubber, with `[` and `]` to jump between them. Player highlights: ring a player and the ring follows the boxes you place, live, in previews and in exports.
+   - **`## [0.1.0] - 2026-09-22`** is the initial release, under `Added`, written for a coach in 10–20 lines. It **absorbs 0.1.1**, which was a build made for one person on one laptop: fold in the frame step (`,` / `.`) and fast scanning (`J` / `L`, up to 32×).
      - **Sources:** the README's "What it does" and the hands-on checklist: projects, scanning several sources, recording commentary with drawing and zoom, clips, tags, notes, filtering and undo, the scoreboard and match clock, transcripts, export, and the `.deb`.
      - **What a coach can do, not how:** no GStreamer, no VA-API. One line may name the platform: Ubuntu 24.04 / Linux Mint 22, x86-64.
-     - **Inline links only inside sections.** A section is cut out whole for the release notes, and a reference-style link would lose its definition.
-   - **Link references at the bottom:** `[Unreleased]: …/compare/v0.1.0...HEAD` and `[0.1.0]: …/releases/tag/v0.1.0`.
+   - **Every section:** grouped under Keep a Changelog headings (`Added`, `Changed`, `Fixed`), plain language, and **inline links only** — a section is cut out whole for the release notes, and a reference-style link would lose its definition.
+   - **Link references at the bottom:** `[Unreleased]: …/compare/v0.5.0...HEAD`, then one `…/releases/tag/vX.Y.Z` per released version, and `…/compare/vA...vB` is not used (there are no earlier tags to compare against).
+   - **Honesty about the dates:** these versions were never published. The changelog records when each was cut, which is what the commit dates say; don't invent release dates.
 2. **`scripts/release-notes.sh <version>`** prints the body of `## [<version>]`.
    - **The heading match is literal:** `index($0, "## [" v "]") == 1`, never a regex.
    - The body runs to the next `## ` heading or the first link-reference line (`[…]: `).
@@ -65,7 +81,7 @@
   - Remove "there are none published yet…".
   - Replace it with: download `coach-cuts_<version>_amd64.deb` from the [latest release](https://github.com/rykerwilliams/coach-cutups/releases/latest), then run `sudo apt install ./coach-cuts_*_amd64.deb`.
   - Leave the rest of the README alone; D2 reshapes it.
-- **CLAUDE.md's Releasing bullet** is rewritten tight, since agents read it every session. It covers:
+- **CLAUDE.md's Releasing bullet** is rewritten tight, since agents read it every session. **It is not edited on this branch** — CLAUDE.md is the Linux session's, whose agents edit it several times a day. Draft the replacement text into `/tmp/claude-1000/.../scratchpad/claude-md-releasing.md`; the orchestrator sends it to that session to apply. It covers:
   - **Choosing the number by semver.** While pre-1.0, a feature or a `formatVersion` bump means a minor bump.
   - **One commit:** `[Unreleased]` becomes `## [x.y.z] - YYYY-MM-DD`; add a fresh `[Unreleased]`; fix the link references; bump `[workspace.package] version`. The user reads the section (`scripts/release-notes.sh x.y.z`) before saying go.
   - **Then:** merge to `main`; `git tag v<version> <sha> && git push origin v<version>`.
@@ -74,22 +90,27 @@
 
 **Done when** the README and CLAUDE.md diffs are confined to those two places.
 
-### Task 3: Ship v0.1.0 (orchestrator)
+### Task 3: Ship the first real release (orchestrator)
 
-1. Check that `rust.yml` is green on `main`'s head. Cite the last green `release.yml` run on the same code: 35703153862.
-2. **Show the user** the output of `scripts/release-notes.sh 0.1.0`, and get their go.
-3. If today isn't the changelog's date, fix the date in the same commit.
-4. **Fast-forward `main`:** `git push origin claude/docs:main`.
-5. **Tag the known SHA:** `sha=$(git rev-parse claude/docs)`, then `git tag -a v0.1.0 -m "Coach Cuts 0.1.0" $sha && git push origin v0.1.0`.
-6. **Watch the run.**
+**Which version.** The workspace says `0.5.0` and 0.6.0 is close on the Linux branch. The first published release is whichever of those the **user** picks; the machinery is identical either way. Don't tag on initiative.
+
+**Two decisions that are the user's, put to them together:**
+- whether `main` is fast-forwarded to the Linux branch first (releases should come off `main`, and `main` is six versions behind);
+- whether to publish `v0.5.0` now or wait for 0.6.0.
+
+1. **Show the user** the whole changelog and the output of `scripts/release-notes.sh <version>`, and get their go on both decisions above.
+2. Check that `rust.yml` is green on the SHA being tagged. The last green `release.yml` run is 35703153862, at `4ef65bf` — **five versions old**, so it proves the pipeline, not this code.
+3. **Fast-forward `main`** once the user says so, coordinating with the Linux session (it owns that branch's content): `git push origin claude/docs:main`, which carries its commits and these.
+4. **Tag the known SHA**, never a moving branch: `sha=$(git rev-parse claude/docs)`, then `git tag -a v<version> -m "Coach Cuts <version>" $sha && git push origin v<version>`. The SHA's `[workspace.package] version` must equal the tag without its `v`, or the `version` job fails by design.
+5. **Watch the run.**
    - If it fails before `release`, nothing is published: delete the tag (locally and on origin), fix it, and tag again.
    - On success, check that the Release page shows the `.deb` and the notes, with no stray headings.
-7. **Message the Linux session:**
-   - the changelog is on `main`, and the `[Unreleased]` and guide rules are live;
-   - `release.yml` now fails a version with no section;
-   - under the semver rule, a format v8 after `1e125ba` makes its next release at least `0.2.0` unless it tags `1e125ba` itself. That's their call and the user's.
+6. **Message the Linux session:**
+   - the changelog is in, and the `[Unreleased]` and guide rules are live;
+   - `release.yml` now fails a version with no changelog section — a bump without one breaks its release;
+   - the earlier versions stay untagged history unless the user asks otherwise.
 
-**Done when** `…/releases/tag/v0.1.0` has the `.deb` and the notes.
+**Done when** `…/releases/tag/v<version>` has the `.deb` and the notes.
 
 ---
 
