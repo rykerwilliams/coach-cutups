@@ -93,6 +93,32 @@ mod tests {
         assert_eq!(format_hms_tenths(f64::INFINITY), "0:00.0");
     }
 
+    /// Core renders the match editor's times with a copy of this, because it
+    /// builds the lines of the grammar and declares no media dependency while
+    /// this module imports glib. Two five-line functions, one test holding
+    /// them together.
+    #[test]
+    fn core_s_copy_of_format_hms_tenths_agrees_with_it() {
+        for seconds in [
+            0.0,
+            0.05,
+            14.06,
+            59.99,
+            754.99,
+            3599.9,
+            3723.45,
+            -5.0,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            assert_eq!(
+                format_hms_tenths(seconds),
+                video_coach_core::match_entry::format_time(seconds),
+                "{seconds}"
+            );
+        }
+    }
+
     /// The clock's shape is the locale's, so both renderings are accepted:
     /// what's pinned here is the arithmetic and the refusals.
     #[test]

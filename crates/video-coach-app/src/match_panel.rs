@@ -7,6 +7,9 @@
 //! go through the bus.
 
 use uuid::Uuid;
+use video_coach_core::match_entry::{
+    format_line, format_time, Batch, BatchVerdict, PendingMatchEvent,
+};
 use video_coach_core::project::Project;
 use video_coach_core::scoreboard::{
     format_clock, labelled_events, MatchEventKind, MatchEventRecord, MatchFormat, ScoreboardConfig,
@@ -28,6 +31,13 @@ pub const CHAPTER_TOLERANCE: f64 = 0.5;
 pub struct MatchRowText {
     pub id: Uuid,
     pub kind: MatchEventKind,
+    /// Which source video it is tagged on, and how far into it: where the
+    /// editor's row reads it from ([`editor_row_where`]) and what the line in
+    /// its field says. The panel ignores both — they are here rather than in a
+    /// second builder, so the editor cannot order its list differently from
+    /// the panel, the scrubber's marks and `[` / `]` (spec T1).
+    pub source_index: usize,
+    pub source_seconds: f64,
     /// Where it sits on the concat timeline, in seconds.
     pub abs: f64,
     /// Where it sits on the concat timeline, already formatted.
@@ -53,6 +63,8 @@ pub fn match_rows(project: &Project) -> Vec<MatchRowText> {
         .map(|e| MatchRowText {
             id: e.event.id,
             kind: e.event.kind,
+            source_index: e.event.source_index,
+            source_seconds: e.event.source_seconds,
             abs: e.abs_seconds,
             time: format_hms(e.abs_seconds),
             label: e.label,
@@ -76,6 +88,140 @@ fn reel_span(goal: &MatchEventRecord) -> String {
     };
     let (lead_in, tail) = goal.reel_span();
     format!("−{} s / +{} s", seconds(lead_in), seconds(tail))
+}
+
+// ------------------------------------------------- the match event editor
+//
+// The editor's every string, so the sheet holds none (spec T, B). The
+// verdicts are core's `match_entry`, which the bus parses the same text with:
+// the wording lives here and the rules live there, and the sheet's mark and
+// the command it sends can't reach different answers.
+
+/// The line the editor seeds a selected row's field with: core's
+/// [`format_line`] for that row's record.
+///
+/// The bus rebuilds the same seed from the same record when the line comes
+/// back (`bus::scoreboard::edit_match_event`), so an edit that leaves the time
+/// alone keeps the stored seconds to the last decimal. Empty for a row with no
+/// record behind it, which [`match_rows`] never produces.
+pub fn editor_row_line(project: &Project, row: &MatchRowText) -> String {
+    project
+        .match_events
+        .iter()
+        .find(|m| m.id == row.id)
+        .map(|record| format_line(project, record))
+        .unwrap_or_default()
+}
+
+/// A row's "where": the 1-based video number and the time into that video, the
+/// paste grammar's own numbering (spec T2).
+pub fn editor_row_where(row: &MatchRowText) -> String {
+    where_text(row.source_index, row.source_seconds)
+}
+
+fn where_text(source_index: usize, source_seconds: f64) -> String {
+    format!("{} · {}", source_index + 1, format_time(source_seconds))
+}
+
+/// One echoed line of the paste box (spec B3).
+pub struct PasteLineText {
+    /// `✓` it will add, `•` it is already tagged, `✗` it is refused.
+    pub glyph: &'static str,
+    pub text: String,
+}
+
+/// Everything the paste box says about the block it holds: a line each, the
+/// summary above the button, and the button's own label.
+pub struct PasteEcho {
+    pub lines: Vec<PasteLineText>,
+    pub summary: String,
+    pub button: String,
+}
+
+/// Reads a parsed block back to the coach, line by line, before Add is pressed
+/// (spec B3).
+///
+/// Blank and comment-only lines say nothing, so they are not in `batch.lines`
+/// and get no row here. A refusal quotes its line back with its number, which
+/// is how the coach finds it in a block of twenty.
+pub fn paste_echo(batch: &Batch) -> PasteEcho {
+    let (mut adding, mut tagged, mut refused) = (0, 0, 0);
+    let lines = batch
+        .lines
+        .iter()
+        .map(|line| match &line.verdict {
+            BatchVerdict::Added(event) => {
+                adding += 1;
+                PasteLineText {
+                    glyph: "✓",
+                    text: reads_as(event),
+                }
+            }
+            BatchVerdict::AlreadyTagged(event) => {
+                tagged += 1;
+                PasteLineText {
+                    glyph: "•",
+                    text: format!("{} — already tagged, skipped", reads_as(event)),
+                }
+            }
+            BatchVerdict::Refused(reason) => {
+                refused += 1;
+                PasteLineText {
+                    glyph: "✗",
+                    text: format!("line {}: \"{}\" — {reason}", line.number, line.text),
+                }
+            }
+        })
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if adding > 0 {
+        parts.push(format!("{adding} {} to add", plural(adding, "event")));
+    }
+    if tagged > 0 {
+        parts.push(format!("{tagged} already tagged"));
+    }
+    if refused > 0 {
+        parts.push(format!("{refused} {} refused", plural(refused, "line")));
+    }
+    PasteEcho {
+        lines,
+        summary: parts.join(" · "),
+        // Nothing to add is a disabled button, which says nothing but its name.
+        button: match adding {
+            0 => "Add".to_string(),
+            n => format!("Add {n} {}", plural(n, "event")),
+        },
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => noun.to_string(),
+        _ => format!("{noun}s"),
+    }
+}
+
+/// A line that will add, or one already tagged, as the echo reads it back:
+/// where it lands and what it is.
+fn reads_as(event: &PendingMatchEvent) -> String {
+    format!(
+        "{} · {}",
+        where_text(event.source_index, event.source_seconds),
+        pending_label(event.kind)
+    )
+}
+
+/// An untagged event's kind in the panel's own words ([`labelled_events`]).
+///
+/// A start/stop is just that: `interpret` gives it a period from its place
+/// among the others, which it does not have until it lands.
+fn pending_label(kind: MatchEventKind) -> &'static str {
+    match kind {
+        MatchEventKind::HomeGoal => "Home goal",
+        MatchEventKind::AwayGoal => "Away goal",
+        MatchEventKind::StartStop => "Start/stop",
+    }
 }
 
 /// Every match event's place on the concat timeline, in match order: the
@@ -269,6 +415,7 @@ fn parse_count(text: &str, min: u32, max: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use video_coach_core::match_entry::parse_batch;
     use video_coach_core::project::SourceRef;
     use video_coach_core::scoreboard::{ReelEnd, ScoreboardContext};
 
@@ -277,7 +424,8 @@ mod tests {
         for i in 0..2 {
             p.source_videos.push(SourceRef {
                 relative_path: format!("{i}.mp4"),
-                display_name: format!("{i}"),
+                // A name the editor's refusals can quote back readably.
+                display_name: format!("clip {}", i + 1),
                 duration_seconds: 600.0,
                 display_aspect: 16.0 / 9.0,
             });
@@ -446,6 +594,114 @@ mod tests {
         // Past the one-minute period: the tail rides beside the clock.
         let stoppage = ctx.state_at(0, 175.0);
         assert_eq!(clock_text(stoppage.as_ref()), "01:00 +0:15");
+    }
+
+    /// The editor's row, from the same list the panel's rows come from: the
+    /// video it is tagged on, the time into it, and the line its field is
+    /// seeded with — core's, not a second rendering.
+    #[test]
+    fn an_editor_row_names_its_video_and_carries_its_line() {
+        let mut p = project();
+        p.append_match_event(MatchEventKind::HomeGoal, 0, 30.0);
+        // The second source starts 600 s in, so these two sort after it.
+        p.append_match_event(MatchEventKind::StartStop, 1, 0.0);
+        p.append_match_event(MatchEventKind::AwayGoal, 1, 125.06);
+
+        let rows = match_rows(&p);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.source_index, r.source_seconds))
+                .collect::<Vec<_>>(),
+            [(0, 30.0), (1, 0.0), (1, 125.06)]
+        );
+        assert_eq!(
+            rows.iter().map(editor_row_where).collect::<Vec<_>>(),
+            ["1 · 0:30.0", "2 · 0:00.0", "2 · 2:05.0"]
+        );
+        // One line per kind, and `period` for the start/stop, whose stored
+        // record doesn't know which end of a half it is.
+        assert_eq!(
+            rows.iter()
+                .map(|r| editor_row_line(&p, r))
+                .collect::<Vec<_>>(),
+            [
+                "1 0:30.0 home goal",
+                "2 0:00.0 period",
+                "2 2:05.0 away goal"
+            ]
+        );
+        // And it is core's own rendering, which the bus rebuilds as the seed.
+        for row in &rows {
+            let record = p.match_events.iter().find(|m| m.id == row.id).unwrap();
+            assert_eq!(editor_row_line(&p, row), format_line(&p, record));
+        }
+    }
+
+    /// The paste box's own feedback, for a block holding one of each verdict:
+    /// the glyphs, the sentences and the summary, singular and plural both.
+    #[test]
+    fn the_echo_reads_back_every_verdict() {
+        let mut p = project();
+        p.append_match_event(MatchEventKind::HomeGoal, 0, 200.0);
+        let batch = parse_batch(
+            &p,
+            0,
+            "2 5:05 away goal\n\
+             # notes\n\
+             1 3:20 home goal\n\
+             2 20:00 home goal\n\
+             \n\
+             1 14:05 kick-off\n",
+        );
+        let echo = paste_echo(&batch);
+
+        // Blanks and comments say nothing at all.
+        assert_eq!(echo.lines.len(), 4);
+        assert_eq!(
+            echo.lines.iter().map(|l| l.glyph).collect::<Vec<_>>(),
+            ["✓", "•", "✗", "✗"]
+        );
+        assert_eq!(echo.lines[0].text, "2 · 5:05.0 · Away goal");
+        assert_eq!(
+            echo.lines[1].text,
+            "1 · 3:20.0 · Home goal — already tagged, skipped"
+        );
+        // A refusal quotes the line back with its number, so the coach finds
+        // it in a block of twenty.
+        assert_eq!(
+            echo.lines[2].text,
+            "line 4: \"2 20:00 home goal\" — clip 2 is 10:00.0 long"
+        );
+        assert!(
+            echo.lines[3]
+                .text
+                .starts_with("line 6: \"1 14:05 kick-off\" — a restart after a goal"),
+            "{}",
+            echo.lines[3].text
+        );
+        assert!(
+            echo.lines[3].text.contains("move every later period"),
+            "{}",
+            echo.lines[3].text
+        );
+
+        assert_eq!(
+            echo.summary,
+            "1 event to add · 1 already tagged · 2 lines refused"
+        );
+        assert_eq!(echo.button, "Add 1 event");
+
+        // And the plural, from a block that lands whole.
+        let batch = parse_batch(&p, 0, "2 5:05 away goal\n2 6:05 away goal\n");
+        let echo = paste_echo(&batch);
+        assert_eq!(echo.summary, "2 events to add");
+        assert_eq!(echo.button, "Add 2 events");
+
+        // Nothing typed: nothing to say, and nothing to press.
+        let echo = paste_echo(&parse_batch(&p, 0, "  \n# just a note\n"));
+        assert!(echo.lines.is_empty());
+        assert_eq!(echo.summary, "");
+        assert_eq!(echo.button, "Add");
     }
 
     #[test]
