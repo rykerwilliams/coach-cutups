@@ -74,6 +74,44 @@ export struct MatchRow {
     reel-span: string,
 }
 
+/// One row of the match event editor's list (spec T2). The same events in the
+/// same order as `MatchRow`, from the same builder, said the editor's way: the
+/// time into a video, which is what its grammar names.
+export struct MatchEditorRow {
+    /// The event's UUID.
+    id: string,
+    /// "2 · 14:05.0": the 1-based video number and the time into that video,
+    /// the paste grammar's own numbering (spec B1).
+    where-text: string,
+    /// "1H start", "Home goal", … — what `interpret` makes of the list as it
+    /// stands. The editor refuses nothing on match logic, so this row is the
+    /// whole feedback channel (spec V2).
+    label: string,
+    /// A start/stop the format has no period for, greyed as the panel's is.
+    role-less: bool,
+}
+
+/// One echoed line of the paste box (spec B3): what the parser made of it,
+/// before Add is pressed.
+export struct PasteLine {
+    /// "✓" it will add, "•" it is already tagged, "✗" it is refused.
+    glyph: string,
+    text: string,
+}
+
+/// Everything the paste box says about the block it holds. One callback
+/// rather than three, so a keystroke parses the block once.
+export struct PasteEcho {
+    lines: [PasteLine],
+    /// "7 events to add · 1 already tagged · 2 lines refused"; empty for an
+    /// empty box.
+    summary: string,
+    /// How many lines will add: what Add is enabled on.
+    adding: int,
+    /// "Add 7 events".
+    button: string,
+}
+
 /// A goal row's reel buttons (spec R3): set one end of the goal's span at the
 /// scan position, or put it back to the default.
 export enum ReelTrim {
@@ -813,11 +851,16 @@ component MatchPanel inherits VerticalLayout {
     in property <bool> can-edit;
     /// How many lines the list has, a goal's row being two: its height.
     in property <int> lines;
+    /// The project has a video to tag against, which the editor's every line
+    /// names by number (spec P4). The panel's own actions need one too, but
+    /// only by way of `can-edit`, which a project with no source never has.
+    in property <bool> has-source;
     callback tag(MatchTag);
     callback seek(string);
     callback remove(string);
     callback trim(string, ReelTrim);
     callback setup();
+    callback edit-events();
 
     padding: 12px;
     spacing: 6px;
@@ -828,6 +871,15 @@ component MatchPanel inherits VerticalLayout {
             text: "Match";
             vertical-alignment: center;
             horizontal-stretch: 1;
+        }
+        Button {
+            text: "Edit events…";
+            enabled: root.can-edit && root.has-source;
+            clicked => { root.edit-events(); }
+
+            Tooltip {
+                text: @markdown("Type or paste match events: one line each, `2 14:05 home goal`");
+            }
         }
         Button {
             text: root.configured ? "Setup…" : "Set up teams…";
@@ -1741,6 +1793,323 @@ component MatchSetupSheet inherits Rectangle {
     }
 }
 
+/// The match event editor (spec P1): the project's events, one retypable line
+/// each, and a box that takes a block of the same lines pasted from the
+/// coach's notes. Both hold the same text in the same grammar
+/// (`core::match_entry`), read by the same parse, so there is no second way to
+/// say a thing.
+///
+/// A fourth copy of the sheet shape, at 640px: the widest thing in it is an
+/// echo line's sentence, not a table. Nothing is staged -- each committed row
+/// and each Add is a bus command and an undo step -- so its one button is
+/// Done, and there is no Cancel (spec P5) and no add control (T7).
+component MatchEditorSheet inherits Rectangle {
+    in property <[MatchEditorRow]> rows;
+    /// The selected row's id, empty for none. The window owns it, so an event
+    /// that goes takes the selection with it.
+    in property <string> selected;
+    // Selecting another row destroys the field under this one, and Slint does
+    // not promise a focus-change callback from an element it has destroyed:
+    // without this the window's shortcuts could stay switched off for good
+    // (HighlightsPanel carries the same guard).
+    changed selected => {
+        root.line-focused = false;
+        root.refresh-editing();
+    }
+    /// The selected row's line, two-way all the way out to the window as every
+    /// field in this app is: a `text:` binding breaks the moment it's typed in.
+    in-out property <string> line;
+    /// The paste box's block. A window property too, so it survives Go and the
+    /// sheet closing (spec F2).
+    in-out property <string> paste;
+    /// "1 · Half 1", …: which video a line with no number of its own means.
+    in property <[string]> sources;
+    in-out property <int> default-source;
+    /// The last refusal (spec C5). The status bar's notice line renders
+    /// *behind* the scrim, so a sheet with commands of its own needs a line.
+    in property <string> message;
+    /// A field has focus, which the window folds into its own `text-editing`
+    /// (spec P3): without the fold the first Esc closes the sheet and the
+    /// window's "Esc leaves the field" cascade is dead code. **In-out and set
+    /// by hand** rather than bound: this element is destroyed when the sheet
+    /// closes, and a binding that goes with it would leave the window's
+    /// shortcuts switched off -- `close-match-editor()` clears it instead.
+    in-out property <bool> editing;
+    property <bool> line-focused;
+    property <bool> paste-focused;
+
+    /// A row's line, as the bus will read it: the mark and the commit call the
+    /// same one, so a field can't read good and then be refused.
+    pure callback valid-line(string, string) -> bool;
+    /// The paste box's verdicts. It takes the text and the picker so the
+    /// binding re-evaluates on every keystroke (the tag field's suggestions
+    /// and the setup sheet's validators are the same shape).
+    pure callback check-paste(string, int) -> PasteEcho;
+    callback select(string);
+    /// A row's line committed: nothing is sent until it parses.
+    callback commit(string, string);
+    callback seek(string);
+    callback remove(string);
+    callback add();
+    callback close();
+
+    property <PasteEcho> echo: root.check-paste(root.paste, root.default-source);
+
+    function refresh-editing() {
+        root.editing = (root.selected != "" && root.line-focused) || root.paste-focused;
+    }
+
+    /// Enter and losing focus both commit, as the inspector's fields do. A
+    /// line that doesn't parse is marked and goes nowhere (spec T5).
+    ///
+    /// The selection test is what makes a *late* focus loss safe: the field
+    /// lives inside the row loop, so selecting another row destroys it, and a
+    /// focus-change it fires on the way out would otherwise carry the new
+    /// row's line to the old row's id.
+    function commit-line(id: string, text: string) {
+        if (id == root.selected && root.valid-line(id, text)) {
+            root.commit(id, text);
+        }
+    }
+
+    width: 640px;
+    height: sheet.preferred-height;
+    background: Palette.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    sheet := VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: "Match events";
+            color: Palette.foreground;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        if root.rows.length == 0: Text {
+            text: "Nothing tagged yet. Paste a block below, or tag with Z, X and V while the game video plays.";
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        // A height of its own, as the panel's list has: a long match scrolls
+        // rather than growing the sheet past the window. The selected row
+        // carries a field under it, which is a line and a half.
+        if root.rows.length > 0: ListView {
+            // 168px is the Match panel's own cap, and the three scrolling
+            // lists here are capped together so the sheet still fits a
+            // 700px window with a long match and a long echo in it.
+            height: min(168px, root.rows.length * 28px + (root.selected == "" ? 0px : 48px));
+            for row in root.rows: VerticalLayout {
+                Rectangle {
+                    height: 28px;
+                    border-radius: 4px;
+                    background: row.id == root.selected ? Palette.selection-background : transparent;
+
+                    // The whole row selects; the buttons in front take their
+                    // own clicks.
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.select(row.id); }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-right: 4px;
+                        spacing: 6px;
+
+                        Text {
+                            text: row.where-text;
+                            color: Palette.alternate-foreground;
+                            font-family: "monospace";
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: row.label;
+                            color: row.role-less ? Palette.alternate-foreground : Palette.foreground;
+                            font-size: 11px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "→";
+                                accessible-label: "Seek";
+                                clicked => { root.seek(row.id); }
+
+                                Tooltip {
+                                    text: @markdown("Play the game video from here. The picture is behind this sheet, so it closes.");
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "×";
+                                accessible-label: "Delete";
+                                clicked => { root.remove(row.id); }
+
+                                Tooltip {
+                                    text: @markdown("Delete this event (undoable)");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // The selected row's one control: the event as a line of the
+                // paste box's grammar, retyped whole (spec T2). No combo box
+                // for the video, none for the kind: a kind is a word and a
+                // video is a number, and both are in the line.
+                if row.id == root.selected: HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 8px;
+                    spacing: 4px;
+
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.line;
+                        accepted(text) => { root.commit-line(row.id, text); }
+                        changed has-focus => {
+                            root.line-focused = self.has-focus;
+                            root.refresh-editing();
+                            if (!self.has-focus) {
+                                root.commit-line(row.id, self.text);
+                            }
+                        }
+                    }
+                    if !root.valid-line(row.id, root.line): VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "✕";
+                            color: #ff6b6b;
+                            font-size: 11px;
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            FieldLabel {
+                text: "Paste events";
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "Lines with no number are:";
+                color: Palette.alternate-foreground;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            ComboBox {
+                width: 160px;
+                model: root.sources;
+                // Two-way: a one-way binding onto `current-index` is dropped
+                // the first time the popup opens, and the readout then lies.
+                current-index <=> root.default-source;
+            }
+        }
+        TextEdit {
+            // Six lines of a block that may well be twenty: it scrolls, as
+            // the lists either side of it do.
+            height: 120px;
+            placeholder-text: "2 14:05 away goal";
+            text <=> root.paste;
+            changed has-focus => {
+                root.paste-focused = self.has-focus;
+                root.refresh-editing();
+            }
+        }
+        Text {
+            text: "One event per line: an optional video number, a time with a colon, then what happened — \"home\", \"away\", \"period\". # starts a comment.";
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        // **Each line wraps rather than elides.** The kick-off refusal is a
+        // sentence explaining why a restart is not a period boundary, and
+        // eliding it hides the one thing the line is for. So this list has a
+        // height of its own rather than one counted in rows: how tall a row
+        // is depends on its sentence, and it scrolls.
+        if root.echo.lines.length > 0: ListView {
+            height: 120px;
+            for line in root.echo.lines: HorizontalLayout {
+                padding-left: 4px;
+                padding-top: 2px;
+                padding-bottom: 2px;
+                spacing: 6px;
+
+                Text {
+                    text: line.glyph;
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                    vertical-alignment: top;
+                }
+                Text {
+                    text: line.text;
+                    color: Palette.foreground;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.echo.summary;
+                color: Palette.alternate-foreground;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: root.echo.button;
+                enabled: root.echo.adding > 0;
+                clicked => { root.add(); }
+
+                Tooltip {
+                    text: @markdown("Add every line marked ✓, in one undo step. The rest stay in the box.");
+                }
+            }
+        }
+
+        // The sheet's own notice line (spec C5): a refused command says so
+        // here, since the status bar is behind the scrim.
+        if root.message != "": Text {
+            text: root.message;
+            color: #ffcc00;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            Button {
+                text: "Done";
+                primary: true;
+                clicked => { root.close(); }
+
+                Tooltip {
+                    text: @markdown("Close the editor. Every edit is already saved, and undoable with Ctrl+Z.");
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Coach Cuts";
     // Every control fits at this size. The window opens at the size it last
@@ -2059,6 +2428,32 @@ export component AppWindow inherits Window {
     in-out property <string> match-overtime-minutes;
     in-out property <bool> match-back-anchor;
 
+    // --- The match event editor (spec P1) ---
+
+    /// The editor sheet is up. UI state: the panel's button opens it, Done
+    /// and Esc close it.
+    in-out property <bool> match-editor-open;
+    /// Its rows, seeded when it opens and rebuilt by its **own** committed
+    /// edit and by nothing else (spec T3) -- `src/main.rs` owns that rule.
+    in property <[MatchEditorRow]> match-editor-rows;
+    /// The selected row, and that row's event as a line. Two-way down to the
+    /// field, and re-seeded from the record on every rebuild.
+    in-out property <string> match-editor-selected;
+    in-out property <string> match-editor-line;
+    /// The paste box's block and its default-video picker. The block lives
+    /// here rather than in the sheet so it survives Go and closing (spec F2);
+    /// the picker resets to the first video on every open.
+    in-out property <string> match-editor-paste;
+    in-out property <int> match-editor-source;
+    in property <[string]> match-editor-sources;
+    /// The sheet's own notice line (spec C5), which the status bar's can't
+    /// stand in for: that one renders behind the scrim. Cleared when the
+    /// sheet closes and when the next command goes out.
+    in-out property <string> match-editor-message;
+    /// A field in the sheet has focus. Set by the sheet and cleared when it
+    /// closes, since the binding goes with the element (see the sheet).
+    property <bool> match-editor-editing;
+
     /// The latest notice (a device fallback, an unclean stop, an export
     /// done), shown in the transport bar without blocking; empty hides it.
     in property <string> notice;
@@ -2068,7 +2463,11 @@ export component AppWindow inherits Window {
     /// A text field has focus: every shortcut yields to it (C6).
     /// J, L and the speed button (spec S1, S2): only while scanning.
     property <bool> can-scan-fast: root.playing && !root.recording && !root.previewing && root.can-play;
-    property <bool> text-editing: name-edit.has-focus || inspector.editing || highlights.editing;
+    // **Every** text field belongs here, the sheets' included: without the
+    // editor's, Esc inside its paste box closes the sheet on the first press
+    // and throws away a half-typed block (spec P3).
+    property <bool> text-editing: name-edit.has-focus || inspector.editing || highlights.editing
+        || root.match-editor-editing;
 
     callback open-project();
     callback add-source();
@@ -2131,6 +2530,22 @@ export component AppWindow inherits Window {
     callback reel-trim(string, ReelTrim);
     /// `]` (true) or `[`: the next or previous chapter (spec C1).
     callback jump-chapter(bool);
+    /// Seed the editor's rows from the project and open it (spec T3): the
+    /// only place they are seeded from outside the editor's own edits.
+    callback open-match-editor();
+    /// A row was clicked: seed its field with that event as a line.
+    callback select-match-event(string);
+    /// A row's field committed: the event's id and the line typed into it.
+    callback edit-match-event(string, string);
+    /// Add every line of the paste box that will add, as one undo step, and
+    /// leave the rest in the box (spec B5).
+    callback add-match-events();
+    /// Whether a row's line parses, asked of the record it names: the field's
+    /// ✕ and the commit share it (spec T5).
+    pure callback valid-match-line(string, string) -> bool;
+    /// The paste box's block, read back line by line, against the picker's
+    /// default video.
+    pure callback check-paste(string, int) -> PasteEcho;
     /// Seed the setup sheet's fields from the project and open it; the sheet
     /// is opened nowhere else, so the fields are never stale.
     callback open-match-setup();
@@ -2218,6 +2633,17 @@ export component AppWindow inherits Window {
         keys.focus();
     }
 
+    /// Closes the editor, however it was closed. It clears `editing` by hand:
+    /// the sheet that sets it is about to be destroyed, and a field that had
+    /// focus would otherwise leave the window's shortcuts switched off for
+    /// good. The message goes with it (spec C5); the paste box's text stays.
+    function close-match-editor() {
+        root.match-editor-editing = false;
+        root.match-editor-message = "";
+        root.match-editor-open = false;
+        keys.focus();
+    }
+
     /// One of the three match tag keys (S4), under the gate the panel's
     /// buttons share -- the cap included, which only the start/stop has: the
     /// bus refuses a tag there, and that refusal is a backstop, not something
@@ -2259,6 +2685,21 @@ export component AppWindow inherits Window {
         if (root.match-sheet-open) {
             if (pressed && event.text == Key.Escape) {
                 root.close-match-setup();
+                return accept;
+            }
+            return reject;
+        }
+        // The editor is modal too, and it has fields of its own -- but
+        // unlike the setup sheet's, they are not re-seeded from the project
+        // every time it opens: a half-typed paste is not something to throw
+        // away on one Esc. So Esc only closes the sheet from *outside* a
+        // field; inside one the cascade below leaves the field first, and the
+        // next Esc closes (spec P3). The `reject` is also what delivers
+        // Ctrl+V to the paste box, since the Ctrl branch below is never
+        // reached from in here.
+        if (root.match-editor-open) {
+            if (pressed && event.text == Key.Escape && !root.text-editing) {
+                root.close-match-editor();
                 return accept;
             }
             return reject;
@@ -3108,6 +3549,9 @@ export component AppWindow inherits Window {
                                 // recording, and neither belongs to the game
                                 // video behind a preview.
                                 can-edit: root.can-play && !root.recording && !root.previewing;
+                                // An event points at a video, so the editor
+                                // needs one to open (spec P4).
+                                has-source: root.sources.length > 0;
                                 // Off any field first, as every other button
                                 // does: a click doesn't take focus from one, and
                                 // the tag keys have to keep working after it.
@@ -3130,6 +3574,10 @@ export component AppWindow inherits Window {
                                 setup => {
                                     keys.focus();
                                     root.open-match-setup();
+                                }
+                                edit-events => {
+                                    keys.focus();
+                                    root.open-match-editor();
                                 }
                             }
 
@@ -3572,6 +4020,47 @@ export component AppWindow inherits Window {
                     root.close-match-setup();
                 }
                 cancel => { root.close-match-setup(); }
+            }
+        }
+
+        // --- Match event editor: modal over the whole window (spec P1) ---
+        if root.match-editor-open: Rectangle {
+            background: #000000a0;
+
+            // Swallows clicks meant for the window behind.
+            TouchArea { }
+
+            MatchEditorSheet {
+                rows: root.match-editor-rows;
+                selected: root.match-editor-selected;
+                line <=> root.match-editor-line;
+                paste <=> root.match-editor-paste;
+                sources: root.match-editor-sources;
+                default-source <=> root.match-editor-source;
+                message: root.match-editor-message;
+                editing <=> root.match-editor-editing;
+                valid-line(id, text) => { return root.valid-match-line(id, text); }
+                check-paste(text, source) => { return root.check-paste(text, source); }
+                select(id) => { root.select-match-event(id); }
+                // **Every commit drops focus** (spec T4), unconditionally
+                // rather than only when the order changed: Slint's `for`
+                // reuses its items by index, so an event that moves to
+                // another place in match order would leave the focused field
+                // sitting over whatever is at the old index now. The row
+                // stays selected -- selection is not focus.
+                commit(id, text) => {
+                    root.edit-match-event(id, text);
+                    keys.focus();
+                }
+                // Go closes: the picture it seeks to is behind this sheet
+                // (spec T10). It leaves the paste box's text alone.
+                seek(id) => {
+                    root.seek-match-event(id);
+                    root.close-match-editor();
+                }
+                remove(id) => { root.delete-match-event(id); }
+                add => { root.add-match-events(); }
+                close => { root.close-match-editor(); }
             }
         }
 
