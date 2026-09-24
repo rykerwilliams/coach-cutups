@@ -59,7 +59,7 @@ use crate::mailbox::{stream_end, stream_time};
 use crate::player::{answer_need_context, seconds, seconds_to_clock};
 
 /// How long any wait goes between checks of the cancel flag and errors.
-const POLL: gst::ClockTime = gst::ClockTime::from_mseconds(10);
+pub(crate) const POLL: gst::ClockTime = gst::ClockTime::from_mseconds(10);
 
 /// Frames an `appsrc` may hold before the pump waits for room.
 const QUEUED: u64 = 4;
@@ -78,15 +78,15 @@ pub enum CompositeError {
 
 /// What every wait checks between polls: the cancel flag, and the first
 /// `ERROR` either pipeline posted.
-struct Watch<'a> {
-    cancel: &'a AtomicBool,
+pub(crate) struct Watch<'a> {
+    pub(crate) cancel: &'a AtomicBool,
     /// Written by the pipelines' sync handlers ([`Gl::install`]) as the error
     /// is posted.
-    error: Arc<Mutex<Option<String>>>,
+    pub(crate) error: Arc<Mutex<Option<String>>>,
 }
 
 impl Watch<'_> {
-    fn check(&self) -> Result<(), CompositeError> {
+    pub(crate) fn check(&self) -> Result<(), CompositeError> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CompositeError::Cancelled);
         }
@@ -97,7 +97,7 @@ impl Watch<'_> {
     }
 
     /// Why a step failed: the posted error if there is one, else `fallback`.
-    fn failure(&self, fallback: impl Into<String>) -> CompositeError {
+    pub(crate) fn failure(&self, fallback: impl Into<String>) -> CompositeError {
         self.check()
             .err()
             .unwrap_or_else(|| CompositeError::Failed(fallback.into()))
@@ -159,7 +159,7 @@ impl Gl {
     /// [`watch_bus`], plus answering `pipeline`'s GL context requests with
     /// this display and context. `watched` sees every message neither of them
     /// took.
-    fn install(
+    pub(crate) fn install(
         &self,
         pipeline: &gst::Pipeline,
         watch: &Watch,

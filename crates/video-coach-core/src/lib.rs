@@ -16,6 +16,7 @@ pub mod highlight;
 pub mod layout;
 pub mod match_entry;
 pub mod metadata;
+pub mod motion;
 pub mod plan;
 pub mod project;
 pub mod recording;
