@@ -948,10 +948,20 @@ Each entry: what, why deferred, when to revisit.
   only mixes; (b) a curated list of links the coach downloads themselves; (c)
   the `.deb` ships tracks, which means clearing each one and carrying the
   licences in `packaging/copyright`.
-- **The decisions before any code:** which of those three; whether the music
-  ducks under the game sound or replaces it; whether a track is per-project or
-  per-export; and what happens when a reel is longer than the track (loop, fade,
-  or refuse).
+- **It should feel semi-automatic** (the coach, same day): *"pick genre"* —
+  choose **rock** or **EDM** on the export and the app does the rest, rather
+  than picking a file and setting levels. That works with any of the three
+  shapes above: a genre is a folder the coach filled once, a curated list
+  grouped by genre, or the shipped set tagged. The app then picks a track that
+  fits the reel's length, starts it at the top, ducks the game sound under it
+  and fades it out at the end — no controls beyond the genre unless the coach
+  opens something.
+- **The decisions before any code:** which of the three shapes; whether the
+  music ducks under the game sound or replaces it; whether the genre is
+  remembered per project or per export; what happens when a reel is longer than
+  the track (loop, fade, or refuse); and whether the same track is used every
+  time or it rotates, since a coach exporting ten matches does not want ten
+  identical soundtracks.
 - **Why deferred:** it is a licensing question with a small piece of code
   attached, not the other way round.
 - **When to revisit:** when the coach says which of the three shapes they want.
