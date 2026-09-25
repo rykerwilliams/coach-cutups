@@ -27,6 +27,12 @@ says what each one added.
   exists.) Chapters closer together than ten seconds are left out, because
   YouTube refuses the whole list otherwise.
 
+### Changed
+
+- **A goals reel's chapters read as prose** — `Goal 3 — Rovers 2-1` — instead of
+  repeating the caption burned across the picture, and the one where the goals
+  cross into the second half says so.
+
 ### Fixed
 
 - **A transcription that failed part-way no longer stops the ones behind it.**
