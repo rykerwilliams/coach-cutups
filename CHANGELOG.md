@@ -6,9 +6,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Versions 0.1.0 to 0.5.0 were built and installed by hand and never published as
 releases, so there is nothing to download for them. Their dates are the day each
 one was cut, and 0.1.1's handful of changes are listed under 0.1.0. The first
-published release is 0.6.0.
+published release is 0.6.0, which contains all of them.
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-09-24
+
+The first published release. Every version below this one was built and
+installed by hand, so this release is all of them together — the
+[changelog](https://github.com/rykerwilliams/coach-cutups/blob/main/CHANGELOG.md)
+says what each one added.
 
 ### Added
 
@@ -19,6 +26,11 @@ published release is 0.6.0.
   (Uploads ignore the chapters stored inside the file, which is why the list
   exists.) Chapters closer together than ten seconds are left out, because
   YouTube refuses the whole list otherwise.
+
+### Fixed
+
+- **A transcription that failed part-way no longer stops the ones behind it.**
+  Every clip queued after it used to sit there silently until you cancelled.
 
 ## [0.5.0] - 2026-09-24
 
@@ -50,9 +62,9 @@ published release is 0.6.0.
 ### Added
 
 - **The whole match exports as a straight copy of your footage.** It finishes in
-  well under a minute instead of an hour, at about a quarter of the size, with nothing
-  lost — the original picture and sound are copied rather than recorded again.
-  Drawings and highlights can't ride a copy, and the export sheet says so.
+  well under a minute instead of an hour, at about a quarter of the size, with
+  nothing lost — the original picture and sound are copied rather than recorded
+  again. Drawings and highlights can't ride a copy, and the export sheet says so.
 - **The scoreboard as a subtitle track.** A copied match comes with the clock
   and score as subtitles — both inside the file and as an `.srt` beside it — so
   VLC shows them as the match goes and Subtitle → Sub Track switches them off.
@@ -164,4 +176,3 @@ x86-64.
   can be cancelled without losing the files that already finished.
 - **Hardware video where your machine has it,** for playback and export, with a
   slower software fallback where it doesn't.
-
