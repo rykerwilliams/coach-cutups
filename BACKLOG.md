@@ -1105,3 +1105,18 @@ Each entry: what, why deferred, when to revisit.
   with no change to it. Pinned by `media/tests/export.rs`'s stacking test (a
   stroke into that corner survives) and `overlay.rs`'s bar test (the corner is
   untinted).
+
+90. **The repository URLs and the docs site's base path, after the rename to
+  `coach-cuts`.** Nine files spell the old slug: `Cargo.toml`'s `repository`,
+  `README.md`, `CHANGELOG.md`, `docs/hands-on-checklist.md`,
+  `docs/book/src/{index,developers,guide/index}.md`, and — the one that is not
+  cosmetic — `docs/book/book.toml`, whose `site-url = "/coach-cutups/"`,
+  `git-repository-url` and `edit-url-template` decide whether the published
+  site's assets and 404 page resolve at all. GitHub redirects the old repository
+  URL forever, so nothing breaks the moment the rename happens, but the Pages
+  site moves to `rykerwilliams.github.io/coach-cuts/` and the old `site-url`
+  would point its assets at a path that no longer exists.
+- **Why deferred:** the rename is the human's to make (Settings → General), and
+  changing these first would point them at a URL that does not resolve yet.
+- **When to revisit:** the same day the repository is renamed — one commit, then
+  watch the Pages deploy.
