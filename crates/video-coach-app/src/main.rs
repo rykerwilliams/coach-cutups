@@ -2242,6 +2242,9 @@ fn on_event(w: &AppWindow, event: Event) {
             t.state = state;
             show_transcription(w, ui);
         }),
+        // The basket travels whole in every event (basket spec C4), for the
+        // sheet that renders it; nothing in the window shows it yet.
+        Event::Basket(_) => {}
         // What the bus's own parse left in the paste box (spec B5): the
         // refused lines, for the coach to fix in place and add again.
         Event::MatchPasteLeftover(text) => w.set_match_editor_paste(text.into()),

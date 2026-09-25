@@ -58,6 +58,21 @@ impl Rig {
     /// [`Rig::open`], with `before_open` run on the project and media folders
     /// first.
     fn open_with(secs: &[f64], before_open: impl FnOnce(&Path, &Path)) -> Self {
+        Self::open_full(&[("a.webm", 2)], 0, secs, before_open)
+    }
+
+    /// [`Rig::open`] over several source videos, with every clip on
+    /// `source_index` — so a test can reach a video the player never loads.
+    fn open_with_sources(videos: &[(&str, u32)], source_index: usize, secs: &[f64]) -> Self {
+        Self::open_full(videos, source_index, secs, |_, _| {})
+    }
+
+    fn open_full(
+        videos: &[(&str, u32)],
+        source_index: usize,
+        secs: &[f64],
+        before_open: impl FnOnce(&Path, &Path),
+    ) -> Self {
         gstreamer::init().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("project");
@@ -65,8 +80,8 @@ impl Rig {
         for dir in [&folder, &media] {
             std::fs::create_dir(dir).unwrap();
         }
-        let mut project = write_project(&folder, &media, &[("a.webm", 2)]);
-        let clips = add_clips(&folder, &mut project, &vec![0; secs.len()])
+        let mut project = write_project(&folder, &media, videos);
+        let clips = add_clips(&folder, &mut project, &vec![source_index; secs.len()])
             .iter()
             .map(|c| c.id)
             .collect();
@@ -445,4 +460,54 @@ fn an_export_carries_the_projects_scoreboard() {
         let off = (0..3).any(|c| (i32::from(actual[c]) - i32::from(expected[c])).abs() > 40);
         assert!(!off, "{what} at ({x}, {y}): got {actual:?}");
     }
+}
+
+/// A game video deleted since the project opened is refused too: the check is
+/// a `stat` at Start, not the `missing` flags cached at open — which say
+/// nothing about a file that vanished while the project sat there, and nothing
+/// at all about the closed projects a basket reaches into (basket spec V2).
+///
+/// The clip is on the **second** source, which the player never loads, so
+/// nothing refreshes the flags behind the test's back.
+#[test]
+fn a_game_video_deleted_since_the_open_is_still_refused() {
+    let mut rig = Rig::open_with_sources(&[("a.webm", 2), ("b.webm", 2)], 1, &[1.0]);
+    std::fs::remove_file(rig.tmp.path().join("media").join("b.webm")).unwrap();
+    rig.export(vec![ExportTarget::AllClips]);
+    assert_eq!(
+        rig.h.wait_for_error(),
+        UserError::CantExport("clip 0's game video is missing; relink it first".into())
+    );
+    let rest = rig.h.shutdown();
+    no_export_events(&rest);
+    assert!(
+        !rig.exports.exists(),
+        "a refused run made {:?}",
+        rig.exports
+    );
+}
+
+/// The pickers become the project's only once a run has actually begun (basket
+/// spec C3): a refused Start leaves `Preferences` as they were rather than
+/// dirtying the project and saving it.
+#[test]
+fn a_refused_run_leaves_the_pickers_alone() {
+    let mut rig = Rig::open_with(&[1.0], |_, media| {
+        std::fs::remove_file(media.join("a.webm")).unwrap();
+    });
+    // The sheet's pickers are 720p / Low; the project has never exported, so
+    // its own are the defaults.
+    rig.export(vec![ExportTarget::AllClips]);
+    rig.h.wait_for_error();
+    let rest = rig.h.shutdown();
+    assert!(
+        !rest.iter().any(|e| matches!(e, Event::ProjectChanged(_))),
+        "{rest:#?}"
+    );
+    let saved = store::read(&rig.tmp.path().join("project")).unwrap();
+    assert_eq!(
+        saved.preferences.last_export_resolution,
+        Resolution::default()
+    );
+    assert_eq!(saved.preferences.last_export_quality, Quality::default());
 }

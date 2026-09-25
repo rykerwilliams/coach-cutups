@@ -9,6 +9,7 @@
 //! the earlier of two deadlines (the skip debounce and the recording start
 //! timeout); with neither armed it simply blocks.
 
+mod basket;
 mod clips;
 mod export;
 mod highlights;
@@ -50,6 +51,7 @@ use video_coach_media::{
 
 use crate::drawing::Pen;
 
+pub use basket::{BasketRow, BasketView};
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
 pub use state::{StateFile, WindowSize};
@@ -293,6 +295,35 @@ pub enum Command {
     /// run's own: a cancel too late to stop a target reports it done.
     CancelExport,
 
+    // The basket (basket spec C1): one film whose pieces come from several
+    // matches. None of these touches a project, and none is on the recording
+    // allow-list — a clip only exists once its recording has stopped, and
+    // `ExportBasket` waits exactly as `Command::Export` does.
+    /// Put the open project's clip in the basket, at the end. Does nothing but
+    /// say so if it is in there already.
+    AddToBasket {
+        clip_id: Uuid,
+    },
+    RemoveFromBasket {
+        index: usize,
+    },
+    /// `Vec::remove` + `Vec::insert`, as [`Command::MoveClip`] is.
+    MoveBasketEntry {
+        from: usize,
+        to: usize,
+    },
+    ClearBasket,
+    /// Resolve every piece against its project and publish the rows.
+    ShowBasket,
+    /// Render the basket as one film. `name`, `resolution` and `quality` are
+    /// the sheet's, and become the basket's. **No folder**: the output
+    /// directory is fixed (basket spec O1).
+    ExportBasket {
+        name: String,
+        resolution: Resolution,
+        quality: Quality,
+    },
+
     // Transcription (Phase 10 spec S5, S6).
     /// Queue the clip's commentary for transcription, behind whatever is
     /// already running. Does nothing if it is queued or running already;
@@ -379,6 +410,11 @@ pub enum Event {
     Export(ExportRun),
     /// The clip being previewed, or `None` once the preview closed.
     Preview(Option<Uuid>),
+    /// The basket, whole (basket spec C4): at startup, on every change to it
+    /// and on [`Command::ShowBasket`]. **Not** on [`Event::ProjectChanged`],
+    /// which fires on every clip edit — re-reading three projects per keystroke
+    /// to refresh labels nothing can see (the sheet is modal) would be waste.
+    Basket(BasketView),
     /// The whole transcription state (Phase 10 spec S5), so no view is left
     /// holding something the bus has moved past.
     ///
@@ -465,6 +501,12 @@ pub enum UserError {
     /// Export is refused: there's nothing (or no way) to export yet.
     #[error("can't export: {0}")]
     CantExport(String),
+    /// A notice: a basket command refused one click with nothing to answer —
+    /// adding a clip that is in the basket already (basket spec V5), following
+    /// [`Command::Transcribe`]'s precedent. Start's refusals are `CantExport`,
+    /// which is a modal.
+    #[error("{0}")]
+    Basket(String),
     /// Preview is refused, or the one running gave up.
     #[error("can't preview: {0}")]
     CantPreview(String),
@@ -490,6 +532,7 @@ impl UserError {
                 | UserError::DeviceFallback { .. }
                 | UserError::StopNotClean
                 | UserError::Scoreboard(_)
+                | UserError::Basket(_)
         )
     }
 }
@@ -568,6 +611,10 @@ pub struct Bus {
     /// where a preview composites on `Gl::shared()` instead (spec P1).
     gl: Option<Gl>,
     state: StateFile,
+    /// The pieces waiting to be made into one film, and the file they are
+    /// remembered in. **Not on `Open`**, which is replaced on every project
+    /// open: the basket is what has to survive that (basket spec H3).
+    basket: basket::Basket,
     open: Option<Open>,
     /// Index of the latest request's source: the one the player holds, or is
     /// heading to. Whether it actually holds it, and where it's heading, are
@@ -639,9 +686,11 @@ impl Bus {
     /// or test sources. `transcribe` picks where transcripts come from the
     /// same way: whisper with a model, or canned text (spec S8).
     ///
-    /// `state` is the app's own state file — the last project and the chosen
-    /// speech model. Production passes [`StateFile::default_location`]; tests
-    /// pass a scratch directory, so the user's own is never touched.
+    /// `state` is where the app's own files live — the state file (the last
+    /// project, the chosen speech model), the basket beside it, and the folder
+    /// a basket's film is written into. Production passes
+    /// [`StateFile::default_location`]; tests pass a scratch directory, so
+    /// none of the user's own is touched.
     ///
     /// `events` is called on the bus thread.
     pub fn spawn(
@@ -667,6 +716,7 @@ impl Bus {
         });
         let position = player.position_handle();
         let transcribe_model = state.whisper_model();
+        let basket = basket::Basket::load(&state);
         let bus = Bus {
             events,
             tx: tx.clone(),
@@ -677,6 +727,7 @@ impl Bus {
             sinks,
             gl: None,
             state,
+            basket,
             open: None,
             current: 0,
             last_position: (0, None),
@@ -715,6 +766,9 @@ impl Bus {
     }
 
     fn run(mut self, rx: mpsc::Receiver<Input>) {
+        // The basket is machine-wide and survives a restart, so the badge's
+        // count is right before anything is opened (basket spec C4).
+        self.publish_basket();
         loop {
             let deadline = self
                 .skip_deadline
@@ -900,6 +954,16 @@ impl Bus {
                 scoreboard,
             } => self.export(targets, resolution, quality, scoreboard),
             Command::CancelExport => self.cancel_export(),
+            Command::AddToBasket { clip_id } => self.add_to_basket(clip_id),
+            Command::RemoveFromBasket { index } => self.remove_from_basket(index),
+            Command::MoveBasketEntry { from, to } => self.move_basket_entry(from, to),
+            Command::ClearBasket => self.clear_basket(),
+            Command::ShowBasket => self.publish_basket(),
+            Command::ExportBasket {
+                name,
+                resolution,
+                quality,
+            } => self.export_basket(name, resolution, quality),
             Command::Transcribe { clip_id } => self.transcribe(clip_id),
             Command::CancelTranscription => self.cancel_transcription(),
             Command::SetTranscribeModel(model) => self.set_transcribe_model(model),

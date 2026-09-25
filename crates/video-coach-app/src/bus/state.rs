@@ -14,6 +14,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use gstreamer::glib;
 use serde::{Deserialize, Serialize};
 use video_coach_media::WhisperModel;
 
@@ -22,6 +23,10 @@ use crate::drawing::Pen;
 /// The app's own directory under whichever XDG base directory is in play.
 pub(super) const APP_DIR: &str = "coach-cuts";
 const FILE: &str = "state.json";
+/// Where a basket's film is written (basket spec O1), under the user's videos
+/// folder: a film whose pieces come from several matches belongs to no
+/// project, so it can't go in one's `exports/`.
+const FILMS_DIR: &str = "Coach Cuts";
 
 /// **Every field defaults**, and a file written by a later version keeps the
 /// fields this one doesn't know only insofar as it rewrites the whole
@@ -62,17 +67,19 @@ impl Default for WindowSize {
     }
 }
 
-/// Where the state file lives. `None` when there is no config directory at
-/// all (no `$XDG_CONFIG_HOME` and no `$HOME`), in which case nothing is
-/// remembered.
+/// Where the app's own files live: the state file — `None` when there is no
+/// config directory at all (no `$XDG_CONFIG_HOME` and no `$HOME`), in which
+/// case nothing is remembered — and the folder a basket's film is written
+/// into, which is nobody's project.
 #[derive(Debug, Clone)]
 pub struct StateFile {
     path: Option<PathBuf>,
+    films: PathBuf,
 }
 
 impl StateFile {
     /// `$XDG_CONFIG_HOME/coach-cuts/state.json`, falling back to
-    /// `~/.config/coach-cuts/state.json`.
+    /// `~/.config/coach-cuts/state.json`; films in `<XDG Videos>/Coach Cuts`.
     pub fn default_location() -> Self {
         StateFile {
             path: config_dir(
@@ -80,14 +87,34 @@ impl StateFile {
                 std::env::var_os("HOME"),
             )
             .map(|dir| dir.join(APP_DIR).join(FILE)),
+            films: films_dir(
+                glib::user_special_dir(glib::UserDirectory::Videos),
+                std::env::var_os("HOME"),
+            ),
         }
     }
 
-    /// The state file under `config_dir` instead of the user's, for tests.
+    /// The app's files under `config_dir` instead of the user's, for tests —
+    /// **films included**, so no test writes a film into the coach's own
+    /// videos folder.
     pub fn in_config_dir(config_dir: &Path) -> Self {
         StateFile {
             path: Some(config_dir.join(APP_DIR).join(FILE)),
+            films: config_dir.join("videos"),
         }
+    }
+
+    /// Another of the app's own files, beside `state.json`: the basket's
+    /// (basket spec H1), which is deliberately **not** a key in this one.
+    /// `None` when there is no config directory, where nothing is remembered.
+    pub(super) fn sibling(&self, file: &str) -> Option<PathBuf> {
+        Some(self.path.as_ref()?.with_file_name(file))
+    }
+
+    /// The folder a basket's film is written into (basket spec O1), created on
+    /// demand by the run that writes one.
+    pub fn basket_dir(&self) -> PathBuf {
+        self.films.clone()
     }
 
     /// The remembered project folder, if any. An unreadable file reads as
@@ -206,6 +233,22 @@ fn config_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> 
     base_dir(xdg, home, ".config")
 }
 
+/// `<videos>/Coach Cuts`, where `videos` is the user's videos folder as glib
+/// reports it: `$HOME/Videos/Coach Cuts` when it reports none — a machine
+/// whose `user-dirs.dirs` has no entry — and a relative `Coach Cuts`, in the
+/// working directory, when there is no home either. The rule is worth a test,
+/// and the environment is passed in as [`config_dir`] takes it.
+fn films_dir(videos: Option<PathBuf>, home: Option<OsString>) -> PathBuf {
+    videos
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join("Videos"))
+        })
+        .unwrap_or_default()
+        .join(FILMS_DIR)
+}
+
 /// `$XDG_CACHE_HOME`, else `~/.cache`: where the whisper models are looked
 /// for and downloaded to (Phase 10 spec S3, Phase 11 S3). Hundreds of
 /// megabytes of downloaded weights are a cache, not configuration.
@@ -257,6 +300,37 @@ mod tests {
             Some(PathBuf::from("/home/u/.cache"))
         );
         assert_eq!(cache_dir(None, None), None);
+    }
+
+    /// Where the films go, and the fallbacks for a machine that doesn't say.
+    #[test]
+    fn the_films_folder_follows_the_videos_directory() {
+        assert_eq!(
+            films_dir(Some("/v".into()), Some("/home/u".into())),
+            PathBuf::from("/v/Coach Cuts")
+        );
+        assert_eq!(
+            films_dir(None, Some("/home/u".into())),
+            PathBuf::from("/home/u/Videos/Coach Cuts")
+        );
+        // No home at all: a relative folder in the working directory, which is
+        // at least somewhere the run can name.
+        assert_eq!(films_dir(None, None), PathBuf::from("Coach Cuts"));
+    }
+
+    /// A test's films land under its own config directory, never in the
+    /// coach's videos folder.
+    #[test]
+    fn a_test_state_file_keeps_its_films_beside_itself() {
+        let dir = Path::new("/x/cfg");
+        assert_eq!(
+            StateFile::in_config_dir(dir).basket_dir(),
+            PathBuf::from("/x/cfg/videos")
+        );
+        assert_eq!(
+            StateFile::in_config_dir(dir).sibling("basket.json"),
+            Some(PathBuf::from("/x/cfg/coach-cuts/basket.json"))
+        );
     }
 
     #[test]

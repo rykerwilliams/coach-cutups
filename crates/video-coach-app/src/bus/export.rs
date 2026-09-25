@@ -40,7 +40,7 @@ use video_coach_core::metadata::{
     clip_label, file_tags, reel_label, CalendarDate, ALL_CLIPS_LABEL, WHOLE_MATCH_LABEL,
 };
 use video_coach_core::plan::{
-    compilation_plan, default_scoreboard_mode, ExportTarget, ScoreboardMode,
+    compilation_plan, default_scoreboard_mode, ExportTarget, PlanEntry, ScoreboardMode,
 };
 use video_coach_core::project::{Preferences, Project, Quality, Resolution};
 use video_coach_core::reel::{reel_goals, ReelSide};
@@ -314,14 +314,9 @@ impl Bus {
 
     fn start_run(&mut self, targets: Vec<ExportTarget>, pickers: Pickers) -> Result<(), UserError> {
         let refused = |why: &str| UserError::CantExport(why.into());
-        if self.export.is_some() {
-            return Err(refused("an export is running"));
-        }
-        // Both composite on the UI's GL context, and an export would take the
-        // frames the preview is pacing itself on (spec P5).
-        if self.preview.is_some() {
-            return Err(refused("a preview is open; close it first"));
-        }
+        // Before any I/O: resolving the targets stats a file per entry, and
+        // there is no reason to do that to hit a field check (basket spec C3).
+        self.refuse_if_busy()?;
         let Some(open) = &self.open else {
             return Err(refused("no project is open"));
         };
@@ -337,16 +332,10 @@ impl Bus {
             labels.push(label(open, target)?);
         }
         de_duplicate(&mut labels);
-        let mut jobs = VecDeque::with_capacity(targets.len());
-        let mut rows = Vec::with_capacity(targets.len());
+        let mut jobs = Vec::with_capacity(targets.len());
         for (target, label) in targets.iter().zip(labels) {
-            let job = job(open, &self.missing, &exports, target, &label, pickers)?;
-            rows.push(ExportTargetRun {
-                label,
-                frames: job.compilation.frames.len(),
-                state: TargetState::Pending,
-            });
-            jobs.push_back(job);
+            let job = job(open, &exports, target, &label, pickers)?;
+            jobs.push((label, job));
         }
         // On demand, so a project that has never been exported has no empty
         // folder (spec E6). After the refusals: a run that can't start
@@ -354,8 +343,11 @@ impl Bus {
         std::fs::create_dir_all(&exports).map_err(|e| {
             UserError::CantExport(format!("could not create {}: {e}", exports.display()))
         })?;
+        self.begin(jobs)?;
 
         // The sheet's pickers are the project's from here on (spec E4).
+        // **After the run began**, or a refusal inside `begin` would dirty the
+        // project and save it (basket spec C3).
         if let Some(open) = &mut self.open {
             let prefs = &mut open.project.preferences;
             if Pickers::of(prefs) != pickers {
@@ -365,8 +357,48 @@ impl Bus {
                 self.project_changed();
             }
         }
+        Ok(())
+    }
 
-        let first = jobs.pop_front().expect("the targets are not empty");
+    /// The two refusals that cost nothing to check, so both job builders can
+    /// make them before they read a project (basket spec C3). [`Bus::begin`]
+    /// checks them again, so no caller can skip them.
+    pub(super) fn refuse_if_busy(&self) -> Result<(), UserError> {
+        let refused = |why: &str| UserError::CantExport(why.into());
+        if self.export.is_some() {
+            return Err(refused("an export is running"));
+        }
+        // Both composite on the UI's GL context, and an export would take the
+        // frames the preview is pacing itself on (spec P5).
+        if self.preview.is_some() {
+            return Err(refused("a preview is open; close it first"));
+        }
+        Ok(())
+    }
+
+    /// Begins a run over `jobs`, each with the label the sheet lists it under,
+    /// and publishes it (basket spec C3).
+    ///
+    /// **The caller creates its own output directory**, after its own refusals
+    /// and before this: an export the project's `exports/`, a basket its one
+    /// folder. A directory is the last thing either does before starting, so a
+    /// run that can't start leaves none behind.
+    pub(super) fn begin(&mut self, jobs: Vec<(String, ExportJob)>) -> Result<(), UserError> {
+        self.refuse_if_busy()?;
+        if jobs.is_empty() {
+            return Err(UserError::CantExport("nothing to export".into()));
+        }
+        let mut rows: Vec<ExportTargetRun> = jobs
+            .iter()
+            .map(|(label, job)| ExportTargetRun {
+                label: label.clone(),
+                frames: job.compilation.frames.len(),
+                state: TargetState::Pending,
+            })
+            .collect();
+        let mut jobs: VecDeque<ExportJob> = jobs.into_iter().map(|(_, job)| job).collect();
+
+        let first = jobs.pop_front().expect("the jobs are not empty");
         rows[0].state = TargetState::Running(0);
         let now = Instant::now();
         self.export = Some(Active {
@@ -606,6 +638,85 @@ fn source_date(sources: &[PathBuf]) -> Option<CalendarDate> {
     })
 }
 
+/// One entry's game video and, when it plays a clip, that clip's own media —
+/// or why it can't run. **The one place a missing game video or commentary
+/// recording is refused** (spec E5, basket spec V1), for an export of the open
+/// project and for a basket piece alike.
+///
+/// `whose` prefixes the refusal: empty for an export, `"Rovers v Athletic — "`
+/// for a basket piece, where two projects can hold clips with the same name.
+/// The alternative — a second resolver writing the same three sentences again —
+/// is how the two drift apart on the first edit to either.
+///
+/// The match's record is **not** joined here: [`job`] only knows whether the
+/// board is burned in once it has this list (see [`carry_scoreboard`]), so each
+/// builder wraps these in its own [`EntryMedia`].
+///
+/// The files are **stat**ed rather than read off `Bus::missing`, which is one
+/// flag per source of the *open* project and says nothing about the closed
+/// projects a basket reaches into (basket spec V2). An ordinary export is
+/// marginally more current for it: a video deleted since the last refresh is
+/// caught here.
+pub(super) fn entry_media(
+    folder: &Path,
+    project: &Project,
+    entry: &PlanEntry,
+    whose: &str,
+) -> Result<(PathBuf, Option<ClipMedia>), UserError> {
+    let refused = |why: String| UserError::CantExport(why);
+    let clip = entry.clip_id.map(|id| {
+        project
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .expect("the plan's clips are the project's clips")
+    });
+    // The game video the entry reads. A source the project doesn't have and
+    // one whose file isn't there are the same refusal, and neither can reach
+    // the job.
+    let source = project
+        .source_videos
+        .get(entry.source_index)
+        .map(|s| folder.join(&s.relative_path))
+        .filter(|path| path.exists());
+    let Some(source) = source else {
+        let what = match clip {
+            Some(clip) => format!("{}'s game video", clip_label(clip)),
+            // A reel or whole-match entry has no clip to name: the file names
+            // itself.
+            None => {
+                let file = project
+                    .source_videos
+                    .get(entry.source_index)
+                    .map_or("a video", |s| s.display_name.as_str());
+                format!("{file} (the game video)")
+            }
+        };
+        return Err(refused(format!(
+            "{whose}{what} is missing; relink it first"
+        )));
+    };
+    let Some(clip) = clip else {
+        return Ok((source, None));
+    };
+    let name = clip_label(clip);
+    let recording = folder
+        .join(RECORDINGS_DIRNAME)
+        .join(&clip.recording_filename);
+    if !recording.exists() {
+        return Err(refused(format!(
+            "{whose}{name}'s commentary recording is missing"
+        )));
+    }
+    Ok((
+        source,
+        Some(ClipMedia {
+            recording,
+            clip: clip.clone(),
+        }),
+    ))
+}
+
 /// The job that renders `target` as `label`, or why it can't run.
 ///
 /// A snapshot: later edits to the project don't reach a running export. Each
@@ -614,7 +725,6 @@ fn source_date(sources: &[PathBuf]) -> Option<CalendarDate> {
 /// avatar, so nothing in media has to resolve a project-local index.
 fn job(
     open: &Open,
-    missing: &[bool],
     exports: &Path,
     target: &ExportTarget,
     label: &str,
@@ -632,7 +742,6 @@ fn job(
         .iter()
         .map(|s| open.folder.join(&s.relative_path))
         .collect();
-    let recordings = open.folder.join(RECORDINGS_DIRNAME);
     // Each entry's game video and its clip's own media. The match's record
     // joins them below rather than here, because the Scoreboard picker decides
     // whether the board is burned in or carried beside the file, and it reads
@@ -640,52 +749,7 @@ fn job(
     let mut pieces: Vec<(PathBuf, Option<ClipMedia>)> =
         Vec::with_capacity(compilation.plan.entries.len());
     for entry in &compilation.plan.entries {
-        let clip = entry.clip_id.map(|id| {
-            open.project
-                .clips
-                .iter()
-                .find(|c| c.id == id)
-                .expect("the plan's clips are the project's clips")
-        });
-        // The game video the entry reads. A source the project doesn't have
-        // and one whose file isn't there are the same refusal, and neither can
-        // reach the job.
-        let source = sources
-            .get(entry.source_index)
-            .filter(|_| !missing.get(entry.source_index).copied().unwrap_or(true))
-            .cloned();
-        let Some(source) = source else {
-            let what = match clip {
-                Some(clip) => format!("{}'s game video", clip_label(clip)),
-                // A reel or whole-match entry has no clip to name: the file
-                // names itself.
-                None => {
-                    let file = open
-                        .project
-                        .source_videos
-                        .get(entry.source_index)
-                        .map_or("a video", |s| s.display_name.as_str());
-                    format!("{file} (the game video)")
-                }
-            };
-            return Err(refused(format!("{what} is missing; relink it first")));
-        };
-        let Some(clip) = clip else {
-            pieces.push((source, None));
-            continue;
-        };
-        let name = clip_label(clip);
-        let recording = recordings.join(&clip.recording_filename);
-        if !recording.exists() {
-            return Err(refused(format!("{name}'s commentary recording is missing")));
-        }
-        pieces.push((
-            source,
-            Some(ClipMedia {
-                recording,
-                clip: clip.clone(),
-            }),
-        ));
+        pieces.push(entry_media(&open.folder, &open.project, entry, "")?);
     }
 
     // The files a copy would join, in entry order — every one of them asked

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 use video_coach_app::bus::{
-    Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot, StateFile,
-    TranscriptionState, UserError,
+    BasketView, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot,
+    StateFile, TranscriptionState, UserError,
 };
 use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::store;
@@ -223,6 +223,14 @@ impl Harness {
     pub fn wait_export(&mut self) -> ExportRun {
         self.wait_map("Export", |e| match e {
             Event::Export(run) => Some(run.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits for the next `Basket`: the whole list as it stood.
+    pub fn wait_basket(&mut self) -> BasketView {
+        self.wait_map("Basket", |e| match e {
+            Event::Basket(view) => Some(view.clone()),
             _ => None,
         })
     }
