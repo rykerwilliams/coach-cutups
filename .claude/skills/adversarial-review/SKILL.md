@@ -18,7 +18,8 @@ the checklist for running it well.
 Each prompt must include:
 - the artifact path (or diff range) and "read it in full first";
 - the reference paths to verify against — for port work, the specific Swift
-  files under `apple/VideoCoachCore/Sources/VideoCoachCore/` and their tests;
+  files in the `macos-reference` tag under `apple/VideoCoachCore/Sources/VideoCoachCore/`
+  (read with `git show macos-reference:<path>`) and their tests;
 - "verify claims against the source; do not trust the artifact";
 - the **User values** block from `CLAUDE.md`, copied verbatim;
 - the output format: numbered findings, most important first, each with the

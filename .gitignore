@@ -1,21 +1,5 @@
-# Xcode
-build/
-DerivedData/
-*.xcuserstate
-xcuserdata/
-*.xcworkspace/xcuserdata/
-
-# Swift
-.build/
-Package.resolved
-.swiftpm/
-
-# macOS
+# Stray editor and desktop files
 .DS_Store
-
-# XcodeGen
-*.xcodeproj
-apple/App/Info.plist
 
 # Claude Code: .claude/ is committed (shared settings, skills). Personal overrides stay local.
 .claude/settings.local.json

@@ -1,22 +1,23 @@
 ---
 name: port-swift-module
-description: Port a module from the macOS reference implementation (apple/VideoCoachCore) into the Rust video-coach-core crate. Use when translating any Swift type, function, or test file to Rust for the Linux port.
+description: Port a module from the macOS original, read out of the macos-reference git tag, into the Rust video-coach-core crate. Use when translating any Swift type, function, or test file to Rust.
 argument-hint: "<Swift file or module name, e.g. ScoreboardState>"
 ---
 
 # Port a Swift module to video-coach-core
 
-The Swift tree under `apple/` is the reference for behavior. It is not the
-spec — it has known bugs (BACKLOG #27) and Apple-framework workarounds that
-must not be ported. The port spec is
+The Swift tree is no longer in the working tree: it lives at the annotated tag
+`macos-reference`, read with `git show macos-reference:<path>` or checked out
+whole with `git worktree add /tmp/macos-reference macos-reference`. It is the
+reference for behavior, not the spec — it has known bugs (BACKLOG #27) and
+Apple-framework workarounds that must not be ported. The port spec is
 `docs/superpowers/specs/2026-09-19-linux-port-design.md`; check its "Logic to
 port verbatim" section and the phase plan for what this module owes.
 
 ## 1. Read before you write any signature
 
-Read the Swift source **and** its test file under
-`apple/VideoCoachCore/Tests/VideoCoachCoreTests/` in full before proposing a
-Rust API. An API written from memory of what a module "probably" does was
+Read the Swift source **and** its test file (`apple/VideoCoachCore/Tests/
+VideoCoachCoreTests/` inside the tag) in full before proposing a Rust API. An API written from memory of what a module "probably" does was
 wrong once already: `SkipCoordinator` was planned with two entry points and an
 enum result, and the real machine has three entry points, issues its coarse
 seek from `seekCompleted`, and returns a seek and a debounce independently.

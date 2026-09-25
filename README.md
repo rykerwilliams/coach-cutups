@@ -108,11 +108,15 @@ export graph, how to run CI's GPU-less path locally — are in
 [`CLAUDE.md`](CLAUDE.md), and the design is in
 [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
-## The macOS original
+## Where this came from
 
-[`apple/`](apple/) holds the original macOS app (Swift, SwiftUI and
-AVFoundation), which this port replaces. It is kept as the reference for how
-things should behave and is not maintained or built by CI.
+Coach Cuts began as a macOS app written in Swift, SwiftUI and AVFoundation,
+and started life as a fork of
+[tayl0r/coach-cutups](https://github.com/tayl0r/coach-cutups). That Swift tree
+lived here under `apple/` while the Linux app was written against it; it is no
+longer in the working tree, and is kept whole at the tag `macos-reference`
+(`git worktree add /tmp/macos-reference macos-reference`). Linux is the only
+platform maintained here.
 
 ## Licence
 

@@ -10,6 +10,13 @@ published release is 0.6.0, which contains all of them.
 
 ## [Unreleased]
 
+### Removed
+
+- **The macOS app is no longer in the tree.** Coach Cuts is a Linux program, and
+  the Swift original it was written against had not been built or maintained for
+  months. It is kept whole at the git tag `macos-reference` for anyone asking
+  what the original did. Nothing in the Linux app changes.
+
 ## [0.7.0] - 2026-09-25
 
 ### Added

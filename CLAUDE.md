@@ -1,4 +1,4 @@
-# Coach Cutups — Project Conventions
+# Coach Cuts — Project Conventions
 
 ## Workflow for non-trivial features
 
@@ -55,7 +55,7 @@ After both reviews return:
 
 | Skill | Use it to |
 |---|---|
-| `port-swift-module` | Translate a module from `apple/` into `video-coach-core` without repeating past mistakes |
+| `port-swift-module` | Read a module out of the `macos-reference` tag into `video-coach-core` without repeating past mistakes |
 | `verify` | Run fmt, clippy, tests and the core dependency audit before committing |
 | `measure-media` | Benchmark GStreamer decode/seek on real hardware without fooling yourself |
 | `adversarial-review` | Run the review pattern below on a spec, plan, or diff |
@@ -589,30 +589,31 @@ measurement phase: it stores nothing, suggests nothing and adds no command).
   the repo or a pasted report** — no club, opponent, player, file or folder
   name. The matches are A, B and C.
 
-### Reference implementation (`apple/`, not maintained)
+### The macOS original (removed from the tree)
 
-The macOS app is kept as the reference for behavior and invariants. It is **not
-maintained in parallel** and is not built by CI. Read it to answer "what did the
-original do?", not to change it. Several known bugs are deliberately left in it
-(see `BACKLOG.md` #27); the port fixes them by construction.
+The Swift app this port replaces lived under `apple/` until 0.7.0. It is gone
+from the working tree and kept whole at the annotated tag **`macos-reference`**:
 
-- **Core package tests:** `swift test --package-path apple/VideoCoachCore`
-- **App build:** the `.xcodeproj` is gitignored, regenerated from `apple/project.yml`. After creating any new file under `apple/App/**`:
-  ```
-  cd apple && xcodegen generate && cd ..
-  xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach -destination 'platform=macOS' build
-  ```
-- Core package files under `apple/VideoCoachCore/**` are auto-discovered by SwiftPM — no xcodegen needed.
+```bash
+git show macos-reference:apple/VideoCoachCore/Sources/VideoCoachCore/<file>.swift
+git worktree add /tmp/macos-reference macos-reference   # the whole tree, read-only in practice
+```
 
-## Architecture notes (reference implementation)
+Read it only to answer "what did the original do?" — never to change it. It was
+never built by CI and several known bugs were deliberately left in it
+(`BACKLOG.md` #27); the port fixes them by construction. The behaviour worth
+keeping is already written down in `docs/superpowers/specs/`, so reach for the
+tag when a spec is silent, not as a first step.
 
-These describe `apple/`. The Rust port's architecture is in the spec above.
+Two of its conventions still bind this codebase, because the format is shared:
 
-- **`VideoCoachCore`** (Swift Package) holds all pure logic: data model, clock semantics, custom AVFoundation compositor, export pipeline. Tested headlessly via `swift test`.
-- **App target** (`apple/App/`) is SwiftUI + AppKit interop. Workspace is `@Observable @MainActor`; ContentView owns ephemeral UI state (`@State` + `@Binding` to children).
-- **`Workspace` is project-data only** — never put pure UI mode flags on it. Inspector mode, modal-flow flags, etc. live on `ContentView` as `@State`.
-- **Custom compositor lives on the export path only.** Preview playback uses AVFoundation's built-in compositor because macOS 26 strips custom-compositor instruction subclasses (`ClipPreviewBuilder.swift` documents this). Overlays in preview live as AppKit overlay views above `AVPlayerView`.
-- **Project file is `project.json` under the project folder**, plus a `recordings/` subdir of `.mov` clips. `formatVersion` discipline: bump on every additive schema change; migration happens at decode time, never at save. (The Rust port starts at v7 and refuses anything lower.)
+- **A project is a folder:** `project.json`, a `recordings/` subdir, an
+  `exports/` one. `formatVersion` bumps on every additive schema change and
+  migration happens at decode time, never at save. The port starts at v7 and
+  refuses anything lower.
+- **Project data and UI state stay apart.** Swift's `Workspace` held project
+  data only, with mode flags on the view; here the same line runs between
+  `project.json` and `state.json` — a preference is never a format change.
 
 ## Backlog
 

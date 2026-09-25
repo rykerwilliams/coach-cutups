@@ -216,12 +216,11 @@ Each entry: what, why deferred, when to revisit.
   display stacks differ. No measurement exists.
 - **When to revisit:** Phase 6 spike, before stroke capture is built on either.
 
-### 26. Fate of the `apple/` tree
-- **Why deferred:** Keep as reference implementation until the Linux port
-  reaches parity, then delete — or keep indefinitely as a macOS build nobody
-  runs. Deleting is the honest choice if nobody runs it, but the decision costs
-  nothing to postpone.
-- **When to revisit:** Milestone D.
+### 26. Fate of the `apple/` tree — RESOLVED (2026-09-25)
+- Deleted from the working tree after 0.7.0, and kept whole at the annotated
+  tag `macos-reference`. Nobody ran it, CI never built it, and the behaviour
+  worth keeping is written down in the specs; the tag costs nothing and answers
+  "what did the original do?" when a spec is silent.
 
 ### 27. macOS export bugs the port fixes but the Swift tree keeps
 - **Why deferred:** The review found five live bugs in the macOS app: the export
@@ -231,8 +230,9 @@ Each entry: what, why deferred, when to revisit.
   has no effect at all (`ExportSettings.bitrate` has zero production call
   sites); and unknown commentary events persist as empty-kind records that lose
   their payload. The port fixes all five by construction. Not fixed in Swift
-  because `apple/` is the reference implementation and is not maintained in
-  parallel.
+  because that app was never maintained in parallel; it now lives only at the
+  `macos-reference` tag (#26), so the file:line citations above are read with
+  `git show macos-reference:<path>`.
 - **When to revisit:** Only if the macOS app ships again. The scoreboard fix is
   small — pass `clip` instead of `clipStartAbsSeconds` into
   `CompilationInstruction` and call the preview formula.
