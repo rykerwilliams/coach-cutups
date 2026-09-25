@@ -1065,3 +1065,27 @@ Each entry: what, why deferred, when to revisit.
   other features are queued in.
 - **When to revisit:** with the next round of UI work, or the first time the
   coach says they can't read a clip name.
+
+88. **The inset's size and corner, per clip.** The coach (2026-09-25): "avatar
+  sizing and position should be settable per clip i think?" Today both are fixed:
+  `PIP_WIDTH_RATIO`/`PIP_MARGIN_RATIO` and a hard bottom-right corner
+  (`core/src/layout.rs`), with `AVATAR_BOX_RATIO` shrinking the avatar's circle
+  inside that box. A clip keeps only *whether* it shows an inset
+  (`Clip::show_pip`) and *which kind* (`Clip::inset`), both v10 fields.
+- **The shape:** two more fields on `Clip` — a size (a ratio, or a few named
+  steps) and a corner (one of four) — defaulted to today's values, so every
+  existing clip renders unchanged. That is a `formatVersion` bump to 12, which
+  is cheap and additive; and inspector controls beside the existing "Show avatar
+  in export" checkbox.
+- **What has to follow it:** the caption bar's available width (which, once the
+  inset sits on the bar, depends on whether the inset is in *that* corner), the
+  scan view's live self-view (`layout::self_view_rect` /
+  `avatar_self_view_rect` — the corner must match what the export will do), the
+  avatar's circle, and the GL 1×1 filler. The scoreboard is top-left, so a
+  top-left inset needs a rule: refuse that corner, or let them overlap.
+- **Worth deciding first:** whether a size is free (a slider) or a few steps
+  ("small / medium / large"), since a free ratio makes every clip's frame a
+  different shape and the reason the app has looked consistent so far is that
+  it has never offered one.
+- **Why deferred:** only by order — the basket is mid-build in the same files.
+- **When to revisit:** straight after the basket closes out.
