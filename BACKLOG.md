@@ -1176,3 +1176,39 @@ Each entry: what, why deferred, when to revisit.
   changing these first would point them at a URL that does not resolve yet.
 - **When to revisit:** the same day the repository is renamed — one commit, then
   watch the Pages deploy.
+
+91. **Stop being a fork, and decide whether the name comes with us.** `gh repo
+  view` shows this repository as a fork of `tayl0r/coach-cutups`. Detaching it
+  is a GitHub Support request from the owner and keeps the URL, the stars, the
+  `v0.7.0` release and both tags; the alternative (a fresh repository, all refs
+  pushed) breaks the release page. The AGPL obligations from the shared history
+  stay either way, which is why `README.md`'s "Where this came from" names the
+  upstream repository in prose.
+- **The name is upstream's, which is the part that surprised us.** `321606d`
+  "Rename app to Coach Cuts + add app icon (#11)", Taylor Steil, 2026-07-13 —
+  two months *before* the fork. `coach-cuts` the identifier is ours (`5b78229`
+  onward) but it is only the slug of their name. There is no trademark in play
+  and the AGPL governs code, not names, so keeping it is legitimate; the cheap
+  first move is to ask Taylor.
+- **The app is going sport-neutral**, so any replacement must be too: it will be
+  used for generic telestration, which rules out `Touchline`, `Pitchside` and
+  every other football-only word. Names considered and not chosen: Coach Clips,
+  Coach Tape, Clip Coach, Clip Clinic, Cliproom, Reel Room, Tape Talk, Chalk,
+  Chalkboard, Filmroom, Breakdown, Cutroom, Tape, Greasepen, Whistle. Ruled out
+  on their own merits: `coach-cuts-ng` (the parent's name plus a suffix
+  announcing we are its sequel), `Sport Shorts` ("Shorts" means vertical
+  short-form video, which our 16:9 exports are not), `Sport Clips` (a US salon
+  chain).
+- **What a rename costs, measured:** the `[[bin]]`, the `.deb` `name` (plus
+  `Conflicts`/`Replaces` so apt removes the installed `coach-cuts`), the
+  `.desktop` file and five icon files, `WM_CLASS` / `app_id`, `APP_NAME` in
+  `core::metadata` (the `encoder` tag), `FILMS_DIR`, `$COACH_CUTS_WHISPER_MODEL`
+  (27 sites), the config and cache directory names — with a first-run rename of
+  both, because the cache holds a 488 MB speech model nobody should download
+  twice — the docs, and a 0.8.0 bump. Optionally the crates as well
+  (`video-coach-*`, a third naming system inherited from Swift's `VideoCoach`:
+  499 occurrences across 99 files, mechanical, compiler-checked).
+- **Why deferred:** the coach paused it on 2026-09-25 with the shortlist open.
+  Nothing was renamed; no file was touched.
+- **When to revisit:** when a name is chosen, or after asking Taylor about
+  keeping this one. Detaching the fork needs neither decision and can go first.
