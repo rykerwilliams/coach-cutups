@@ -23,9 +23,9 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    self, export_targets, whisper, whisper_model_override, Bus, BusHandle, CaptureKind, Command,
-    Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage, StateFile,
-    TargetState, TranscriptionState, WindowSize,
+    self, export_targets, whisper, whisper_model_override, BasketView, Bus, BusHandle, CaptureKind,
+    Command, Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage,
+    StateFile, TargetState, TranscriptionState, WindowSize,
 };
 use video_coach_app::color_picker;
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
@@ -161,6 +161,12 @@ struct UiState {
     /// The previewed clip's duration while a preview is open. The transport
     /// then runs over the clip rather than the concat timeline (spec P6).
     preview_duration: Option<f64>,
+    /// The basket's name and pickers have been taken from the bus once, at
+    /// startup (basket spec C4). They are the sheet's own after that: a field
+    /// re-seeded by a later event — an Add from another project, say — would
+    /// take the name the coach had just typed with it, and the bus keeps them
+    /// at Start, so the two differ only while a name is typed and not started.
+    basket_seeded: bool,
     /// What the export sheet's rows stand for, in its order (Phase 8 E8).
     /// The window holds the labels and the ticks; the targets are here, since
     /// it has no type for one.
@@ -258,6 +264,7 @@ impl Default for UiState {
             highlight_drag: None,
             notice_until: None,
             preview_duration: None,
+            basket_seeded: false,
             export_targets: Vec::new(),
             scoreboard: None,
             board_renderer: None,
@@ -534,6 +541,7 @@ fn wire_callbacks(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
     wire_devices(window, bus);
     wire_clips(window, bus);
     wire_export(window, bus);
+    wire_basket(window, bus);
     wire_preview(window, bus);
     wire_match(window, bus);
     wire_match_editor(window, bus);
@@ -647,6 +655,7 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let (weak, bus) = (window.as_weak(), bus.clone());
         move || {
             let Some(w) = weak.upgrade() else { return };
+            clear_run(&w, false);
             let ticked = w.get_export_targets();
             let targets = UI.with_borrow(|ui| {
                 ui.export_targets
@@ -749,6 +758,92 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
     w.set_export_whole_match_ticked(whole_match_ticked(rows.iter().cloned()));
     w.set_export_targets(ModelRc::new(VecModel::from(rows)));
     w.set_export_sheet_open(true);
+}
+
+/// The basket (basket spec U): the clip menu adds to it, the bottom bar's
+/// badge opens the sheet, and Start hands the bus the name and the pickers as
+/// they stand.
+///
+/// **Nothing here holds a piece.** The list is `Event::Basket`'s every time,
+/// so the sheet cannot be left showing a piece the bus has dropped, and the
+/// badge's count is that same list's length.
+fn wire_basket(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
+    window.on_add_to_basket({
+        let bus = bus.clone();
+        move |id| {
+            if let Some(clip_id) = parse_id(&id) {
+                bus.borrow().send(Command::AddToBasket { clip_id });
+            }
+        }
+    });
+    window.on_open_basket({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            w.set_basket_message(SharedString::new());
+            w.set_basket_sheet_open(true);
+            // Resolved as the sheet opens, against what each project says now
+            // (basket spec U5): the sheet is modal, so nothing under it moves
+            // while it is up.
+            bus.borrow().send(Command::ShowBasket);
+        }
+    });
+    window.on_remove_basket_piece({
+        let bus = bus.clone();
+        move |index| {
+            if let Ok(index) = usize::try_from(index) {
+                bus.borrow().send(Command::RemoveFromBasket { index });
+            }
+        }
+    });
+    window.on_move_basket_piece({
+        let bus = bus.clone();
+        move |from, to| {
+            let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) else {
+                return;
+            };
+            bus.borrow().send(Command::MoveBasketEntry { from, to });
+        }
+    });
+    window.on_clear_basket({
+        let bus = bus.clone();
+        move || bus.borrow().send(Command::ClearBasket)
+    });
+    window.on_start_basket({
+        let (weak, bus) = (window.as_weak(), bus.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            w.set_basket_message(SharedString::new());
+            clear_run(&w, true);
+            bus.borrow().send(Command::ExportBasket {
+                name: w.get_basket_name().to_string(),
+                resolution: match w.get_basket_resolution() {
+                    0 => Resolution::R720,
+                    // As the export sheet has it: 2160p is in the project
+                    // format but not offered.
+                    _ => Resolution::R1080,
+                },
+                quality: match w.get_basket_quality() {
+                    0 => Quality::Low,
+                    2 => Quality::High,
+                    _ => Quality::Medium,
+                },
+            });
+        }
+    });
+}
+
+/// Clears the run the sheets show, and says whose the next one is.
+///
+/// Called by both Starts, because there is one run and two sheets rendering
+/// it: without this a Start that is *refused* leaves the previous run's rows
+/// standing in the sheet that just asked for one, labelled as though it had
+/// started them. A run in progress refuses a second, so what this drops is
+/// always a finished one.
+fn clear_run(w: &AppWindow, basket: bool) {
+    w.set_export_run(ModelRc::default());
+    w.set_export_finish(SharedString::new());
+    w.set_basket_run(basket);
 }
 
 /// Whether the whole-match row is among the ticked ones.
@@ -2242,9 +2337,9 @@ fn on_event(w: &AppWindow, event: Event) {
             t.state = state;
             show_transcription(w, ui);
         }),
-        // The basket travels whole in every event (basket spec C4), for the
-        // sheet that renders it; nothing in the window shows it yet.
-        Event::Basket(_) => {}
+        // The basket travels whole in every event (basket spec C4): the sheet
+        // and the bottom bar's badge are this and nothing else.
+        Event::Basket(view) => show_basket(w, &view),
         // What the bus's own parse left in the paste box (spec B5): the
         // refused lines, for the coach to fix in place and add again.
         Event::MatchPasteLeftover(text) => w.set_match_editor_paste(text.into()),
@@ -2262,7 +2357,17 @@ fn on_event(w: &AppWindow, event: Event) {
             }
             show_notice(w, text);
         }
-        Event::Error(e) => show_error(w, &e.to_string()),
+        Event::Error(e) => {
+            // A Start refusal goes to the basket sheet's own line as well
+            // (basket spec C6): the dialog is dismissed with one key, and the
+            // line is what the coach reads while fixing the piece it names.
+            // Every basket refusal is a `CantExport`, and while the sheet is up
+            // nothing else can have caused one.
+            if w.get_basket_sheet_open() && matches!(e, bus::UserError::CantExport(_)) {
+                w.set_basket_message(sentence(&e.to_string()).into());
+            }
+            show_error(w, &e.to_string())
+        }
     }
 }
 
@@ -2300,13 +2405,38 @@ fn show_export(w: &AppWindow, run: &ExportRun) {
     if running {
         return;
     }
+    // Whether the run that just ended was the basket's. Its outcome is also
+    // reported on the sheet's own line, which is the only place either the
+    // failure or the file is readable while the scrim is up (basket spec C6).
+    let basket = w.get_basket_run();
     // A run stops at nothing: the first failure is what to say, since a run
     // of one target is still the common case.
     if let Some(why) = run.targets.iter().find_map(|t| match &t.state {
         TargetState::Failed(e) => Some(e.clone()),
         _ => None,
     }) {
-        return show_error(w, &format!("export failed: {why}"));
+        let text = format!("export failed: {why}");
+        if basket {
+            w.set_basket_message(sentence(&text).into());
+        }
+        return show_error(w, &text);
+    }
+    // A basket is one file, under a name that may have been suffixed rather
+    // than overwriting a film already there — so the line names the file that
+    // was written, not the name that was asked for (basket spec O1).
+    if basket {
+        if let Some(path) = run.targets.iter().find_map(|t| match &t.state {
+            TargetState::Done(path) => Some(path),
+            _ => None,
+        }) {
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            w.set_basket_message(format!("Wrote {}", path.display()).into());
+            show_notice(
+                w,
+                format!("Wrote {file} to Coach Cuts in your videos folder"),
+            );
+        }
+        return;
     }
     let written = run
         .targets
@@ -2319,6 +2449,42 @@ fn show_export(w: &AppWindow, run: &ExportRun) {
             w,
             format!("Exported {written} video{plural} to the project's exports folder"),
         );
+    }
+}
+
+/// The basket, whole, as its sheet lists it and the bottom bar's badge counts
+/// it (basket spec C4). Every row is the bus's, resolved against its own
+/// project when it published this.
+fn show_basket(w: &AppWindow, view: &BasketView) {
+    let rows: Vec<BasketPieceRow> = view
+        .pieces
+        .iter()
+        .map(|piece| BasketPieceRow {
+            match_label: piece.match_label.as_str().into(),
+            clip_label: piece.clip_label.as_str().into(),
+            // A piece with no clip to measure shows nothing rather than
+            // "0:00", which would read as a clip of no length.
+            length: match piece.problem.is_empty() {
+                true => format_hms(piece.seconds).into(),
+                false => SharedString::new(),
+            },
+            problem: sentence(&piece.problem).into(),
+        })
+        .collect();
+    w.set_basket_pieces(ModelRc::new(VecModel::from(rows)));
+    // The name and the pickers are taken once and are the sheet's after that
+    // (see `UiState::basket_seeded`).
+    if !UI.with_borrow_mut(|ui| std::mem::replace(&mut ui.basket_seeded, true)) {
+        w.set_basket_name(view.name.as_str().into());
+        w.set_basket_resolution(match view.resolution {
+            Resolution::R720 => 0,
+            _ => 1,
+        });
+        w.set_basket_quality(match view.quality {
+            Quality::Low => 0,
+            Quality::Medium => 1,
+            Quality::High => 2,
+        });
     }
 }
 

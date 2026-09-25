@@ -364,7 +364,8 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Measured:** 30.005 fps on 1440p HEVC, audio leading the picture by 2–7 ms. Don't measure the rate first-frame-to-last-frame; the mixer flushes its tail late. The UI budget is relative to a scanning control in the same session, not to an idle window.
 
 **Export burns in the overlay and mixes the audio** (Phase 8).
-- **Layers:** the pumped source (zoom, per-entry fit rect), the webcam PiP, then one output-size overlay carrying strokes (mapped into the picture rect), the text bar's background and its glyphs. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
+- **Layers:** the pumped source (zoom, per-entry fit rect), then one output-size overlay carrying strokes (mapped into the picture rect), the text bar's background and its glyphs, and the inset **over both**. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
+- **Both furniture pieces are locked to a corner** (the coach, 2026-09-25): the scoreboard flush into the top-left, the inset flush into the bottom-right, over the caption bar. The inset is the mixer's **top** layer, so the bar's 60% black never washes over the coach's face, and the bar's *line* — never its background — is laid out in the width the inset leaves (`layout::bar_text_rect`, keyed on `Clip::shows_inset`), because a caption is ellipsized and never shrunk and would otherwise run underneath it. The cost of that z-order is that a stroke drawn into that corner is behind the inset; the app's live self-view still sits under the drawings.
 - **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
 - **The avatar is that same inset pad, never the overlay.** An avatar clip's inset is the project's image: decoded and pre-scaled once, **uploaded to GL once** (the filler's own hop, for the filler's own reason) and pushed as a re-stamped header over the one texture per frame; preview, whose recording has no video pad to play, feeds the pad from an `appsrc` of its own. **The avatar's box is `AVATAR_BOX_RATIO` (0.75) of the webcam inset**, shrunk about the inset's bottom-right corner so it keeps that corner's margins and is simply smaller (the coach, 2026-09-23); `core::avatar::avatar_box` is the whole of it, one pure function on the avatar paths only, and retuning the size is that one constant. The pulse is the **pad's rect**, `core::avatar::avatar_rect(box, level)`, set in the PTS-keyed probe from one level per output frame built at job setup from the recording's own audio — never in the frame loop, where an audio decode would stall the pump — and **bounded by the entry**: the reader is asked for exactly the samples the entry's frames cover, so a two-second entry of an hour-long take reads two seconds. `avatar_rect` is exactly the rect it is given at level 1.0, which is what every non-avatar frame carries, so a camera export is unchanged to the integer. Both raster pads blend `blend-function-src-rgb=one`: what they carry is a premultiplied tiny-skia pixmap. **Measured, and the reason:** drawing the inset in the overlay costs 4.2–4.8 ms a frame against the 3.2 ms the whole overlay costs — `tiny_skia` has no sprite fast path (`the_avatar_blit_costs`, `#[ignore]`d in `media/tests/avatar.rs`).
 - **`Clip::shows_camera_pip()` and `shows_avatar()` are the only readings of `show_pip × inset`.** Preview has **three** sites to the first — the launch string's branch, the pad's placement, `decodebin3`'s pad-added link — and they must agree or the mixer stalls. They take one answer, and it includes a **probe of the recording**: `show_pip` says the coach wants an inset, but an avatar take's file has no video track and neither has a webcam take whose camera died. Export probes before it opens a decoder and falls back to the filler; preview has no filler and asks for no pad at all.
@@ -423,6 +424,38 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
   frame's source time as the highlight rings do, is dropped while `scrubbing`
   and restored on release, and is kept through a fast scan, where the shown
   frame's own time is as honest at 32× as at 1×.
+
+**The basket is one film whose pieces come from several matches.** A piece is a
+reference — `(project folder, clip id)` — added from the clip row's menu in
+whatever project is open, and resolved at Start.
+- **It lives in its own file**, `$XDG_CONFIG_HOME/coach-cuts/basket.json`, and
+  **not as a key in `state.json`**: `StateFile::read` discards that whole
+  document on any parse error and every setter rewrites it, so one basket value
+  a build couldn't read would take the last project, the pen and the speech
+  model with it. Inside it, the two pickers are **string labels** for the same
+  reason — an unknown one reads as the default rather than costing the pieces.
+- **Each piece draws its own match's board and clock**, because the match's
+  record hangs off `EntryMedia` and the clock is still
+  `state_at(entry.source_index, frame.source_time)` per frame. `PlanEntry` knows
+  nothing about matches, and `source_index` stays project-local.
+- **The export's decoders are bounded**: one per distinct file, dropped as soon
+  as no later entry reads it — the audio mixer's own rule — and the zero-copy
+  diagnostic is therefore taken when the **first** decoder opens, not after the
+  loop, where it may be gone.
+- **A basket's text bar is three parts** (`<match> | <clip> | tags`). The bar
+  ellipsizes rather than shrinks, so a fourth part would spend the safe end of
+  the line on a position that means nothing across matches; the position is in
+  the chapters instead.
+- **It mixes at the default volumes.** A project's preview volumes are a
+  scanning convenience, and a film whose level jumps between pieces for an
+  invisible reason is worse than one that doesn't.
+- **The sheet is the fifth `Sheet`, and a row is a reference and a length.** A
+  row's problem line covers a project that can't be read and a clip that has
+  gone; **footage is checked at Start**, not per row, so a clean-looking row can
+  still be refused — which is why the sheet says so above its own message line,
+  and why that line exists at all (the status bar's notice renders *behind* the
+  scrim). The row carries the short phrase and Start's refusal carries the
+  sentence that names the folder.
 
 **Match events are tagged at the playhead or typed, in one grammar.** `z` /
 `x` / `v` tag where the game video is; the editor sheet ("Edit events…" in the

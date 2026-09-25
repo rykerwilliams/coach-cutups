@@ -316,14 +316,20 @@ impl Bus {
             .pieces
             .iter()
             .map(|piece| match self.project_for(&piece.folder) {
-                Err(e) => BasketRow {
+                Err(_) => BasketRow {
                     match_label: piece
                         .folder
                         .file_name()
                         .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
                     clip_label: String::new(),
                     seconds: 0.0,
-                    problem: e.to_string(),
+                    // **A phrase, not the store error's sentence.** A row is
+                    // one line of a narrow list, and the sentence that names
+                    // the folder and the reason (spec V6) is elided down to
+                    // the half of it that says nothing. The folder is in the
+                    // label beside this, and the whole sentence is Start's
+                    // refusal, on the sheet's message line.
+                    problem: "the project can't be read".into(),
                 },
                 Ok(project) => {
                     let clip = project.clips.iter().find(|c| c.id == piece.clip);

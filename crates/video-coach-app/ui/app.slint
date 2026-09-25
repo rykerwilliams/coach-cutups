@@ -57,6 +57,23 @@ export struct RunRow {
     status: string,
 }
 
+/// One piece of the basket, as its sheet lists it (basket spec C4). The bus
+/// resolves all four against the piece's own project every time it publishes
+/// the basket, so nothing here is the window's to keep.
+export struct BasketPieceRow {
+    /// "Rovers v Athletic", or the project's own name — what changes between
+    /// two adjacent corners from two different games (basket spec T2).
+    match-label: string,
+    clip-label: string,
+    /// "0:14": roughly how long the piece runs, already formatted.
+    length: string,
+    /// Why this piece can't be exported, or empty. It covers a project that
+    /// can't be read and a clip that has gone; **footage is checked at Start,
+    /// not here** (basket spec V1), which is what the note under the list
+    /// says.
+    problem: string,
+}
+
 /// One row of the Match panel's event list (Phase 9 S4).
 export struct MatchRow {
     /// The event's UUID.
@@ -1385,10 +1402,10 @@ component Scrim inherits Rectangle {
 /// The card every modal in this app is drawn as: a fixed width, a height of
 /// whatever it holds, the house chrome and the heading.
 ///
-/// There are four of these -- export, match setup, the match event editor and
-/// the error dialog -- and this is the one shape they are. A sheet sets its
-/// width and its title and lays its own body out as children; everything else
-/// is here, once.
+/// There are five of these -- export, the basket, match setup, the match event
+/// editor and the error dialog -- and this is the one shape they are. A sheet
+/// sets its width and its title and lays its own body out as children;
+/// everything else is here, once.
 component Sheet inherits Rectangle {
     /// The card's width. Wide enough for the widest thing in it, and no
     /// wider: the height follows the content.
@@ -1577,6 +1594,277 @@ component ExportSheet inherits Sheet {
             text: "Export";
             primary: true;
             enabled: root.any-ticked;
+            clicked => { root.start(); }
+        }
+    }
+}
+
+/// The basket sheet (basket spec U3): the pieces gathered across matches,
+/// what the film they make is called, and how its run is going.
+///
+/// A `Sheet` at 520px -- the setup sheet's width, because the widest thing in
+/// it is a row's match beside its clip name -- and **no fifth panel shape**.
+///
+/// It renders what it is handed and keeps nothing: the pieces are
+/// `Event::Basket`'s and the run row is `Event::Export`'s, for the export
+/// sheet's own reason -- a sheet holding its own copy can be left standing on
+/// a state the bus has moved past.
+component BasketSheet inherits Sheet {
+    in property <[BasketPieceRow]> pieces;
+    /// The run in progress, one row; empty before the first.
+    in property <[RunRow]> run;
+    /// The one run the app has is **this sheet's**. Without it an ordinary
+    /// export going on behind the sheet would be drawn here as though Start
+    /// had started it.
+    in property <bool> basket-run;
+    /// "Finishes at 3:42 PM", empty until the rate is steady.
+    in property <string> finish;
+    /// A run is going -- this sheet's or another's. The pickers and Start are
+    /// settled for it either way, since the bus refuses a second run.
+    in property <bool> exporting;
+    /// Refusals, and the file a finished run wrote (basket spec C6). The
+    /// status bar's notice renders *behind* the scrim, so a sheet with
+    /// commands of its own needs a line.
+    in property <string> message;
+    /// The film's name. Two-way all the way out to the window as every field
+    /// in this app is: a `text:` binding breaks the moment it is typed in.
+    in-out property <string> name;
+    /// 720p or 1080p, and Low / Medium / High: the pickers' indices, the
+    /// export sheet's own two.
+    in-out property <int> resolution;
+    in-out property <int> quality;
+    /// The name field has focus, which the window folds into its own
+    /// `text-editing`: without the fold the first Esc closes the sheet from
+    /// inside the field and the window's "Esc leaves the field" cascade is
+    /// dead code. **In-out and set by hand** rather than bound -- this element
+    /// is destroyed when the sheet closes, and a binding that went with it
+    /// would leave the window's shortcuts switched off (the match editor
+    /// carries the same guard).
+    in-out property <bool> editing;
+    /// A row moved: from this index to that one.
+    callback reorder(int, int);
+    callback remove(int);
+    callback clear();
+    callback start();
+    callback cancel();
+    callback close();
+
+    card-width: 520px;
+    title: "Basket";
+
+    if root.pieces.length == 0: Text {
+        text: "Nothing gathered yet. Right-click a clip and choose \"Add to basket\" — in as many projects as you like, and they wait here until you press Start.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+    // A height of its own, in the house idiom: twenty pieces scroll rather
+    // than growing the sheet past the window.
+    if root.pieces.length > 0: ListView {
+        height: min(280px, root.pieces.length * 30px);
+        for piece[index] in root.pieces: Rectangle {
+            height: 30px;
+
+            HorizontalLayout {
+                padding-left: 4px;
+                padding-right: 4px;
+                spacing: 6px;
+
+                // ↑ and ↓, not a drag: the clip list's `DragArea` /
+                // `DropArea` machinery is real, and a five-row modal list
+                // does not earn a second copy of it (basket spec U6).
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "↑";
+                        accessible-label: "Move up";
+                        enabled: index > 0 && !root.exporting;
+                        clicked => { root.reorder(index, index - 1); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "↓";
+                        accessible-label: "Move down";
+                        enabled: index < root.pieces.length - 1 && !root.exporting;
+                        clicked => { root.reorder(index, index + 1); }
+                    }
+                }
+                Text {
+                    text: piece.match-label;
+                    // A piece that can't be resolved is the whole row greyed,
+                    // not one cell of it.
+                    color: piece.problem == "" ? Palette.foreground : Palette.alternate-foreground;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    min-width: 120px;
+                }
+                // The clip, or the short reason there isn't one. A row with
+                // a problem has no clip name to lose -- the bus leaves it
+                // empty precisely because it could not find the clip -- and
+                // the *long* form of the reason, the one that names the
+                // folder, is Start's refusal (basket spec V6), which lands on
+                // the message line below.
+                Text {
+                    text: piece.problem == "" ? piece.clip-label : piece.problem;
+                    color: piece.problem == "" ? Palette.foreground : Palette.alternate-foreground;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: piece.length;
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    min-width: 36px;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "×";
+                        accessible-label: "Remove";
+                        enabled: !root.exporting;
+                        clicked => { root.remove(index); }
+                    }
+                }
+            }
+        }
+    }
+    // **What the rows above don't know.** A piece's footage is resolved at
+    // Start, not per row: a row is a reference and a length, and building a
+    // plan for each one to find its game video would be the sheet doing the
+    // run's work every time it opens (basket spec C4, V1). So a row that
+    // looks clean can still be refused, and this says where that lands.
+    if root.pieces.length > 0: Text {
+        text: "Start checks each piece's video and recording; anything missing is reported below.";
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    // On a row of its own rather than a third column, as the export sheet's
+    // Scoreboard picker is: three of these abreast overflow the card.
+    VerticalLayout {
+        spacing: 4px;
+        FieldLabel { text: "Name"; }
+        LineEdit {
+            // What an empty name becomes, so what the coach sees is what they
+            // get (basket spec O1).
+            placeholder-text: "Basket";
+            enabled: !root.exporting;
+            text <=> root.name;
+            changed has-focus => { root.editing = self.has-focus; }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 16px;
+
+        VerticalLayout {
+            spacing: 4px;
+            FieldLabel { text: "Resolution"; }
+            ComboBox {
+                // 2160p is in the project format but not offered, as the
+                // export sheet has it.
+                model: ["720p", "1080p"];
+                enabled: !root.exporting;
+                current-index <=> root.resolution;
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            FieldLabel { text: "Quality"; }
+            ComboBox {
+                model: ["Low", "Medium", "High"];
+                enabled: !root.exporting;
+                current-index <=> root.quality;
+            }
+        }
+    }
+
+    if root.basket-run && root.run.length > 0: FieldLabel { text: "Run"; }
+    if root.basket-run && root.run.length > 0: HorizontalLayout {
+        height: 28px;
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 8px;
+
+        Text {
+            text: root.run[0].label;
+            color: Palette.foreground;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        // Only while it renders; the status word stands in otherwise.
+        if root.run[0].rendering: VerticalLayout {
+            alignment: center;
+            ProgressIndicator {
+                width: 120px;
+                progress: root.run[0].progress;
+            }
+        }
+        Text {
+            text: root.run[0].status;
+            color: Palette.alternate-foreground;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            min-width: 64px;
+        }
+    }
+    if root.basket-run && root.finish != "": Text {
+        text: root.finish;
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+    }
+    if root.message != "": Text {
+        text: root.message;
+        color: Palette.alternate-foreground;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 8px;
+
+        // First, and two buttons clear of Start: it is the one control here
+        // with no undo.
+        Button {
+            text: "Clear";
+            enabled: root.pieces.length > 0 && !root.exporting;
+            clicked => { root.clear(); }
+
+            Tooltip {
+                text: @markdown("Empty the basket. There is no undo -- but nothing is lost: every clip is still in its own project.");
+            }
+        }
+        if root.exporting && root.basket-run: Button {
+            text: "Cancel export";
+            clicked => { root.cancel(); }
+
+            Tooltip {
+                text: @markdown("Stop the run. Nothing is written, and the basket is left as it is.");
+            }
+        }
+        Button {
+            text: "Close";
+            clicked => { root.close(); }
+        }
+        // Start leaves the basket alone: the coach may re-run at another
+        // resolution, or add a ninth piece and run again (basket spec U8).
+        // A piece that can't be resolved is not greyed out here -- the
+        // refusal names it, which is more use than a dead button.
+        if !root.exporting: Button {
+            text: "Start";
+            primary: true;
+            enabled: root.pieces.length > 0;
             clicked => { root.start(); }
         }
     }
@@ -2720,6 +3008,34 @@ export component AppWindow inherits Window {
     /// which the bus refuses while one is.
     in property <bool> exporting;
 
+    // --- The basket (basket spec U): one film, pieces from several matches ---
+
+    /// The sheet is up. UI state: the Basket… button opens it, its own buttons
+    /// and Esc close it.
+    in-out property <bool> basket-sheet-open;
+    /// The pieces waiting, whole, from the bus's `Basket` event — which
+    /// arrives at startup and on every change, so **the badge's count is right
+    /// with the sheet closed and with no project open**, which is the point of
+    /// the feature.
+    in property <[BasketPieceRow]> basket-pieces;
+    /// The film's name and the two pickers. Seeded from the bus's event when
+    /// the sheet opens and **not on every event**: the name is typed into, and
+    /// re-seeding it under the coach's hands is the one thing a field must
+    /// never do.
+    in-out property <string> basket-name;
+    in-out property <int> basket-resolution;
+    in-out property <int> basket-quality;
+    /// The run in progress is the basket's, not an ordinary export's, so the
+    /// sheet draws it as its own.
+    in property <bool> basket-run;
+    /// The sheet's own message line (basket spec C6): a refusal, or the file a
+    /// finished run wrote. The status bar's notice can't stand in for it —
+    /// that one renders behind the scrim.
+    in-out property <string> basket-message;
+    /// The name field has focus. Set by the sheet and cleared when it closes,
+    /// since the binding goes with the element (see the sheet).
+    property <bool> basket-editing;
+
     // --- Preview (Phase 7 P6) ---
 
     /// The clip on screen instead of the game video, empty with none, and its
@@ -2830,7 +3146,7 @@ export component AppWindow inherits Window {
     // editor's, Esc inside its paste box closes the sheet on the first press
     // and throws away a half-typed block (spec P3).
     property <bool> text-editing: name-edit.has-focus || inspector.editing || highlights.editing
-        || root.match-editor-editing;
+        || root.match-editor-editing || root.basket-editing;
 
     callback open-project();
     callback add-source();
@@ -2881,6 +3197,17 @@ export component AppWindow inherits Window {
     /// Export what's ticked, at the pickers' resolution and quality.
     callback start-export();
     callback cancel-export();
+    /// The basket (basket spec C1). `open-basket` also asks the bus for it, so
+    /// the rows are resolved against their projects as the sheet opens.
+    callback open-basket();
+    /// The clip menu's "Add to basket", on the row it was opened on.
+    callback add-to-basket(string);
+    callback remove-basket-piece(int);
+    callback move-basket-piece(int, int);
+    callback clear-basket();
+    /// Render the basket as one film, under the name and pickers as they
+    /// stand — which become the basket's either way.
+    callback start-basket();
     /// Preview the clip with this id, in place of the game video, and close
     /// the one open (P5).
     callback open-preview(string);
@@ -3023,6 +3350,18 @@ export component AppWindow inherits Window {
         keys.focus();
     }
 
+    /// Closes the basket sheet, however it was closed. It clears `editing` by
+    /// hand, as the editor's close does: the sheet that sets it is about to be
+    /// destroyed, and a field that had focus would otherwise leave the
+    /// window's shortcuts switched off for good. The message goes with it
+    /// (basket spec C6); the pieces are the bus's and stay.
+    function close-basket() {
+        root.basket-editing = false;
+        root.basket-message = "";
+        root.basket-sheet-open = false;
+        keys.focus();
+    }
+
     /// One of the three match tag keys (S4), under the gate the panel's
     /// buttons share -- the cap included, which only the start/stop has: the
     /// bus refuses a tag there, and that refusal is a backstop, not something
@@ -3056,6 +3395,19 @@ export component AppWindow inherits Window {
                 root.export-sheet-open = false;
             }
             return accept;
+        }
+        // The basket sheet is modal too, and it has a field of its own. Esc
+        // closes it from *outside* the name field; inside one it leaves the
+        // field first and the next Esc closes, which is the editor's shape and
+        // the reason the window's `text-editing` carries `basket-editing` --
+        // without that fold the test below is always true and the cascade is
+        // dead code. The `reject` is also what delivers Ctrl+V to the field.
+        if (root.basket-sheet-open) {
+            if (pressed && event.text == Key.Escape && !root.text-editing) {
+                root.close-basket();
+                return accept;
+            }
+            return reject;
         }
         // The match setup sheet is modal too, and it has fields of its own:
         // Esc closes it, and everything else goes to whatever in it has
@@ -3518,6 +3870,16 @@ export component AppWindow inherits Window {
                                                     title: "Export video…";
                                                     enabled: !root.exporting && !root.previewing;
                                                     activated => { root.export-clip(clip.id); }
+                                                }
+                                                // Beside its nearest neighbour
+                                                // in meaning. Nothing is
+                                                // rendered, so it needs no
+                                                // gate beyond the menu's own
+                                                // `enabled: !root.recording`
+                                                // (basket spec U1).
+                                                MenuItem {
+                                                    title: "Add to basket";
+                                                    activated => { root.add-to-basket(clip.id); }
                                                 }
                                                 MenuItem {
                                                     title: "Delete clip";
@@ -4150,6 +4512,29 @@ export component AppWindow inherits Window {
                                 text: @markdown("Export clips, the goals reel, or the whole match, as videos");
                             }
                         }
+                        // The badge, and the answer to "is a basket waiting":
+                        // the count is the stored list's, so it is right the
+                        // moment the app starts and survives every project
+                        // switch. **No `has-project`** -- a basket can be
+                        // started with none, and being in project B and seeing
+                        // that four pieces are waiting is the whole point
+                        // (basket spec U2). Still on while a run is going: the
+                        // sheet is where one is watched and cancelled from.
+                        Button {
+                            text: root.basket-pieces.length > 0
+                                ? "Basket (" + root.basket-pieces.length + ")…"
+                                : "Basket…";
+                            enabled: root.basket-pieces.length > 0 && !root.recording
+                                && !root.previewing;
+                            clicked => {
+                                keys.focus();
+                                root.open-basket();
+                            }
+
+                            Tooltip {
+                                text: @markdown("Make one video of the clips gathered from any number of matches");
+                            }
+                        }
                         Button {
                             text: "Devices…";
                             enabled: root.has-project && !root.recording;
@@ -4399,6 +4784,41 @@ export component AppWindow inherits Window {
             }
         }
 
+        // --- Basket sheet: modal over the whole window (basket spec U3) ---
+        if root.basket-sheet-open: Scrim {
+            BasketSheet {
+                pieces: root.basket-pieces;
+                run: root.export-run;
+                basket-run: root.basket-run;
+                finish: root.export-finish;
+                exporting: root.exporting;
+                message: root.basket-message;
+                name <=> root.basket-name;
+                resolution <=> root.basket-resolution;
+                quality <=> root.basket-quality;
+                editing <=> root.basket-editing;
+                // Off the name field first, as every other button in this app
+                // does -- a click doesn't take focus from a field by itself.
+                reorder(from, to) => {
+                    keys.focus();
+                    root.move-basket-piece(from, to);
+                }
+                remove(index) => {
+                    keys.focus();
+                    root.remove-basket-piece(index);
+                }
+                clear => {
+                    keys.focus();
+                    root.clear-basket();
+                }
+                // The name field's text is read on the way out, so Start does
+                // not need it committed first.
+                start => { root.start-basket(); }
+                cancel => { root.cancel-export(); }
+                close => { root.close-basket(); }
+            }
+        }
+
         // --- Match setup sheet: modal over the whole window (Phase 9 S4) ---
         if root.match-sheet-open: Scrim {
             MatchSetupSheet {
@@ -4492,7 +4912,7 @@ export component AppWindow inherits Window {
 
         // --- Error dialog: modal over the whole window ---
         //
-        // The fourth sheet, and the one with no heading: its message is the
+        // The one sheet with no heading: its message is the
         // only thing it has to say.
         if root.error-message != "": Scrim {
             Sheet {
