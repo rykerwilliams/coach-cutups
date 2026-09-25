@@ -1212,3 +1212,59 @@ Each entry: what, why deferred, when to revisit.
   Nothing was renamed; no file was touched.
 - **When to revisit:** when a name is chosen, or after asking Taylor about
   keeping this one. Detaching the fork needs neither decision and can go first.
+
+92. **Slates: a time range tagged now, its commentary recorded later.** THE NEXT
+  FEATURE, at the coach's direction (2026-09-25). Watching a game through, the
+  coach wants to mark "here to here, corner routine, #corners" and move on,
+  then come back and record the commentary over those ranges in a later pass.
+- **A slate is not a clip, by construction.** A clip *is* a recording — `Clip`
+  carries `recording_filename` and `recording_duration` as required fields, and
+  "no commentary-less clips" is the model's own rule. So this is a new record on
+  the project, `Project.slates: Vec<Slate>` (v12, additive, floor stays 7), and
+  the clip list's invariants are untouched.
+- **The name.** A slate is what identifies a take before it is shot, and this
+  codebase already calls a recording session a *take* ("a camera take", "an
+  avatar take", "a paused take" — `bus/mod.rs`). It is film-native like *reel*,
+  *basket* and *film*, and it reads as a verb on a button: *shoot this slate*.
+  Considered and rejected: *span* (precise, says nothing about intent),
+  *draft clip* (implies a commentary-less clip, blurring the one rule above),
+  *mark* (an instant, and the marking keys are the interaction, not the record),
+  *segment* (taken — `timeline`'s play segments), *cue* (taken — `core::cues`),
+  *highlight* (taken — `player_highlights`), *bookmark* (an instant).
+- **Shape, following the format rules:** `id`, `source_index`, `in_seconds`,
+  `out_seconds`, `name`, `notes`, `tags`, `created_at`, `sort_index` — a new
+  struct, so no field-level defaults, and one source per slate (a range cannot
+  span two files any more than a clip can).
+- **The interaction is `i` / `o` while scanning** (in and out, the editing
+  convention; `z`/`x`/`v` are match events, `,`/`.` frame steps, `J`/`L` scan
+  speed). Marking an out before an in, or crossing a source boundary, is
+  refused at the key, not stored and fixed later.
+- **Typing them should reuse `core::match_entry`'s grammar**, which already has
+  the refusals that matter: a time has a colon, a bare leading integer is a
+  video number. A slate line adds a range — `2 14:05-14:40 corner routine
+  #corners` — and the Edit events… sheet's row-plus-paste-box pattern is the
+  editor, not a new kind of sheet.
+- **Shooting one:** the slate's row offers Record, which seeks to `in_seconds`,
+  arms the recording, and the resulting clip inherits the slate's name, notes
+  and tags. That is the whole point of the feature — the tagging work is done
+  once, live.
+- **Open questions, all of them real:**
+  - Does the slate survive its clip? Keeping it (with the clip's id) allows a
+    second take and lets the list show what is still unshot; consuming it keeps
+    one row per thing. Lean: keep it, because a coach re-records.
+  - Is `out_seconds` binding or advisory? A clip's extent comes from its
+    recording's length, so a take that runs past the out point already works.
+    Advisory is the smaller change; binding needs a rule for the overrun.
+  - "Watching the game live" has two readings: a first pass through the footage
+    in the app (which is what this entry assumes, since a range is a source
+    time), or at the pitch with no video loaded, which would need wall-clock
+    times mapped through the match clock. Ask before building the second.
+  - Slates in the same list as clips, greyed with a Record button, or a list of
+    their own? The tag filter should cover both either way.
+- **A natural follow-on, deliberately out of scope:** slates are already an edit
+  decision list, so "export the slates" would be a silent breakdown film with
+  the scoreboard burned in and no commentary — close to the whole-match copy
+  path. Worth doing, worth not doing first.
+- **Why deferred:** only by order; nothing is built yet.
+- **When to revisit:** next, ahead of #88 (the per-clip inset) and #77 (the
+  export queue). Starts with a spec, per the workflow in `CLAUDE.md`.
