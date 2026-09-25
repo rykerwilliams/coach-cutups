@@ -10,7 +10,7 @@
 //! against fixtures whose tone is known to the sample.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
@@ -38,8 +38,8 @@ use video_coach_media::fixtures::{
     ffprobe, one_entry, read_counter, sample_export_tags, CounterKind, CounterQuirks, COUNTER_BITS,
 };
 use video_coach_media::{
-    ChapterOutcome, Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage,
-    Exporter, Render,
+    ChapterOutcome, ClipMedia, Encode, EntryMedia, ExportDone, ExportError, ExportJob,
+    ExportMessage, Exporter, MatchMedia, Render,
 };
 
 /// Far beyond any export here, even on a loaded llvmpipe runner; only a hang
@@ -125,6 +125,27 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
     }
 }
 
+/// One entry's media: the game video its frames come from, its commentary
+/// recording and its clip, belonging to a match with no board, no highlights
+/// and no avatar — which is every test here but the ones about those.
+///
+/// A test that needs a match writes `EntryMedia { match_media, ..media(...) }`.
+fn media(source: PathBuf, recording: PathBuf, clip: Clip) -> EntryMedia {
+    EntryMedia {
+        source,
+        clip: Some(ClipMedia { recording, clip }),
+        match_media: Arc::default(),
+    }
+}
+
+/// A match whose only property is its avatar image.
+fn with_avatar(avatar: PathBuf) -> Arc<MatchMedia> {
+    Arc::new(MatchMedia {
+        avatar: Some(avatar),
+        ..MatchMedia::default()
+    })
+}
+
 /// A one-entry export of `frames` from `source`, with no picture-in-picture,
 /// no text bar and **no audio edit**: the plain picture, which most of these
 /// tests are about. An empty edit still writes a full-length silent track.
@@ -133,21 +154,15 @@ fn job(source: PathBuf, frames: Vec<FrameSpec>, path: PathBuf) -> ExportJob {
     ExportJob {
         tags: FileTags::default(),
         compilation: one_entry(&clip, frames, ""),
-        sources: vec![source],
         path,
         cues: None,
         render: Render::Encode(Encode {
-            entries: vec![Some(EntryMedia {
-                // Unread: `show_pip` is off, so the pad takes the filler.
-                recording: PathBuf::new(),
-                clip,
-            })],
+            // The recording is unread: `show_pip` is off, so the pad takes the
+            // filler.
+            entries: vec![media(source, PathBuf::new(), clip)],
             audio: Vec::new(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     }
 }
@@ -350,17 +365,13 @@ fn fiducial(kind: CounterKind) {
     let done = export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![src.path.clone()],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
             audio,
-            entries: vec![Some(EntryMedia { recording, clip })],
+            entries: vec![media(src.path.clone(), recording, clip)],
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();
@@ -457,7 +468,6 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
     export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![wide, narrow],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
@@ -466,17 +476,12 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
                 .iter()
                 .zip(recordings)
                 .map(|(clip, recording)| {
-                    Some(EntryMedia {
-                        recording,
-                        clip: clip.clone(),
-                    })
+                    let source = [&wide, &narrow][clip.source_index].clone();
+                    media(source, recording, clip.clone())
                 })
                 .collect(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();
@@ -787,17 +792,13 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
         ExportJob {
             tags: FileTags::default(),
             compilation: one_entry(&clip, frames, "1 / 2 | Demo"),
-            sources: vec![source],
             path: path.clone(),
             cues: None,
             render: Render::Encode(Encode {
-                entries: vec![Some(EntryMedia { recording, clip })],
+                entries: vec![media(source, recording, clip)],
                 audio: Vec::new(),
                 resolution: Resolution::R720,
                 quality: Quality::Medium,
-                scoreboard: None,
-                highlights: Vec::new(),
-                avatar: None,
             }),
         },
         path,
@@ -896,6 +897,68 @@ fn cell_corner(cell: &LayoutRect) -> (usize, usize) {
     ((cell.x + 4.0) as usize, (cell.y + cell.h - 4.0) as usize)
 }
 
+/// A club in its kit, from two `0xRRGGBB` colours.
+fn team(name: &str, primary: u32, secondary: u32) -> TeamConfig {
+    let rgb = |c: u32| Rgba {
+        r: f64::from((c >> 16) as u8) / 255.0,
+        g: f64::from((c >> 8) as u8) / 255.0,
+        b: f64::from(c as u8) / 255.0,
+        a: 1.0,
+    };
+    TeamConfig::new(name, rgb(primary), rgb(secondary))
+}
+
+/// How many pixels inside `cell` are the white its label is drawn in. The
+/// count follows the glyphs, so two different scores in the same cell read
+/// differently.
+fn label_pixels(frame: &fixtures::RgbFrame, cell: &LayoutRect) -> usize {
+    ((cell.y as usize)..(cell.y + cell.h) as usize)
+        .flat_map(|y| ((cell.x as usize)..(cell.x + cell.w) as usize).map(move |x| (x, y)))
+        .filter(|&(x, y)| frame.at(x, y).iter().all(|&c| c > 200))
+        .count()
+}
+
+/// How many pixels inside `cell` differ between the two frames, beyond
+/// [`TOLERANCE`].
+fn differing_pixels(a: &fixtures::RgbFrame, b: &fixtures::RgbFrame, cell: &LayoutRect) -> usize {
+    ((cell.y as usize)..(cell.y + cell.h) as usize)
+        .flat_map(|y| ((cell.x as usize)..(cell.x + cell.w) as usize).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            a.at(x, y)
+                .iter()
+                .zip(b.at(x, y))
+                .any(|(&l, r)| i32::from(l).abs_diff(i32::from(r)) as i32 > TOLERANCE)
+        })
+        .count()
+}
+
+/// A match kicked off at the top of its one `duration`-second source video,
+/// with `home_goals` scored a quarter of a second in, played by `board`'s
+/// clubs. The names are invented; the footage is a fixture.
+fn match_with_board(duration: f64, board: ScoreboardConfig, home_goals: usize) -> Project {
+    let mut project = Project::new("m");
+    project.source_videos.push(SourceRef {
+        relative_path: "src".into(),
+        display_name: "src".into(),
+        duration_seconds: duration,
+        display_aspect: 16.0 / 9.0,
+    });
+    project.scoreboard = Some(board);
+    project.append_match_event(MatchEventKind::StartStop, 0, 0.0);
+    for _ in 0..home_goals {
+        project.append_match_event(MatchEventKind::HomeGoal, 0, 0.25);
+    }
+    project
+}
+
+/// `project`'s match, as an entry of it carries it: its board and nothing else.
+fn with_board(project: &Project) -> Arc<MatchMedia> {
+    Arc::new(MatchMedia {
+        scoreboard: ScoreboardContext::for_project(project),
+        ..MatchMedia::default()
+    })
+}
+
 /// The `ScoreboardContext` the bus will build reaches the overlay through the
 /// export driver, and the board is burned into the file.
 ///
@@ -909,15 +972,6 @@ fn the_export_burns_in_the_scoreboard() {
     gst::init().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 60, BLUE, false);
-    let team = |name: &str, primary: u32, secondary: u32| {
-        let rgb = |c: u32| Rgba {
-            r: f64::from((c >> 16) as u8) / 255.0,
-            g: f64::from((c >> 8) as u8) / 255.0,
-            b: f64::from(c as u8) / 255.0,
-            a: 1.0,
-        };
-        TeamConfig::new(name, rgb(primary), rgb(secondary))
-    };
     let mut project = Project::new("p");
     project.source_videos.push(SourceRef {
         relative_path: "src.webm".into(),
@@ -948,20 +1002,19 @@ fn the_export_burns_in_the_scoreboard() {
     export(ExportJob {
         tags: FileTags::default(),
         compilation: one_entry(&clip, frames, ""),
-        sources: vec![source],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
-            entries: vec![Some(EntryMedia {
-                recording: PathBuf::new(),
-                clip,
-            })],
+            entries: vec![EntryMedia {
+                match_media: Arc::new(MatchMedia {
+                    scoreboard: ScoreboardContext::for_project(&project),
+                    ..MatchMedia::default()
+                }),
+                ..media(source, PathBuf::new(), clip)
+            }],
             audio: Vec::new(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: ScoreboardContext::for_project(&project),
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();
@@ -975,6 +1028,264 @@ fn the_export_burns_in_the_scoreboard() {
     // strip the inset leaves to its left, are the source's own blue.
     assert_rgb(frame, "the picture", (640, 400), BLUE);
     assert_rgb(frame, "left of the board", (2, 40), BLUE);
+}
+
+/// Two pieces from two matches in one film, and **each draws its own match's
+/// board** (spec J3) over its own game video.
+///
+/// The board is reached through the entry's own `match_media`, so nothing on
+/// the way to it can be a per-job value. One board for the run and both halves
+/// would read the same score and the same kit; one flat source list indexed by
+/// `PlanEntry::source_index` and both halves would read the same file, since
+/// each clip is source 0 **of its own project**.
+#[test]
+fn two_matches_draw_their_own_boards() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // 16:9 then 4:3, so the picture is re-letterboxed at the join too.
+    let wide = fixtures::solid_video(&dir.path().join("a.webm"), 640, 360, 30, 60, BLUE, false);
+    let narrow = fixtures::solid_video(&dir.path().join("b.webm"), 480, 360, 30, 60, GREEN, false);
+    // A goal in the first match only, so at the same output time the two
+    // boards read 1 - 0 and 0 - 0.
+    let first = match_with_board(
+        2.0,
+        ScoreboardConfig {
+            home: team("ROVERS", 0x0000ff, 0xffff00),
+            away: team("ATHLETIC", 0xff0000, 0x00ffff),
+            format: MatchFormat::default(),
+            auto_back_anchor_p1: false,
+        },
+        1,
+    );
+    let second = match_with_board(
+        2.0,
+        ScoreboardConfig {
+            home: team("CITY", 0x00ff00, 0xff00ff),
+            away: team("UNITED", 0xffff00, 0x0000ff),
+            format: MatchFormat::default(),
+            auto_back_anchor_p1: false,
+        },
+        0,
+    );
+
+    // Two clips, each source 0 of its own match: the entry's file is the only
+    // thing that tells the two apart.
+    let clips: Vec<Clip> = (0..2)
+        .map(|i| Clip {
+            id: Uuid::new_v4(),
+            sort_index: i,
+            ..clip(0.5, 0.4, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[2.0]);
+    let per_entry = compilation.plan.entries[0].frames;
+    let total = compilation.frames.len();
+    let path = dir.path().join("out.mp4");
+    export(ExportJob {
+        tags: FileTags::default(),
+        compilation,
+        path: path.clone(),
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![
+                EntryMedia {
+                    match_media: with_board(&first),
+                    ..media(wide, PathBuf::new(), clips[0].clone())
+                },
+                EntryMedia {
+                    match_media: with_board(&second),
+                    ..media(narrow, PathBuf::new(), clips[1].clone())
+                },
+            ],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+        }),
+    })
+    .unwrap();
+
+    // One output geometry for the whole film, whatever its pieces came from.
+    duration_is_the_schedule_s(&path, total);
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(out.len(), total, "one output frame per schedule frame");
+    let (a, b) = (&out[per_entry / 2], &out[per_entry + per_entry / 2]);
+    let rects = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
+
+    // Each piece's own clubs, in their own kit: the config travels with the
+    // state, so the names and the colours redraw at the join.
+    assert_rgb(a, "Rovers' cell", cell_corner(&rects.home), 0x0000ff);
+    assert_rgb(a, "Athletic's cell", cell_corner(&rects.away), 0xff0000);
+    assert_rgb(b, "City's cell", cell_corner(&rects.home), 0x00ff00);
+    assert_rgb(b, "United's cell", cell_corner(&rects.away), 0xffff00);
+
+    // And each piece's own score, which is the whole point: "1 - 0" against
+    // "0 - 0", in the same cell at the same output time. Counted as the pixels
+    // that moved rather than as glyph weight — the label is centred, so a
+    // different score shifts most of the cell — and the cell's own fill is
+    // opaque, so nothing but the glyphs can move in it.
+    let (lit_a, lit_b) = (label_pixels(a, &rects.score), label_pixels(b, &rects.score));
+    assert!(
+        lit_a > 20 && lit_b > 20,
+        "no score drawn: {lit_a} and {lit_b}"
+    );
+    let moved = differing_pixels(a, b, &rects.score);
+    assert!(
+        moved > lit_a.min(lit_b) / 2,
+        "both pieces drew the same score: {moved} pixels moved, of ~{lit_a} lit"
+    );
+
+    // The join re-letterboxes: the 4:3 piece is pillarboxed, so where the
+    // first piece's picture reached the frame edge the second has the mixer's
+    // black — read below the board, clear of it.
+    assert_rgb(a, "the first piece at the frame edge", (40, 600), BLUE);
+    assert_rgb(b, "the second piece's pillarbox", (40, 600), 0x000000);
+    assert_rgb(b, "the second piece's picture", (640, 600), GREEN);
+}
+
+/// The zero-copy diagnostic still names a decoder after a run whose first
+/// entry's decoder was closed at the join (spec J2).
+///
+/// It is read as that decoder is opened rather than after the loop, which is
+/// where the bounded cache would have left nothing to read.
+#[test]
+fn the_diagnostics_survive_a_dropped_first_decoder() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let first = fixtures::solid_video(&dir.path().join("a.webm"), 320, 180, 30, 30, BLUE, false);
+    let second = fixtures::solid_video(&dir.path().join("b.webm"), 320, 180, 30, 30, GREEN, false);
+    let clips: Vec<Clip> = (0..2)
+        .map(|i| Clip {
+            id: Uuid::new_v4(),
+            sort_index: i,
+            ..clip(0.0, 0.2, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[1.0]);
+    let done = export(ExportJob {
+        tags: FileTags::default(),
+        compilation,
+        path: dir.path().join("out.mp4"),
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: vec![
+                media(first, PathBuf::new(), clips[0].clone()),
+                media(second, PathBuf::new(), clips[1].clone()),
+            ],
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+        }),
+    })
+    .unwrap();
+    assert!(
+        done.diagnostics.decoder.is_some(),
+        "the run reported no decode path: {:?}",
+        done.diagnostics
+    );
+}
+
+/// An entry whose game video isn't there fails the run and leaves nothing
+/// behind — no output and no `.part`.
+///
+/// The entry carries the file rather than an index into a list, so this is the
+/// only shape the failure has left.
+#[test]
+fn an_entry_whose_source_is_missing_fails_and_leaves_no_part() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.mp4");
+    let job = job(
+        dir.path().join("gone.webm"),
+        (0..6)
+            .map(|_| FrameSpec {
+                entry: 0,
+                source_time: 0.0,
+                zoom: Zoom::IDENTITY,
+            })
+            .collect(),
+        path.clone(),
+    );
+    let err = export(job).expect_err("a missing game video exported");
+    assert!(matches!(err, ExportError::Failed(_)), "{err:?}");
+    assert!(!path.exists(), "a failed export left an output file");
+    assert!(
+        !dir.path().join("out.mp4.part").exists(),
+        "a failed export left its .part"
+    );
+}
+
+/// Two matches sharing one avatar image both draw it, and a piece whose match
+/// has no image takes the filler without stalling the run (spec J5).
+///
+/// The gate is per entry — its clip's `shows_avatar` **and** its match's image
+/// — so the three pads alternate avatar, avatar, filler, which is a caps
+/// change on a pad whose caps feature never changes. A system-memory filler
+/// would break the next entry's `glupload`.
+#[test]
+fn two_matches_share_an_avatar_and_a_third_takes_the_filler() {
+    gst::init().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixtures::solid_video(&dir.path().join("src.webm"), 640, 360, 30, 60, BLUE, false);
+    let avatar = fixtures::solid_png(dir.path(), "avatar.png", 96, 96, RED, 0xff);
+    // The same image behind two different matches: one texture, two records.
+    let shared = [with_avatar(avatar.clone()), with_avatar(avatar)];
+    let clips: Vec<Clip> = (0..3)
+        .map(|i| Clip {
+            id: Uuid::new_v4(),
+            sort_index: i,
+            show_pip: true,
+            inset: Inset::Avatar,
+            ..clip(0.0, 0.3, Vec::new())
+        })
+        .collect();
+    let compilation = compilation(&clips, &[2.0]);
+    let per_entry = compilation.plan.entries[0].frames;
+    let total = compilation.frames.len();
+    let path = dir.path().join("out.mp4");
+    export(ExportJob {
+        tags: FileTags::default(),
+        compilation,
+        path: path.clone(),
+        cues: None,
+        render: Render::Encode(Encode {
+            entries: clips
+                .iter()
+                .enumerate()
+                .map(|(i, clip)| EntryMedia {
+                    // The third match has no avatar at all.
+                    match_media: shared.get(i).cloned().unwrap_or_default(),
+                    // No recording, so the pulse is flat and the avatar rests.
+                    ..media(source.clone(), PathBuf::new(), clip.clone())
+                })
+                .collect(),
+            audio: Vec::new(),
+            resolution: Resolution::R720,
+            quality: Quality::Medium,
+        }),
+    })
+    .unwrap();
+
+    let out = fixtures::decode_rgb(&path);
+    assert_eq!(out.len(), total, "an unfed pad stalled the run");
+    let box_rect = avatar_box(pip_rect(f64::from(OUT_W), f64::from(OUT_H), 1.0));
+    let centre = (
+        (box_rect.x + box_rect.w / 2.0) as usize,
+        (box_rect.y + box_rect.h / 2.0) as usize,
+    );
+    for entry in 0..2 {
+        assert_rgb(
+            &out[entry * per_entry + per_entry / 2],
+            "an avatar match's inset",
+            centre,
+            RED,
+        );
+    }
+    assert_rgb(
+        &out[2 * per_entry + per_entry / 2],
+        "the match with no avatar",
+        centre,
+        BLUE,
+    );
 }
 
 /// With `show_pip` off the pad takes a 1×1 transparent filler, which is
@@ -1068,17 +1379,16 @@ fn an_avatar_clip_pulses_in_the_export() {
     export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![source],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
-            entries: vec![Some(EntryMedia { recording, clip })],
+            entries: vec![EntryMedia {
+                match_media: with_avatar(avatar),
+                ..media(source, recording, clip)
+            }],
             audio: Vec::new(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: Some(avatar),
         }),
     })
     .unwrap();
@@ -1160,10 +1470,11 @@ fn an_avatar_and_a_camera_clip_export_together() {
     let total = compilation.frames.len();
     let path = dir.path().join("out.mp4");
     let audio = audio_regions(&compilation, &Preferences::default());
+    // One match behind both entries, as every single-project export has.
+    let match_media = with_avatar(avatar);
     export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![source],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
@@ -1171,18 +1482,13 @@ fn an_avatar_and_a_camera_clip_export_together() {
             entries: clips
                 .iter()
                 .zip([spoken, webcam])
-                .map(|(clip, recording)| {
-                    Some(EntryMedia {
-                        recording,
-                        clip: clip.clone(),
-                    })
+                .map(|(clip, recording)| EntryMedia {
+                    match_media: match_media.clone(),
+                    ..media(source.clone(), recording, clip.clone())
                 })
                 .collect(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: Some(avatar),
         }),
     })
     .unwrap();
@@ -1240,17 +1546,16 @@ fn avatar_export(
     export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![source],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
-            entries: vec![Some(EntryMedia { recording, clip })],
+            entries: vec![EntryMedia {
+                match_media: with_avatar(avatar),
+                ..media(source, recording, clip)
+            }],
             audio: Vec::new(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: Some(avatar),
         }),
     })
     .unwrap();
@@ -1317,17 +1622,13 @@ fn sounded_job(
     ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![source],
         path,
         cues: None,
         render: Render::Encode(Encode {
             audio,
-            entries: vec![Some(EntryMedia { recording, clip })],
+            entries: vec![media(source, recording, clip)],
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     }
 }
@@ -1518,17 +1819,17 @@ fn an_entry_with_no_media_exports_game_audio_only_with_a_filler_pip() {
     export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![source],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
             audio,
-            entries: vec![None],
+            entries: vec![EntryMedia {
+                source,
+                clip: None,
+                match_media: Arc::default(),
+            }],
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();
@@ -1708,7 +2009,6 @@ fn a_compilation_gets_a_chapter_per_entry() {
     let done = export(ExportJob {
         tags: FileTags::default(),
         compilation,
-        sources: vec![src.path.clone()],
         path: path.clone(),
         cues: Some(Vec::new()),
         render: Render::Encode(Encode {
@@ -1716,19 +2016,12 @@ fn a_compilation_gets_a_chapter_per_entry() {
             audio: Vec::new(),
             entries: clips
                 .into_iter()
-                .map(|clip| {
-                    Some(EntryMedia {
-                        // Unread: `show_pip` is off and there is no audio edit.
-                        recording: PathBuf::new(),
-                        clip,
-                    })
-                })
+                // The recording is unread: `show_pip` is off and there is no
+                // audio edit.
+                .map(|clip| media(src.path.clone(), PathBuf::new(), clip))
                 .collect(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();
@@ -1785,25 +2078,16 @@ fn an_encoded_export_tags_its_file_and_still_chapters_it() {
     let done = export(ExportJob {
         tags: sample_export_tags(),
         compilation,
-        sources: vec![src.path.clone()],
         path: path.clone(),
         cues: None,
         render: Render::Encode(Encode {
             audio: Vec::new(),
             entries: clips
                 .into_iter()
-                .map(|clip| {
-                    Some(EntryMedia {
-                        recording: PathBuf::new(),
-                        clip,
-                    })
-                })
+                .map(|clip| media(src.path.clone(), PathBuf::new(), clip))
                 .collect(),
             resolution: Resolution::R720,
             quality: Quality::Medium,
-            scoreboard: None,
-            highlights: Vec::new(),
-            avatar: None,
         }),
     })
     .unwrap();

@@ -87,7 +87,7 @@ use video_coach_core::export::OUTPUT_FPS;
 use video_coach_core::metadata::FileTags;
 
 use super::export::{
-    reserve_remaining, reserved_duration, ExportError, ExportJob, ExportMessage, Render, Rendered,
+    reserve_remaining, reserved_duration, ExportError, ExportJob, ExportMessage, Rendered,
 };
 use super::{frame_time, tags, watch_bus, Stopper, Watch, POLL};
 use crate::player::{seconds, seconds_to_clock, Diagnostics};
@@ -171,26 +171,24 @@ pub fn can_copy(files: &[PathBuf]) -> Result<(), ExportError> {
     declare(&files, &watch).map(|_| ())
 }
 
-/// Copies `job`'s entries into `part`, in entry order.
+/// Copies `files` into `part`, one per plan entry and in that order
+/// (spec L1b).
 ///
 /// The file it leaves is finished but unchaptered and still named `.part`:
 /// [`run`](super::export::run) owns the rest, for both renderers alike.
 pub(super) fn copy(
     job: &ExportJob,
+    files: &[PathBuf],
     part: &Path,
     cancel: &AtomicBool,
     on_message: &mut impl FnMut(ExportMessage),
 ) -> Result<Rendered, ExportError> {
-    debug_assert!(
-        matches!(job.render, Render::Copy),
-        "the copy renders only what asks for it"
-    );
     let total = job.compilation.plan.total_frames();
     let watch = Watch {
         cancel,
         error: Arc::default(),
     };
-    let files = files(job)?;
+    let files: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     // Every source is asked first and refused here, so the muxing pipeline —
     // and with it the `.part` — is built only once they can all be joined.
     let audio_rate = declare(&files, &watch)?;
@@ -226,21 +224,6 @@ pub(super) fn copy(
         diagnostics: Diagnostics::default(),
         reserve_remaining: reserve_remaining(&out.mux),
     })
-}
-
-/// The file each entry reads, in entry order (spec L1b).
-fn files(job: &ExportJob) -> Result<Vec<&Path>, ExportError> {
-    job.compilation
-        .plan
-        .entries
-        .iter()
-        .map(|entry| {
-            job.sources
-                .get(entry.source_index)
-                .map(PathBuf::as_path)
-                .ok_or_else(|| ExportError::Failed("a whole-match entry has no game video".into()))
-        })
-        .collect()
 }
 
 /// Which of the muxer's tracks a source's stream feeds.

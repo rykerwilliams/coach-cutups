@@ -89,10 +89,11 @@ fn job(m: &Match, path: PathBuf) -> ExportJob {
     ExportJob {
         tags: FileTags::default(),
         compilation: m.compilation.clone(),
-        sources: m.files.clone(),
         path,
         cues: Some(Vec::new()),
-        render: Render::Copy,
+        // One file per plan entry, in entry order: a whole match's entries are
+        // its sources, in the order the project lists them.
+        render: Render::Copy(m.files.clone()),
     }
 }
 

@@ -28,6 +28,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use gstreamer::glib;
@@ -47,7 +48,8 @@ use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store::{EXPORTS_DIRNAME, RECORDINGS_DIRNAME};
 use video_coach_core::tag::tag_summaries;
 use video_coach_media::{
-    Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter, Render,
+    ClipMedia, Encode, EntryMedia, ExportDone, ExportError, ExportJob, ExportMessage, Exporter,
+    MatchMedia, Render,
 };
 
 use super::{Bus, Event, Input, Open, UserError};
@@ -520,13 +522,14 @@ struct Carry {
 ///
 /// `context` is the run's frozen [`ScoreboardContext`], `None` for a project
 /// with no scoreboard set up — which means no cues either, since there is
-/// nothing to derive them from (spec E5).
+/// nothing to derive them from (spec E5). `files` is what a copy would join,
+/// one per plan entry and in that order.
 fn carry_scoreboard(
     target: &ExportTarget,
     picked: Option<ScoreboardMode>,
     compilation: &Compilation,
     context: Option<ScoreboardContext>,
-    sources: &[PathBuf],
+    files: &[PathBuf],
 ) -> Carry {
     // The board burned into the picture, which is what every target but a
     // copied whole match does with it.
@@ -560,7 +563,7 @@ fn carry_scoreboard(
         // the worst available answer.
         ScoreboardMode::Track => {
             if picked.is_none() {
-                if let Err(why) = video_coach_media::can_copy(&copy_files(compilation, sources)) {
+                if let Err(why) = video_coach_media::can_copy(files) {
                     eprintln!(
                         "bus: the whole match can't be copied ({why}), \
                          so it is re-encoded with the scoreboard burned in"
@@ -603,22 +606,12 @@ fn source_date(sources: &[PathBuf]) -> Option<CalendarDate> {
     })
 }
 
-/// The files a copy of `compilation` would join, in entry order: what
-/// `composite::copy` reads from the same two fields of the job.
-fn copy_files(compilation: &Compilation, sources: &[PathBuf]) -> Vec<PathBuf> {
-    compilation
-        .plan
-        .entries
-        .iter()
-        .filter_map(|entry| sources.get(entry.source_index).cloned())
-        .collect()
-}
-
 /// The job that renders `target` as `label`, or why it can't run.
 ///
-/// A snapshot: later edits to the project don't reach a running export. The
-/// whole source list goes with it because `PlanEntry::source_index` indexes
-/// it — a compilation may walk several game videos.
+/// A snapshot: later edits to the project don't reach a running export. Each
+/// entry carries its own game video, its own clip and — shared by `Arc` with
+/// every other entry of the same project — the match's board, highlights and
+/// avatar, so nothing in media has to resolve a project-local index.
 fn job(
     open: &Open,
     missing: &[bool],
@@ -633,8 +626,19 @@ fn job(
         return Err(refused(format!("{label} has nothing to export")));
     }
 
+    let sources: Vec<PathBuf> = open
+        .project
+        .source_videos
+        .iter()
+        .map(|s| open.folder.join(&s.relative_path))
+        .collect();
     let recordings = open.folder.join(RECORDINGS_DIRNAME);
-    let mut entries = Vec::with_capacity(compilation.plan.entries.len());
+    // Each entry's game video and its clip's own media. The match's record
+    // joins them below rather than here, because the Scoreboard picker decides
+    // whether the board is burned in or carried beside the file, and it reads
+    // this list to answer.
+    let mut pieces: Vec<(PathBuf, Option<ClipMedia>)> =
+        Vec::with_capacity(compilation.plan.entries.len());
     for entry in &compilation.plan.entries {
         let clip = entry.clip_id.map(|id| {
             open.project
@@ -643,7 +647,14 @@ fn job(
                 .find(|c| c.id == id)
                 .expect("the plan's clips are the project's clips")
         });
-        if missing.get(entry.source_index).copied().unwrap_or(true) {
+        // The game video the entry reads. A source the project doesn't have
+        // and one whose file isn't there are the same refusal, and neither can
+        // reach the job.
+        let source = sources
+            .get(entry.source_index)
+            .filter(|_| !missing.get(entry.source_index).copied().unwrap_or(true))
+            .cloned();
+        let Some(source) = source else {
             let what = match clip {
                 Some(clip) => format!("{}'s game video", clip_label(clip)),
                 // A reel or whole-match entry has no clip to name: the file
@@ -658,9 +669,9 @@ fn job(
                 }
             };
             return Err(refused(format!("{what} is missing; relink it first")));
-        }
+        };
         let Some(clip) = clip else {
-            entries.push(None);
+            pieces.push((source, None));
             continue;
         };
         let name = clip_label(clip);
@@ -668,18 +679,18 @@ fn job(
         if !recording.exists() {
             return Err(refused(format!("{name}'s commentary recording is missing")));
         }
-        entries.push(Some(EntryMedia {
-            recording,
-            clip: clip.clone(),
-        }));
+        pieces.push((
+            source,
+            Some(ClipMedia {
+                recording,
+                clip: clip.clone(),
+            }),
+        ));
     }
 
-    let sources: Vec<PathBuf> = open
-        .project
-        .source_videos
-        .iter()
-        .map(|s| open.folder.join(&s.relative_path))
-        .collect();
+    // The files a copy would join, in entry order — every one of them asked
+    // for above, so there is nothing to drop and nothing to report.
+    let files: Vec<PathBuf> = pieces.iter().map(|(source, _)| source.clone()).collect();
     let carry = carry_scoreboard(
         target,
         pickers.scoreboard,
@@ -687,31 +698,39 @@ fn job(
         // Frozen with the project as it is now: the run's own copy of the
         // events on the concat timeline (spec S2).
         ScoreboardContext::for_project(&open.project),
-        &sources,
+        &files,
     );
+    // One record of the match for the whole run, shared by every entry of it.
+    let match_media = Arc::new(MatchMedia {
+        scoreboard: carry.scoreboard,
+        highlights: open.project.player_highlights.clone(),
+        // The project's one image, snapshotted like everything else here: a
+        // pick or a removal while this run is going does not reach it (I6).
+        avatar: open
+            .project
+            .avatar
+            .as_ref()
+            .map(|file| open.folder.join(file)),
+    });
     let job = ExportJob {
         render: match carry.copy {
-            true => Render::Copy,
+            true => Render::Copy(files),
             false => Render::Encode(Encode {
                 audio: audio_regions(&compilation, &open.project.preferences),
-                entries,
+                entries: pieces
+                    .into_iter()
+                    .map(|(source, clip)| EntryMedia {
+                        source,
+                        clip,
+                        match_media: match_media.clone(),
+                    })
+                    .collect(),
                 resolution: pickers.resolution,
                 quality: pickers.quality,
-                scoreboard: carry.scoreboard,
-                highlights: open.project.player_highlights.clone(),
-                // The project's one image, snapshotted like everything else
-                // here: a pick or a removal while this run is going does not
-                // reach it (I6).
-                avatar: open
-                    .project
-                    .avatar
-                    .as_ref()
-                    .map(|file| open.folder.join(file)),
             }),
         },
         tags: file_tags(&open.project, target, source_date(&sources)),
         compilation,
-        sources,
         path: exports.join(file_name(label, &open.project.name)),
         cues: carry.cues,
     };

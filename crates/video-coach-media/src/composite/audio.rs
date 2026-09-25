@@ -39,7 +39,7 @@ use video_coach_core::audio::{
     envelope, Region, Track, AUDIO_SAMPLE_RATE, PRIMING_SAMPLES, SAMPLES_PER_FRAME,
 };
 
-use super::export::{Encode, ExportJob};
+use super::export::Encode;
 use super::{CompositeError, Stopper, Watch, POLL, QUEUED};
 use crate::player::seconds_to_clock;
 
@@ -91,27 +91,25 @@ pub(super) struct Mixer {
 }
 
 impl Mixer {
-    /// The mixer for `job`: `encode`'s regions, resolved to the files they
-    /// read.
-    pub(super) fn new(job: &ExportJob, encode: &Encode) -> Mixer {
-        let entries = &job.compilation.plan.entries;
+    /// The mixer for `encode`: its regions, resolved to the files they read
+    /// through the entry each one belongs to.
+    pub(super) fn new(encode: &Encode) -> Mixer {
         let paths: Vec<PathBuf> = encode
             .audio
             .iter()
-            .map(|region| match region.track {
-                // A source index with no file is caught by the pump, which
-                // needs the same video; here it is one more silent file.
-                Track::Game => job
-                    .sources
-                    .get(entries[region.entry].source_index)
-                    .cloned()
-                    .unwrap_or_default(),
-                // An entry with no clip has no recording: audio_regions gives
-                // it no commentary region, and one would be silence anyway.
-                Track::Commentary => encode.entries[region.entry]
-                    .as_ref()
-                    .map(|media| media.recording.clone())
-                    .unwrap_or_default(),
+            .map(|region| {
+                let media = &encode.entries[region.entry];
+                match region.track {
+                    Track::Game => media.source.clone(),
+                    // An entry with no clip has no recording: audio_regions
+                    // gives it no commentary region, and one would be silence
+                    // anyway.
+                    Track::Commentary => media
+                        .clip
+                        .as_ref()
+                        .map(|clip| clip.recording.clone())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
         let mut order: Vec<usize> = (0..encode.audio.len()).collect();

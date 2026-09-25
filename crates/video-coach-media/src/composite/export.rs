@@ -18,7 +18,10 @@
 //! receives one produced no output at all and backed the base `appsrc` up,
 //! with no error (measured), so an entry with the PiP off, or with a recording
 //! that can't be read, pushes a 1×1 transparent pixel instead — in GL memory,
-//! like the recording's own frames (see [`Texture`]).
+//! like the recording's own frames (see [`Texture`]). A cut whose pieces come
+//! from several matches alternates fed and filler pads as the ordinary case,
+//! so the GL memory is not a nicety: a system-memory filler breaks the
+//! `glupload` of the next entry that has a real inset.
 //!
 //! **Caps may change from the pushing thread; geometry may not.** Every
 //! `appsrc` takes a mid-stream caps change and it lands on exactly the right
@@ -83,18 +86,19 @@ pub enum Render {
     /// The composite graph: every frame decoded, drawn on and encoded.
     Encode(Encode),
     /// The stream copy ([`copy`](super::copy)): the sources' own packets
-    /// joined, which only the whole match in track mode may ask for.
-    Copy,
+    /// joined, which only the whole match in track mode may ask for. Carries
+    /// the files to join, one per plan entry and in that order.
+    Copy(Vec<PathBuf>),
 }
 
 /// What only the encoded export reads: the pixels it composites, the sound it
 /// mixes, and what it writes them as.
 #[derive(Debug, Clone)]
 pub struct Encode {
-    /// One per `compilation.plan.entries`, in the same order: `None` exactly
-    /// for an entry with no clip (`PlanEntry::clip_id`), which gets the PiP
-    /// filler, no drawings and no commentary.
-    pub entries: Vec<Option<EntryMedia>>,
+    /// One per `compilation.plan.entries`, in the same order. **Not an
+    /// `Option`**: every entry has a game video and a match behind it, even
+    /// when it has no clip.
+    pub entries: Vec<EntryMedia>,
     /// The audio edit over the same compilation, from
     /// `video_coach_core::audio::audio_regions`: which span of which file is
     /// heard at each emitted sample, and how loud. Empty is a silent track,
@@ -102,19 +106,6 @@ pub struct Encode {
     pub audio: Vec<Region>,
     pub resolution: Resolution,
     pub quality: Quality,
-    /// The match clock and score to burn in, or `None` when the project has no
-    /// scoreboard configured, or carries it beside the file instead. Built
-    /// once by the bus, and **never reused across a source add, move, remove
-    /// or relink** — see [`ScoreboardContext`].
-    pub scoreboard: Option<ScoreboardContext>,
-    /// The project's player highlights, a snapshot taken when the run starts.
-    /// They belong to the footage rather than to a clip (spec H1), so an entry
-    /// with no clip — a reel piece — gets them too.
-    pub highlights: Vec<PlayerHighlight>,
-    /// The project's avatar image, or `None` for a project that records on
-    /// camera. One image for the project, so one path for the run: every
-    /// entry whose clip `shows_avatar` draws this one (spec A1, I6).
-    pub avatar: Option<PathBuf>,
 }
 
 /// What to export: one compilation, the files its entries read, and the
@@ -124,10 +115,6 @@ pub struct ExportJob {
     /// Every output frame and the plan they came from
     /// (`video_coach_core::export::compilation_schedule`).
     pub compilation: Compilation,
-    /// The project's game videos, indexed by `PlanEntry::source_index`: one
-    /// decoder is opened per distinct index and lives for the whole run.
-    /// A snapshot taken when the export starts.
-    pub sources: Vec<PathBuf>,
     /// The output file. Written as `<path>.part` and renamed on success, so a
     /// failed export never touches a file already there.
     pub path: PathBuf,
@@ -150,11 +137,49 @@ pub struct ExportJob {
 /// neither the files nor the drawings.
 #[derive(Debug, Clone)]
 pub struct EntryMedia {
-    /// The commentary recording, under the project's `recordings/`: the
+    /// The game video this entry's frames come from — **the file, not an
+    /// index**: `PlanEntry::source_index` stays the project-local index the
+    /// board and the highlights are keyed by, and nothing here has to map it.
+    pub source: PathBuf,
+    /// `None` exactly for an entry with no clip (`PlanEntry::clip_id`): the
+    /// PiP filler, no drawings, no commentary.
+    pub clip: Option<ClipMedia>,
+    /// The match this entry's footage belongs to. One value per contributing
+    /// project, **shared by `Arc`** between that project's entries: a
+    /// twenty-piece cut from three matches holds three `ScoreboardContext`s,
+    /// not twenty.
+    pub match_media: Arc<MatchMedia>,
+}
+
+/// What one entry's clip carries: the commentary, and the drawings over it.
+#[derive(Debug, Clone)]
+pub struct ClipMedia {
+    /// The commentary recording, under its project's `recordings/`: the
     /// picture-in-picture's video.
     pub recording: PathBuf,
     /// The clip, for the drawings the overlay replays.
     pub clip: Clip,
+}
+
+/// Everything an entry needs from the match it came from rather than from its
+/// clip: which is to say, everything that is a property of a project.
+///
+/// Built once per contributing project when the run starts, and — like every
+/// [`ScoreboardContext`] — **never reused across a source add, move, remove or
+/// relink**, which a job being a snapshot already guarantees.
+#[derive(Debug, Clone, Default)]
+pub struct MatchMedia {
+    /// The match clock and score to burn in, or `None` when the project has no
+    /// scoreboard configured, or carries it beside the file instead.
+    pub scoreboard: Option<ScoreboardContext>,
+    /// The project's player highlights, a snapshot taken when the run starts.
+    /// They belong to the footage rather than to a clip (spec H1), so an entry
+    /// with no clip — a reel piece — gets them too.
+    pub highlights: Vec<PlayerHighlight>,
+    /// The project's avatar image, or `None` for a project that records on
+    /// camera. One image for the project, so one path here: every entry of it
+    /// whose clip `shows_avatar` draws this one (spec A1, I6).
+    pub avatar: Option<PathBuf>,
 }
 
 /// What a running export reports, on its own thread.
@@ -225,12 +250,18 @@ impl Exporter {
         inject: Option<&'static str>,
     ) -> Exporter {
         debug_assert!(!job.compilation.frames.is_empty(), "an export needs frames");
-        if let Render::Encode(encode) = &job.render {
-            debug_assert_eq!(
+        let entries = job.compilation.plan.entries.len();
+        match &job.render {
+            Render::Encode(encode) => debug_assert_eq!(
                 encode.entries.len(),
-                job.compilation.plan.entries.len(),
+                entries,
                 "every plan entry needs its files"
-            );
+            ),
+            Render::Copy(files) => debug_assert_eq!(
+                files.len(),
+                entries,
+                "every plan entry needs the file it is copied from"
+            ),
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
@@ -377,7 +408,7 @@ fn run(
     // holds the file open.
     let result = match &job.render {
         Render::Encode(encode) => export(job, encode, &part, cancel, inject, on_message),
-        Render::Copy => super::copy::copy(job, &part, cancel, on_message),
+        Render::Copy(files) => super::copy::copy(job, files, &part, cancel, on_message),
     }
     .and_then(|rendered| finish(job, &part, rendered));
     if result.is_err() {
@@ -513,34 +544,48 @@ fn export(
     };
     let (out_w, out_h) = output_size(encode.resolution);
     let plan = &job.compilation.plan;
-    // The avatar and its pulse, before anything is pushed: one decode and one
-    // upload for the run, and one pass over each avatar entry's commentary
-    // (spec D5, E2). Both belong here, beside the audio edit's regions, and
-    // neither belongs beside `Pip::open`, which runs inside the loop. And both
-    // only when an entry asks for one: an avatar project exporting a
-    // compilation of camera clips decodes nothing and reports nothing.
-    let avatar = encode
-        .avatar
-        .as_deref()
-        .filter(|_| {
-            encode
-                .entries
-                .iter()
-                .flatten()
-                .any(|media| media.clip.shows_avatar())
-        })
-        .and_then(|path| AvatarInset::open(path, &gl, &watch, (out_w, out_h)));
-    let levels = match avatar {
-        Some(_) => pulse_levels(job, encode, cancel),
-        None => vec![1.0; job.compilation.frames.len()],
-    };
-    let schedule = Schedule::new(job.compilation.frames.clone(), levels, plan.entries.len());
+    // The avatars and their pulse, before anything is pushed: one decode and
+    // one upload per *distinct image* some entry asks for, and one pass over
+    // each avatar entry's commentary (spec D5, E2). Both belong here, beside
+    // the audio edit's regions, and neither belongs beside `Pip::open`, which
+    // runs inside the loop. And both only where an entry asks for one: an
+    // avatar project exporting a compilation of camera clips decodes nothing
+    // and reports nothing.
+    //
+    // **Keyed on the path**, as the decoders below are: two matches sharing
+    // one image — this coach's own case — hold one texture and one GL upload.
+    // An image that will not open is remembered as `None`, so it is reported
+    // once for the run rather than once per entry that wanted it.
+    let mut avatars: HashMap<PathBuf, Option<AvatarInset>> = HashMap::new();
+    for path in encode.entries.iter().filter_map(wanted_avatar) {
+        avatars
+            .entry(path.clone())
+            .or_insert_with(|| AvatarInset::open(path, &gl, &watch, (out_w, out_h)));
+    }
+    let schedule = Schedule::new(
+        job.compilation.frames.clone(),
+        pulse_levels(job, encode, cancel),
+        plan.entries.len(),
+    );
 
-    // One decoder per distinct source, alive for the whole compilation: a
-    // compilation normally walks one match video over and over, and reopening
-    // it per entry would cost a preroll each time.
-    let mut sources: HashMap<usize, Decoder> = HashMap::new();
-    let mut mixer = Mixer::new(job, encode);
+    // One decoder per distinct source **file**, so a compilation that walks
+    // one match video over and over opens it once: reopening it per entry
+    // would cost a preroll each time.
+    //
+    // **And closed as soon as no entry from the current one on reads it**, the
+    // rule the audio mixer already applies to its readers, for the same reason
+    // (`composite::audio::Mixer::block`): "Kept open, a compilation of two
+    // hundred clips would hold two hundred pipelines at once, where the
+    // picture holds one recording at a time." A cut whose pieces come from
+    // thirty matches would otherwise hold thirty decode pipelines, their
+    // threads and their fds at once. A single-match compilation keeps its one
+    // decoder from the first entry to the last, exactly as it always did.
+    let mut sources: HashMap<PathBuf, Decoder> = HashMap::new();
+    // **The first entry's decoder, read as it is opened**, not after the loop:
+    // the first file the run opens is the first entry's, and by the end it may
+    // be closed, which would leave the zero-copy line empty.
+    let mut diagnostics: Option<Diagnostics> = None;
+    let mut mixer = Mixer::new(encode);
     let mut overlays = OverlayRenderer::new();
     // Before any decoding: the encode side depends on nothing the pump
     // produces, so a missing encoder is reported in the moment the run starts
@@ -557,24 +602,30 @@ fn export(
     let mut percent = 0;
     for (n, frame) in job.compilation.frames.iter().enumerate() {
         let entry = &plan.entries[frame.entry];
-        let media = encode.entries[frame.entry].as_ref();
-        if let std::collections::hash_map::Entry::Vacant(slot) = sources.entry(entry.source_index) {
-            let source = job
-                .sources
-                .get(entry.source_index)
-                .ok_or_else(|| ExportError::Failed(format!("{} has no game video", entry.text)))?;
-            slot.insert(Decoder::start(source, &gl, &watch)?);
+        let media = &encode.entries[frame.entry];
+        if laid_out != Some(frame.entry) {
+            close_unread(&mut sources, &encode.entries, frame.entry);
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = sources.entry(media.source.clone())
+        {
+            let decoder = slot.insert(Decoder::start(&media.source, &gl, &watch)?);
+            diagnostics.get_or_insert_with(|| decoder.diagnostics());
         }
         let decoder = sources
-            .get_mut(&entry.source_index)
-            .expect("inserted just above");
+            .get_mut(&media.source)
+            .expect("opened just above, and not closed until a later entry");
         let sample = decoder.frame_at(seconds_to_clock(frame.source_time), &watch)?;
         if laid_out != Some(frame.entry) {
             let caps = source_caps(sample)?;
             let info = gst_video::VideoInfo::from_caps(&caps)
                 .map_err(|e| ExportError::Failed(format!("unusable decoded caps {caps}: {e}")))?;
             picture = fit_rect(&info, out_w, out_h);
-            pip = Pip::open(media, avatar.as_ref(), &gl, cancel, (out_w, out_h));
+            let avatar = media
+                .match_media
+                .avatar
+                .as_ref()
+                .and_then(|path| avatars.get(path)?.as_ref());
+            pip = Pip::open(media, avatar, &gl, cancel, (out_w, out_h));
             // Before the push, so the pad probes find it (see `Schedule`).
             schedule.set_layout(
                 frame.entry,
@@ -591,7 +642,11 @@ fn export(
         // **The displayed frame's source time**, not a per-clip constant plus
         // the record time: that sum is exactly the macOS bug that put the
         // match clock ahead of the footage after every pause (BACKLOG #27).
-        let scoreboard = encode.scoreboard.as_ref().and_then(|context| {
+        //
+        // **The entry's own match's board**, reached through the entry rather
+        // than through an index into a per-job list, so a piece from another
+        // match cannot draw this one's score (spec J3).
+        let scoreboard = media.match_media.scoreboard.as_ref().and_then(|context| {
             let state = context.state_at(entry.source_index, frame.source_time)?;
             Some((context.config(), state))
         });
@@ -599,7 +654,7 @@ fn export(
         // frame's source time too, and mapped through that frame's own zoom.
         // Core owns the geometry; the overlay only draws what comes back.
         let highlights = highlight_shapes(
-            &encode.highlights,
+            &media.match_media.highlights,
             entry.source_index,
             frame.source_time,
             frame.zoom,
@@ -608,7 +663,7 @@ fn export(
         );
         let overlay = overlays.render(
             &OverlayFrame {
-                clip: media.map(|m| &m.clip),
+                clip: media.clip.as_ref().map(|c| &c.clip),
                 record_time,
                 picture,
                 highlights: &highlights,
@@ -643,14 +698,39 @@ fn export(
     drop(encoder);
     Ok(Rendered {
         encoder: name.to_owned(),
-        diagnostics: plan
-            .entries
-            .first()
-            .and_then(|e| sources.get(&e.source_index))
-            .map(Decoder::diagnostics)
-            .unwrap_or_default(),
+        diagnostics: diagnostics.unwrap_or_default(),
         reserve_remaining: reserve,
     })
+}
+
+/// Closes every open source no entry from `from` on reads.
+///
+/// The rule — and the reason for it — is the audio mixer's, applied to the
+/// picture: `Mixer::block` closes a reader "nothing later reads", because
+/// "kept open, a compilation of two hundred clips would hold two hundred
+/// pipelines at once". Here the scan is over the entries still to come rather
+/// than over the regions still to arrive, which is the same shape as the
+/// mixer's `active.chain(order[next..])`.
+///
+/// **Nothing is ever reopened**, which is what makes this free: a file is only
+/// closed once no entry that could ask for it is left.
+fn close_unread<T>(open: &mut HashMap<PathBuf, T>, entries: &[EntryMedia], from: usize) {
+    open.retain(|path, _| entries[from..].iter().any(|media| media.source == *path));
+}
+
+/// The avatar image `media` draws, or `None` — its clip doesn't show one, it
+/// has no clip at all, or its match has no image.
+///
+/// **One expression, two readers**: the pre-pass that opens the textures and
+/// [`pulse_levels`]' per-entry filter. There is no per-job gate beside it —
+/// with the image in the condition, a run nobody asks an avatar for opens
+/// nothing and pulses nothing by itself.
+fn wanted_avatar(media: &EntryMedia) -> Option<&PathBuf> {
+    media
+        .clip
+        .as_ref()
+        .filter(|c| c.clip.shows_avatar())
+        .and(media.match_media.avatar.as_ref())
 }
 
 /// `sample`'s caps with the output frame rate on them, which is what the base
@@ -724,17 +804,20 @@ impl Pip {
     ///
     /// A webcam recording that will not open falls back to the filler, saying
     /// on stderr why: a missing inset is a smaller loss than a failed export of
-    /// an hour of video. An entry with no media, a clip with `show_pip` off and
+    /// an hour of video. An entry with no clip, a clip with `show_pip` off and
     /// an avatar whose image is gone take the filler silently — the image was
-    /// reported once for the run, by [`AvatarInset::open`].
+    /// reported once per image, by [`AvatarInset::open`].
+    ///
+    /// `avatar` is this entry's **match's** texture, already looked up by the
+    /// caller.
     fn open(
-        media: Option<&EntryMedia>,
+        media: &EntryMedia,
         avatar: Option<&AvatarInset>,
         gl: &Gl,
         cancel: &AtomicBool,
         (out_w, out_h): (i32, i32),
     ) -> Pip {
-        let Some(EntryMedia { recording, clip }) = media else {
+        let Some(ClipMedia { recording, clip }) = media.clip.as_ref() else {
             return Pip::filler();
         };
         if clip.shows_avatar() {
@@ -945,8 +1028,8 @@ impl AvatarInset {
     /// Decodes, pre-scales and uploads the project's avatar, or says on stderr
     /// why there is none.
     ///
-    /// **Once for the run, and a failure costs the inset rather than the
-    /// export** (spec A4) — one line, not one per entry. An image that has
+    /// **Once per distinct image, and a failure costs the inset rather than
+    /// the export** (spec A4) — one line, not one per entry. An image that has
     /// gone under the project is exactly as fatal as a picture-in-picture that
     /// will not open, which is to say not at all: the entries that wanted it
     /// take the filler and the file is written.
@@ -975,16 +1058,21 @@ impl AvatarInset {
 /// commentary, and `1.0` everywhere else — which `pulsed` maps to exactly the
 /// inset rect, so nothing but an avatar moves (spec E3).
 ///
-/// Called only once the image has opened: an entry that will take the filler
-/// must keep its level at 1.0, since scaling a 1×1 filler rect would round it
-/// away.
+/// Only for an entry that asks for an avatar ([`wanted_avatar`]): every other
+/// one keeps its level at 1.0, which is the pad's own rect — and for an entry
+/// that ends up on the filler that matters, since scaling a 1×1 rect would
+/// round it away.
 fn pulse_levels(job: &ExportJob, encode: &Encode, cancel: &AtomicBool) -> Vec<f64> {
     let mut levels = vec![1.0; job.compilation.frames.len()];
     for (entry, media) in job.compilation.plan.entries.iter().zip(&encode.entries) {
-        let Some(media) = media.as_ref().filter(|m| m.clip.shows_avatar()) else {
+        let Some(clip) = media
+            .clip
+            .as_ref()
+            .filter(|_| wanted_avatar(media).is_some())
+        else {
             continue;
         };
-        let table = avatar::pulse_table(&media.recording, entry.frames, cancel);
+        let table = avatar::pulse_table(&clip.recording, entry.frames, cancel);
         for (slot, level) in levels.iter_mut().skip(entry.start_frame).zip(table) {
             *slot = level;
         }
@@ -1276,6 +1364,50 @@ mod tests {
         }
     }
 
+    /// Entries reading `files` in turn, with no clips: the shape
+    /// [`close_unread`] reads.
+    fn entries(files: &[&str]) -> Vec<EntryMedia> {
+        files
+            .iter()
+            .map(|file| EntryMedia {
+                source: PathBuf::from(file),
+                clip: None,
+                match_media: Arc::default(),
+            })
+            .collect()
+    }
+
+    /// The open sources after [`close_unread`] has run at entry `from`, sorted.
+    fn left_open(files: &[&str], from: usize) -> Vec<String> {
+        let mut open: HashMap<PathBuf, ()> = files
+            .iter()
+            .take(from + 1)
+            .map(|f| (f.into(), ()))
+            .collect();
+        close_unread(&mut open, &entries(files), from);
+        let mut left: Vec<String> = open.keys().map(|p| p.display().to_string()).collect();
+        left.sort();
+        left
+    }
+
+    /// The bound on the decoder cache: a file is closed at the entry boundary
+    /// past its last reader, and only there.
+    #[test]
+    fn a_decoder_is_dropped_when_no_later_entry_reads_it() {
+        // Three matches in a row: each boundary closes the one behind it, so
+        // the run holds one decoder at a time however many pieces it has.
+        assert_eq!(left_open(&["a", "b", "c"], 1), ["b"]);
+        assert_eq!(left_open(&["a", "b", "c"], 2), ["c"]);
+        // A file a later entry comes back to stays open, so nothing is ever
+        // reopened: two decoders here, never three.
+        assert_eq!(left_open(&["a", "b", "a"], 1), ["a", "b"]);
+        assert_eq!(left_open(&["a", "b", "a"], 2), ["a"]);
+        // One match, walked over and over: its decoder is opened once and
+        // never dropped, exactly as before the cache was bounded.
+        assert_eq!(left_open(&["a", "a", "a"], 1), ["a"]);
+        assert_eq!(left_open(&["a", "a", "a"], 2), ["a"]);
+    }
+
     #[test]
     fn part_path_appends_to_the_file_name() {
         assert_eq!(
@@ -1347,20 +1479,20 @@ mod tests {
         let job = ExportJob {
             tags: FileTags::default(),
             compilation: fixtures::one_entry(&clip, frames, ""),
-            sources: vec![source],
             path: path.clone(),
             cues: None,
             render: Render::Encode(Encode {
-                entries: vec![Some(EntryMedia {
-                    recording: dir.path().join("missing.mkv"),
-                    clip,
-                })],
+                entries: vec![EntryMedia {
+                    source,
+                    clip: Some(ClipMedia {
+                        recording: dir.path().join("missing.mkv"),
+                        clip,
+                    }),
+                    match_media: Arc::default(),
+                }],
                 audio: Vec::new(),
                 resolution: Resolution::R720,
                 quality: Quality::Medium,
-                scoreboard: None,
-                highlights: Vec::new(),
-                avatar: None,
             }),
         };
         let (tx, rx) = mpsc::channel();
