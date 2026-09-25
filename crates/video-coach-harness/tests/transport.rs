@@ -35,8 +35,15 @@ impl Rig {
         std::fs::create_dir(&media).unwrap();
         let project = write_project(&folder, &media, videos);
 
-        let h = Harness::new(&tmp.path().join("config"));
+        let mut h = Harness::new(&tmp.path().join("config"));
         h.send(Command::OpenProject(folder));
+        // Step by step, so a failure here names the step it stuck on and its
+        // dump holds only what came after the last one: an open that never
+        // settles is BACKLOG #72, and both investigations so far were sent
+        // down the wrong path by a dump that (correctly) still held every
+        // event the session had ever emitted.
+        h.wait_opened();
+        h.wait_settled();
         let mut rig = Rig {
             h,
             project,

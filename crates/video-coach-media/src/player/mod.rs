@@ -407,7 +407,12 @@ impl SourcePlayer {
                     Flight::Loading(request) => {
                         // A stale ASYNC_DONE (from before the READY) can arrive
                         // while the load is still prerolling; only a finished
-                        // preroll is this load's.
+                        // preroll is this load's. Measured: `playbin3` commits
+                        // READY -> PAUSED *before* it posts the load's own
+                        // ASYNC_DONE, so this can never absorb the message it
+                        // is waiting for — only one from before the load.
+                        // Nothing bounds the wait it goes back to, so it says
+                        // when it absorbs one (BACKLOG #72).
                         if self.pipeline.state(gst::ClockTime::ZERO)
                             == (
                                 Ok(gst::StateChangeSuccess::Success),
@@ -420,6 +425,12 @@ impl SourcePlayer {
                             });
                             self.seek(request, &mut events);
                         } else {
+                            eprintln!(
+                                "player: absorbed an ASYNC_DONE from before the load of {}; \
+                                 state {:?}",
+                                request.uri,
+                                self.pipeline.state(gst::ClockTime::ZERO)
+                            );
                             self.flight = Flight::Loading(request);
                         }
                     }

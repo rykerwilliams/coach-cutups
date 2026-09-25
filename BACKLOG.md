@@ -729,6 +729,10 @@ Each entry: what, why deferred, when to revisit.
   added, so a race in GStreamer, Mesa or llvmpipe teardown is the lead. It is
   now recurring, so it is due: `MALLOC_CHECK_=3` or valgrind on the media
   export binary.
+- **Update (2026-09-25):** `malloc(): mismatching next->prev_size` in the media
+  `tests/export.rs` again, in 2 of 3 `cargo test --workspace` runs at 2430d39,
+  both after 5 of its 29 tests — while the same binary run on its own passed 4
+  times in a row. Whatever the trigger is, it is not the binary alone.
 
 71. **A possible thump at the start of every commentary recording.** The
   Android session's audio analyzer found that real Linux recordings open with
@@ -746,26 +750,78 @@ Each entry: what, why deferred, when to revisit.
   the encoder; find the true source first by recording a few seconds with and
   without each element.
 
-72. **A source's first load once never prerolled, on CI.** GitHub run
+72. **A source's first load at open once never settled, on CI.** GitHub run
   35697707647, attempt 1: `a_seek_in_the_final_second_stays_in_its_source`
   (`crates/video-coach-harness/tests/transport.rs`) opened its project, the bus
   issued the load of source 0 at 0 s (`Position { target_abs: Some(0.0) }`), and
   no settled position followed within the harness's 15 s. Attempt 2 of the
   same commit passed, as did the runs before and after.
-- **Why deferred:** once in roughly seven runs, and not reproduced. It is
-  probably not the BACKLOG #47 fix: `SourcePlayer::take_down` only waits when a
-  load is already in flight (READY, going up), and a first load starts from a
-  stopped player — unless two loads were issued back to back at open, when the
-  second would wait up to `LOAD_SETTLE` (5 s) on the first.
+- **Why deferred:** roughly once in seven runs and not reproduced in ~6000 local
+  opens, so no fix can be shown to work yet; what is written down below is the
+  evidence and the discriminator, so the next occurrence settles it.
 - **Recurred locally, 2026-09-24**, on the same symptom and a different test in
   the same file: `a_skip_burst_then_a_scrub_release_never_sticks` timed out
-  "waiting for settled at 0 in source 0" with `ProjectOpened` still unconsumed,
-  during a full `cargo test --workspace` on a machine also running a release
-  build. The same suite reran green. So it is the **open**, not the skip burst,
-  and it is not CI-only.
-- **When to revisit:** if it recurs on CI, or if a video ever fails to appear
-  when a project opens. Capture `GST_DEBUG=*:3,playbin3:5,urisourcebin:5` on
-  the failing run; check whether two loads were in flight at open.
+  "waiting for settled at 0 in source 0", during a full `cargo test --workspace`
+  on a machine also running a release build. The same suite reran green. So it
+  is the **open**, not the skip burst, and it is not CI-only.
+- **Recurred on CI 2026-09-25**, failing the v0.7.0 release workflow:
+  `a_skip_burst_across_a_source_boundary_lands_on_the_accumulated_target`, same
+  "settled at 0 in source 0" — every failure so far is `Rig::open`'s settle,
+  whose message is that string whatever the test goes on to do.
+- **Two red herrings, both from the dump, both ruled out (2026-09-25).** The
+  unconsumed-events dump listed `Basket` first and `ProjectOpened` second, which
+  looked like the bus's new opening event being mishandled. It is an artifact:
+  `Rig::open` waited with `poll_until`, which receives events without consuming
+  them, and its condition reads only the *latest* `Position`, so **every**
+  failure in these files dumped the whole session from its first event
+  regardless of the cause. The rigs now wait step by step (`wait_opened`, then
+  `wait_settled`), so the next dump names the step and holds only what came
+  after it. The other red herring is this entry's own guess above: only one load
+  is issued at open (`commit` → `ensure_loaded`, one `Position` target in the
+  dump), and in every failure so far the bus was **fresh** — its `playbin3` had
+  only ever gone NULL → READY, so `take_down` can have waited on nothing and no
+  stale `ASYNC_DONE` can have existed.
+- **What is left, and it is in the player.** `Flight::Loading`,
+  `Flight::Seeking` and `Flight::Settling` each wait for an `ASYNC_DONE` with no
+  bound, and in all three `Bus::publish_position` publishes nothing — the first
+  two have a target to republish, and `Settling` has neither a target nor
+  `is_idle`, so it publishes nothing at all. One lost `ASYNC_DONE` is therefore
+  a permanent silent wedge, in the app as much as in a test: a project that
+  opens on a black frame, a scrubber stuck at 0, no error, for ever. The symptom
+  says a message was lost; it does not yet say which.
+- **Ruled out by measurement** (a `playbin3` running the player's load sequence
+  — READY, `uri`, PAUSED — on a WebM fixture, this laptop, GStreamer 1.24.2):
+  READY → PAUSED returned `Async` 200/200, so `preroll` never silently misses
+  the `ASYNC_DONE` it then waits for; and the pipeline had already committed to
+  `(Success, Paused, VoidPending)` at the instant the load's `ASYNC_DONE` was
+  *posted*, 200/200 — the commit precedes the post, so the staleness filter in
+  the `Loading` arm cannot absorb the message it is waiting for, and the bus
+  thread, which reads the state later still, can see it only more settled. The
+  filter now logs when it absorbs one (`player: absorbed an ASYNC_DONE …`).
+- **Not reproduced:** ~6000 first opens (8 threads, fresh bus each, 8 busy-loop
+  processes for load) settled every time, the slowest in 348 ms — against a
+  15 s bound, so the timeout is not merely too short *here*. Twelve rounds of
+  the `transport` binary under the same load were clean too (its fixture
+  encodes time out at that load, which is the noise you will see).
+- **When to revisit:** the next occurrence, which is now decidable from the
+  failing test's captured stderr:
+  - **`bus: loaded …` present** → the preroll finished and the *seek's*
+    `ASYNC_DONE` was lost (`Flight::Seeking`), or `apply_playing`'s redundant
+    PAUSED returned `Async` and left the slot in `Flight::Settling` waiting for
+    an `ASYNC_DONE` nobody will post.
+  - **absent** → the preroll itself never completed, and
+    `GST_DEBUG=*:3,playbin3:5,urisourcebin:5` on the run is the next step.
+  - **`player: absorbed an ASYNC_DONE …` present** → the staleness filter ate
+    it after all, and it should be replaced by counting the stale messages
+    `take_down` can leave behind rather than querying the state.
+- **The fix nobody has earned yet:** a bound on a load and on a seek, armed in
+  `Bus::load` and disarmed by `Loaded`/`SeekDone`, dispatched by the deadline
+  the run loop already computes (`skip_deadline`, `start_deadline`), and on
+  expiry an `Event::Error` and a `reset` — about thirty lines and one more
+  deadline. It would turn the wedge into a reported error, which is right for
+  the app whatever the cause; it would *not* make the test pass, and a bound
+  loose enough to be safe on a loaded CI runner would fire well after the
+  harness's own 15 s. So it waits for the diagnosis.
 
 
 73. **`,` looks stuck across a timestamp gap longer than half a frame.** A back

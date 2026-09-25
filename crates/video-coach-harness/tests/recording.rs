@@ -57,7 +57,9 @@ impl Rig {
 
         let mut h = Harness::with_capture(&tmp.path().join("config"), capture);
         h.send(Command::OpenProject(folder.clone()));
+        // Step by step: see the note on transport.rs's rig (BACKLOG #72).
         h.wait_opened();
+        h.wait_settled();
         let mut rig = Rig {
             h,
             project,
