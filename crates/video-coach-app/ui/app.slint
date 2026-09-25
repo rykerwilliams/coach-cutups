@@ -3018,10 +3018,10 @@ export component AppWindow inherits Window {
     /// with the sheet closed and with no project open**, which is the point of
     /// the feature.
     in property <[BasketPieceRow]> basket-pieces;
-    /// The film's name and the two pickers. Seeded from the bus's event when
-    /// the sheet opens and **not on every event**: the name is typed into, and
-    /// re-seeding it under the coach's hands is the one thing a field must
-    /// never do.
+    /// The film's name and the two pickers. They follow the bus's event while
+    /// this sheet is **closed** — so what it opens on is the basket's — and are
+    /// the sheet's own while it is up: re-seeding the name under the coach's
+    /// hands is the one thing a field must never do.
     in-out property <string> basket-name;
     in-out property <int> basket-resolution;
     in-out property <int> basket-quality;

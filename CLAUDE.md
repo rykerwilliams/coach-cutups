@@ -364,14 +364,14 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 - **Measured:** 30.005 fps on 1440p HEVC, audio leading the picture by 2–7 ms. Don't measure the rate first-frame-to-last-frame; the mixer flushes its tail late. The UI budget is relative to a scanning control in the same session, not to an idle window.
 
 **Export burns in the overlay and mixes the audio** (Phase 8).
-- **Layers:** the pumped source (zoom, per-entry fit rect), then one output-size overlay carrying strokes (mapped into the picture rect), the text bar's background and its glyphs, and the inset **over both**. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
-- **Both furniture pieces are locked to a corner** (the coach, 2026-09-25): the scoreboard flush into the top-left, the inset flush into the bottom-right, over the caption bar. The inset is the mixer's **top** layer, so the bar's 60% black never washes over the coach's face, and the bar's *line* — never its background — is laid out in the width the inset leaves (`layout::bar_text_rect`, keyed on `Clip::shows_inset`), because a caption is ellipsized and never shrunk and would otherwise run underneath it. The cost of that z-order is that a stroke drawn into that corner is behind the inset; the app's live self-view still sits under the drawings.
+- **Layers:** the pumped source (zoom, per-entry fit rect), then the inset, then one output-size overlay carrying strokes (mapped into the picture rect), the text bar and the scoreboard **over both**. The z-order and its reason live in `composite::install_overlay_pad`: the coach's pen is what must never be hidden, so nothing is ever mixed over the overlay. Pad rects are **PTS-keyed in probes**; set from the pushing thread they land up to `QUEUED` frames early.
+- **Both furniture pieces are locked to a corner** (the coach, 2026-09-25): the scoreboard flush into the top-left, the inset flush into the bottom-right. The caption bar **stops where the inset stands**, background and line alike, so the bar's 60% black never washes over the coach's face and a caption — ellipsized, never shrunk — never runs under it; `layout::bar_rect`, keyed on `Clip::shows_inset`, is the whole rule.
 - **The PiP pad is fed every frame,** with a **GL** 1×1 transparent filler when a clip has `show_pip` off or its recording is unusable. An unfed pad stalls the run, and a system-memory filler breaks `glupload` when a later entry has a real inset.
 - **The avatar is that same inset pad, never the overlay.** An avatar clip's inset is the project's image: decoded and pre-scaled once, **uploaded to GL once** (the filler's own hop, for the filler's own reason) and pushed as a re-stamped header over the one texture per frame; preview, whose recording has no video pad to play, feeds the pad from an `appsrc` of its own. **The avatar's box is `AVATAR_BOX_RATIO` (0.75) of the webcam inset**, shrunk about the inset's bottom-right corner so it keeps that corner's margins and is simply smaller (the coach, 2026-09-23); `core::avatar::avatar_box` is the whole of it, one pure function on the avatar paths only, and retuning the size is that one constant. The pulse is the **pad's rect**, `core::avatar::avatar_rect(box, level)`, set in the PTS-keyed probe from one level per output frame built at job setup from the recording's own audio — never in the frame loop, where an audio decode would stall the pump — and **bounded by the entry**: the reader is asked for exactly the samples the entry's frames cover, so a two-second entry of an hour-long take reads two seconds. `avatar_rect` is exactly the rect it is given at level 1.0, which is what every non-avatar frame carries, so a camera export is unchanged to the integer. Both raster pads blend `blend-function-src-rgb=one`: what they carry is a premultiplied tiny-skia pixmap. **Measured, and the reason:** drawing the inset in the overlay costs 4.2–4.8 ms a frame against the 3.2 ms the whole overlay costs — `tiny_skia` has no sprite fast path (`the_avatar_blit_costs`, `#[ignore]`d in `media/tests/avatar.rs`).
 - **`Clip::shows_camera_pip()` and `shows_avatar()` are the only readings of `show_pip × inset`.** Preview has **three** sites to the first — the launch string's branch, the pad's placement, `decodebin3`'s pad-added link — and they must agree or the mixer stalls. They take one answer, and it includes a **probe of the recording**: `show_pip` says the coach wants an inset, but an avatar take's file has no video track and neither has a webcam take whose camera died. Export probes before it opens a decoder and falls back to the filler; preview has no filler and asks for no pad at all.
 - **Audio:** one audio-only pipeline per file (flushing ACCURATE seeks per play segment, silence for a file with no audio), mixed in Rust from `core::audio`'s regions and envelope, pushed **at or ahead of** the video into an **unbounded** appsrc, then `avenc_aac` (needs `gstreamer1.0-libav`). **Drop the first 1024 samples** for the encoder's priming; shifting timestamps does nothing. A tone at 1.000 s must decode back within a millisecond.
 - **Every denominator is `plan.total_frames()`,** never a duration sum: per-entry quantization can add a frame per entry.
-- **A run is started by `begin(jobs)`** over jobs the caller built: the caller owns its own refusals, its own output directory and its own picker write-back, and the write-back happens only **after** `begin` returns `Ok` — a refusal inside it would otherwise dirty the project and save it.
+- **A run is started by `begin(jobs)`** over jobs the caller built: the caller owns its own refusals (`refuse_if_busy` first, before any I/O), its own output directory and its own picker write-back. `begin` is **infallible** — by the time it is called there is nothing left to refuse — and the write-back still happens after it, so nothing on the way to a refusal can dirty the project.
 - **Chapters are a hand-written `chpl`** (`media/src/chapters.rs`), one per plan entry (`CompilationPlan::chapters`, none under two entries), spliced into the reserved `moov` by shrinking the `free` after it, on the `.part` before the rename. `mp4mux` has no `GstTocSetter`. A chapter starts at `start_frame / OUTPUT_FPS`, never at a duration sum. **Chapters never cost an export:** any layout problem found before the write (no room, no `moov`, a box that doesn't fit) keeps the file whole without chapters, and `bus: exported …` says why. Only an I/O error opening the file or in the positioned write itself fails it.
 - **A reel's chapters are worded twice, and mark the periods** (`core::reel::reel_plan`). The chapter reads as prose — `Goal 3 — Rovers 2-1` — where the bar burned across the picture reads `3 / 6 | Rovers goal | 2-1`; the same split as the Match panel's `labelled_events` and the whole match's `chapter_events`, and the two are meant to differ. Where the goals cross a period the boundary is marked **on the chapter already there**, as a prefix (`Second half: Goal 3 — Rovers 2-1`): a reel's entries run back to back, so a chapter of its own would share an instant with the next goal's — a zero-length chapter in the MP4, and a goal dropped by the ten-second rule in the pasteable list. A reel's entries and chapters are therefore built together, unlike every other target's, because the chapter needs the goal its entry was cut around.
 - **`ffprobe` is the chapter test's reader** (`qtdemux` doesn't read `chpl`), so `ffmpeg` is a **test-only** build dependency: the test fails without it, never skips, and the `.deb` doesn't depend on it.
@@ -429,19 +429,25 @@ Verify on real hardware with `scripts/linux-gate-check.sh <file>`; see
 reference — `(project folder, clip id)` — added from the clip row's menu in
 whatever project is open, and resolved at Start.
 - **It lives in its own file**, `$XDG_CONFIG_HOME/coach-cuts/basket.json`, and
-  **not as a key in `state.json`**: `StateFile::read` discards that whole
+  **not as a key in `state.json`**: `AppFiles`' own read discards that whole
   document on any parse error and every setter rewrites it, so one basket value
   a build couldn't read would take the last project, the pen and the speech
   model with it. Inside it, the two pickers are **string labels** for the same
   reason — an unknown one reads as the default rather than costing the pieces.
+  (`AppFiles`, in `bus/state.rs`, is *where the app's own files are*: `state.json`
+  with its accessors, its siblings, and — under the user's videos folder, which
+  is neither state nor config — the folder a basket's film is written into.)
 - **Each piece draws its own match's board and clock**, because the match's
   record hangs off `EntryMedia` and the clock is still
   `state_at(entry.source_index, frame.source_time)` per frame. `PlanEntry` knows
   nothing about matches, and `source_index` stays project-local.
 - **The export's decoders are bounded**: one per distinct file, dropped as soon
-  as no later entry reads it — the audio mixer's own rule — and the zero-copy
-  diagnostic is therefore taken when the **first** decoder opens, not after the
-  loop, where it may be gone.
+  as neither the previous entry nor any later one reads it — the audio mixer's
+  own rule, one entry wider because up to `QUEUED` of the previous entry's
+  frames are still downstream and freeing their DMABuf pool is a hazard CI's
+  llvmpipe would never show. At most two open. The zero-copy diagnostic is
+  therefore taken when the **first** decoder opens, not after the loop, where it
+  may be gone.
 - **A basket's text bar is three parts** (`<match> | <clip> | tags`). The bar
   ellipsizes rather than shrinks, so a fourth part would spend the safe end of
   the line on a position that means nothing across matches; the position is in
@@ -455,7 +461,15 @@ whatever project is open, and resolved at Start.
   still be refused — which is why the sheet says so above its own message line,
   and why that line exists at all (the status bar's notice renders *behind* the
   scrim). The row carries the short phrase and Start's refusal carries the
-  sentence that names the folder.
+  sentence that names the folder. Both the sheet and Start read **one project
+  per match, not one per piece** (`basket::distinct_matches`), and the sheet's name and
+  pickers follow the bus only while the sheet is closed — never under the
+  coach's hands.
+- **The film's name is cleaned before anything runs**: trimmed, `/` and `:`
+  replaced, cut to 200 bytes, and defaulted to `Basket` when what is left is
+  empty or starts with a dot (which would give a hidden `.mp4`). Start is the
+  "walk away" button, so a name must not fail at `File::create` after twenty
+  pieces have resolved; an existing film is suffixed ` (2)`, never overwritten.
 
 **Match events are tagged at the playhead or typed, in one grammar.** `z` /
 `x` / `v` tag where the game video is; the editor sheet ("Edit events…" in the

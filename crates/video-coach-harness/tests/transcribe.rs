@@ -15,7 +15,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 use video_coach_app::bus::{
-    CaptureKind, Command, Event, Finish, RecordingStatus, Stage, StateFile, TranscriptionState,
+    AppFiles, CaptureKind, Command, Event, Finish, RecordingStatus, Stage, TranscriptionState,
 };
 use video_coach_core::project::{Clip, Project};
 use video_coach_core::store;
@@ -570,7 +570,7 @@ fn replacing_a_preview_does_not_start_the_queue() {
 #[test]
 fn the_chosen_model_is_remembered_for_the_machine() {
     let rig = Rig::open(1, Duration::ZERO);
-    let state = StateFile::in_config_dir(&rig.config);
+    let state = AppFiles::in_config_dir(&rig.config);
     assert_eq!(
         state.whisper_model(),
         WhisperModel::Small,

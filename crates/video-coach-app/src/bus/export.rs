@@ -343,11 +343,11 @@ impl Bus {
         std::fs::create_dir_all(&exports).map_err(|e| {
             UserError::CantExport(format!("could not create {}: {e}", exports.display()))
         })?;
-        self.begin(jobs)?;
+        self.begin(jobs);
 
-        // The sheet's pickers are the project's from here on (spec E4).
-        // **After the run began**, or a refusal inside `begin` would dirty the
-        // project and save it (basket spec C3).
+        // The sheet's pickers are the project's from here on (spec E4). After
+        // the run began, so nothing above this can have dirtied the project on
+        // its way to a refusal (basket spec C3).
         if let Some(open) = &mut self.open {
             let prefs = &mut open.project.preferences;
             if Pickers::of(prefs) != pickers {
@@ -360,9 +360,10 @@ impl Bus {
         Ok(())
     }
 
-    /// The two refusals that cost nothing to check, so both job builders can
-    /// make them before they read a project (basket spec C3). [`Bus::begin`]
-    /// checks them again, so no caller can skip them.
+    /// The two refusals that cost nothing to check, so both job builders make
+    /// them **first**, before they read a project (basket spec C3). They are
+    /// also the whole of what [`Bus::begin`] would have to refuse, which is why
+    /// it refuses nothing.
     pub(super) fn refuse_if_busy(&self) -> Result<(), UserError> {
         let refused = |why: &str| UserError::CantExport(why.into());
         if self.export.is_some() {
@@ -379,15 +380,18 @@ impl Bus {
     /// Begins a run over `jobs`, each with the label the sheet lists it under,
     /// and publishes it (basket spec C3).
     ///
+    /// **Infallible, because the caller has already refused everything there is
+    /// to refuse**: [`Bus::refuse_if_busy`] first, then a job per target — and
+    /// an empty list of targets is itself one of those refusals (`"nothing is
+    /// ticked"` for an export, `"the basket is empty"` for a basket). So a run
+    /// that reaches here starts, and neither caller has to unwind work it did
+    /// on the way.
+    ///
     /// **The caller creates its own output directory**, after its own refusals
     /// and before this: an export the project's `exports/`, a basket its one
     /// folder. A directory is the last thing either does before starting, so a
     /// run that can't start leaves none behind.
-    pub(super) fn begin(&mut self, jobs: Vec<(String, ExportJob)>) -> Result<(), UserError> {
-        self.refuse_if_busy()?;
-        if jobs.is_empty() {
-            return Err(UserError::CantExport("nothing to export".into()));
-        }
+    pub(super) fn begin(&mut self, jobs: Vec<(String, ExportJob)>) {
         let mut rows: Vec<ExportTargetRun> = jobs
             .iter()
             .map(|(label, job)| ExportTargetRun {
@@ -398,7 +402,12 @@ impl Bus {
             .collect();
         let mut jobs: VecDeque<ExportJob> = jobs.into_iter().map(|(_, job)| job).collect();
 
-        let first = jobs.pop_front().expect("the jobs are not empty");
+        let Some(first) = jobs.pop_front() else {
+            // A builder that got this far with nothing is a bug in it, not
+            // something the coach did: both refuse an empty list of targets
+            // before they build a single job.
+            return eprintln!("bus: a run was begun with no jobs");
+        };
         rows[0].state = TargetState::Running(0);
         let now = Instant::now();
         self.export = Some(Active {
@@ -417,7 +426,6 @@ impl Bus {
         });
         let run = self.export.as_ref().expect("just set").run.clone();
         self.emit(Event::Export(run));
-        Ok(())
     }
 
     /// Renders `job` on a thread of its own, forwarding its messages to the

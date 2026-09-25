@@ -45,44 +45,59 @@ pub const BAR_INSET_RATIO: f64 = 0.15;
 /// that a line plus its ascender and descender fits the inset rect.
 pub const BAR_FONT_RATIO: f64 = 0.5;
 
-/// The text bar's rect in output space: a full-width strip along the bottom.
-pub fn bar_rect(out_w: f64, out_h: f64) -> Rect {
+/// The inset's left edge in output space — the column it stands in, and so
+/// where the text bar stops.
+///
+/// **One function, two readers** ([`pip_rect`] and [`bar_rect`]), so the bar
+/// ending exactly at the inset is the rule rather than two arithmetic
+/// coincidences that a retuned [`PIP_WIDTH_RATIO`] could part.
+pub fn pip_left(out_w: f64) -> f64 {
+    out_w - PIP_WIDTH_RATIO * out_w
+}
+
+/// The text bar's rect in output space: a strip along the bottom, reaching the
+/// left edge and stopping where the inset stands — or reaching both edges for
+/// an entry that has no inset.
+///
+/// **The whole bar stops, background and line alike** (the coach's corner-lock,
+/// 2026-09-25). The inset is flush into the same corner ([`pip_rect`]), so a
+/// bar that ran under it would put its 60% black over the coach's own face; a
+/// bar that ends at the inset instead reads as the bottom row being shared
+/// between the two. The line has to stop for a second reason of its own: it is
+/// ellipsized and never shrunk (`media::overlay`), so a reel's three-part
+/// caption or a basket's `<match> | <clip> | tags` would otherwise run
+/// underneath the inset, and losing the tags to an ellipsis is a smaller loss
+/// than losing them behind a picture.
+///
+/// Stopping the bar is also what keeps the **overlay the mixer's top layer**
+/// (`media::composite::install_overlay_pad`), which is what the coach's pen
+/// needs: a stroke into that corner stays visible, because nothing in this
+/// layer washes the inset.
+///
+/// The height is the same either way, so a caller that wants only the bar's
+/// height — the glyphs' size and their inset, which are fractions of it — may
+/// ask with any `has_inset`.
+///
+/// **The camera's column, whichever inset the clip has:** an avatar's circle
+/// keeps the inset's right edge and is narrower
+/// ([`crate::avatar::avatar_box`]), and its pulse only shrinks it further, so
+/// this width clears either kind. A round avatar cannot finish the row the way
+/// a camera's rectangle does whatever width is picked, so it is not worth a
+/// second edge. And `has_inset` is the coach's own
+/// [`Clip::shows_inset`](crate::project::Clip::shows_inset), not whether a
+/// recording opened: preview learns its camera's shape from caps on a
+/// GStreamer thread, long after the bar is laid out, so anything finer would
+/// have preview and export cut the same caption differently.
+pub fn bar_rect(out_w: f64, out_h: f64, has_inset: bool) -> Rect {
     let h = BAR_HEIGHT_RATIO * out_h;
     Rect {
         x: 0.0,
         y: out_h - h,
-        w: out_w,
-        h,
-    }
-}
-
-/// The bar's **line**, which is the strip less the column the inset stands in
-/// — or the whole strip for an entry that has no inset.
-///
-/// The bar's *background* is [`bar_rect`] either way: it reaches both edges as
-/// it always has, and the inset is mixed over its right-hand end. It is the
-/// words that have to stop, because the line is ellipsized and never shrunk
-/// (`media::overlay`), so a reel's three-part caption or a basket's
-/// `<match> | <clip> | tags` would otherwise run underneath the inset. Losing
-/// the tags to an ellipsis is a smaller loss than losing them behind a
-/// picture.
-///
-/// **The camera's column, whichever inset the clip has:** an avatar's box
-/// keeps the inset's right edge and is narrower
-/// ([`crate::avatar::avatar_box`]), and its pulse only shrinks it further, so
-/// this width clears either kind. And `has_inset` is the coach's own
-/// [`Clip::shows_inset`](crate::project::Clip::shows_inset), not whether a
-/// recording opened: preview learns its camera's shape from caps on a
-/// GStreamer thread, long after the line is laid out, so anything finer would
-/// have preview and export cut the same caption differently.
-pub fn bar_text_rect(out_w: f64, out_h: f64, has_inset: bool) -> Rect {
-    let bar = bar_rect(out_w, out_h);
-    match has_inset {
-        true => Rect {
-            w: bar.w - PIP_WIDTH_RATIO * out_w,
-            ..bar
+        w: match has_inset {
+            true => pip_left(out_w),
+            false => out_w,
         },
-        false => bar,
+        h,
     }
 }
 
@@ -94,21 +109,18 @@ pub fn bar_text_rect(out_w: f64, out_h: f64, has_inset: bool) -> Rect {
 /// **display** aspect (width ÷ height with the pixel aspect ratio applied) and
 /// must be positive: a camera reporting neither is not a camera.
 ///
-/// **Flush, and over the bar** (the coach, 2026-09-25). A margin off the two
-/// edges plus the bar's height left a strip of picture under the inset that
-/// did nothing — the same accident as the scoreboard's old inset — so the
-/// inset finishes the bottom row the bar starts. Two things follow: the inset
-/// is mixed **above** the overlay (`media::composite`), so the bar's tint
-/// never washes over the picture it carries, and the bar's line stops at
-/// [`bar_text_rect`], so the words are never behind it. macOS split the bar's
-/// background from its glyphs across two layers to get those same two results;
-/// one overlay above the picture and a shorter line need neither the split nor
-/// a fourth pad.
+/// **Flush, not inset** (the coach, 2026-09-25). A margin off the two edges
+/// plus the bar's height left a strip of picture under the inset that did
+/// nothing — the same accident as the scoreboard's old gap — so the inset
+/// finishes the bottom row the bar starts, and the bar stops where it begins
+/// ([`bar_rect`]). macOS split the bar's background from its glyphs across two
+/// layers to keep its PiP out of its own caption; a bar that ends at the inset
+/// needs neither the split nor a fourth pad.
 pub fn pip_rect(out_w: f64, out_h: f64, cam_aspect: f64) -> Rect {
     let w = PIP_WIDTH_RATIO * out_w;
     let h = w / cam_aspect;
     Rect {
-        x: out_w - w,
+        x: pip_left(out_w),
         y: out_h - h,
         w,
         h,

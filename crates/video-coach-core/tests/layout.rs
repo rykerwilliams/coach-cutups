@@ -2,8 +2,8 @@
 
 use video_coach_core::avatar::avatar_box;
 use video_coach_core::layout::{
-    avatar_self_view_rect, bar_rect, bar_text_rect, pip_rect, pip_rect_over_picture,
-    scoreboard_rects, self_view_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
+    avatar_self_view_rect, bar_rect, pip_left, pip_rect, pip_rect_over_picture, scoreboard_rects,
+    self_view_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
     SCOREBOARD_FONT_RATIO,
 };
 
@@ -32,31 +32,31 @@ fn the_pip_sits_flush_in_the_bottom_right_corner_over_the_bar() {
         let r = pip_rect(w, h, 16.0 / 9.0);
         assert!((r.x + r.w - w).abs() < 1e-9, "not flush right at {w}×{h}");
         assert!((r.y + r.h - h).abs() < 1e-9, "not flush bottom at {w}×{h}");
-        assert!(r.y + r.h > bar_rect(w, h).y);
+        assert!(r.y + r.h > bar_rect(w, h, true).y);
     }
 }
 
-/// The bar's *line* stops where the inset stands; its background does not.
-/// A caption is ellipsized and never shrunk, so this is the only thing keeping
-/// a long one out from under the inset.
+/// **The whole bar stops where the inset stands** — background and line alike
+/// — so nothing it draws is over the coach's face and nothing it draws is under
+/// the inset. Both edges come from `pip_left`, so this pins the rule rather
+/// than an arithmetic coincidence.
 #[test]
-fn the_bar_s_line_leaves_the_inset_s_column_alone() {
-    let bar = bar_rect(1920.0, 1080.0);
-    let with = bar_text_rect(1920.0, 1080.0, true);
-    // Same strip, and it ends exactly where a camera inset begins.
-    assert_eq!((with.x, with.y, with.h), (bar.x, bar.y, bar.h));
-    assert_eq!(with.w, pip_rect(1920.0, 1080.0, 16.0 / 9.0).x);
+fn the_bar_stops_where_the_inset_stands() {
+    let full = bar_rect(1920.0, 1080.0, false);
+    let short = bar_rect(1920.0, 1080.0, true);
+    // The same strip, ending exactly where a camera inset begins.
+    assert_eq!((short.x, short.y, short.h), (full.x, full.y, full.h));
+    assert_eq!(short.w, pip_rect(1920.0, 1080.0, 16.0 / 9.0).x);
+    assert_eq!(short.w, pip_left(1920.0));
     // An avatar's box keeps the inset's right edge and is narrower, so the one
     // column clears both kinds of inset.
     let avatar = avatar_box(pip_rect(1920.0, 1080.0, 1.0));
-    assert!(with.w <= avatar.x);
-    // And with no inset the line gets the whole strip back.
-    assert_eq!(bar_text_rect(1920.0, 1080.0, false), bar);
+    assert!(short.w <= avatar.x);
 }
 
 #[test]
-fn the_text_bar_is_a_full_width_strip_along_the_bottom() {
-    let bar = bar_rect(1920.0, 1080.0);
+fn the_text_bar_is_a_strip_along_the_bottom() {
+    let bar = bar_rect(1920.0, 1080.0, false);
     assert_eq!(
         bar,
         Rect {
@@ -66,11 +66,14 @@ fn the_text_bar_is_a_full_width_strip_along_the_bottom() {
             h: BAR_HEIGHT_RATIO * 1080.0,
         }
     );
-    // It reaches the bottom edge exactly, at every output size.
+    // It reaches the bottom edge exactly, at every output size, and the
+    // inset's column costs it width and nothing else.
     for (w, h) in [(1280.0, 720.0), (1920.0, 1080.0), (3840.0, 2160.0)] {
-        let bar = bar_rect(w, h);
-        assert_eq!(bar.y + bar.h, h);
-        assert_eq!(bar.h / h, BAR_HEIGHT_RATIO);
+        for has_inset in [false, true] {
+            let bar = bar_rect(w, h, has_inset);
+            assert_eq!(bar.y + bar.h, h);
+            assert_eq!(bar.h / h, BAR_HEIGHT_RATIO);
+        }
     }
 }
 

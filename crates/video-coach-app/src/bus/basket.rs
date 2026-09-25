@@ -8,7 +8,7 @@
 //! name rather than silently dropped (spec E1).
 //!
 //! **It lives in its own file, `$XDG_CONFIG_HOME/coach-cuts/basket.json`, and
-//! not in `state.json`** — [`StateFile::read`](super::state) discards that
+//! not in `state.json`** — [`AppFiles::read`](super::state) discards that
 //! whole document on any parse error and every setter rewrites it, so one
 //! basket value a build can't read would take the last project, the pen and the
 //! speech model with it (spec H1). The same discipline applies inside this
@@ -30,12 +30,12 @@ use video_coach_core::audio::audio_regions;
 use video_coach_core::export::basket_schedule;
 use video_coach_core::metadata::{basket_tags, clip_label, match_label};
 use video_coach_core::plan::{clip_source_duration, BasketPiece};
-use video_coach_core::project::{Clip, Preferences, Project, Quality, Resolution};
+use video_coach_core::project::{Preferences, Project, Quality, Resolution};
 use video_coach_core::scoreboard::ScoreboardContext;
 use video_coach_core::store;
 use video_coach_media::{Encode, EntryMedia, ExportJob, MatchMedia, Render};
 
-use super::state::StateFile;
+use super::state::AppFiles;
 use super::{Bus, Event, UserError};
 
 /// Beside `state.json`, and deliberately not inside it (spec H1).
@@ -132,7 +132,7 @@ pub(super) struct Basket {
 impl Basket {
     /// The basket as `state`'s directory has it, defaulted where the file is
     /// absent or unreadable.
-    pub(super) fn load(state: &StateFile) -> Self {
+    pub(super) fn load(state: &AppFiles) -> Self {
         let path = state.sibling(FILE);
         let stored = path.as_deref().map(read).unwrap_or_default();
         Basket {
@@ -169,7 +169,7 @@ impl Basket {
 }
 
 /// The file as it stands, defaulted where it is absent or unreadable — the
-/// whole document, as `StateFile::read` does, because a file this build can't
+/// whole document, as `AppFiles::read` does, because a file this build can't
 /// parse says nothing trustworthy about any of its fields.
 fn read(path: &Path) -> Stored {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -310,46 +310,59 @@ impl Bus {
     /// Resolves every piece against its project and publishes the rows
     /// (spec C4). Also what the bus does at startup, so the badge's count is
     /// right before anything is opened.
+    ///
+    /// **One read per project, not one per piece** ([`distinct_matches`]): opening the
+    /// sheet on twenty pieces from three matches reads three `project.json`,
+    /// which is the same dedupe Start makes twelve lines below.
     pub(super) fn publish_basket(&mut self) {
-        let pieces: Vec<BasketRow> = self
-            .basket
-            .pieces
-            .iter()
-            .map(|piece| match self.project_for(&piece.folder) {
-                Err(_) => BasketRow {
-                    match_label: piece
-                        .folder
-                        .file_name()
-                        .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
-                    clip_label: String::new(),
-                    seconds: 0.0,
-                    // **A phrase, not the store error's sentence.** A row is
-                    // one line of a narrow list, and the sentence that names
-                    // the folder and the reason (spec V6) is elided down to
-                    // the half of it that says nothing. The folder is in the
-                    // label beside this, and the whole sentence is Start's
-                    // refusal, on the sheet's message line.
-                    problem: "the project can't be read".into(),
-                },
-                Ok(project) => {
-                    let clip = project.clips.iter().find(|c| c.id == piece.clip);
-                    BasketRow {
-                        match_label: match_label(&project),
-                        clip_label: clip.map_or_else(String::new, |c| clip_label(c).to_owned()),
-                        seconds: clip.map_or(0.0, |c| c.recording_duration),
-                        problem: match clip {
-                            Some(_) => String::new(),
-                            None => "the clip is gone".into(),
+        // The borrows of `self` end with this block, so the emit below can take
+        // it mutably: a `Cow::Owned(Project)` holds its borrow until it drops.
+        let view = {
+            let (folders, of) = distinct_matches(&self.basket.pieces);
+            let projects: Vec<Result<Cow<Project>, UserError>> =
+                folders.iter().map(|f| self.project_for(f)).collect();
+            BasketView {
+                name: self.basket.name.clone(),
+                resolution: self.basket.resolution,
+                quality: self.basket.quality,
+                pieces: self
+                    .basket
+                    .pieces
+                    .iter()
+                    .zip(&of)
+                    .map(|(piece, &i)| match &projects[i] {
+                        Err(_) => BasketRow {
+                            match_label: piece
+                                .folder
+                                .file_name()
+                                .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
+                            clip_label: String::new(),
+                            seconds: 0.0,
+                            // **A phrase, not the store error's sentence.** A
+                            // row is one line of a narrow list, and the
+                            // sentence that names the folder and the reason
+                            // (spec V6) is elided down to the half of it that
+                            // says nothing. The folder is in the label beside
+                            // this, and the whole sentence is Start's refusal,
+                            // on the sheet's message line.
+                            problem: "the project can't be read".into(),
                         },
-                    }
-                }
-            })
-            .collect();
-        let view = BasketView {
-            name: self.basket.name.clone(),
-            resolution: self.basket.resolution,
-            quality: self.basket.quality,
-            pieces,
+                        Ok(project) => {
+                            let clip = project.clips.iter().find(|c| c.id == piece.clip);
+                            BasketRow {
+                                match_label: match_label(project),
+                                clip_label: clip
+                                    .map_or_else(String::new, |c| clip_label(c).to_owned()),
+                                seconds: clip.map_or(0.0, |c| c.recording_duration),
+                                problem: match clip {
+                                    Some(_) => String::new(),
+                                    None => "the clip is gone".into(),
+                                },
+                            }
+                        }
+                    })
+                    .collect(),
+            }
         };
         self.emit(Event::Basket(view));
     }
@@ -365,11 +378,7 @@ impl Bus {
         self.basket.quality = quality;
         self.basket.save();
         match self.basket_job() {
-            Ok(job) => {
-                if let Err(e) = self.begin(vec![job]) {
-                    self.emit(Event::Error(e));
-                }
-            }
+            Ok(job) => self.begin(vec![job]),
             Err(e) => self.emit(Event::Error(e)),
         }
         // Last, so the sheet's list is re-resolved against whatever Start
@@ -388,63 +397,52 @@ impl Bus {
             return Err(refused("the basket is empty".into()));
         }
 
-        // Each distinct project read once, in the order the pieces name them,
-        // and one record of each match shared by every piece of it.
-        let mut matches: Vec<(&Path, Cow<Project>, Arc<MatchMedia>)> = Vec::new();
-        for piece in &self.basket.pieces {
-            if matches.iter().any(|(folder, ..)| *folder == piece.folder) {
-                continue;
-            }
-            let project = self.project_for(&piece.folder)?;
+        // Each distinct project read once, in the order the pieces name them
+        // ([`distinct_matches`]), with its label and one record of the match shared by
+        // every piece of it.
+        let (folders, of) = distinct_matches(&self.basket.pieces);
+        let mut read: Vec<(Cow<Project>, String, Arc<MatchMedia>)> =
+            Vec::with_capacity(folders.len());
+        for folder in &folders {
+            let project = self.project_for(folder)?;
             let media = Arc::new(MatchMedia {
                 // Frozen with the project as it stands: the run's own copy.
                 scoreboard: ScoreboardContext::for_project(&project),
                 highlights: project.player_highlights.clone(),
-                avatar: project.avatar.as_ref().map(|file| piece.folder.join(file)),
+                avatar: project.avatar.as_ref().map(|file| folder.join(file)),
             });
-            matches.push((&piece.folder, project, media));
+            let label = match_label(&project);
+            read.push((project, label, media));
         }
-        // Which match each piece plays from, and the clip itself: a piece is
-        // handed to core as the clip, never as an id to look up, so no pairing
-        // can degrade to a clip with no events (spec J7).
-        let mut played: Vec<(usize, &Clip)> = Vec::with_capacity(self.basket.pieces.len());
-        for piece in &self.basket.pieces {
-            let index = matches
-                .iter()
-                .position(|(folder, ..)| *folder == piece.folder)
-                .expect("every piece's project was read above");
-            let (_, project, _) = &matches[index];
+
+        // The pieces as core takes them: each is handed over as the clip
+        // itself, never as an id to look up, so no pairing can degrade to a
+        // clip with no events (spec J7).
+        let mut pieces: Vec<BasketPiece> = Vec::with_capacity(self.basket.pieces.len());
+        for (piece, &i) in self.basket.pieces.iter().zip(&of) {
+            let (project, label, _) = &read[i];
             let clip = project
                 .clips
                 .iter()
                 .find(|c| c.id == piece.clip)
-                .ok_or_else(|| {
-                    refused(format!("{} — a piece's clip is gone", match_label(project)))
-                })?;
-            played.push((index, clip));
+                .ok_or_else(|| refused(format!("{label} — a piece's clip is gone")))?;
+            pieces.push(BasketPiece {
+                clip,
+                source_duration: clip_source_duration(project, clip),
+                match_label: label.clone(),
+            });
         }
-
-        let pieces: Vec<BasketPiece> = played
-            .iter()
-            .map(|&(index, clip)| {
-                let (_, project, _) = &matches[index];
-                BasketPiece {
-                    clip,
-                    source_duration: clip_source_duration(project, clip),
-                    match_label: match_label(project),
-                }
-            })
-            .collect();
         let compilation = basket_schedule(&pieces);
 
+        // The plan's entries are 1:1 with the pieces, in order (`basket_plan`).
         let mut entries = Vec::with_capacity(compilation.plan.entries.len());
-        for (entry, &(index, _)) in compilation.plan.entries.iter().zip(&played) {
-            let (folder, project, media) = &matches[index];
+        for (entry, &i) in compilation.plan.entries.iter().zip(&of) {
+            let (project, label, media) = &read[i];
             // Every refusal names the match as well as the clip: two projects
             // can hold clips with the same name, and "Corner's game video is
             // missing" would not say which one to go and fix (spec V1).
-            let whose = format!("{} — ", match_label(project));
-            let (source, clip) = super::export::entry_media(folder, project, entry, &whose)?;
+            let whose = format!("{label} — ");
+            let (source, clip) = super::export::entry_media(folders[i], project, entry, &whose)?;
             entries.push(EntryMedia {
                 source,
                 clip,
@@ -452,22 +450,19 @@ impl Bus {
             });
         }
 
-        let name = match self.basket.name.trim() {
-            "" => DEFAULT_NAME,
-            name => name,
-        };
-        let dir = self.state.basket_dir();
-        let path = output_path(&dir, name);
+        let name = file_stem(&self.basket.name);
+        let dir = self.files.basket_dir();
+        let path = output_path(&dir, &name);
         // On demand, and after the refusals: a run that can't start leaves no
         // folder behind (spec O1).
         std::fs::create_dir_all(&dir)
             .map_err(|e| refused(format!("could not create {}: {e}", dir.display())))?;
         let tags = basket_tags(
-            name,
+            &name,
             pieces.len(),
-            &matches
+            &read
                 .iter()
-                .map(|(_, project, _)| project.as_ref())
+                .map(|(project, ..)| project.as_ref())
                 .collect::<Vec<&Project>>(),
         );
         let job = ExportJob {
@@ -494,6 +489,33 @@ impl Bus {
     }
 }
 
+/// Which distinct project each piece names, and which of them each piece plays
+/// from: `folders[of[i]]` is `pieces[i]`'s project, and `folders` holds each
+/// one once, in the order the pieces first name it.
+///
+/// **The basket's dedupe, shared by its two readers.** Twenty pieces from three
+/// matches name three projects, so the sheet reads three `project.json` to
+/// label its rows and Start reads three to build three [`MatchMedia`] — one per
+/// match, shared by every piece of it. A piece is `(folder, clip id)` and a
+/// coach gathers several clips from the match they are working in, so the
+/// duplicates are the normal case rather than the odd one.
+fn distinct_matches(pieces: &[Piece]) -> (Vec<&Path>, Vec<usize>) {
+    let mut folders: Vec<&Path> = Vec::new();
+    let mut of = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        of.push(
+            folders
+                .iter()
+                .position(|folder| *folder == piece.folder)
+                .unwrap_or_else(|| {
+                    folders.push(&piece.folder);
+                    folders.len() - 1
+                }),
+        );
+    }
+    (folders, of)
+}
+
 /// What the run's one row is called: the film's own stem, so a name that had to
 /// be suffixed says so wherever the run is shown (spec O1).
 fn label_of(path: &Path) -> String {
@@ -503,8 +525,47 @@ fn label_of(path: &Path) -> String {
     )
 }
 
-/// `<dir>/<name>.mp4`, with `/` and `:` replaced as an export's file name does,
-/// and ` (2)`, ` (3)` … rather than overwriting a film already there.
+/// How many bytes of a typed name reach the file, before the ` (n)` suffix.
+///
+/// Every filesystem the app runs on caps a single name at 255 bytes, and this
+/// leaves room for `.mp4`, a ` (10)` suffix and a multi-byte character that
+/// straddles the cut. It is not a limit the coach can reach by accident:
+/// "Corners, second half, away at City" is 34.
+const MAX_STEM_BYTES: usize = 200;
+
+/// The basket's typed name as a file's stem: trimmed, `/` and `:` replaced as
+/// an export's file name does, cut to [`MAX_STEM_BYTES`], and defaulted where
+/// what is left would not make a file the coach can find.
+///
+/// **A leading dot is defaulted too, not just an empty name.** `"."` survives
+/// the replacement whole, and `..mp4` — or `.mp4` from `""`, were it not
+/// defaulted — is a hidden file with no stem, written without complaint and
+/// then invisible in the folder the sheet has just named. `".."` and `"..."`
+/// are the same trap.
+///
+/// Cut and defaulted **here**, rather than at [`std::fs::File::create`]: Start
+/// is the "walk away" button, and a name that fails after twenty pieces have
+/// resolved is the worst moment there is to find out (spec O1).
+fn file_stem(name: &str) -> String {
+    let cleaned = name.trim().replace(['/', ':'], "-");
+    // The last character boundary within the budget, so the cut can't land
+    // inside a multi-byte character and panic.
+    let cut = cleaned
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([cleaned.len()])
+        .take_while(|&i| i <= MAX_STEM_BYTES)
+        .last()
+        .unwrap_or_default();
+    let stem = cleaned[..cut].trim_end();
+    match stem.is_empty() || stem.starts_with('.') {
+        true => DEFAULT_NAME.to_owned(),
+        false => stem.to_owned(),
+    }
+}
+
+/// `<dir>/<stem>.mp4`, with ` (2)`, ` (3)` … rather than overwriting a film
+/// already there. `stem` comes from [`file_stem`].
 ///
 /// An export's `<label> - <project>.mp4` is safe to overwrite because it is
 /// derived from stable identity. A basket's name is typed, free-form, and its
@@ -513,8 +574,7 @@ fn label_of(path: &Path) -> String {
 /// button — refusing at the last possible moment, after twenty pieces have
 /// resolved, over a file the coach may not care about, is the worse failure
 /// (spec O1).
-fn output_path(dir: &Path, name: &str) -> PathBuf {
-    let stem = name.replace(['/', ':'], "-");
+fn output_path(dir: &Path, stem: &str) -> PathBuf {
     let mut path = dir.join(format!("{stem}.mp4"));
     let mut n = 2;
     while path.exists() {
@@ -529,7 +589,7 @@ mod tests {
     use super::*;
 
     fn stored(dir: &Path) -> PathBuf {
-        StateFile::in_config_dir(dir)
+        AppFiles::in_config_dir(dir)
             .sibling(FILE)
             .expect("a config directory")
     }
@@ -539,7 +599,7 @@ mod tests {
     #[test]
     fn the_basket_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         let mut basket = Basket::load(&state);
         assert!(basket.pieces.is_empty());
         basket.name = "Corners".into();
@@ -572,7 +632,7 @@ mod tests {
                 "pieces":[{"folder":"/p/game","clip":"00000000-0000-0000-0000-000000000000"}]}"#,
         )
         .unwrap();
-        let basket = Basket::load(&StateFile::in_config_dir(dir.path()));
+        let basket = Basket::load(&AppFiles::in_config_dir(dir.path()));
         assert_eq!(basket.resolution, Resolution::default());
         assert_eq!(basket.quality, Quality::default());
         assert_eq!(basket.name, "Corners");
@@ -587,7 +647,7 @@ mod tests {
         let path = stored(dir.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{not json").unwrap();
-        let basket = Basket::load(&StateFile::in_config_dir(dir.path()));
+        let basket = Basket::load(&AppFiles::in_config_dir(dir.path()));
         assert!(basket.pieces.is_empty());
         assert_eq!(basket.name, "");
     }
@@ -597,7 +657,7 @@ mod tests {
     #[test]
     fn the_basket_and_the_state_file_are_independent() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         state.set_last_project(Some(Path::new("/p/game")));
         state.set_pen(crate::drawing::Pen::Pink);
 
@@ -622,7 +682,7 @@ mod tests {
     #[test]
     fn the_film_is_named_after_the_basket_and_never_overwrites_one() {
         let dir = tempfile::tempdir().unwrap();
-        let path = |name: &str| output_path(dir.path(), name);
+        let path = |name: &str| output_path(dir.path(), &file_stem(name));
         assert_eq!(path("Corners"), dir.path().join("Corners.mp4"));
         assert_eq!(
             path("4/4 press: away"),
@@ -635,21 +695,72 @@ mod tests {
         assert_eq!(path("Corners"), dir.path().join("Corners (3).mp4"));
     }
 
-    /// An empty or blank name is the default, which is also the sheet's
-    /// placeholder — so `" .mp4"`, a dotfile with no stem, is unreachable.
+    /// **Every name that would not make a findable file is the default**: blank,
+    /// and anything whose cleaned stem starts with a dot — `"."` would give a
+    /// hidden `..mp4` that the folder the sheet just named does not show.
     #[test]
-    fn a_blank_name_falls_back_to_the_default() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["", "   "] {
-            let trimmed = match name.trim() {
-                "" => DEFAULT_NAME,
-                name => name,
-            };
-            assert_eq!(
-                output_path(dir.path(), trimmed),
-                dir.path().join("Basket.mp4"),
-                "{name:?}"
-            );
+    fn a_name_with_no_usable_stem_falls_back_to_the_default() {
+        for name in ["", "   ", ".", "..", " ...  ", ".hidden"] {
+            assert_eq!(file_stem(name), DEFAULT_NAME, "{name:?}");
         }
+        // A name that merely *contains* a dot keeps it, and one whose every
+        // character is replaced still leaves a stem to find the file by.
+        assert_eq!(file_stem("2nd half v. City"), "2nd half v. City");
+        assert_eq!(file_stem("/"), "-");
+    }
+
+    /// **A very long name is cut before the file is created, not at
+    /// `File::create` after twenty pieces have resolved** — on a character
+    /// boundary, so a multi-byte character can't be split.
+    #[test]
+    fn a_very_long_name_is_cut_to_something_a_filesystem_takes() {
+        let stem = file_stem(&"a".repeat(400));
+        assert_eq!(stem.len(), MAX_STEM_BYTES);
+        // Three bytes a character, so the cut lands between characters rather
+        // than 200 bytes in.
+        let wide = file_stem(&"é".repeat(400));
+        assert!(wide.len() <= MAX_STEM_BYTES, "{} bytes", wide.len());
+        assert_eq!(wide.chars().count(), MAX_STEM_BYTES / 2);
+        // The whole name plus its suffix and extension still fits a file name.
+        let dir = Path::new("/films");
+        let path = output_path(dir, &stem);
+        assert!(
+            path.file_name().unwrap().len() + " (10)".len() < 255,
+            "{}",
+            path.display()
+        );
+    }
+
+    /// **Each distinct project once, in first-mention order** — the dedupe the
+    /// sheet and Start share. Twenty pieces from three matches read three
+    /// projects and, at Start, build three `MatchMedia`.
+    #[test]
+    fn pieces_from_the_same_match_name_it_once() {
+        let folders = ["/p/a", "/p/b", "/p/c"];
+        let pieces: Vec<Piece> = (0..20)
+            .map(|i| Piece {
+                // a, b, c, a, b, c, …: the coach working match by match and
+                // coming back to one.
+                folder: folders[i % 3].into(),
+                clip: Uuid::new_v4(),
+            })
+            .collect();
+
+        let (read, of) = distinct_matches(&pieces);
+        assert_eq!(read, folders.map(Path::new));
+        assert_eq!(of.len(), pieces.len());
+        // Every piece points at its own project, whichever slot it landed in.
+        for (piece, &i) in pieces.iter().zip(&of) {
+            assert_eq!(read[i], piece.folder);
+        }
+        // And a basket of one match reads one project, twenty pieces or not.
+        let one: Vec<Piece> = pieces
+            .iter()
+            .map(|p| Piece {
+                folder: "/p/a".into(),
+                clip: p.clip,
+            })
+            .collect();
+        assert_eq!(distinct_matches(&one).0.len(), 1);
     }
 }

@@ -216,12 +216,17 @@ impl Clip {
         self.show_pip && self.inset == Inset::Avatar
     }
 
-    /// **Some** inset is drawn, whichever kind: what the bar's line is fitted
-    /// to, since it has to stop short of the inset either way
-    /// (`layout::bar_text_rect`). The third reading of the same pair, here with
-    /// the other two so all three stay one decision.
+    /// **Some** inset is drawn: what the text bar is fitted to, since it stops
+    /// where the inset stands whichever kind it is (`layout::bar_rect`).
+    ///
+    /// It is `show_pip` alone, and says so rather than or-ing the two above:
+    /// every [`Inset`] is drawn somewhere, so a clip that shows one shows one
+    /// whatever it picked. Written as `shows_camera_pip() || shows_avatar()`
+    /// this would read as a claim about the variants that it cannot make — a
+    /// third kind nobody drew would still be `true` here, and the or-form would
+    /// suggest it wasn't.
     pub fn shows_inset(&self) -> bool {
-        self.shows_camera_pip() || self.shows_avatar()
+        self.show_pip
     }
 }
 

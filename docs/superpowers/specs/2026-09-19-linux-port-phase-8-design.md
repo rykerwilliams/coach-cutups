@@ -55,11 +55,15 @@ Export **compilations**: all clips, one tag's clips, or a single clip, each as o
 | Pad | z | Content |
 |---|---|---|
 | 0 | 0 | the pumped source frame through `gltransformation` (zoom), at **that entry's** fit rect |
-| 1 | 2 | the webcam PiP (**changed 2026-09-25**: the top layer, since it now lands on the bar) |
-| 2 | 1 | the overlay: drawings, the bar's background and its glyphs, at the **output size** |
+| 1 | 1 | the webcam PiP |
+| 2 | 2 | the overlay: drawings, the bar's background and its glyphs, at the **output size** |
+
+The z-order lives in `composite::install_overlay_pad`, with the reason it is
+this way round: the coach's pen must never be hidden, so nothing is mixed over
+the overlay.
 
 - **One overlay layer, not two.** Strokes are mapped into the entry's fit rect **inside** the output-size overlay (line width still from the picture's height), and the bar is drawn in output space. That keeps Phase 7's rule (strokes belong to the picture, chrome to the frame) without splitting a layer across two z-levels.
-- **The PiP sits above the bar, not over it:** its bottom margin becomes `bar height + margin`, one constant in `layout.rs`. macOS split the bar's background and glyphs across two layers precisely because its PiP overlapped the bar; moving the PiP removes the need. **Changed 2026-09-25**, at the coach's ask: the inset is flush into the bottom-right corner, over the bar. The split is still unnecessary — the inset pad is mixed above the overlay, so the bar's tint never reaches it, and the bar's *line* is laid out in the width the inset leaves (`layout::bar_text_rect`), so the words never reach under it.
+- **The PiP sits above the bar, not over it:** its bottom margin becomes `bar height + margin`, one constant in `layout.rs`. macOS split the bar's background and glyphs across two layers precisely because its PiP overlapped the bar; moving the PiP removes the need. **Changed 2026-09-25**, at the coach's ask: the inset is flush into the bottom-right corner, over the bar. The split is still unnecessary — the bar itself stops where the inset stands, background and line alike (`layout::bar_rect`), so nothing of the bar reaches the inset and nothing of the bar is hidden by it. (An intermediate version of that change raised the inset above the overlay instead; that hid strokes drawn into the corner, and was reverted in the same day's review.)
 - **The PiP pad is fed every frame, always.** A clip with `show_pip` off, or a recording that is missing or video-less, pushes a 1×1 transparent RGBA. An unfed pad stalls the export silently (measured). A recording that runs short **holds its last frame** (`repeat-after-eos`).
 - **Geometry is keyed to PTS in pad probes,** never set from the pushing thread: with `QUEUED = 4` a direct set lands up to four frames early (measured). Only pad 0's rect and caps change per entry; pads 1 and 2 are fixed for the run.
 - **One `Decoder` per distinct source**, alive for the whole compilation; one per entry's recording, opened and closed with the entry.

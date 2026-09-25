@@ -64,14 +64,14 @@ impl Bus {
     /// folder. On any failure the path is forgotten and the UI stays in its
     /// no-project state.
     pub(super) fn restore_last_project(&mut self) {
-        let Some(folder) = self.state.last_project() else {
+        let Some(folder) = self.files.last_project() else {
             return;
         };
         match store::read(&folder) {
             Ok(project) => self.commit(folder, project),
             Err(e) => {
                 eprintln!("bus: not restoring last project {}: {e}", folder.display());
-                self.state.set_last_project(None);
+                self.files.set_last_project(None);
             }
         }
     }
@@ -95,7 +95,7 @@ impl Bus {
         // relative source paths computed against it resolve the way the
         // kernel resolves `..`.
         let folder = folder.canonicalize().unwrap_or(folder);
-        self.state.set_last_project(Some(&folder));
+        self.files.set_last_project(Some(&folder));
 
         // Nothing of the previous project survives: not its requests, its
         // skip burst, nor its frame.

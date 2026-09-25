@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 use video_coach_app::bus::{
-    BasketView, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus, Snapshot,
-    StateFile, TranscriptionState, UserError,
+    AppFiles, BasketView, Bus, BusHandle, CaptureKind, Command, Event, ExportRun, RecordingStatus,
+    Snapshot, TranscriptionState, UserError,
 };
 use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 use video_coach_core::store;
@@ -111,7 +111,7 @@ impl Harness {
             sinks,
             capture,
             transcribe,
-            StateFile::in_config_dir(config_dir),
+            AppFiles::in_config_dir(config_dir),
             Box::new(move |event| {
                 let _ = tx.send(event);
             }),

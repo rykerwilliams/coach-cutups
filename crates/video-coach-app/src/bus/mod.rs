@@ -54,7 +54,7 @@ use crate::drawing::Pen;
 pub use basket::{BasketRow, BasketView};
 pub use export::{export_targets, ExportRun, ExportTargetRow, ExportTargetRun, TargetState};
 pub use recording::{CaptureKind, RecordingStatus};
-pub use state::{StateFile, WindowSize};
+pub use state::{AppFiles, WindowSize};
 pub use transcribe::{whisper, whisper_model_override, Finish, Stage, TranscriptionState};
 
 /// Which way [`Command::ScanSpeed`] moves through the speeds (spec S1).
@@ -610,7 +610,8 @@ pub struct Bus {
     /// The UI's GL display and context, once they arrive. Never set headless,
     /// where a preview composites on `Gl::shared()` instead (spec P1).
     gl: Option<Gl>,
-    state: StateFile,
+    /// Where the app's own files are, and the state file's accessors.
+    files: AppFiles,
     /// The pieces waiting to be made into one film, and the file they are
     /// remembered in. **Not on `Open`**, which is replaced on every project
     /// open: the basket is what has to survive that (basket spec H3).
@@ -686,10 +687,10 @@ impl Bus {
     /// or test sources. `transcribe` picks where transcripts come from the
     /// same way: whisper with a model, or canned text (spec S8).
     ///
-    /// `state` is where the app's own files live — the state file (the last
+    /// `files` is where the app's own files live — the state file (the last
     /// project, the chosen speech model), the basket beside it, and the folder
     /// a basket's film is written into. Production passes
-    /// [`StateFile::default_location`]; tests pass a scratch directory, so
+    /// [`AppFiles::default_location`]; tests pass a scratch directory, so
     /// none of the user's own is touched.
     ///
     /// `events` is called on the bus thread.
@@ -697,7 +698,7 @@ impl Bus {
         sinks: SinkKind,
         capture: CaptureKind,
         transcribe: TranscribeKind,
-        state: StateFile,
+        files: AppFiles,
         events: Box<dyn Fn(Event) + Send>,
     ) -> BusHandle {
         gst::init().expect("GStreamer failed to initialize");
@@ -715,8 +716,8 @@ impl Bus {
             }
         });
         let position = player.position_handle();
-        let transcribe_model = state.whisper_model();
-        let basket = basket::Basket::load(&state);
+        let transcribe_model = files.whisper_model();
+        let basket = basket::Basket::load(&files);
         let bus = Bus {
             events,
             tx: tx.clone(),
@@ -726,7 +727,7 @@ impl Bus {
             self_view: self_view.clone(),
             sinks,
             gl: None,
-            state,
+            files,
             basket,
             open: None,
             current: 0,
@@ -942,7 +943,7 @@ impl Bus {
             Command::Zoom { host_ns, zoom } => self.log_zoom(host_ns, zoom),
             Command::Stroke { host_ns, stroke } => self.log_stroke(host_ns, stroke),
             Command::ClearAll { host_ns } => self.log_clear_all(host_ns),
-            Command::SetPen(pen) => self.state.set_pen(pen),
+            Command::SetPen(pen) => self.files.set_pen(pen),
             Command::SetCamera(camera) => self.set_camera(camera),
             Command::SetMic(mic) => self.set_mic(mic),
             Command::SetAvatar(path) => self.set_avatar(path),

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
-use video_coach_app::bus::{Command, Event, ExportRun, StateFile, TargetState, UserError};
+use video_coach_app::bus::{AppFiles, Command, Event, ExportRun, TargetState, UserError};
 use video_coach_core::project::{Quality, Resolution};
 use video_coach_core::store::{self, CURRENT_FORMAT_VERSION, RECORDINGS_DIRNAME};
 use video_coach_core::undo::ClipEdit;
@@ -72,7 +72,16 @@ fn outcome(h: &mut Harness) -> ExportRun {
 /// Where a basket's film is written for a harness whose config directory is
 /// `config` — under it, so no test writes into the coach's own `~/Videos`.
 fn films(config: &Path) -> PathBuf {
-    StateFile::in_config_dir(config).basket_dir()
+    AppFiles::in_config_dir(config).basket_dir()
+}
+
+/// **A refused run leaves no folder at all**, not an empty one (spec O1): the
+/// basket's folder is created on demand by the run that writes a film into it,
+/// which is the same rule an export's `exports/` follows — and the difference
+/// [`outputs`] cannot see.
+fn no_films(config: &Path) {
+    let films = films(config);
+    assert!(!films.exists(), "a refused run made {films:?}");
 }
 
 /// The files in the basket's folder, sorted; empty when no run has created it.
@@ -156,7 +165,7 @@ fn a_refused_start_changes_no_project() {
             folder.display()
         );
     }
-    assert!(outputs(&films(&config)).is_empty());
+    no_films(&config);
 }
 
 /// **The film Start makes**: one run of one target, rendered from two
@@ -375,7 +384,7 @@ fn every_refusal_names_its_piece_and_writes_nothing() {
         !rest.iter().any(|e| matches!(e, Event::Export(_))),
         "{rest:#?}"
     );
-    assert!(outputs(&films(&config)).is_empty());
+    no_films(&config);
 }
 
 /// Removing and reordering pieces changes the film: the rows follow the list,

@@ -12,7 +12,9 @@
 use std::collections::VecDeque;
 
 use crate::event::CommentaryEvent;
-use crate::plan::{basket_plan, compilation_plan, BasketPiece, CompilationPlan, ExportTarget};
+use crate::plan::{
+    basket_plan, compilation_plan, BasketPiece, CompilationPlan, ExportTarget, PlanEntry,
+};
 use crate::project::Project;
 use crate::timeline::{PlaybackSegment, SegmentKind};
 use crate::zoom::{zoom_at, Zoom};
@@ -117,26 +119,44 @@ pub struct Compilation {
     pub plan: CompilationPlan,
 }
 
-/// Schedule every output frame of `target`.
+/// Schedule every output frame of `plan`, with each entry's commentary events
+/// from `events`.
 ///
-/// Built on [`compilation_plan`] rather than walking the clips again, so the
-/// plan's frame counts and the frames actually produced cannot disagree: each
-/// entry emits exactly its `frames`, starting at its `start_frame`.
-pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compilation {
-    let plan = compilation_plan(project, target);
-
+/// Built on a plan rather than walking the clips again, so the plan's frame
+/// counts and the frames actually produced cannot disagree: each entry emits
+/// exactly its `frames`, starting at its `start_frame`. Where an entry's events
+/// come from is the **only** difference between the two schedulers below, so it
+/// is the only thing they pass in.
+fn schedule<'a>(
+    plan: CompilationPlan,
+    events: impl Fn(usize, &PlanEntry) -> &'a [CommentaryEvent],
+) -> Compilation {
     let mut frames = Vec::with_capacity(plan.total_frames());
     for (i, entry) in plan.entries.iter().enumerate() {
         debug_assert_eq!(entry.start_frame, frames.len());
-        // An entry with no clip has no events: identity zoom throughout.
-        let events = entry
+        walk(
+            &entry.segments,
+            events(i, entry),
+            entry.frames,
+            i,
+            &mut frames,
+        );
+    }
+    Compilation { frames, plan }
+}
+
+/// Schedule every output frame of `target`.
+///
+/// The events are the project's clip with the entry's `clip_id`, and an entry
+/// with no clip — a reel's or a whole match's — has none: identity zoom
+/// throughout.
+pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compilation {
+    schedule(compilation_plan(project, target), |_, entry| {
+        entry
             .clip_id
             .and_then(|id| project.clips.iter().find(|c| c.id == id))
-            .map_or(&[][..], |c| &c.events[..]);
-        walk(&entry.segments, events, entry.frames, i, &mut frames);
-    }
-
-    Compilation { frames, plan }
+            .map_or(&[][..], |c| &c.events[..])
+    })
 }
 
 /// Schedule every output frame of a basket (spec J7).
@@ -148,21 +168,7 @@ pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compila
 /// silent degradation to identity zoom on a piece whose project was paired
 /// wrongly, so the pairing is removed rather than asserted.
 pub fn basket_schedule(pieces: &[BasketPiece]) -> Compilation {
-    let plan = basket_plan(pieces);
-
-    let mut frames = Vec::with_capacity(plan.total_frames());
-    for (i, entry) in plan.entries.iter().enumerate() {
-        debug_assert_eq!(entry.start_frame, frames.len());
-        walk(
-            &entry.segments,
-            &pieces[i].clip.events,
-            entry.frames,
-            i,
-            &mut frames,
-        );
-    }
-
-    Compilation { frames, plan }
+    schedule(basket_plan(pieces), |i, _| &pieces[i].clip.events)
 }
 
 /// Append `count` frames covering `segments`, tagged with `entry`.

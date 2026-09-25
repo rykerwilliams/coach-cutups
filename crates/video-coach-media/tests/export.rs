@@ -548,7 +548,9 @@ fn a_three_clip_export_shows_each_entry_s_frames_in_its_own_rect() {
 
     // And each entry's own line is on the bar: white glyphs over a strip that
     // is black in the counter fixture and tinted blacker still by the bar.
-    let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H));
+    // Entries 0 and 2 show an inset, so their bar stops at its column; entry
+    // 1's reaches the frame's edge. The glyphs are counted well left of both.
+    let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H), true);
     let glyphs: Vec<usize> = (0..3)
         .map(|entry| {
             let frame = &out[entry * per_entry as usize + per_entry as usize / 2];
@@ -741,7 +743,13 @@ fn a_4_3_source_is_pillarboxed_and_zoomed_as_predicted() {
 /// A horizontal stroke across the picture at `y`, from `x = 0.2` to `x = 0.8`,
 /// logged (as the recorder does) at pen-up.
 fn stroke(y: f64, color: Rgba) -> CommentaryEvent {
-    let points = [0.2, 0.5, 0.8]
+    stroke_between(0.2, 0.8, y, color)
+}
+
+/// The same, between two given normalized `x`, for a stroke that has to reach
+/// somewhere in particular.
+fn stroke_between(x0: f64, x1: f64, y: f64, color: Rgba) -> CommentaryEvent {
+    let points = [x0, (x0 + x1) / 2.0, x1]
         .into_iter()
         .enumerate()
         .map(|(i, x)| StrokePoint {
@@ -762,8 +770,9 @@ fn stroke(y: f64, color: Rgba) -> CommentaryEvent {
     )
 }
 
-/// The clip the layout test exports: a pillarboxed blue source with two
-/// strokes on it, `show_pip` as given, and a line for the bar.
+/// The clip the layout test exports: a pillarboxed blue source with three
+/// strokes on it — the third drawn into the inset's own corner — `show_pip` as
+/// given, and a line for the bar.
 fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
     gst::init().unwrap();
     // 4:3, so the picture is pillarboxed to (160, 0, 960, 720) and a stroke
@@ -777,7 +786,14 @@ fn laid_out_job(dir: &Path, show_pip: bool) -> (ExportJob, PathBuf) {
     let clip = Clip {
         show_pip,
         inset: Inset::Camera,
-        events: vec![stroke(0.5, Rgba::RED), stroke(0.75, translucent)],
+        events: vec![
+            stroke(0.5, Rgba::RED),
+            stroke(0.75, translucent),
+            // Into the inset's corner: 0.90..0.98 of a picture that starts at
+            // x = 160 is 1024..1101, and the inset owns 998..1280 from y = 562
+            // down. This is the stroke the z-order has to keep.
+            stroke_between(0.9, 0.98, 0.9, Rgba::RED),
+        ],
         ..clip(0.0, 0.2, Vec::new())
     };
     let frames = (0..6)
@@ -822,9 +838,9 @@ fn assert_rgb(frame: &fixtures::RgbFrame, what: &str, (x, y): (usize, usize), ex
 }
 
 /// The three pads land where `core::layout` says, in z-order: the source
-/// pillarboxed at the bottom, the overlay above it — the strokes mapped into
-/// the picture, the bar over the whole width — and the PiP on top of both, in
-/// the corner, over the bar it lands on.
+/// pillarboxed at the bottom, the inset over it in the corner, and the overlay
+/// on top of both — the strokes mapped into the picture, the bar stopping where
+/// the inset stands.
 #[test]
 fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
     let dir = tempfile::tempdir().unwrap();
@@ -846,7 +862,7 @@ fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
     // space -- overlapping the right pillarbox bar, which is the point of
     // putting it there -- and OVER the text bar rather than on it.
     let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 16.0 / 9.0);
-    let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H));
+    let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H), true);
     assert!(pip.y + pip.h > bar.y, "the PiP is not on the bar");
     let pip_centre = (
         (pip.x + pip.w / 2.0) as usize,
@@ -859,16 +875,21 @@ fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
         (pip.x as usize - 20, pip_centre.1),
         BLUE,
     );
-    // And the bar's tint is under it rather than over it: the inset pad is the
-    // top layer, so its bottom row is the recording's own green and not green
-    // washed 60% black. This is the assertion that fails if the z-order goes
-    // back to the overlay on top.
+    // **Nothing washes the inset, and nothing hides the coach's pen.** The
+    // overlay is the top layer, so the stroke drawn into this corner is over
+    // the recording rather than swallowed by it -- and the bar's own tint never
+    // reaches the inset, because the whole bar stops at its left edge
+    // (`core::layout::bar_rect`). These two are the z-order: the first fails if
+    // the inset goes back on top, the second if the bar goes back to full
+    // width.
+    assert_rgb(frame, "the stroke over the PiP", (1060, 648), 0xff3333);
     assert_rgb(
         frame,
-        "the PiP over the bar",
+        "the PiP under the bar's row",
         (pip_centre.0, OUT_H as usize - 8),
         GREEN,
     );
+    assert_eq!(bar.w, pip.x, "the bar does not stop at the inset");
 
     // The overlay's strokes are mapped into the picture rect, so the middle of
     // a stroke drawn at x = 0.5 is at 160 + 0.5*960, not 0.5*1280.

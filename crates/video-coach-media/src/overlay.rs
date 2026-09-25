@@ -12,11 +12,9 @@
 //! and belongs to the frame. Splitting them across two mixer pads would buy
 //! nothing — the extra pad is free either way (measured) — and would put the
 //! bar's background and its glyphs on different layers, which is what macOS had
-//! to do to keep its PiP out of its own caption. The inset overlaps the bar here
-//! too, and the split is still unnecessary: the inset pad is mixed **above**
-//! this layer (`composite`), so it is never tinted by the bar, and the bar's
-//! line is laid out in the width the inset leaves
-//! (`core::layout::bar_text_rect`), so it is never hidden by it.
+//! to do to keep its PiP out of its own caption. The inset overlaps the bar
+//! here too, and the split is still unnecessary: the bar stops where the inset
+//! stands, background and line alike (`core::layout::bar_rect`).
 //!
 //! **The fonts are vendored** (`fonts/DejaVuSans*.ttf`, with their licence
 //! beside them) and they are the only fonts loaded, because [`font_system`]
@@ -50,9 +48,9 @@ use tiny_skia::{
 };
 use video_coach_core::highlight::{label_ink, HighlightShape, LABEL_PAD_RATIO, LABEL_PILL_RATIO};
 use video_coach_core::layout::{
-    bar_rect, bar_text_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect,
-    BAR_FONT_RATIO, BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO,
-    SCOREBOARD_NAME_PAD_RATIO, SCOREBOARD_TAIL_FONT_RATIO,
+    bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
+    BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO,
+    SCOREBOARD_TAIL_FONT_RATIO,
 };
 use video_coach_core::project::Clip;
 use video_coach_core::scoreboard::{format_clock, ScoreboardConfig, ScoreboardState};
@@ -318,10 +316,11 @@ impl OverlayRenderer {
     /// go under all of it (spec H5): they mark the footage, and the coach's own
     /// pen is what they must never hide.
     ///
-    /// The inset is not in this layer and sits **over** all of it, so the one
-    /// thing here that would land under it — the bar's line — is laid out in
-    /// the width it leaves. The board cannot reach it: it is 0.36 of the width
-    /// from the left edge and the inset starts at 0.78.
+    /// The inset is not in this layer and sits **under** all of it
+    /// (`composite::install_overlay_pad`), so nothing here has to give it room
+    /// except the bar, which stops where it stands rather than tinting it
+    /// (`core::layout::bar_rect`). The board cannot reach it: it is 0.36 of the
+    /// width from the left edge and the inset starts at 0.78.
     fn draw(&mut self, pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         // The allocator hands back whatever was in that memory, and nothing
         // else clears it: `from_bytes` adopts the bytes as they are.
@@ -330,7 +329,10 @@ impl OverlayRenderer {
         self.draw_highlights(pixmap, frame);
 
         let (out_w, out_h) = (f64::from(pixmap.width()), f64::from(pixmap.height()));
-        let bar = bar_rect(out_w, out_h);
+        // The whole bar stops where the inset stands, background and line
+        // alike, so nothing this layer draws is washed over the coach's face
+        // and nothing it draws is hidden by the inset either.
+        let bar = bar_rect(out_w, out_h, frame.clip.is_some_and(Clip::shows_inset));
         if !frame.text.is_empty() {
             fill(
                 pixmap,
@@ -342,14 +344,11 @@ impl OverlayRenderer {
         draw_strokes(pixmap, frame);
 
         if !frame.text.is_empty() {
-            // The line stops where the inset stands; the background does not.
-            // A line that is ellipsized rather than shrunk would otherwise run
-            // under the inset, which is mixed over this layer.
             self.draw_label(
                 pixmap,
                 &Label {
                     text: frame.text,
-                    rect: bar_text_rect(out_w, out_h, frame.clip.is_some_and(Clip::shows_inset)),
+                    rect: bar,
                     style: Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL),
                     // Its own size, so the bar never shrinks: it is a whole
                     // sentence, and one that resized with its length would
@@ -1265,9 +1264,16 @@ mod tests {
         let bar_top = (720.0 - BAR_HEIGHT_RATIO * 720.0) as u32;
         // Premultiplied black at 60%: (0, 0, 0, 153).
         assert_eq!(at(&px, 1280, 20, bar_top + 4), [0, 0, 0, 153]);
-        // Including the corner the inset lands in: it is the *line* that stops
-        // at the inset's column, never the background.
-        assert_eq!(at(&px, 1280, 1260, 719), [0, 0, 0, 153]);
+        // **Not** the corner the inset lands in: the whole bar stops there, so
+        // the 60% black is never over the coach's own face.
+        assert_eq!(at(&px, 1280, 1260, 719), [0, 0, 0, 0]);
+        // A clip that shows no inset takes that corner back.
+        let no_inset = Clip {
+            show_pip: false,
+            ..clip(Vec::new())
+        };
+        let full = render_at(&no_inset, 0.0, "1 / 3", (0, 0, 1280, 720), 1280, 720);
+        assert_eq!(at(&full, 1280, 1260, 719), [0, 0, 0, 153]);
         // One row above the bar is untouched.
         assert_eq!(at(&px, 1280, 20, bar_top - 2), [0, 0, 0, 0]);
     }
@@ -1305,9 +1311,9 @@ mod tests {
     }
 
     /// A caption long enough to reach the right edge stops at the inset's
-    /// column, which the inset is mixed over: the line is ellipsized and never
-    /// shrunk, so nothing else would keep the words out from behind the coach's
-    /// face. With no inset asked for it takes the whole strip back.
+    /// column, which is where the bar itself stops: the line is ellipsized and
+    /// never shrunk, so nothing else would keep the words out from behind the
+    /// coach's face. With no inset asked for it takes the whole strip back.
     #[test]
     fn a_long_caption_stops_where_the_inset_stands() {
         let long = "12 / 24 | Second-half restart down the left channel, the one we \
@@ -1346,7 +1352,7 @@ mod tests {
         let mut renderer = OverlayRenderer::new();
         // The shipping width: the strip less the inset's column, since that is
         // what the line is actually fitted to.
-        let bar = bar_text_rect(1920.0, 1080.0, true);
+        let bar = bar_rect(1920.0, 1080.0, true);
         let style = Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL);
         let max_width = bar.w as f32 - 2.0 * (bar.h * BAR_INSET_RATIO) as f32;
 

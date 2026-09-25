@@ -23,9 +23,9 @@ use slint::{ComponentHandle, DataTransfer, Model, ModelRc, SharedString, VecMode
 use uuid::Uuid;
 
 use video_coach_app::bus::{
-    self, export_targets, whisper, whisper_model_override, BasketView, Bus, BusHandle, CaptureKind,
-    Command, Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot, Stage,
-    StateFile, TargetState, TranscriptionState, WindowSize,
+    self, export_targets, whisper, whisper_model_override, AppFiles, BasketView, Bus, BusHandle,
+    CaptureKind, Command, Event, ExportRun, ExportTargetRun, Finish, RecordingStatus, Snapshot,
+    Stage, TargetState, TranscriptionState, WindowSize,
 };
 use video_coach_app::color_picker;
 use video_coach_app::drawing::{path_commands, InProgress, Pen};
@@ -161,12 +161,6 @@ struct UiState {
     /// The previewed clip's duration while a preview is open. The transport
     /// then runs over the clip rather than the concat timeline (spec P6).
     preview_duration: Option<f64>,
-    /// The basket's name and pickers have been taken from the bus once, at
-    /// startup (basket spec C4). They are the sheet's own after that: a field
-    /// re-seeded by a later event — an Add from another project, say — would
-    /// take the name the coach had just typed with it, and the bus keeps them
-    /// at Start, so the two differ only while a name is typed and not started.
-    basket_seeded: bool,
     /// What the export sheet's rows stand for, in its order (Phase 8 E8).
     /// The window holds the labels and the ticks; the targets are here, since
     /// it has no type for one.
@@ -264,7 +258,6 @@ impl Default for UiState {
             highlight_drag: None,
             notice_until: None,
             preview_duration: None,
-            basket_seeded: false,
             export_targets: Vec::new(),
             scoreboard: None,
             board_renderer: None,
@@ -300,7 +293,7 @@ fn main() {
 
     // The last project, the chosen speech model and pen and the window's
     // size, all this machine's and none the project's.
-    let state = StateFile::default_location();
+    let state = AppFiles::default_location();
     let model = state.whisper_model();
     show_transcribe_model(&window, model);
     window.set_pen_colors(ModelRc::new(VecModel::from(
@@ -667,15 +660,8 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             });
             bus.borrow().send(Command::Export {
                 targets,
-                resolution: match w.get_export_resolution() {
-                    0 => Resolution::R720,
-                    _ => Resolution::R1080,
-                },
-                quality: match w.get_export_quality() {
-                    0 => Quality::Low,
-                    2 => Quality::High,
-                    _ => Quality::Medium,
-                },
+                resolution: resolution_at(w.get_export_resolution()),
+                quality: quality_at(w.get_export_quality()),
                 // 0 is "Default", which is the target's own (spec M1).
                 scoreboard: match w.get_export_scoreboard() {
                     1 => Some(ScoreboardMode::Burned),
@@ -689,6 +675,44 @@ fn wire_export(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
         let bus = bus.clone();
         move || bus.borrow().send(Command::CancelExport)
     });
+}
+
+/// The two pickers both sheets carry, between the index Slint holds and the
+/// value the bus takes. **One pair each, for the export sheet and the basket's
+/// alike**, so the rule below is stated once rather than at four call sites.
+///
+/// **2160p is in the project format but not offered** (Phase 8 E8): a project
+/// that holds it shows 1080p, and a run started from either sheet saves it back
+/// as 1080p. The match here is exhaustive so a new resolution has to be
+/// answered for rather than quietly reading as 1080p.
+fn resolution_index(resolution: Resolution) -> i32 {
+    match resolution {
+        Resolution::R720 => 0,
+        Resolution::R1080 | Resolution::R2160 => 1,
+    }
+}
+
+fn resolution_at(index: i32) -> Resolution {
+    match index {
+        0 => Resolution::R720,
+        _ => Resolution::R1080,
+    }
+}
+
+fn quality_index(quality: Quality) -> i32 {
+    match quality {
+        Quality::Low => 0,
+        Quality::Medium => 1,
+        Quality::High => 2,
+    }
+}
+
+fn quality_at(index: i32) -> Quality {
+    match index {
+        0 => Quality::Low,
+        2 => Quality::High,
+        _ => Quality::Medium,
+    }
 }
 
 /// Opens the export sheet: every target the project offers, with `clip`'s own
@@ -738,17 +762,8 @@ fn open_export_sheet(w: &AppWindow, clip: Option<Uuid>, only_clip: bool) {
     }) else {
         return;
     };
-    w.set_export_resolution(match resolution {
-        Resolution::R720 => 0,
-        // 2160p is kept in the format but not offered (E8), so it shows as
-        // 1080p — and a run started here saves it as that.
-        _ => 1,
-    });
-    w.set_export_quality(match quality {
-        Quality::Low => 0,
-        Quality::Medium => 1,
-        Quality::High => 2,
-    });
+    w.set_export_resolution(resolution_index(resolution));
+    w.set_export_quality(quality_index(quality));
     w.set_export_scoreboard(match scoreboard {
         None => 0,
         Some(ScoreboardMode::Burned) => 1,
@@ -817,17 +832,8 @@ fn wire_basket(window: &AppWindow, bus: &Rc<RefCell<BusHandle>>) {
             clear_run(&w, true);
             bus.borrow().send(Command::ExportBasket {
                 name: w.get_basket_name().to_string(),
-                resolution: match w.get_basket_resolution() {
-                    0 => Resolution::R720,
-                    // As the export sheet has it: 2160p is in the project
-                    // format but not offered.
-                    _ => Resolution::R1080,
-                },
-                quality: match w.get_basket_quality() {
-                    0 => Quality::Low,
-                    2 => Quality::High,
-                    _ => Quality::Medium,
-                },
+                resolution: resolution_at(w.get_basket_resolution()),
+                quality: quality_at(w.get_basket_quality()),
             });
         }
     });
@@ -2472,19 +2478,15 @@ fn show_basket(w: &AppWindow, view: &BasketView) {
         })
         .collect();
     w.set_basket_pieces(ModelRc::new(VecModel::from(rows)));
-    // The name and the pickers are taken once and are the sheet's after that
-    // (see `UiState::basket_seeded`).
-    if !UI.with_borrow_mut(|ui| std::mem::replace(&mut ui.basket_seeded, true)) {
+    // **The name and the pickers follow the bus while the sheet is closed, and
+    // are the sheet's own while it is open.** Re-seeding a field under the
+    // coach's hands is the one thing it must never do, and the bus takes the
+    // sheet's values at Start, so what the sheet shows when it opens is already
+    // the basket's.
+    if !w.get_basket_sheet_open() {
         w.set_basket_name(view.name.as_str().into());
-        w.set_basket_resolution(match view.resolution {
-            Resolution::R720 => 0,
-            _ => 1,
-        });
-        w.set_basket_quality(match view.quality {
-            Quality::Low => 0,
-            Quality::Medium => 1,
-            Quality::High => 2,
-        });
+        w.set_basket_resolution(resolution_index(view.resolution));
+        w.set_basket_quality(quality_index(view.quality));
     }
 }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 use uuid::Uuid;
-use video_coach_app::bus::{Command, Event, StateFile, UserError};
+use video_coach_app::bus::{AppFiles, Command, Event, UserError};
 use video_coach_core::project::Project;
 use video_coach_core::scoreboard::{MatchEventKind, MatchEventRecord};
 use video_coach_core::store;
@@ -106,7 +106,7 @@ fn opening_a_folder_without_a_project_creates_one() {
 
     assert_eq!(store::read(&folder).unwrap(), **p);
     assert_eq!(
-        StateFile::in_config_dir(&dirs.config()).last_project(),
+        AppFiles::in_config_dir(&dirs.config()).last_project(),
         Some(folder.canonicalize().unwrap())
     );
     h.shutdown();
@@ -162,7 +162,7 @@ fn opening_an_unreadable_project_keeps_the_previous_project_and_folder() {
         "{rest:#?}"
     );
     assert_eq!(
-        StateFile::in_config_dir(&dirs.config()).last_project(),
+        AppFiles::in_config_dir(&dirs.config()).last_project(),
         Some(dirs.project().canonicalize().unwrap())
     );
 }
@@ -202,7 +202,7 @@ fn restoring_a_folder_that_no_longer_exists_does_not_create_it() {
     );
     assert!(!dirs.project().exists(), "restore recreated the folder");
     assert_eq!(
-        StateFile::in_config_dir(&dirs.config()).last_project(),
+        AppFiles::in_config_dir(&dirs.config()).last_project(),
         None,
         "a folder that can't be restored is forgotten"
     );
@@ -393,10 +393,7 @@ fn opening_a_folder_that_does_not_exist_errors_and_creates_nothing() {
         "{rest:#?}"
     );
     assert!(!nowhere.exists(), "the open created the folder");
-    assert_eq!(
-        StateFile::in_config_dir(&dirs.config()).last_project(),
-        None
-    );
+    assert_eq!(AppFiles::in_config_dir(&dirs.config()).last_project(), None);
 }
 
 #[test]

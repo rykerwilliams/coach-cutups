@@ -2,13 +2,16 @@
 //! to H.264 and muxed into an MP4, driven by the pump on a thread of its own.
 //!
 //! ```text
-//! pad 0, z 0: the pumped source frame through `gltransformation` (zoom), at
-//!             that entry's fit rect
-//! pad 1, z 1: the entry's inset -- its webcam recording, or the project's
-//!             avatar, at the PiP rect (the avatar's scaled by the pulse)
-//! pad 2, z 2: the overlay -- drawings, the text bar and the scoreboard --
-//!             at the output size
+//! pad 0: the pumped source frame through `gltransformation` (zoom), at that
+//!        entry's fit rect
+//! pad 1: the entry's inset -- its webcam recording, or the project's avatar,
+//!        at the PiP rect (the avatar's scaled by the pulse)
+//! pad 2: the overlay -- drawings, the text bar and the scoreboard -- at the
+//!        output size
 //! ```
+//!
+//! Which of the three lands on top, and why, is
+//! [`install_overlay_pad`](super::install_overlay_pad)'s.
 //!
 //! The sound goes into the same muxer, mixed per output frame by
 //! [`Mixer`](super::audio::Mixer) and pushed **at or ahead of** the frames it
@@ -564,7 +567,7 @@ fn export(
     }
     let schedule = Schedule::new(
         job.compilation.frames.clone(),
-        pulse_levels(job, encode, cancel),
+        pulse_levels(job, encode, &avatars, cancel),
         plan.entries.len(),
     );
 
@@ -703,7 +706,8 @@ fn export(
     })
 }
 
-/// Closes every open source no entry from `from` on reads.
+/// Closes every open source neither the entry before `from` nor any entry from
+/// `from` on reads.
 ///
 /// The rule — and the reason for it — is the audio mixer's, applied to the
 /// picture: `Mixer::block` closes a reader "nothing later reads", because
@@ -712,19 +716,28 @@ fn export(
 /// than over the regions still to arrive, which is the same shape as the
 /// mixer's `active.chain(order[next..])`.
 ///
+/// **The window keeps the previous entry**, which is why it starts one back.
+/// This is called as the run crosses into `from`, and at that moment up to
+/// [`QUEUED`] of the previous entry's frames are still in flight downstream
+/// (the base `appsrc` is `max-buffers=QUEUED`): taking their decoder to NULL
+/// would free the DMABuf pool those buffers were allocated from. CI's llvmpipe
+/// does not import DMABufs and would never show it. One extra decoder, so at
+/// most two are open.
+///
 /// **Nothing is ever reopened**, which is what makes this free: a file is only
 /// closed once no entry that could ask for it is left.
 fn close_unread<T>(open: &mut HashMap<PathBuf, T>, entries: &[EntryMedia], from: usize) {
-    open.retain(|path, _| entries[from..].iter().any(|media| media.source == *path));
+    let live = &entries[from.saturating_sub(1)..];
+    open.retain(|path, _| live.iter().any(|media| media.source == *path));
 }
 
 /// The avatar image `media` draws, or `None` — its clip doesn't show one, it
 /// has no clip at all, or its match has no image.
 ///
-/// **One expression, two readers**: the pre-pass that opens the textures and
-/// [`pulse_levels`]' per-entry filter. There is no per-job gate beside it —
-/// with the image in the condition, a run nobody asks an avatar for opens
-/// nothing and pulses nothing by itself.
+/// **One expression, two readers**: the pre-pass that opens the textures, and
+/// [`pulse_levels`], which takes what that pre-pass managed to open as its real
+/// gate. There is no per-job gate beside it — with the image in the condition, a
+/// run nobody asks an avatar for opens nothing and pulses nothing by itself.
 fn wanted_avatar(media: &EntryMedia) -> Option<&PathBuf> {
     media
         .clip
@@ -1058,18 +1071,25 @@ impl AvatarInset {
 /// commentary, and `1.0` everywhere else — which `pulsed` maps to exactly the
 /// inset rect, so nothing but an avatar moves (spec E3).
 ///
-/// Only for an entry that asks for an avatar ([`wanted_avatar`]): every other
-/// one keeps its level at 1.0, which is the pad's own rect — and for an entry
-/// that ends up on the filler that matters, since scaling a 1×1 rect would
-/// round it away.
-fn pulse_levels(job: &ExportJob, encode: &Encode, cancel: &AtomicBool) -> Vec<f64> {
+/// Only for an entry that asks for an avatar ([`wanted_avatar`]) **and whose
+/// image opened**, which is what `avatars` says: every other one keeps its
+/// level at 1.0, which is the pad's own rect — and for an entry that ends up on
+/// the filler that matters, since scaling a 1×1 rect would round it away. An
+/// entry whose image did not open is exactly such an entry ([`Pip::open`]), so
+/// gating on the asking alone would decode its whole commentary to fill a table
+/// nothing then reads.
+fn pulse_levels(
+    job: &ExportJob,
+    encode: &Encode,
+    avatars: &HashMap<PathBuf, Option<AvatarInset>>,
+    cancel: &AtomicBool,
+) -> Vec<f64> {
+    let opened = |media: &EntryMedia| {
+        wanted_avatar(media).is_some_and(|path| avatars.get(path).is_some_and(Option::is_some))
+    };
     let mut levels = vec![1.0; job.compilation.frames.len()];
     for (entry, media) in job.compilation.plan.entries.iter().zip(&encode.entries) {
-        let Some(clip) = media
-            .clip
-            .as_ref()
-            .filter(|_| wanted_avatar(media).is_some())
-        else {
+        let Some(clip) = media.clip.as_ref().filter(|_| opened(media)) else {
             continue;
         };
         let table = avatar::pulse_table(&clip.recording, entry.frames, cancel);
@@ -1229,9 +1249,8 @@ impl Encoder {
         // run.
         install_geometry(&mix_pad("sink_0"), schedule, 0, Schedule::picture);
         let inset_pad = mix_pad("sink_1");
-        // Over the overlay, not under it: the inset lands on the bar
-        // (`install_overlay_pad`).
-        install_geometry(&inset_pad, schedule, 2, Schedule::inset);
+        // Over the picture and under the overlay (`install_overlay_pad`).
+        install_geometry(&inset_pad, schedule, 1, Schedule::inset);
         // The avatar reaching this pad is a premultiplied pixmap; a webcam
         // frame and the filler blend the same either way (spec E4).
         premultiplied_over(&inset_pad);
@@ -1392,18 +1411,24 @@ mod tests {
         left
     }
 
-    /// The bound on the decoder cache: a file is closed at the entry boundary
-    /// past its last reader, and only there.
+    /// The bound on the decoder cache: a file is closed one entry boundary
+    /// **past** the one after its last reader, and only there.
+    ///
+    /// The window keeps the previous entry, because at the boundary its last
+    /// frames are still in flight downstream and freeing their buffer pool is
+    /// the hazard the reference laptop has and CI's llvmpipe does not — so
+    /// three matches in a row hold two decoders, never one and never three.
     #[test]
     fn a_decoder_is_dropped_when_no_later_entry_reads_it() {
-        // Three matches in a row: each boundary closes the one behind it, so
-        // the run holds one decoder at a time however many pieces it has.
-        assert_eq!(left_open(&["a", "b", "c"], 1), ["b"]);
-        assert_eq!(left_open(&["a", "b", "c"], 2), ["c"]);
+        // Three matches in a row: at each boundary the entry just left is still
+        // open and the one before it has gone.
+        assert_eq!(left_open(&["a", "b", "c"], 1), ["a", "b"]);
+        assert_eq!(left_open(&["a", "b", "c"], 2), ["b", "c"]);
+        assert_eq!(left_open(&["a", "b", "c", "d"], 3), ["c", "d"]);
         // A file a later entry comes back to stays open, so nothing is ever
-        // reopened: two decoders here, never three.
+        // reopened.
         assert_eq!(left_open(&["a", "b", "a"], 1), ["a", "b"]);
-        assert_eq!(left_open(&["a", "b", "a"], 2), ["a"]);
+        assert_eq!(left_open(&["a", "b", "a"], 2), ["a", "b"]);
         // One match, walked over and over: its decoder is opened once and
         // never dropped, exactly as before the cache was bounded.
         assert_eq!(left_open(&["a", "a", "a"], 1), ["a"]);

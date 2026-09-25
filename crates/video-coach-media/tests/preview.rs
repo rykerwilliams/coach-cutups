@@ -313,9 +313,10 @@ fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
         BLUE,
     );
     // Its bottom row is the recording's own green, not green under the bar's
-    // 60% black: the inset pad is the top layer, here as in the export.
+    // 60% black: the whole bar stops at the inset's left edge, here as in the
+    // export (`core::layout::bar_rect`).
     picture.assert_rgb(
-        "the PiP over the text bar",
+        "the PiP under the text bar's row",
         (pip_centre.0, OUT_H - 8),
         GREEN,
     );

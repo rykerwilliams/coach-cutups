@@ -272,8 +272,8 @@ fn head(out_w: i32, out_h: i32) -> String {
 }
 
 /// The overlay pad's branch, which both tails share: an `out_w`×`out_h` RGBA
-/// `appsrc` uploaded into GL memory and linked to the mixer's third pad (its
-/// middle layer — see [`install_overlay_pad`]).
+/// `appsrc` uploaded into GL memory and linked to the mixer's third pad (the
+/// top layer — see [`install_overlay_pad`]).
 ///
 /// RGBA end to end. GStreamer's `RGBA` means *straight* alpha and
 /// `OverlayRenderer` hands over premultiplied pixels; nothing here
@@ -290,20 +290,26 @@ fn overlay_branch(out_w: i32, out_h: i32) -> String {
     )
 }
 
-/// Places [`overlay_branch`]'s mixer pad: the whole `out_w`×`out_h` frame, over
-/// the picture and **under the inset**, blended as the premultiplied pixels it
-/// carries. Returns the pad, which preview also makes repeat after EOS.
+/// Places [`overlay_branch`]'s mixer pad: the whole `out_w`×`out_h` frame,
+/// blended as the premultiplied pixels it carries. Returns the pad, which
+/// preview also makes repeat after EOS.
 ///
-/// **The inset is the top layer** (z 2 to this pad's 1) because it lands on the
-/// bar, whose tint would otherwise wash over the coach's own face
-/// (`core::layout::pip_rect`). The bar's line is laid out clear of it, so the
-/// only thing this pad loses to the inset is a stroke drawn into that corner —
-/// over a picture the inset is covering anyway.
+/// **This is the mixer's z-order, for both tails and in one place.** The
+/// picture is pad 0 at z 0, the inset (a camera frame or an avatar) is pad 1 at
+/// z 1, and this — the coach's strokes, the highlight pills, the caption bar
+/// and the scoreboard — is pad 2 at z 2, over everything.
+///
+/// **The overlay is on top because the coach's pen is what must never be
+/// hidden** (`overlay`, spec H5): the inset is flush into the bottom-right
+/// corner, so an inset above this pad would swallow every stroke and pill drawn
+/// into roughly 422×152 px of the picture. Nothing is washed for it, because
+/// the caption bar stops where the inset stands rather than running under it
+/// (`core::layout::bar_rect`).
 fn install_overlay_pad(mix: &gst::Element, out_w: i32, out_h: i32) -> gst::Pad {
     let pad = mix
         .static_pad("sink_2")
         .expect("requested in the launch string");
-    place(&pad, (0, 0, out_w, out_h), 1);
+    place(&pad, (0, 0, out_w, out_h), 2);
     premultiplied_over(&pad);
     pad
 }

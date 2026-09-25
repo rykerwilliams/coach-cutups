@@ -1077,9 +1077,10 @@ Each entry: what, why deferred, when to revisit.
   existing clip renders unchanged. That is a `formatVersion` bump to 12, which
   is cheap and additive; and inspector controls beside the existing "Show avatar
   in export" checkbox.
-- **What has to follow it:** the caption bar's available width — which
-  `layout::bar_text_rect` now reserves at the right-hand end, so a left-hand
-  corner has to move the reservation with it, not just widen it — the
+- **What has to follow it:** the caption bar's width — the whole bar, background
+  and line, now stops at the inset's left edge (`layout::bar_rect` over
+  `layout::pip_left`), so a left-hand corner has to move that edge with it, not
+  just widen it — the
   scan view's live self-view (`layout::self_view_rect` /
   `avatar_self_view_rect` — the corner must match what the export will do), the
   avatar's circle, and the GL 1×1 filler. The scoreboard is top-left, so a
@@ -1091,16 +1092,16 @@ Each entry: what, why deferred, when to revisit.
 - **Why deferred:** only by order — the basket is mid-build in the same files.
 - **When to revisit:** straight after the basket closes out.
 
-89. **The app's live self-view sits under the drawings; the export's inset sits
-  over them.** The inset became the mixer's **top** layer on 2026-09-25, so that
-  the caption bar's 60% black could not wash over the coach's face once the inset
-  was moved onto the bar (`composite::install_overlay_pad`). A stroke drawn into
-  that corner is therefore behind the inset in an export, while `app.slint` draws
-  the live self-view *under* the live stroke layer and says in a comment that
-  this is "the export's layer order".
-- **The fix is one move:** put the self-view's `Image` above the drawing layer in
-  `app.slint` and correct that comment. Two lines.
-- **Why deferred:** `app.slint` and `main.rs` were owned by another agent for the
-  change that caused this, and a stroke into the inset's own corner is rare
-  enough that the app and the export disagreeing there costs a corner of a line.
-- **When to revisit:** the next time anything touches the player's layer stack.
+89. **The app's live self-view sat under the drawings; the export's inset sat
+  over them — RESOLVED** (2026-09-25 review, the other way round). The inset had
+  been raised to the mixer's top layer so the caption bar's 60% black could not
+  wash over the coach's face once the inset moved onto the bar. That hid every
+  stroke and highlight pill drawn into ~422×152 px of picture, against the app's
+  own rule that the coach's pen is what must never be hidden. The fix stops the
+  **bar** at the inset's left edge instead (`layout::bar_rect`, which the line
+  already did), and puts the overlay back on top
+  (`composite::install_overlay_pad`): nothing washes the inset, nothing hides
+  the pen, and `app.slint`'s "the export's layer order" comment is true again
+  with no change to it. Pinned by `media/tests/export.rs`'s stacking test (a
+  stroke into that corner survives) and `overlay.rs`'s bar test (the corner is
+  untinted).

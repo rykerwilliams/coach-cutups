@@ -295,7 +295,7 @@ impl Bus {
             return;
         }
         self.transcribe_model = model;
-        self.state.set_whisper_model(model);
+        self.files.set_whisper_model(model);
         retarget(&mut self.transcribe, model);
         if self
             .transcribing

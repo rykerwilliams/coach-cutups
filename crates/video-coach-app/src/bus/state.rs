@@ -1,5 +1,6 @@
-//! The app's own state file, `$XDG_CONFIG_HOME/coach-cuts/state.json`: the
-//! last successfully opened project folder (spec D6), which speech model
+//! Where the app's own files live ([`AppFiles`]), and the one it reads and
+//! writes itself: `$XDG_CONFIG_HOME/coach-cuts/state.json`, holding the last
+//! successfully opened project folder (spec D6), which speech model
 //! transcription runs (Phase 10 S3), which pen the coach draws with and how
 //! big the window was. **None is a project's.** The model describes how fast
 //! this machine is, not the match, the pen and the window are the coach's
@@ -67,21 +68,28 @@ impl Default for WindowSize {
     }
 }
 
-/// Where the app's own files live: the state file — `None` when there is no
-/// config directory at all (no `$XDG_CONFIG_HOME` and no `$HOME`), in which
-/// case nothing is remembered — and the folder a basket's film is written
-/// into, which is nobody's project.
+/// Where the app's own files live — three things, which is why this is not
+/// named after any one of them:
+///
+/// - `state.json`, which this type reads and writes through its own accessors;
+///   `None` when there is no config directory at all (no `$XDG_CONFIG_HOME` and
+///   no `$HOME`), in which case nothing is remembered.
+/// - the app's other files beside it, found through [`AppFiles::sibling`] —
+///   today just the basket's.
+/// - the folder a basket's film is written into
+///   ([`AppFiles::basket_dir`]), which is under the **user's videos**
+///   directory: neither state nor configuration, and nobody's project.
 #[derive(Debug, Clone)]
-pub struct StateFile {
+pub struct AppFiles {
     path: Option<PathBuf>,
     films: PathBuf,
 }
 
-impl StateFile {
+impl AppFiles {
     /// `$XDG_CONFIG_HOME/coach-cuts/state.json`, falling back to
     /// `~/.config/coach-cuts/state.json`; films in `<XDG Videos>/Coach Cuts`.
     pub fn default_location() -> Self {
-        StateFile {
+        AppFiles {
             path: config_dir(
                 std::env::var_os("XDG_CONFIG_HOME"),
                 std::env::var_os("HOME"),
@@ -98,7 +106,7 @@ impl StateFile {
     /// **films included**, so no test writes a film into the coach's own
     /// videos folder.
     pub fn in_config_dir(config_dir: &Path) -> Self {
-        StateFile {
+        AppFiles {
             path: Some(config_dir.join(APP_DIR).join(FILE)),
             films: config_dir.join("videos"),
         }
@@ -324,11 +332,11 @@ mod tests {
     fn a_test_state_file_keeps_its_films_beside_itself() {
         let dir = Path::new("/x/cfg");
         assert_eq!(
-            StateFile::in_config_dir(dir).basket_dir(),
+            AppFiles::in_config_dir(dir).basket_dir(),
             PathBuf::from("/x/cfg/videos")
         );
         assert_eq!(
-            StateFile::in_config_dir(dir).sibling("basket.json"),
+            AppFiles::in_config_dir(dir).sibling("basket.json"),
             Some(PathBuf::from("/x/cfg/coach-cuts/basket.json"))
         );
     }
@@ -336,7 +344,7 @@ mod tests {
     #[test]
     fn remembers_and_forgets() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         assert_eq!(state.last_project(), None);
         state.set_last_project(Some(Path::new("/p/game")));
         assert_eq!(state.last_project(), Some(PathBuf::from("/p/game")));
@@ -350,12 +358,12 @@ mod tests {
     #[test]
     fn remembers_the_speech_model() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         assert_eq!(state.whisper_model(), WhisperModel::default());
         state.set_whisper_model(WhisperModel::Base);
         // A second handle on the same file: what a relaunch sees.
         assert_eq!(
-            StateFile::in_config_dir(dir.path()).whisper_model(),
+            AppFiles::in_config_dir(dir.path()).whisper_model(),
             WhisperModel::Base
         );
     }
@@ -364,10 +372,10 @@ mod tests {
     #[test]
     fn remembers_the_pen() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         assert_eq!(state.pen(), Pen::Red);
         state.set_pen(Pen::Yellow);
-        assert_eq!(StateFile::in_config_dir(dir.path()).pen(), Pen::Yellow);
+        assert_eq!(AppFiles::in_config_dir(dir.path()).pen(), Pen::Yellow);
     }
 
     /// The window likewise: machine-wide, surviving a restart, and the
@@ -375,14 +383,14 @@ mod tests {
     #[test]
     fn remembers_the_window_size() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         assert_eq!(state.window_size(), WindowSize::default());
         let size = WindowSize {
             width: 1400,
             height: 900,
         };
         state.set_window_size(size);
-        assert_eq!(StateFile::in_config_dir(dir.path()).window_size(), size);
+        assert_eq!(AppFiles::in_config_dir(dir.path()).window_size(), size);
     }
 
     /// **No setter may clobber another's field.** Each write rewrites the
@@ -391,7 +399,7 @@ mod tests {
     #[test]
     fn the_settings_are_independent() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         state.set_last_project(Some(Path::new("/p/game")));
         state.set_whisper_model(WhisperModel::Base);
         state.set_pen(Pen::Pink);
@@ -423,7 +431,7 @@ mod tests {
     #[test]
     fn an_unknown_or_absent_model_reads_as_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         std::fs::create_dir_all(dir.path().join(APP_DIR)).unwrap();
         let file = dir.path().join(APP_DIR).join(FILE);
         for text in [
@@ -443,7 +451,7 @@ mod tests {
     #[test]
     fn corrupt_file_reads_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        let state = StateFile::in_config_dir(dir.path());
+        let state = AppFiles::in_config_dir(dir.path());
         std::fs::create_dir_all(dir.path().join(APP_DIR)).unwrap();
         std::fs::write(dir.path().join(APP_DIR).join(FILE), "{not json").unwrap();
         assert_eq!(state.last_project(), None);
