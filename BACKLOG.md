@@ -1041,3 +1041,27 @@ Each entry: what, why deferred, when to revisit.
   exported as one video — is buildable now and is the smaller feature.
 - **When to revisit:** after #77's queue, whose machinery it shares, or sooner
   if the coach starts gathering corners before the queue exists.
+
+87. **Resizable panels.** The coach (2026-09-25): "resizing all the panels". Every
+  column is a fixed width today — the left column is **280 px** of a window whose
+  minimum is 1100×700 (`app.slint:638`, `:672`), and the lists inside it are
+  capped in px too (the Match panel at `min(168px, lines × 28px)`, the
+  highlights panel likewise). So a coach with a 4K screen gets the same 280 px
+  of clip names as one on a laptop, and a long team name or clip name is
+  ellipsized when there is room to spare.
+- **What it means concretely:** a draggable splitter between the picture and each
+  side column, a minimum per panel, and the widths remembered. `state.json` is
+  the right home (machine-wide, no format bump, and it already keeps the window
+  size), which also decides the question: a width is a property of the coach's
+  screen, not of a project.
+- **What to watch:** the picture's content rect is computed from the space left
+  over, and three things are placed in it by the app — the live rings, the
+  scoreboard image and the rubber band. They all follow the content rect
+  already, so a resize is not a new class of bug, but the scoreboard is
+  rasterized per device-pixel size (`main.rs`'s `show_board`) and would re-raster
+  on every drag frame — it needs to raster on release, or on a coalesced size.
+- **Why deferred:** nothing is broken; it is a comfort gap on large screens. It
+  is also best done once rather than per panel, and it touches the same file four
+  other features are queued in.
+- **When to revisit:** with the next round of UI work, or the first time the
+  coach says they can't read a clip name.
