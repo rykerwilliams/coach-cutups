@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 
 use crate::event::CommentaryEvent;
-use crate::plan::{compilation_plan, CompilationPlan, ExportTarget};
+use crate::plan::{basket_plan, compilation_plan, BasketPiece, CompilationPlan, ExportTarget};
 use crate::project::Project;
 use crate::timeline::{PlaybackSegment, SegmentKind};
 use crate::zoom::{zoom_at, Zoom};
@@ -134,6 +134,32 @@ pub fn compilation_schedule(project: &Project, target: &ExportTarget) -> Compila
             .and_then(|id| project.clips.iter().find(|c| c.id == id))
             .map_or(&[][..], |c| &c.events[..]);
         walk(&entry.segments, events, entry.frames, i, &mut frames);
+    }
+
+    Compilation { frames, plan }
+}
+
+/// Schedule every output frame of a basket (spec J7).
+///
+/// The events come from `pieces[i].clip.events` **directly**. A basket's
+/// entries are 1:1 with its pieces, in order, so there is nothing to look up —
+/// where [`compilation_schedule`] finds its clip by `clip_id` and, on a miss,
+/// falls back to no events at all. Across matches that fallback would be a
+/// silent degradation to identity zoom on a piece whose project was paired
+/// wrongly, so the pairing is removed rather than asserted.
+pub fn basket_schedule(pieces: &[BasketPiece]) -> Compilation {
+    let plan = basket_plan(pieces);
+
+    let mut frames = Vec::with_capacity(plan.total_frames());
+    for (i, entry) in plan.entries.iter().enumerate() {
+        debug_assert_eq!(entry.start_frame, frames.len());
+        walk(
+            &entry.segments,
+            &pieces[i].clip.events,
+            entry.frames,
+            i,
+            &mut frames,
+        );
     }
 
     Compilation { frames, plan }

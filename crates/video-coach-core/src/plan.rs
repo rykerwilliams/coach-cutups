@@ -90,7 +90,9 @@ pub struct PlanEntry {
     /// The text bar's line: `"<n> / <total> | <name> | tag1, tag2"`, where
     /// `<total>` is the target's clip count. An empty part is dropped along
     /// with its separator, so an unnamed, untagged clip reads `"3 / 7"`. A
-    /// reel entry's line names its goal instead ([`crate::reel`]).
+    /// reel entry's line names its goal instead ([`crate::reel`]), and a
+    /// basket piece's names its match in place of the position
+    /// ([`basket_plan`]).
     pub text: String,
 }
 
@@ -159,15 +161,63 @@ fn entry_chapters(entries: &[PlanEntry]) -> Vec<(f64, String)> {
 
 /// The bar's line for the `n`th of `total` clips, empty parts collapsed.
 fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
-    [
+    line([
         format!("{n} / {total}"),
         clip.name.trim().to_string(),
         clip.tags.join(", "),
-    ]
-    .into_iter()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join(" | ")
+    ])
+}
+
+/// The bar's parts joined, an empty one dropped along with its separator.
+fn line(parts: [String; 3]) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// The duration a clip is planned against: its source's, or the fallback for a
+/// source that isn't there. **The** duration authority, under one name for
+/// both builders.
+///
+/// `SourceRef::duration_seconds` is that authority. Phase 2's probe writes it
+/// back when a source is added or relinked, so there is nothing to override it
+/// with. An earlier draft took a `HashMap` of probed durations that took
+/// precedence, which reintroduced exactly the two-duration-sources
+/// disagreement the spec's golden rule exists to kill — preview clamping
+/// against the persisted value while export clamped against the map.
+///
+/// When the clip's source is missing entirely, the fallback is
+/// `start_source_seconds + recording_duration`: the smallest value guaranteed
+/// to cover any in-range position the clip visits at rate 1, so the segment
+/// builder never clamps a forward skip it should not have.
+pub fn clip_source_duration(project: &Project, clip: &Clip) -> f64 {
+    project
+        .source_videos
+        .get(clip.source_index)
+        .map(|s| s.duration_seconds)
+        .unwrap_or(clip.start_source_seconds + clip.recording_duration)
+}
+
+/// One entry playing `clip`, cut against `source_duration` and captioned with
+/// `text`.
+///
+/// Shared by [`compilation_plan`] and [`basket_plan`], so a clip is walked and
+/// quantized the same way whichever film it lands in — and so the fields a
+/// clip entry carries are written once.
+fn clip_entry(clip: &Clip, source_duration: f64, start_frame: usize, text: String) -> PlanEntry {
+    let segments = playback_segments(clip, source_duration);
+    // Quantized per entry, so the next one starts on a frame boundary.
+    let frames = frame_count(segments.iter().map(|s| s.out_duration).sum());
+    PlanEntry {
+        clip_id: Some(clip.id),
+        source_index: clip.source_index,
+        segments,
+        start_frame,
+        frames,
+        text,
+    }
 }
 
 /// Build a plan for `target`.
@@ -179,17 +229,8 @@ fn entry_text(clip: &Clip, n: usize, total: usize) -> String {
 /// [`PlanEntry::clip_id`], so nothing downstream pairs entries with clips by
 /// position.
 ///
-/// **`SourceRef::duration_seconds` is the single duration authority.** Phase 2's
-/// probe writes it back when a source is added or relinked, so there is nothing
-/// to override it with. An earlier draft took a `HashMap` of probed durations
-/// that took precedence, which reintroduced exactly the two-duration-sources
-/// disagreement the spec's golden rule exists to kill — preview clamping
-/// against the persisted value while export clamped against the map.
-///
-/// When a clip's source is missing entirely, the fallback is
-/// `start_source_seconds + recording_duration`: the smallest value guaranteed
-/// to cover any in-range position the clip visits at rate 1, so the segment
-/// builder never clamps a forward skip it should not have.
+/// Every clip is planned against [`clip_source_duration`] — the single
+/// duration authority, and the same one a basket's pieces are planned against.
 pub fn compilation_plan(project: &Project, target: &ExportTarget) -> CompilationPlan {
     let all = project.clips.iter();
     let clips: Vec<&Clip> = match target {
@@ -214,29 +255,89 @@ pub fn compilation_plan(project: &Project, target: &ExportTarget) -> Compilation
     let mut start_frame = 0;
 
     for (i, clip) in clips.into_iter().enumerate() {
-        let source_duration = project
-            .source_videos
-            .get(clip.source_index)
-            .map(|s| s.duration_seconds)
-            .unwrap_or(clip.start_source_seconds + clip.recording_duration);
-
-        let segments = playback_segments(clip, source_duration);
-        // Quantized per entry, so the next one starts on a frame boundary.
-        let frames = frame_count(segments.iter().map(|s| s.out_duration).sum());
-
-        entries.push(PlanEntry {
-            clip_id: Some(clip.id),
-            source_index: clip.source_index,
-            segments,
+        let entry = clip_entry(
+            clip,
+            clip_source_duration(project, clip),
             start_frame,
-            frames,
-            text: entry_text(clip, i + 1, count),
-        });
-        start_frame += frames;
+            entry_text(clip, i + 1, count),
+        );
+        start_frame += entry.frames;
+        entries.push(entry);
     }
 
     CompilationPlan {
         chapters: entry_chapters(&entries),
         entries,
     }
+}
+
+// ── A basket: one film whose pieces come from several matches ──────────────
+
+/// One piece of a basket: the clip it plays, the duration it is planned
+/// against, and what its match is called.
+///
+/// **The caller resolves all three** — and refuses what it can't find —
+/// because it is the one that can name what is missing. Nothing here is looked
+/// up: a basket's pieces come from several projects, so a single `&Project` (or
+/// a flat list of them, indexed per entry) would be a pairing to get wrong,
+/// and a miss would degrade silently to a clip with no events. Core is handed
+/// the clip itself instead.
+#[derive(Debug, Clone)]
+pub struct BasketPiece<'a> {
+    pub clip: &'a Clip,
+    /// From [`clip_source_duration`], against the clip's own project.
+    pub source_duration: f64,
+    /// [`crate::metadata::match_label`] of the clip's own project (spec T2).
+    pub match_label: String,
+}
+
+/// Build a plan for a basket: one entry per piece, in the order given.
+///
+/// There is no project and no [`ExportTarget`] here, because there is no one
+/// project: each entry keeps **its own** match's `source_index`, which the
+/// entry's source file, its scoreboard and its highlights are all keyed by in
+/// the job built around this plan (spec J1). A merged source list would
+/// collide two matches' indices.
+///
+/// Everything downstream is unchanged: [`CompilationPlan::total_frames`] is
+/// still the denominator, and the chapters are still one per entry.
+pub fn basket_plan(pieces: &[BasketPiece]) -> CompilationPlan {
+    let mut entries = Vec::with_capacity(pieces.len());
+    let mut start_frame = 0;
+
+    for piece in pieces {
+        let entry = clip_entry(
+            piece.clip,
+            piece.source_duration,
+            start_frame,
+            basket_text(piece),
+        );
+        start_frame += entry.frames;
+        entries.push(entry);
+    }
+
+    CompilationPlan {
+        chapters: entry_chapters(&entries),
+        entries,
+    }
+}
+
+/// The bar's line for a basket piece: `"<match> | <clip name> | tags"`, empty
+/// parts collapsed, and **no position** (spec T1, T3).
+///
+/// Dropping the position is mechanical rather than a matter of taste. The bar
+/// is left-aligned and *ellipsized, never shrunk* (`video-coach-media`'s
+/// `overlay.rs`), so a long line loses its **tail** and whatever comes first
+/// spends the safe end of it. A four-part `"3 / 7 | match | clip | tags"`
+/// would spend that end on the count — the one part that means nothing across
+/// matches, since piece 3 of a basket is nothing to a viewer — and leave the
+/// clip's name, which says *which corner this is*, where the ellipsis eats it.
+/// The position is not lost: [`entry_chapters`] writes one chapter per piece,
+/// so a player lists them at a size that doesn't compete with the caption.
+fn basket_text(piece: &BasketPiece) -> String {
+    line([
+        piece.match_label.trim().to_string(),
+        piece.clip.name.trim().to_string(),
+        piece.clip.tags.join(", "),
+    ])
 }

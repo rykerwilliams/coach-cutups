@@ -1,9 +1,10 @@
 //! What an exported file is called and what its header tags say: the wording
 //! of a title, a description, the result and the teams, per export target and
-//! for a project that has no scoreboard to draw them from.
+//! for a project that has no scoreboard to draw them from — then the same for
+//! a basket, which spans matches and so tells the truth about fewer of them.
 
 use uuid::Uuid;
-use video_coach_core::metadata::{file_tags, CalendarDate};
+use video_coach_core::metadata::{basket_tags, file_tags, match_label, CalendarDate};
 use video_coach_core::plan::ExportTarget;
 use video_coach_core::project::{Project, SourceRef};
 use video_coach_core::recording::PendingClip;
@@ -218,4 +219,91 @@ fn the_date_is_whatever_the_caller_read_off_the_footage() {
         Some(date)
     );
     assert_eq!(file_tags(&p, &ExportTarget::WholeMatch, None).date, None);
+}
+
+// ── A basket, whose pieces come from several matches ───────────────────────
+
+#[test]
+fn a_basket_is_titled_by_its_name_and_counts_what_went_into_it() {
+    let rovers = project("Saturday league", Some(("Rovers", "Athletic")));
+    let city = project("Cup run", Some(("City", "Harriers")));
+
+    let tags = basket_tags("  Corners  ", 7, &[&rovers, &city]);
+    assert_eq!(tags.title, "Corners");
+    assert_eq!(
+        tags.description,
+        "A Coach Cuts basket of 7 pieces from 2 matches."
+    );
+    // One of each reads as one of each.
+    assert_eq!(
+        basket_tags("Corners", 1, &[&rovers]).description,
+        "A Coach Cuts basket of 1 piece from 1 match."
+    );
+    assert_eq!(
+        tags.encoder,
+        format!("Coach Cuts {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// Where a tag can't be told the truth it is left out: a film of two matches
+/// has no result and no footage date. Both are still written for an export of
+/// one match, so this is the basket's rule rather than a lost feature.
+#[test]
+fn a_basket_states_no_result_and_no_footage_date() {
+    let mut rovers = project("Saturday league", Some(("Rovers", "Athletic")));
+    play(&mut rovers, 2, 1);
+    let city = project("Cup run", Some(("City", "Harriers")));
+
+    let tags = basket_tags("Corners", 3, &[&rovers, &city]);
+    assert_eq!(tags.comment, "");
+    assert_eq!(tags.date, None);
+
+    let date = CalendarDate {
+        year: 2026,
+        month: 9,
+        day: 21,
+    };
+    let one_match = file_tags(&rovers, &ExportTarget::AllClips, Some(date));
+    assert_eq!(one_match.comment, "Rovers 2 - 1 Athletic");
+    assert_eq!(one_match.date, Some(date));
+}
+
+/// The one tag the span makes *more* useful — and the one behaviour here that
+/// `team_keywords` has never had to have: a club in two of the matches is a
+/// duplicate across projects, not within one.
+#[test]
+fn basket_keywords_are_deduped_across_matches() {
+    let rovers = project("Saturday league", Some(("Rovers", "Athletic")));
+    let city = project("Cup run", Some(("City", "Rovers")));
+    let unconfigured = project("Friendly", None);
+
+    assert_eq!(
+        basket_tags("Corners", 3, &[&rovers, &city, &unconfigured]).keywords,
+        ["Rovers", "Athletic", "City"]
+    );
+    // A match with no scoreboard names no teams, and a blank name is no name.
+    let blank = project("Friendly", Some(("   ", "Harriers")));
+    assert_eq!(
+        basket_tags("Corners", 2, &[&unconfigured, &blank]).keywords,
+        ["Harriers"]
+    );
+    assert!(basket_tags("Corners", 0, &[]).keywords.is_empty());
+}
+
+/// What a piece's text bar and chapter call its match (spec T2): the teams,
+/// the project's own name, then "Untitled".
+#[test]
+fn the_match_label_names_the_teams_then_the_project_then_untitled() {
+    let configured = project("Saturday league", Some(("Rovers", "Athletic")));
+    assert_eq!(match_label(&configured), "Rovers v Athletic");
+    assert_eq!(
+        match_label(&project("Saturday league", None)),
+        "Saturday league"
+    );
+    assert_eq!(match_label(&project("   ", None)), "Untitled");
+    // A blank team name is no scoreboard at all, as it is for a title.
+    assert_eq!(
+        match_label(&project("Saturday league", Some(("   ", "Athletic")))),
+        "Saturday league"
+    );
 }

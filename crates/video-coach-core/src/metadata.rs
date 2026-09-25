@@ -130,6 +130,75 @@ pub fn file_tags(project: &Project, target: &ExportTarget, date: Option<Calendar
     }
 }
 
+/// What a basket's file says about itself (spec O4), for a film whose pieces
+/// come from several matches.
+///
+/// `name` is the basket's resolved name — the one its file is called after —
+/// so the title and the file agree. `matches` is the distinct set of matches
+/// that contributed, and `pieces` how many pieces they contributed between
+/// them.
+///
+/// Two tags are **left out rather than guessed**, which is this module's rule:
+/// a film of three matches has no one result to state, so it gets no comment
+/// ([`final_score`] speaks for one match), and no one footage date, so it gets
+/// no date — the earliest of three match days would be a guess. The keywords
+/// are the one tag the span makes *more* useful: a library can group the film
+/// under every club in it.
+pub fn basket_tags(name: &str, pieces: usize, matches: &[&Project]) -> FileTags {
+    fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+        if n == 1 {
+            one
+        } else {
+            many
+        }
+    }
+    FileTags {
+        title: name.trim().to_owned(),
+        description: format!(
+            "A {APP_NAME} basket of {pieces} {} from {} {}.",
+            plural(pieces, "piece", "pieces"),
+            matches.len(),
+            plural(matches.len(), "match", "matches"),
+        ),
+        comment: String::new(),
+        keywords: basket_keywords(matches),
+        encoder: format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")),
+        date: None,
+    }
+}
+
+/// Every contributing match's team names, in order, with blanks dropped and
+/// duplicates collapsed **across** matches.
+///
+/// New behaviour rather than a call into [`team_keywords`]: that dedupes
+/// within one project, where the only repeat possible is a derby typed twice.
+/// `"Rovers"` in three of a basket's matches is a repeat it has never seen, so
+/// its two rules are applied once more a level up.
+fn basket_keywords(matches: &[&Project]) -> Vec<String> {
+    let mut keywords: Vec<String> = Vec::new();
+    for name in matches.iter().flat_map(|project| team_keywords(project)) {
+        if !keywords.contains(&name) {
+            keywords.push(name);
+        }
+    }
+    keywords
+}
+
+/// What a match is called wherever a label is needed and `None` is no use — a
+/// basket piece's text bar and its chapter (spec T2): the teams, or the
+/// project's own name, or [`UNTITLED`].
+///
+/// Not the project's folder name: the coach's folders are called things like
+/// `20260917-canfield`, which names nothing a viewer knows.
+pub fn match_label(project: &Project) -> String {
+    match_name(project)
+        .or_else(|| match project.name.trim() {
+            "" => None,
+            name => Some(name.to_owned()),
+        })
+        .unwrap_or_else(|| UNTITLED.to_owned())
+}
+
 /// `"Rovers v Athletic"`, or `None` where no scoreboard names the teams — a
 /// title then falls back to what the export is, since inventing "Home v Away"
 /// for a file someone else will read is worse than saying nothing.

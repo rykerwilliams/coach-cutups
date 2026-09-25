@@ -2,17 +2,22 @@
 //! frame, and where one entry ends and the next begins.
 //!
 //! Target filtering and empty targets are `tests/plan.rs`'s; these tests take
-//! the selection as given and check the frames it produces. The rate window,
-//! which counts those same frames, is at the bottom.
+//! the selection as given and check the frames it produces. A basket's
+//! schedule — pieces from several matches — has its own section, and the rate
+//! window, which counts those same frames, is at the bottom.
 
 use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
 use video_coach_core::export::{
-    compilation_schedule, Compilation, FrameSpec, RateWindow, OUTPUT_FPS,
+    basket_schedule, compilation_schedule, Compilation, FrameSpec, RateWindow, OUTPUT_FPS,
 };
-use video_coach_core::plan::ExportTarget;
+use video_coach_core::plan::{BasketPiece, ExportTarget};
 use video_coach_core::project::{Clip, Inset, Project, SourceRef};
+use video_coach_core::scoreboard::{
+    ClockDisplay, MatchEventKind, MatchFormat, ScoreboardConfig, ScoreboardContext, TeamConfig,
+};
+use video_coach_core::stroke::Rgba;
 use video_coach_core::zoom::Zoom;
 
 fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
@@ -34,9 +39,10 @@ fn clip(start: f64, duration: f64, events: Vec<CommentaryEvent>) -> Clip {
     }
 }
 
-/// Every clip of `clips`, over one source `source_duration` seconds long.
-fn compile(clips: Vec<Clip>, source_duration: f64) -> Compilation {
-    let mut p = Project::new("p");
+/// A project called `name` holding `clips`, over one source `source_duration`
+/// seconds long.
+fn project_of(name: &str, clips: Vec<Clip>, source_duration: f64) -> Project {
+    let mut p = Project::new(name);
     p.source_videos.push(SourceRef {
         relative_path: "film.mp4".into(),
         display_name: "film".into(),
@@ -44,6 +50,12 @@ fn compile(clips: Vec<Clip>, source_duration: f64) -> Compilation {
         display_aspect: 16.0 / 9.0,
     });
     p.clips = clips;
+    p
+}
+
+/// Every clip of `clips`, over one source `source_duration` seconds long.
+fn compile(clips: Vec<Clip>, source_duration: f64) -> Compilation {
+    let p = project_of("p", clips, source_duration);
     compilation_schedule(&p, &ExportTarget::AllClips)
 }
 
@@ -77,6 +89,16 @@ fn zoom(t: f64, scale: f64) -> CommentaryEvent {
 
 fn approx(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
+}
+
+/// A scoreboard naming two teams, in the default match format.
+fn board(home: &str, away: &str) -> ScoreboardConfig {
+    ScoreboardConfig {
+        home: TeamConfig::new(home, Rgba::RED, Rgba::RED),
+        away: TeamConfig::new(away, Rgba::RED, Rgba::RED),
+        format: MatchFormat::default(),
+        auto_back_anchor_p1: false,
+    }
 }
 
 const DUR: f64 = 1000.0;
@@ -247,6 +269,104 @@ fn record_time_is_derived_from_the_entry_and_the_frame_index() {
         second.record_time(second.start_frame + second.frames - 1),
         29.0 / FPS
     ));
+}
+
+// ── A basket, whose pieces come from several matches ───────────────────────
+
+fn piece<'a>(clip: &'a Clip, match_label: &str) -> BasketPiece<'a> {
+    BasketPiece {
+        clip,
+        source_duration: DUR,
+        match_label: match_label.into(),
+    }
+}
+
+/// The events a piece plays are its own clip's, read straight off it: a basket
+/// pairs nothing, so it can pair nothing wrongly. `compilation_schedule` finds
+/// its clip by id and falls back to *no events* on a miss, which across
+/// matches would draw a zoomed, drawn-on clip at identity zoom and say
+/// nothing.
+#[test]
+fn a_pieces_clip_is_the_only_source_of_its_events() {
+    let mut zoomed = clip(0.0, 1.0, vec![zoom(0.0, 1.0), zoom(1.0, 2.0)]);
+    let plain = clip(100.0, 1.0, vec![]);
+    // The two matches' clips share an id — two projects' uuids are independent
+    // — so a lookup by id would answer with whichever project it was handed.
+    zoomed.id = plain.id;
+
+    let rovers = project_of("Rovers v Athletic", vec![zoomed], DUR);
+    let city = project_of("City v Rovers", vec![plain], DUR);
+    let pieces = vec![
+        piece(&rovers.clips[0], "Rovers v Athletic"),
+        piece(&city.clips[0], "City v Rovers"),
+    ];
+
+    let c = basket_schedule(&pieces);
+    let [first, second] = &c.plan.entries[..] else {
+        panic!("two entries")
+    };
+    assert_eq!((first.frames, second.frames), (30, 30));
+
+    // The first piece zooms across its 1 s; the second has no events at all.
+    assert_eq!(c.frames[0].zoom, Zoom::IDENTITY);
+    assert!(approx(c.frames[15].zoom.scale, 1.5));
+    for f in &c.frames[second.start_frame..] {
+        assert_eq!(f.zoom, Zoom::IDENTITY);
+    }
+
+    // Swapping the ids the two clips carry changes nothing: nothing reads
+    // them.
+    let mut swapped = rovers.clips[0].clone();
+    swapped.id = Uuid::new_v4();
+    let swapped_pieces = vec![
+        piece(&swapped, "Rovers v Athletic"),
+        piece(&city.clips[0], "City v Rovers"),
+    ];
+    assert_eq!(basket_schedule(&swapped_pieces).frames, c.frames);
+}
+
+/// **The point of the feature.** Each piece reads its *own* match's board, so
+/// two pieces at the same output time show two different clocks and scores.
+/// The clock is still the displayed frame's source time, asked per frame —
+/// there is no per-clip constant anywhere in it (BACKLOG #27).
+#[test]
+fn each_piece_reads_its_own_matchs_clock_and_score() {
+    // Rovers: kick-off 10 s in, one goal at 60 s. The piece plays from 100 s,
+    // so its clock reads 90 s.
+    let mut rovers = project_of("Rovers v Athletic", vec![clip(100.0, 1.0, vec![])], DUR);
+    rovers.scoreboard = Some(board("Rovers", "Athletic"));
+    rovers.append_match_event(MatchEventKind::StartStop, 0, 10.0);
+    rovers.append_match_event(MatchEventKind::HomeGoal, 0, 60.0);
+
+    // City: kick-off 500 s in, no goals. The piece plays from 800 s, so its
+    // clock reads 300 s.
+    let mut city = project_of("City v Rovers", vec![clip(800.0, 1.0, vec![])], DUR);
+    city.scoreboard = Some(board("City", "Rovers"));
+    city.append_match_event(MatchEventKind::StartStop, 0, 500.0);
+
+    let pieces = vec![
+        piece(&rovers.clips[0], "Rovers v Athletic"),
+        piece(&city.clips[0], "City v Rovers"),
+    ];
+    let c = basket_schedule(&pieces);
+    let boards = [
+        ScoreboardContext::for_project(&rovers).unwrap(),
+        ScoreboardContext::for_project(&city).unwrap(),
+    ];
+
+    // Frame 15 of each piece, a full second apart in the output and half a
+    // second into each piece.
+    for (i, expect) in [(90.5, 1, 0), (300.5, 0, 0)].into_iter().enumerate() {
+        let (seconds, home, away) = expect;
+        let entry = &c.plan.entries[i];
+        let frame = c.frames[entry.start_frame + 15];
+        assert_eq!(frame.entry, i);
+        let state = boards[i]
+            .state_at(entry.source_index, frame.source_time)
+            .expect("the match has started");
+        assert_eq!(state.clock, ClockDisplay::Running { seconds }, "piece {i}");
+        assert_eq!((state.home_score, state.away_score), (home, away));
+    }
 }
 
 // ── The rate window ────────────────────────────────────────────────────────

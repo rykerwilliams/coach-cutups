@@ -1,10 +1,13 @@
 //! Compilation planning: target filtering, ordering, length accounting and the
-//! text bar's line.
+//! text bar's line — then the same for a basket, whose pieces come from
+//! several matches.
 
 use uuid::Uuid;
 
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::plan::{compilation_plan, ExportTarget, PlanEntry};
+use video_coach_core::plan::{
+    basket_plan, clip_source_duration, compilation_plan, BasketPiece, ExportTarget, PlanEntry,
+};
 use video_coach_core::project::{Clip, Inset, Project, SourceRef};
 
 fn clip(name: &str, sort_index: i64, tags: &[&str]) -> Clip {
@@ -247,6 +250,126 @@ fn chapters_start_on_each_entrys_first_frame() {
     assert_eq!(chapters.len(), 3);
     assert_eq!(chapters[0], (0.0, "1 / 3 | a".to_string()));
     assert_eq!(chapters[1], (151.0 / 30.0, "2 / 3 | b | shot".to_string()));
+}
+
+// ── A basket's plan: pieces from several matches ───────────────────────────
+
+fn piece<'a>(clip: &'a Clip, match_label: &str) -> BasketPiece<'a> {
+    BasketPiece {
+        clip,
+        source_duration: 1000.0,
+        match_label: match_label.into(),
+    }
+}
+
+#[test]
+fn basket_entries_are_the_pieces_in_order() {
+    let mut a = clip("Corner", 10, &[]);
+    a.recording_duration = 2.01;
+    let mut b = clip("Turnover", 20, &[]);
+    b.recording_duration = 2.01;
+
+    // The order given, not the clips' own `sort_index`: the basket is a list
+    // the coach built.
+    let plan = basket_plan(&[piece(&b, "City v Rovers"), piece(&a, "Rovers v Athletic")]);
+    assert_eq!(
+        plan.entries.iter().map(|e| e.clip_id).collect::<Vec<_>>(),
+        [Some(b.id), Some(a.id)]
+    );
+    // Quantized per entry, as every other plan is: 2.01 s is 61 frames.
+    assert_eq!(
+        (plan.entries[0].start_frame, plan.entries[0].frames),
+        (0, 61)
+    );
+    assert_eq!(
+        (plan.entries[1].start_frame, plan.entries[1].frames),
+        (61, 61)
+    );
+    assert_eq!(plan.total_frames(), 122);
+    assert_eq!(segment_sum(&plan.entries[0]), 2.01);
+
+    assert!(basket_plan(&[]).entries.is_empty());
+    assert_eq!(basket_plan(&[]).total_frames(), 0);
+}
+
+/// A piece keeps **its own** match's `source_index`: the entry's source file,
+/// its scoreboard and its highlights are all keyed by it, so a merged source
+/// list across matches would collide their indices.
+#[test]
+fn a_piece_keeps_its_own_matchs_source_index() {
+    let first = clip("a", 10, &[]);
+    let mut second = clip("b", 20, &[]);
+    second.source_index = 2; // the third source of its own project
+
+    let plan = basket_plan(&[
+        piece(&first, "Rovers v Athletic"),
+        piece(&second, "City v Rovers"),
+    ]);
+    assert_eq!(plan.entries[0].source_index, 0);
+    assert_eq!(plan.entries[1].source_index, 2);
+}
+
+/// The duration authority under its own name, for the caller that resolves a
+/// piece against its own project.
+#[test]
+fn clip_source_duration_is_the_sources_or_a_covering_fallback() {
+    let present = clip("a", 10, &[]);
+    let p = project_with(vec![present.clone()]);
+    assert_eq!(clip_source_duration(&p, &present), 1000.0);
+
+    // No such source: start 10 + duration 5 covers every position the clip
+    // visits.
+    let mut missing = clip("b", 20, &[]);
+    missing.source_index = 7;
+    assert_eq!(clip_source_duration(&p, &missing), 15.0);
+}
+
+#[test]
+fn the_basket_line_is_the_match_then_the_clip_then_its_tags() {
+    let named = clip("Back post header", 10, &["shot", "set piece"]);
+    let untagged = clip("Turnover", 20, &[]);
+    let anonymous = clip("   ", 30, &[]);
+
+    let plan = basket_plan(&[
+        piece(&named, "Rovers v Athletic"),
+        piece(&untagged, "City v Rovers"),
+        piece(&anonymous, "  Rovers v Athletic  "),
+    ]);
+    let text = |i: usize| plan.entries[i].text.as_str();
+    assert_eq!(
+        text(0),
+        "Rovers v Athletic | Back post header | shot, set piece"
+    );
+    // An empty part goes with its separator, as it does in a compilation.
+    assert_eq!(text(1), "City v Rovers | Turnover");
+    assert_eq!(text(2), "Rovers v Athletic");
+
+    // No position anywhere in it (spec T3): numbering means nothing across
+    // matches, and the bar ellipsizes rather than shrinking, so the safe end
+    // of the line goes to the match and the clip's name.
+    assert!(plan.entries.iter().all(|e| !e.text.contains('/')));
+}
+
+#[test]
+fn basket_chapters_are_one_per_piece_titled_with_its_line() {
+    let mut a = clip("Corner", 10, &[]);
+    a.recording_duration = 5.01;
+    let b = clip("Turnover", 20, &[]);
+
+    let plan = basket_plan(&[piece(&a, "Rovers v Athletic"), piece(&b, "City v Rovers")]);
+    assert_eq!(plan.entries[1].start_frame, 151);
+    assert_eq!(
+        plan.chapters,
+        [
+            (0.0, "Rovers v Athletic | Corner".to_string()),
+            (151.0 / 30.0, "City v Rovers | Turnover".to_string()),
+        ]
+    );
+
+    // One piece is the whole film, so a chapter would only repeat it.
+    assert!(basket_plan(&[piece(&a, "Rovers v Athletic")])
+        .chapters
+        .is_empty());
 }
 
 #[test]
