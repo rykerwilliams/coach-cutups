@@ -30,12 +30,16 @@ your exports in `exports/`. The game video stays where it is.
 ## Install
 
 Coach Cuts ships as a `.deb` for **Ubuntu 24.04 and Linux Mint 22** on
-x86-64. Releases are built from version tags by CI; there are none published
-yet, so for now build the package yourself ([below](#build-from-source)). Then:
+x86-64. Download it from the
+[releases page](https://github.com/rykerwilliams/coach-cutups/releases), then,
+in the folder you downloaded it to:
 
 ```bash
-sudo apt install ./coach-cuts_<version>_amd64.deb
+sudo apt install ./coach-cuts_*_amd64.deb
 ```
+
+Or [build the package yourself](#build-from-source), which is also how you get
+a build newer than the last release.
 
 It appears in the applications menu as **Coach Cuts**. From a terminal it is
 `coach-cuts`, or `coach-cuts <folder>` to open (or create) a project there;
