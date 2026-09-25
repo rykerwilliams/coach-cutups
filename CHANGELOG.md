@@ -10,6 +10,30 @@ published release is 0.6.0, which contains all of them.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-25
+
+### Added
+
+- **The basket: one film from several matches.** Add a clip to the basket from
+  whichever project you have open, move to another match, add another, and press
+  Start — you get a single video of all the pieces, in the order you added them,
+  each carrying its own match's scoreboard and clock. It's in a clip's menu
+  ("Add to basket") and behind the **Basket…** button beside Export…, which works
+  with no project open. The film lands in Coach Cuts in your videos folder.
+- **The score and match clock on the picture while you scan**, drawn by the same
+  code that burns them into an export, so what you see is what you'll get. It
+  disappears while you drag the scrubber and comes back when you let go.
+- **The mouse wheel scrubs** when the pointer is over the scrubber: a notch is
+  3 seconds, Shift makes it 10, and it keeps working while you record, where
+  dragging the scrubber doesn't.
+
+### Changed
+
+- **The scoreboard and the webcam or avatar inset sit in the picture's corners**
+  rather than floating a little way off them, and the caption bar stops where the
+  inset begins instead of running underneath it.
+
+
 ## [0.6.0] - 2026-09-24
 
 The first published release. Every version below this one was built and
