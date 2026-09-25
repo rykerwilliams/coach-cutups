@@ -2,8 +2,8 @@
 
 use video_coach_core::avatar::avatar_box;
 use video_coach_core::layout::{
-    avatar_self_view_rect, bar_rect, pip_rect, pip_rect_over_picture, scoreboard_rects,
-    self_view_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
+    avatar_self_view_rect, bar_rect, bar_text_rect, pip_rect, pip_rect_over_picture,
+    scoreboard_rects, self_view_rect, stroke_line_width, Rect, BAR_HEIGHT_RATIO, PIP_WIDTH_RATIO,
     SCOREBOARD_FONT_RATIO,
 };
 
@@ -14,23 +14,44 @@ fn close(a: Rect, b: Rect) -> bool {
 }
 
 #[test]
-fn the_pip_sits_above_the_text_bar_at_the_ratio_table_s_size() {
-    // 1920×1080 with a 16:9 camera: 422.4 × 237.6, 23.76 from the right edge
-    // and the same again above the 86.4 px bar.
+fn the_pip_sits_flush_in_the_bottom_right_corner_over_the_bar() {
+    // 1920×1080 with a 16:9 camera: 422.4 × 237.6 in the corner itself.
     let r = pip_rect(1920.0, 1080.0, 16.0 / 9.0);
     assert_eq!(
         r,
         Rect {
-            x: 1920.0 - 23.76 - 422.4,
-            y: 1080.0 - 86.4 - 23.76 - 237.6,
+            x: 1920.0 - 422.4,
+            y: 1080.0 - 237.6,
             w: 422.4,
             h: 237.6,
         }
     );
-    // The same margin from the right edge as from the bar's top (spec E2):
-    // the inset sits on the bar rather than over it.
+    // Flush on both edges at every output size, and over the bar rather than
+    // on it: the row the bar starts, the inset finishes.
+    for (w, h) in [(1280.0, 720.0), (1920.0, 1080.0), (3840.0, 2160.0)] {
+        let r = pip_rect(w, h, 16.0 / 9.0);
+        assert!((r.x + r.w - w).abs() < 1e-9, "not flush right at {w}×{h}");
+        assert!((r.y + r.h - h).abs() < 1e-9, "not flush bottom at {w}×{h}");
+        assert!(r.y + r.h > bar_rect(w, h).y);
+    }
+}
+
+/// The bar's *line* stops where the inset stands; its background does not.
+/// A caption is ellipsized and never shrunk, so this is the only thing keeping
+/// a long one out from under the inset.
+#[test]
+fn the_bar_s_line_leaves_the_inset_s_column_alone() {
     let bar = bar_rect(1920.0, 1080.0);
-    assert!((1920.0 - (r.x + r.w) - (bar.y - (r.y + r.h))).abs() < 1e-9);
+    let with = bar_text_rect(1920.0, 1080.0, true);
+    // Same strip, and it ends exactly where a camera inset begins.
+    assert_eq!((with.x, with.y, with.h), (bar.x, bar.y, bar.h));
+    assert_eq!(with.w, pip_rect(1920.0, 1080.0, 16.0 / 9.0).x);
+    // An avatar's box keeps the inset's right edge and is narrower, so the one
+    // column clears both kinds of inset.
+    let avatar = avatar_box(pip_rect(1920.0, 1080.0, 1.0));
+    assert!(with.w <= avatar.x);
+    // And with no inset the line gets the whole strip back.
+    assert_eq!(bar_text_rect(1920.0, 1080.0, false), bar);
 }
 
 #[test]
@@ -138,15 +159,22 @@ fn over_a_wide_picture_the_inset_is_placed_in_the_letterboxed_frame() {
 }
 
 #[test]
-fn the_scoreboard_sits_inset_from_the_top_left() {
+fn the_scoreboard_sits_flush_in_the_top_left_corner() {
     let s = scoreboard_rects(1920.0, 1080.0);
-    // 0.015 × 1080 in from both edges, 0.36 × 1920 by 0.08 × 1080.
-    assert_eq!(s.bar.x, 16.2);
-    assert_eq!(s.bar.y, 16.2);
+    // The corner itself, 0.36 × 1920 by 0.08 × 1080: locked to the two edges
+    // the way the caption bar is locked to the bottom.
+    assert_eq!(s.bar.x, 0.0);
+    assert_eq!(s.bar.y, 0.0);
     assert!((s.bar.w - 691.2).abs() < 1e-9);
     assert_eq!(s.bar.h, 86.4);
-    // Square gap: the same pixels from the top as from the left, at any aspect.
-    assert_eq!(s.bar.x, s.bar.y);
+    // Including at every other output size: nothing here is a pixel count.
+    for (w, h) in [(1280.0, 720.0), (3840.0, 2160.0)] {
+        let s = scoreboard_rects(w, h);
+        assert_eq!((s.bar.x, s.bar.y), (0.0, 0.0));
+    }
+    // The accent strip and the cells start in the corner with it.
+    assert_eq!((s.accent.x, s.accent.y), (0.0, 0.0));
+    assert_eq!(s.home.x, 0.0);
 }
 
 #[test]

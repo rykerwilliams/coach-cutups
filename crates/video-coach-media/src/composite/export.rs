@@ -1229,7 +1229,9 @@ impl Encoder {
         // run.
         install_geometry(&mix_pad("sink_0"), schedule, 0, Schedule::picture);
         let inset_pad = mix_pad("sink_1");
-        install_geometry(&inset_pad, schedule, 1, Schedule::inset);
+        // Over the overlay, not under it: the inset lands on the bar
+        // (`install_overlay_pad`).
+        install_geometry(&inset_pad, schedule, 2, Schedule::inset);
         // The avatar reaching this pad is a premultiplied pixmap; a webcam
         // frame and the filler blend the same either way (spec E4).
         premultiplied_over(&inset_pad);

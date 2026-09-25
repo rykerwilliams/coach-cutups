@@ -67,7 +67,7 @@ The scoreboard joins `overlay.rs`'s single layer, drawn **after** the strokes an
 
 | Element | Value |
 |---|---|
-| Bar | `0.36 × outW` by `0.08 × outH`, inset `0.015 × outH`, top-left |
+| Bar | `0.36 × outW` by `0.08 × outH`, flush into the top-left corner (**changed 2026-09-25**: it was inset `0.015 × outH`, which beside a flush caption bar read as an accident) |
 | Accent strip | `0.08 × barH`, **above** the cells, over the home and away columns only |
 | Cells | height `scoreBarH = barH − accentH`, at `top + accentH` |
 | Columns | home `0.27`, score `0.20`, away `0.27`, clock `0.26` |

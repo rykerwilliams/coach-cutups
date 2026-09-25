@@ -1075,7 +1075,7 @@ fn link_recording(
 fn place_avatar(pad: &gst::Pad, rect: PadRect, levels: Arc<[f64]>) {
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
-            place(pad, pulsed(rect, level_at(&levels, pts)), 1);
+            place(pad, pulsed(rect, level_at(&levels, pts)), 2);
         }
         gst::PadProbeReturn::Ok
     });
@@ -1085,7 +1085,8 @@ fn place_avatar(pad: &gst::Pad, rect: PadRect, levels: Arc<[f64]>) {
 ///
 /// It is chrome in **output** space — the coach never drew it, so nothing ties
 /// it to the picture — and its height comes from the camera's display aspect,
-/// so the inset is never stretched (`core::layout::pip_rect`).
+/// so the inset is never stretched (`core::layout::pip_rect`). Both insets sit
+/// at z 2, over the overlay whose bar they land on (`install_overlay_pad`).
 fn place_pip(pad: &gst::Pad) {
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |pad, info| {
         let Some(gst::PadProbeData::Event(event)) = &info.data else {
@@ -1105,7 +1106,7 @@ fn place_pip(pad: &gst::Pad) {
                 f64::from(OUTPUT_HEIGHT),
                 display_aspect(&info),
             )),
-            1,
+            2,
         );
         gst::PadProbeReturn::Remove
     });

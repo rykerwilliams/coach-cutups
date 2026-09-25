@@ -1068,7 +1068,7 @@ Each entry: what, why deferred, when to revisit.
 
 88. **The inset's size and corner, per clip.** The coach (2026-09-25): "avatar
   sizing and position should be settable per clip i think?" Today both are fixed:
-  `PIP_WIDTH_RATIO`/`PIP_MARGIN_RATIO` and a hard bottom-right corner
+  `PIP_WIDTH_RATIO` and a hard, flush bottom-right corner
   (`core/src/layout.rs`), with `AVATAR_BOX_RATIO` shrinking the avatar's circle
   inside that box. A clip keeps only *whether* it shows an inset
   (`Clip::show_pip`) and *which kind* (`Clip::inset`), both v10 fields.
@@ -1077,8 +1077,9 @@ Each entry: what, why deferred, when to revisit.
   existing clip renders unchanged. That is a `formatVersion` bump to 12, which
   is cheap and additive; and inspector controls beside the existing "Show avatar
   in export" checkbox.
-- **What has to follow it:** the caption bar's available width (which, once the
-  inset sits on the bar, depends on whether the inset is in *that* corner), the
+- **What has to follow it:** the caption bar's available width — which
+  `layout::bar_text_rect` now reserves at the right-hand end, so a left-hand
+  corner has to move the reservation with it, not just widen it — the
   scan view's live self-view (`layout::self_view_rect` /
   `avatar_self_view_rect` — the corner must match what the export will do), the
   avatar's circle, and the GL 1×1 filler. The scoreboard is top-left, so a
@@ -1089,3 +1090,17 @@ Each entry: what, why deferred, when to revisit.
   it has never offered one.
 - **Why deferred:** only by order — the basket is mid-build in the same files.
 - **When to revisit:** straight after the basket closes out.
+
+89. **The app's live self-view sits under the drawings; the export's inset sits
+  over them.** The inset became the mixer's **top** layer on 2026-09-25, so that
+  the caption bar's 60% black could not wash over the coach's face once the inset
+  was moved onto the bar (`composite::install_overlay_pad`). A stroke drawn into
+  that corner is therefore behind the inset in an export, while `app.slint` draws
+  the live self-view *under* the live stroke layer and says in a comment that
+  this is "the export's layer order".
+- **The fix is one move:** put the self-view's `Image` above the drawing layer in
+  `app.slint` and correct that comment. Two lines.
+- **Why deferred:** `app.slint` and `main.rs` were owned by another agent for the
+  change that caused this, and a stroke into the inset's own corner is rare
+  enough that the app and the export disagreeing there costs a corner of a line.
+- **When to revisit:** the next time anything touches the player's layer stack.

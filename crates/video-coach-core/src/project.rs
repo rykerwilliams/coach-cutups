@@ -215,6 +215,14 @@ impl Clip {
     pub fn shows_avatar(&self) -> bool {
         self.show_pip && self.inset == Inset::Avatar
     }
+
+    /// **Some** inset is drawn, whichever kind: what the bar's line is fitted
+    /// to, since it has to stop short of the inset either way
+    /// (`layout::bar_text_rect`). The third reading of the same pair, here with
+    /// the other two so all three stay one decision.
+    pub fn shows_inset(&self) -> bool {
+        self.shows_camera_pip() || self.shows_avatar()
+    }
 }
 
 /// The project document.

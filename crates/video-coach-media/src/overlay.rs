@@ -11,8 +11,12 @@
 //! rect and its pen denormalizes against *that* height, while the bar is chrome
 //! and belongs to the frame. Splitting them across two mixer pads would buy
 //! nothing — the extra pad is free either way (measured) — and would put the
-//! bar's background and its glyphs on different layers, which is exactly the
-//! macOS arrangement the raised PiP exists to remove.
+//! bar's background and its glyphs on different layers, which is what macOS had
+//! to do to keep its PiP out of its own caption. The inset overlaps the bar here
+//! too, and the split is still unnecessary: the inset pad is mixed **above**
+//! this layer (`composite`), so it is never tinted by the bar, and the bar's
+//! line is laid out in the width the inset leaves
+//! (`core::layout::bar_text_rect`), so it is never hidden by it.
 //!
 //! **The fonts are vendored** (`fonts/DejaVuSans*.ttf`, with their licence
 //! beside them) and they are the only fonts loaded, because [`font_system`]
@@ -46,9 +50,9 @@ use tiny_skia::{
 };
 use video_coach_core::highlight::{label_ink, HighlightShape, LABEL_PAD_RATIO, LABEL_PILL_RATIO};
 use video_coach_core::layout::{
-    bar_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect, BAR_FONT_RATIO,
-    BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO, SCOREBOARD_NAME_PAD_RATIO,
-    SCOREBOARD_TAIL_FONT_RATIO,
+    bar_rect, bar_text_rect, scoreboard_rects, stroke_line_width, Rect as LayoutRect,
+    BAR_FONT_RATIO, BAR_INSET_RATIO, SCOREBOARD_FONT_RATIO, SCOREBOARD_MIN_FONT_RATIO,
+    SCOREBOARD_NAME_PAD_RATIO, SCOREBOARD_TAIL_FONT_RATIO,
 };
 use video_coach_core::project::Clip;
 use video_coach_core::scoreboard::{format_clock, ScoreboardConfig, ScoreboardState};
@@ -313,6 +317,11 @@ impl OverlayRenderer {
     /// over the drawing, and the board is never drawn through. The highlights
     /// go under all of it (spec H5): they mark the footage, and the coach's own
     /// pen is what they must never hide.
+    ///
+    /// The inset is not in this layer and sits **over** all of it, so the one
+    /// thing here that would land under it — the bar's line — is laid out in
+    /// the width it leaves. The board cannot reach it: it is 0.36 of the width
+    /// from the left edge and the inset starts at 0.78.
     fn draw(&mut self, pixmap: &mut PixmapMut, frame: &OverlayFrame) {
         // The allocator hands back whatever was in that memory, and nothing
         // else clears it: `from_bytes` adopts the bytes as they are.
@@ -333,11 +342,14 @@ impl OverlayRenderer {
         draw_strokes(pixmap, frame);
 
         if !frame.text.is_empty() {
+            // The line stops where the inset stands; the background does not.
+            // A line that is ellipsized rather than shrunk would otherwise run
+            // under the inset, which is mixed over this layer.
             self.draw_label(
                 pixmap,
                 &Label {
                     text: frame.text,
-                    rect: bar,
+                    rect: bar_text_rect(out_w, out_h, frame.clip.is_some_and(Clip::shows_inset)),
                     style: Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL),
                     // Its own size, so the bar never shrinks: it is a whole
                     // sentence, and one that resized with its length would
@@ -774,8 +786,9 @@ impl ScoreboardRenderer {
     }
 
     /// The board as it would be burned into an `out_w`×`out_h` frame, cropped
-    /// to the top-left corner it occupies: the bar, its inset from the two
-    /// edges, and room for the stoppage tail, which hangs past the clock cell.
+    /// to the top-left corner it occupies: the bar, which starts at the frame's
+    /// own corner, and room for the stoppage tail, which hangs past the clock
+    /// cell.
     ///
     /// The tail's room is kept whether or not the clock is in stoppage, so the
     /// image is one size for a given frame and entering stoppage doesn't move
@@ -1252,6 +1265,8 @@ mod tests {
         let bar_top = (720.0 - BAR_HEIGHT_RATIO * 720.0) as u32;
         // Premultiplied black at 60%: (0, 0, 0, 153).
         assert_eq!(at(&px, 1280, 20, bar_top + 4), [0, 0, 0, 153]);
+        // Including the corner the inset lands in: it is the *line* that stops
+        // at the inset's column, never the background.
         assert_eq!(at(&px, 1280, 1260, 719), [0, 0, 0, 153]);
         // One row above the bar is untouched.
         assert_eq!(at(&px, 1280, 20, bar_top - 2), [0, 0, 0, 0]);
@@ -1285,12 +1300,40 @@ mod tests {
         };
         assert!(lit(bar_top..720, 0..640) > 100, "no glyphs in the bar");
         assert_eq!(lit(0..bar_top, 0..1280), 0, "glyphs above the bar");
-        // And they start after the inset rather than at the very edge.
-        assert_eq!(lit(bar_top..720, 0..4), 0, "glyphs in the inset");
-        // The PiP's column is clear at this length, so the inset never has to
-        // fight the webcam for the right-hand end of the bar.
+        // And they start after the bar's own inset rather than at the very edge.
+        assert_eq!(lit(bar_top..720, 0..4), 0, "glyphs at the frame's edge");
+    }
+
+    /// A caption long enough to reach the right edge stops at the inset's
+    /// column, which the inset is mixed over: the line is ellipsized and never
+    /// shrunk, so nothing else would keep the words out from behind the coach's
+    /// face. With no inset asked for it takes the whole strip back.
+    #[test]
+    fn a_long_caption_stops_where_the_inset_stands() {
+        let long = "12 / 24 | Second-half restart down the left channel, the one we \
+                    talked about on Tuesday | press, transition, wide, set-piece";
+        let bar_top = (720.0 - BAR_HEIGHT_RATIO * 720.0) as u32;
         let pip_left = (1280.0 * (1.0 - PIP_WIDTH_RATIO)) as u32;
-        assert_eq!(lit(bar_top..720, pip_left..1280), 0);
+        let ink = |px: &[[u8; 4]], cols: std::ops::Range<u32>| {
+            (bar_top..720)
+                .flat_map(|y| cols.clone().map(move |x| (x, y)))
+                .filter(|&(x, y)| at(px, 1280, x, y)[0] > 128)
+                .count()
+        };
+
+        let inset = render_at(&clip(Vec::new()), 0.0, long, (0, 0, 1280, 720), 1280, 720);
+        assert!(ink(&inset, 0..pip_left) > 100, "no caption at all");
+        assert_eq!(ink(&inset, pip_left..1280), 0, "glyphs under the inset");
+
+        // The same line on a clip whose inset is off runs past that column,
+        // which is what makes the assertion above about the reservation and not
+        // about the line being short.
+        let no_inset = Clip {
+            show_pip: false,
+            ..clip(Vec::new())
+        };
+        let full = render_at(&no_inset, 0.0, long, (0, 0, 1280, 720), 1280, 720);
+        assert!(ink(&full, pip_left..1280) > 0, "the line stopped anyway");
     }
 
     /// A line too long for the bar is cut with an ellipsis rather than
@@ -1301,7 +1344,9 @@ mod tests {
                     the one we talked about on Tuesday | press, transition, wide, \
                     set-piece";
         let mut renderer = OverlayRenderer::new();
-        let bar = bar_rect(1920.0, 1080.0);
+        // The shipping width: the strip less the inset's column, since that is
+        // what the line is actually fitted to.
+        let bar = bar_text_rect(1920.0, 1080.0, true);
         let style = Style::new((bar.h * BAR_FONT_RATIO) as f32, Weight::NORMAL);
         let max_width = bar.w as f32 - 2.0 * (bar.h * BAR_INSET_RATIO) as f32;
 
@@ -1361,8 +1406,8 @@ mod tests {
             .filter(|&(x, y)| at(&px, 1280, x, y)[3] > 0)
             .count();
         assert_eq!(above, 0, "{above} pixels of text above the bar");
-        // The last column of the bar is inset, so a line that overflowed the
-        // frame would have painted into it.
+        // The line stops a whole inset's column short of the frame's edge, so
+        // one that overflowed would have painted into the last column.
         let right_edge = (bar_top..720)
             .filter(|&y| at(&px, 1280, 1279, y)[0] > 128)
             .count();
@@ -1733,9 +1778,15 @@ mod tests {
         let clock = corner(&r.clock);
         assert_eq!(clock[3], 242, "the clock cell's alpha");
         assert!(clock[0] < 16, "the clock cell is dark: {clock:?}");
-        // Named for what they are: the inset's own margins.
-        assert_eq!(at(&px, OUT_W, r.bar.x as u32 - 4, 60), [0, 0, 0, 0]);
-        assert_eq!(at(&px, OUT_W, 60, r.bar.y as u32 - 4), [0, 0, 0, 0]);
+        // The board starts in the frame's own corner, so there is no margin
+        // left of it or above it to check — the first pixel of the frame is the
+        // home team's accent strip.
+        assert_eq!((r.bar.x, r.bar.y), (0.0, 0.0));
+        assert_eq!(at(&px, OUT_W, 0, 0), [255, 255, 0, 255]);
+        // What it does not reach is still empty: a row under the bar, and a
+        // column past its right edge (the tail's gap, with no tail to draw).
+        assert_eq!(at(&px, OUT_W, 60, (r.bar.y + r.bar.h) as u32 + 4), [0; 4]);
+        assert_eq!(at(&px, OUT_W, (r.bar.x + r.bar.w) as u32 + 1, 60), [0; 4]);
     }
 
     /// Nothing at all is painted outside the bar — and outside the stoppage
@@ -1861,7 +1912,7 @@ mod tests {
                 line_width: 0.05,
                 // Across the board's cells and out past them, a twentieth of
                 // the way down the picture.
-                points: [0.01, 0.5]
+                points: [0.0, 0.5]
                     .into_iter()
                     .enumerate()
                     .map(|(i, x)| StrokePoint {
@@ -1888,6 +1939,10 @@ mod tests {
         );
         let r = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
         // The stroke crosses this row of the home cell; the cell's fill wins.
+        // A few pixels in, clear of the name centred in the cell — and the
+        // stroke starts at the picture's own edge, because the cell does now:
+        // from x = 0.01 it began to the right of this sample, where the fill
+        // would have won whether or not the board covered anything.
         let y = (0.055 * f64::from(OUT_H)) as u32;
         assert_eq!(at(&px, OUT_W, r.home.x as u32 + 4, y), [0, 0, 255, 255]);
         // And it is still there past the board's right edge.

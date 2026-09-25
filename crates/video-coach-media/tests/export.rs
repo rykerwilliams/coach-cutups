@@ -822,9 +822,9 @@ fn assert_rgb(frame: &fixtures::RgbFrame, what: &str, (x, y): (usize, usize), ex
 }
 
 /// The three pads land where `core::layout` says, in z-order: the source
-/// pillarboxed at the bottom, the PiP above it and clear of the bar, and the
-/// overlay — the strokes mapped into the picture, the bar over the whole
-/// width — on top of both.
+/// pillarboxed at the bottom, the overlay above it — the strokes mapped into
+/// the picture, the bar over the whole width — and the PiP on top of both, in
+/// the corner, over the bar it lands on.
 #[test]
 fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
     let dir = tempfile::tempdir().unwrap();
@@ -842,12 +842,12 @@ fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
     assert_rgb(frame, "the right bar", (1200, 100), 0x000000);
     assert_rgb(frame, "the picture", (300, 200), BLUE);
 
-    // The PiP is the recording, flush to the right edge in output space --
-    // overlapping the right pillarbox bar, which is the point of putting it
-    // there -- and sitting ON the text bar rather than under it.
+    // The PiP is the recording, flush into the bottom-right corner in output
+    // space -- overlapping the right pillarbox bar, which is the point of
+    // putting it there -- and OVER the text bar rather than on it.
     let pip = pip_rect(f64::from(OUT_W), f64::from(OUT_H), 16.0 / 9.0);
     let bar = bar_rect(f64::from(OUT_W), f64::from(OUT_H));
-    assert!(pip.y + pip.h <= bar.y, "the PiP overlaps the bar");
+    assert!(pip.y + pip.h > bar.y, "the PiP is not on the bar");
     let pip_centre = (
         (pip.x + pip.w / 2.0) as usize,
         (pip.y + pip.h / 2.0) as usize,
@@ -858,6 +858,16 @@ fn the_export_stacks_the_picture_the_pip_and_the_overlay() {
         "just left of the PiP",
         (pip.x as usize - 20, pip_centre.1),
         BLUE,
+    );
+    // And the bar's tint is under it rather than over it: the inset pad is the
+    // top layer, so its bottom row is the recording's own green and not green
+    // washed 60% black. This is the assertion that fails if the z-order goes
+    // back to the overlay on top.
+    assert_rgb(
+        frame,
+        "the PiP over the bar",
+        (pip_centre.0, OUT_H as usize - 8),
+        GREEN,
     );
 
     // The overlay's strokes are mapped into the picture rect, so the middle of
@@ -980,7 +990,10 @@ fn the_export_burns_in_the_scoreboard() {
         display_aspect: 16.0 / 9.0,
     });
     project.scoreboard = Some(ScoreboardConfig {
-        home: team("HOME", 0x0000ff, 0xffff00),
+        // Magenta at home, not the source's own blue: the board reaches the
+        // frame's edge now, so a home cell the colour of the footage would make
+        // the checks below unable to tell the two apart.
+        home: team("HOME", 0xff00ff, 0xffff00),
         away: team("AWAY", 0xff0000, 0x00ffff),
         format: MatchFormat::default(),
         auto_back_anchor_p1: false,
@@ -1022,12 +1035,16 @@ fn the_export_burns_in_the_scoreboard() {
     let out = fixtures::decode_rgb(&path);
     let frame = out.last().expect("frames out");
     let rects = scoreboard_rects(f64::from(OUT_W), f64::from(OUT_H));
-    assert_rgb(frame, "the home cell", cell_corner(&rects.home), 0x0000ff);
+    assert_rgb(frame, "the home cell", cell_corner(&rects.home), 0xff00ff);
     assert_rgb(frame, "the away cell", cell_corner(&rects.away), 0xff0000);
-    // The board is top-left and nothing else is: the picture below it, and the
-    // strip the inset leaves to its left, are the source's own blue.
+    // The board is locked to the frame's own corner, so a pixel a few in from
+    // both edges is the home cell and not the picture -- which is where this
+    // used to read the board's margin, the strip the coach asked to lose.
+    assert_rgb(frame, "the frame's corner", (2, 8), 0xff00ff);
+    // And the board is the only thing up there: the picture below it is the
+    // source's own blue.
     assert_rgb(frame, "the picture", (640, 400), BLUE);
-    assert_rgb(frame, "left of the board", (2, 40), BLUE);
+    assert_rgb(frame, "under the board", (2, 120), BLUE);
 }
 
 /// Two pieces from two matches in one film, and **each draws its own match's
@@ -1320,14 +1337,15 @@ const RED: u32 = 0x00ff_0000;
 /// The avatar is one flat red and every source here is blue, so the count of
 /// red pixels along that row is the drawn circle's diameter — which is the
 /// pulse, and nothing else. It scans a little either side of `pip` so a circle
-/// that grew past its rect would be counted rather than clipped.
+/// that grew past its rect would be counted rather than clipped — to the right
+/// only as far as the frame goes, since the inset is flush with its edge.
 fn avatar_width(frame: &fixtures::RgbFrame, pip: &LayoutRect) -> usize {
     let y = (pip.y + pip.h / 2.0) as usize;
     let red = |x: usize| {
         let px = frame.at(x, y);
         i32::from(px[0]) - i32::from(px[2]) > 80
     };
-    ((pip.x as usize - 16)..(pip.x + pip.w) as usize + 16)
+    ((pip.x as usize - 16)..((pip.x + pip.w) as usize + 16).min(frame.width))
         .filter(|&x| red(x))
         .count()
 }

@@ -826,5 +826,7 @@ fn one_predicate_per_inset_and_never_both() {
         assert_eq!(clip.shows_camera_pip(), camera, "{show_pip} {inset:?}");
         assert_eq!(clip.shows_avatar(), avatar, "{show_pip} {inset:?}");
         assert!(!(clip.shows_camera_pip() && clip.shows_avatar()));
+        // And the third reading, which the bar's line turns on: either inset.
+        assert_eq!(clip.shows_inset(), camera || avatar, "{show_pip} {inset:?}");
     }
 }

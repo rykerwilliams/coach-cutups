@@ -270,7 +270,7 @@ impl Picture {
 
 /// The mixer lays the three pads out as `core::layout` says: the source
 /// pillarboxed, the overlay over the *picture* and not the output, and the
-/// PiP as chrome in output space, above the text bar. And the overlay blends
+/// PiP as chrome in output space, over the text bar. And the overlay blends
 /// premultiplied.
 #[test]
 fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
@@ -298,8 +298,9 @@ fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
     picture.assert_rgb("the right bar", (1200, 100), 0x000000);
     picture.assert_rgb("the picture", (300, 200), BLUE);
 
-    // The PiP is the recording, flush to the bottom-right in output space --
-    // overlapping the right bar, which is the point of putting it there.
+    // The PiP is the recording, flush into the bottom-right corner in output
+    // space -- overlapping the right bar, which is the point of putting it
+    // there, and overlapping the text bar, which it is mixed over.
     let pip = pip_rect(OUT_W as f64, OUT_H as f64, 16.0 / 9.0);
     let pip_centre = (
         (pip.x + pip.w / 2.0) as usize,
@@ -310,6 +311,13 @@ fn the_composite_places_the_pip_and_the_overlay_on_the_picture() {
         "just left of the PiP",
         (pip.x as usize - 20, pip_centre.1),
         BLUE,
+    );
+    // Its bottom row is the recording's own green, not green under the bar's
+    // 60% black: the inset pad is the top layer, here as in the export.
+    picture.assert_rgb(
+        "the PiP over the text bar",
+        (pip_centre.0, OUT_H - 8),
+        GREEN,
     );
 
     // The overlay is normalized to the picture rect, so the middle of a stroke

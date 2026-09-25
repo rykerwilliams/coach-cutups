@@ -227,12 +227,12 @@ This is a genuine improvement to bank. On macOS the two paths were *forced* apar
 | Text bar | empty string | draws nothing; background still drawn | `:332` vs `:160` |
 | PiP | width | `0.22 × outW` | `:172` |
 | PiP | height | `pipW × camH / camW` | `:173` |
-| PiP | margin | `0.022 × outH` from bottom and right | `:174`, `:182-185` |
+| PiP | margin | none (**changed 2026-09-25**: the coach asked for the inset flush into the bottom-right corner, over the text bar; macOS's `0.022 × outH` left a strip of picture doing nothing) | `:174`, `:182-185` |
 | PiP | corners | square | (absent) |
 | PiP | visibility | honors `showPiP` in **both** paths | `:101` |
 | Stroke | line width | `stroke.lineWidth × outH` (height) | `:276` |
 | Stroke | caps/joins | round / round | `:310-311` |
-| Scoreboard | bar | `0.36 × outW` × `0.08 × outH`, inset `0.015 × outH` | `ScoreboardDraw.swift:11-15` |
+| Scoreboard | bar | `0.36 × outW` × `0.08 × outH`, flush into the top-left corner (**changed 2026-09-25**: macOS's `0.015 × outH` inset read as an accident beside a caption bar on the bottom edge) | `ScoreboardDraw.swift:11-15` |
 | Scoreboard | accent strip | `0.08 × barH`, home and away cells only | `:17`, `:41-43` |
 | Scoreboard | columns | home `.30`, score `.20`, away `.30`, clock `.20` | `:20-23` |
 | Scoreboard | team font | `0.55 × scoreBarH` with ellipsis (**corrected 2026-09-20**: ratios are of `scoreBarH = barH − accentH`, and the port fixes the size rather than shrinking to fit) | `:48-54`, `:89-94` |

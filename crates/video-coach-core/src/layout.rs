@@ -33,11 +33,6 @@ pub struct Rect {
 /// The webcam inset's width, as a fraction of the **output** width.
 pub const PIP_WIDTH_RATIO: f64 = 0.22;
 
-/// The webcam inset's gap from the bottom and right edges, as a fraction of
-/// the **output height** — the same fraction on both axes, so the gap is
-/// square in pixels rather than matching the frame's aspect.
-pub const PIP_MARGIN_RATIO: f64 = 0.022;
-
 /// The text bar's height, as a fraction of the **output height** (macOS's
 /// `size.height * 0.08`).
 pub const BAR_HEIGHT_RATIO: f64 = 0.08;
@@ -61,25 +56,60 @@ pub fn bar_rect(out_w: f64, out_h: f64) -> Rect {
     }
 }
 
-/// The webcam inset's rect in output space, flush to the right edge and
-/// sitting **on** the text bar rather than over it.
+/// The bar's **line**, which is the strip less the column the inset stands in
+/// — or the whole strip for an entry that has no inset.
+///
+/// The bar's *background* is [`bar_rect`] either way: it reaches both edges as
+/// it always has, and the inset is mixed over its right-hand end. It is the
+/// words that have to stop, because the line is ellipsized and never shrunk
+/// (`media::overlay`), so a reel's three-part caption or a basket's
+/// `<match> | <clip> | tags` would otherwise run underneath the inset. Losing
+/// the tags to an ellipsis is a smaller loss than losing them behind a
+/// picture.
+///
+/// **The camera's column, whichever inset the clip has:** an avatar's box
+/// keeps the inset's right edge and is narrower
+/// ([`crate::avatar::avatar_box`]), and its pulse only shrinks it further, so
+/// this width clears either kind. And `has_inset` is the coach's own
+/// [`Clip::shows_inset`](crate::project::Clip::shows_inset), not whether a
+/// recording opened: preview learns its camera's shape from caps on a
+/// GStreamer thread, long after the line is laid out, so anything finer would
+/// have preview and export cut the same caption differently.
+pub fn bar_text_rect(out_w: f64, out_h: f64, has_inset: bool) -> Rect {
+    let bar = bar_rect(out_w, out_h);
+    match has_inset {
+        true => Rect {
+            w: bar.w - PIP_WIDTH_RATIO * out_w,
+            ..bar
+        },
+        false => bar,
+    }
+}
+
+/// The webcam inset's rect in output space: flush into the **bottom-right
+/// corner**, over the text bar.
 ///
 /// Width comes from the output; height comes from `cam_aspect`, so the camera
 /// is never stretched or letterboxed inside the inset. `cam_aspect` is the
 /// **display** aspect (width ÷ height with the pixel aspect ratio applied) and
 /// must be positive: a camera reporting neither is not a camera.
 ///
-/// **The bottom margin is the bar's height plus the margin** (spec E2). macOS
-/// split the bar's background and its glyphs across two layers precisely
-/// because its PiP overlapped the bar; raising the PiP removes the need, and
-/// the bar is drawn in one piece.
+/// **Flush, and over the bar** (the coach, 2026-09-25). A margin off the two
+/// edges plus the bar's height left a strip of picture under the inset that
+/// did nothing — the same accident as the scoreboard's old inset — so the
+/// inset finishes the bottom row the bar starts. Two things follow: the inset
+/// is mixed **above** the overlay (`media::composite`), so the bar's tint
+/// never washes over the picture it carries, and the bar's line stops at
+/// [`bar_text_rect`], so the words are never behind it. macOS split the bar's
+/// background from its glyphs across two layers to get those same two results;
+/// one overlay above the picture and a shorter line need neither the split nor
+/// a fourth pad.
 pub fn pip_rect(out_w: f64, out_h: f64, cam_aspect: f64) -> Rect {
     let w = PIP_WIDTH_RATIO * out_w;
     let h = w / cam_aspect;
-    let margin = PIP_MARGIN_RATIO * out_h;
     Rect {
-        x: out_w - margin - w,
-        y: bar_rect(out_w, out_h).y - margin - h,
+        x: out_w - w,
+        y: out_h - h,
         w,
         h,
     }
@@ -165,10 +195,6 @@ const SCOREBOARD_WIDTH_RATIO: f64 = 0.36;
 /// The bar's height, as a fraction of the **output height**.
 const SCOREBOARD_HEIGHT_RATIO: f64 = 0.08;
 
-/// The bar's gap from the top and left edges, as a fraction of the **output
-/// height** — the same fraction on both axes, so the gap is square in pixels.
-const SCOREBOARD_INSET_RATIO: f64 = 0.015;
-
 /// The accent strip's height, as a fraction of the **bar's height**.
 const SCOREBOARD_ACCENT_RATIO: f64 = 0.08;
 
@@ -241,12 +267,19 @@ pub struct ScoreboardRects {
     pub tail: Rect,
 }
 
-/// The scoreboard's rects in output space, anchored to the top-left.
+/// The scoreboard's rects in output space, flush into the **top-left corner**.
+///
+/// **Flush, not inset** (the coach, 2026-09-25). The bar used to sit
+/// `0.015 × outH` off both edges — 16 px at 1080p — which beside a caption bar
+/// that lies on the bottom edge read as an accident rather than a decision, so
+/// the board is locked to its corner the way the bar is to its own. Nothing
+/// under it moves: the accent strip and the cells are placed off `bar`, and the
+/// stoppage tail keeps its own gap off the clock **cell**, which is a gap
+/// between two drawn things rather than off a frame edge.
 pub fn scoreboard_rects(out_w: f64, out_h: f64) -> ScoreboardRects {
-    let inset = SCOREBOARD_INSET_RATIO * out_h;
     let bar = Rect {
-        x: inset,
-        y: inset,
+        x: 0.0,
+        y: 0.0,
         w: SCOREBOARD_WIDTH_RATIO * out_w,
         h: SCOREBOARD_HEIGHT_RATIO * out_h,
     };
